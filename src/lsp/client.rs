@@ -500,6 +500,19 @@ impl LspClient {
         &mut self.server
     }
 
+    /// A detached handle to the server, for a request whose answer must be
+    /// awaited WITHOUT holding this client's lock (#533 regression).
+    ///
+    /// `ServerSocket` is the sending half of the mainloop's channel, so a
+    /// clone talks to the same server and its responses are routed the same
+    /// way. A caller that awaits a slow request on the clone leaves the
+    /// `LspClient` itself free, which matters for any request the server may
+    /// never answer: holding the lock across such an await blocks every other
+    /// user of that client, including `open_doc` on the worker loop.
+    pub fn detached_server(&self) -> ServerSocket {
+        self.server.clone()
+    }
+
     pub fn did_open(
         &mut self,
         uri: Url,
@@ -713,6 +726,13 @@ impl LspClient {
     /// LSP 3.17 `workspace/diagnostic`: PULL the whole project's diagnostics
     /// over the existing connection (#533).
     ///
+    /// Issued on a socket the CALLER owns rather than on `&mut self`, so the
+    /// client lock can be released before the await. That is not a
+    /// convenience: a server may accept this request and never answer it
+    /// (`ty` 0.0.73 does), and holding the client across such an await blocks
+    /// every other user of it — including `open_doc` on the worker loop, which
+    /// wedged Go to Definition outright (#533 regression, 0.1.939).
+    ///
     /// `identifier` is echoed back from the server's own
     /// `diagnosticProvider.identifier` - a server that registered several
     /// diagnostic sources uses it to tell which one the previous result ids
@@ -723,12 +743,12 @@ impl LspClient {
     /// Only call this on a server whose capability says
     /// `workspaceDiagnostics: true` - one that pulls per document but not per
     /// workspace answers `-32601 Unhandled method`.
-    pub async fn workspace_diagnostics(
-        &mut self,
+    pub async fn workspace_diagnostics_on(
+        mut server: ServerSocket,
         identifier: Option<String>,
         previous_result_ids: Vec<lsp_types::PreviousResultId>,
     ) -> Result<lsp_types::WorkspaceDiagnosticReportResult> {
-        self.server
+        server
             .workspace_diagnostic(lsp_types::WorkspaceDiagnosticParams {
                 identifier,
                 previous_result_ids,
