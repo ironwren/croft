@@ -43,6 +43,48 @@ EXPECTED_TARGETS = {
 }
 
 
+def matrix_targets(text: str) -> set[str]:
+    """The triples the build matrix actually names.
+
+    Searching the whole file for each triple answers a different question:
+    whether the NAME appears anywhere. It appears in the artifact-kind
+    assertion's case arms, and it would appear in a comment, so a target
+    dropped from the matrix left this check green while no release carried it
+    (#554). The matrix block is the corpus; a mention outside it is not a
+    build.
+    """
+    lines = text.splitlines()
+    matrix_indent = None
+    section = None
+    out = set()
+    for line in lines:
+        if matrix_indent is None:
+            m = re.match(r"^(\s*)matrix:\s*$", line)
+            if m:
+                matrix_indent = len(m.group(1))
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= matrix_indent:
+            break
+        m = re.match(r"^\s*([A-Za-z_-]+):\s*$", line)
+        if m and indent == matrix_indent + 2:
+            section = m.group(1)
+            continue
+        if section == "include":
+            m = re.match(r"^\s*-\s*target:\s*(\S+)\s*$", line)
+            if m:
+                out.add(m.group(1))
+        elif section == "target":
+            m = re.match(r"^\s*-\s*(\S+)\s*$", line)
+            if m:
+                out.add(m.group(1))
+
+    if matrix_indent is None:
+        fail("no build matrix in release.yml")
+    return out
+
+
 def fail(msg: str) -> None:
     print(f"binstall contract: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -161,7 +203,8 @@ def main() -> None:
         fail("release.yml does not trigger on v* tags, but pkg-url assumes it")
 
     # 5. Every expected target is actually built.
-    missing = sorted(t for t in EXPECTED_TARGETS if t not in workflow)
+    built = matrix_targets(workflow)
+    missing = sorted(EXPECTED_TARGETS - built)
     if missing:
         fail("release.yml does not build " + ", ".join(missing))
 
