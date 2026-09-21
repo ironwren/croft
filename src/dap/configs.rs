@@ -373,9 +373,10 @@ pub struct Compound {
     ///
     /// Recorded rather than silently dropped because a ONE-member compound now
     /// launches, and launching it via its member alone would run neither the
-    /// compound's own pre-launch task nor respect its presentation. Note the
-    /// MULTI-member path still discards these silently: it refuses for the
-    /// session count first, and #310 is the blocker the user must clear.
+    /// compound's own pre-launch task nor respect its presentation. Both
+    /// arities consult this list now: the multi-member path used to discard
+    /// it silently because it refused for the session count first, and #310
+    /// removed that refusal.
     pub unsupported_keys: Vec<&'static str>,
     /// Which file declared it. A compound's members name configurations in
     /// ITS OWN file first: both files may declare the same name, and binding
@@ -449,10 +450,16 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // croft honours both perfectly by doing nothing, so refusing to
             // launch would name a key whose behaviour it is already delivering.
             //
-            // `stopAll` is excluded from the ONE-member gate entirely, at either
-            // value: it governs whether ending one session ends the others, and
-            // with a single session there are no others. It cannot change a
-            // one-member outcome, so it cannot be a reason to refuse one.
+            // `stopAll` depends on ARITY. With one member it governs whether
+            // ending a session ends the others, and there are no others, so
+            // neither value can change the outcome and neither is a reason to
+            // refuse. With several - which #310 made possible - `true` asks
+            // for a teardown croft does not implement, and the siblings keep
+            // running after a member ends. Documenting that mismatch does not
+            // stop the launch, so it is recorded as unsupported below and
+            // refused with a message naming the key, exactly as a malformed
+            // one is. `false` and omission stay silent: both describe what
+            // croft already does.
             let asks_for_something = |k: &str| match obj.get(k) {
                 None | Some(Value::Null) => false,
                 Some(Value::String(s)) => !s.is_empty(),
@@ -480,11 +487,31 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // telling the user to "remove that key" would otherwise read as
             // deleting the whole `presentation` block, taking a working
             // `group` with it.
-            let unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
+            let mut unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
+            // Only where there ARE siblings to stop, and for anything that is
+            // not the default. `false` and absence describe what croft does;
+            // everything else - `true`, and the `"true"` quoted-bool typo the
+            // presentation keys already guard against - asks for something
+            // croft will not deliver, and launching as the opposite in silence
+            // is the outcome this whole list exists to prevent.
+            if configurations.len() > 1 {
+                match obj.get("stopAll") {
+                    None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+                    Some(_) => unsupported_keys.push("stopAll"),
+                }
+            }
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
                 .flatten()
                 .map(str::to_string);
+            // A non-STRING `preLaunchTask` asks for something and cannot be
+            // read: `asks_for_something` passes `true` or `7`, and `as_str`
+            // then drops it, so the compound would launch with the task
+            // silently not run - debugging whatever the last build left
+            // behind, the exact hazard the task exists to prevent.
+            if pre_launch_task.is_none() && asks_for_something("preLaunchTask") {
+                unsupported_keys.push("preLaunchTask");
+            }
             Some(Compound {
                 name,
                 configurations,
@@ -1455,24 +1482,30 @@ mod tests {
     /// of them perfectly by doing nothing, so naming them in a refusal tells
     /// the user croft cannot do what it is already doing.
     ///
-    /// `stopAll` is excluded at EITHER value: it decides whether ending one
-    /// session ends the others, and a one-member compound has no others.
+    /// `stopAll` is excluded at either value for ONE member: it decides whether
+    /// ending one session ends the others, and a one-member compound has no
+    /// others. At two it is recorded at `true` only - see
+    /// `stop_all_true_is_refused_only_where_there_are_siblings_to_stop`.
     #[test]
     fn a_compound_key_that_requests_nothing_is_not_recorded_as_unsupported() {
         let text = r#"{
-            "configurations": [ { "name": "A", "type": "node", "program": "a.js" } ],
+            "configurations": [
+                { "name": "A", "type": "node", "program": "a.js" },
+                { "name": "B", "type": "node", "program": "b.js" }
+            ],
             "compounds": [
                 { "name": "DefaultStopAll", "configurations": ["A"], "stopAll": false },
                 { "name": "TrueStopAll", "configurations": ["A"], "stopAll": true },
                 { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
                 { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
+                { "name": "BoolTask", "configurations": ["A"], "preLaunchTask": true },
                 { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
                 { "name": "RealPresentation", "configurations": ["A"], "presentation": { "order": 1 } },
                 { "name": "Malformed", "configurations": ["A"], "presentation": 7 }
             ]
         }"#;
         let cs = parse_compounds(text, ".vscode/launch.json");
-        assert_eq!(cs.len(), 7, "precondition: every compound parsed");
+        assert_eq!(cs.len(), 8, "precondition: every compound parsed");
         let by = |n: &str| {
             cs.iter()
                 .find(|c| c.name == n)
@@ -1484,6 +1517,20 @@ mod tests {
             "stopAll:false is VS Code's default and cannot change a one-member \
              outcome: {:?}",
             by("DefaultStopAll").unsupported_keys
+        );
+        // A task that asks for something croft cannot READ is refused, unlike
+        // one that asks for nothing. Without this pair the rule reads as
+        // "preLaunchTask is never recorded", which was the bug.
+        assert_eq!(
+            by("BoolTask").unsupported_keys,
+            vec!["preLaunchTask"],
+            "a non-string task cannot be named or run, so it is refused \
+             rather than skipped in silence"
+        );
+        assert!(
+            by("NulledTask").unsupported_keys.is_empty(),
+            "while a null one asks for nothing: {:?}",
+            by("NulledTask").unsupported_keys
         );
         assert!(
             by("TrueStopAll").unsupported_keys.is_empty(),
@@ -1521,6 +1568,63 @@ mod tests {
             by("RealPresentation").unsupported_keys,
             Vec::<&str>::new(),
             "while a well-formed order is honoured rather than refused"
+        );
+    }
+
+    /// `stopAll: true` is refused at two members and silent at one.
+    ///
+    /// The pair is the point. Recording it at either arity would refuse a
+    /// one-member compound over a key that cannot change its outcome; at two
+    /// members, NOT recording it launches a compound whose siblings keep
+    /// running after a member ends - the opposite of what the file asked for,
+    /// with nothing said. Only asserting the refusal would pass a rule that
+    /// fires everywhere, so the one-member arm is the control.
+    #[test]
+    fn stop_all_true_is_refused_only_where_there_are_siblings_to_stop() {
+        let text = r#"{
+            "configurations": [
+                { "name": "A", "type": "node", "program": "a.js" },
+                { "name": "B", "type": "node", "program": "b.js" }
+            ],
+            "compounds": [
+                { "name": "OneTrue", "configurations": ["A"], "stopAll": true },
+                { "name": "TwoTrue", "configurations": ["A", "B"], "stopAll": true },
+                { "name": "TwoQuoted", "configurations": ["A", "B"], "stopAll": "true" },
+                { "name": "TwoFalse", "configurations": ["A", "B"], "stopAll": false },
+                { "name": "TwoAbsent", "configurations": ["A", "B"] }
+            ]
+        }"#;
+        let cs = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(cs.len(), 5, "precondition: every compound parsed");
+        let by = |n: &str| cs.iter().find(|c| c.name == n).expect("parsed");
+
+        assert_eq!(
+            by("TwoTrue").unsupported_keys,
+            vec!["stopAll"],
+            "at two members `true` asks for a teardown croft does not do, so \
+             it is refused rather than launched as its opposite"
+        );
+        assert_eq!(
+            by("TwoQuoted").unsupported_keys,
+            vec!["stopAll"],
+            "and `\"true\"` is the same typo the presentation keys already \
+             refuse - matching only the BOOL let it launch as `false`"
+        );
+        assert!(
+            by("OneTrue").unsupported_keys.is_empty(),
+            "but one member has no siblings to stop, so the same value is \
+             honoured by doing nothing: {:?}",
+            by("OneTrue").unsupported_keys
+        );
+        assert!(
+            by("TwoFalse").unsupported_keys.is_empty(),
+            "and `false` is VS Code's default, which croft already does: {:?}",
+            by("TwoFalse").unsupported_keys
+        );
+        assert!(
+            by("TwoAbsent").unsupported_keys.is_empty(),
+            "as is omitting it: {:?}",
+            by("TwoAbsent").unsupported_keys
         );
     }
 
