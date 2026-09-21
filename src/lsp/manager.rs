@@ -5240,12 +5240,10 @@ fn spawn_workspace_pull_within(
             // every later command including Go to Definition (#533
             // regression, 0.1.939). Cloning the socket keeps the request on
             // the same server while leaving the client free.
-            // Snapshot the detached server BEFORE taking result_ids, so this
-            // task never holds the ids while it waits on the client lock.
-            let server = {
-                let client = target.client.lock().await;
-                client.detached_server()
-            };
+            // Lock order: result ids BEFORE the client, never the reverse.
+            // The pull task is the only consumer of the ids, so nothing can
+            // hold them and want the client today — but reversing this without
+            // that still being true would deadlock.
             let mut ids = target.result_ids.lock().await;
             // Re-check retirement HERE, not only in `workspace_pull_targets`.
             // That filter reads the flag when the target list is built; this
@@ -5261,6 +5259,10 @@ fn spawn_workspace_pull_within(
                 continue;
             }
             let previous = ids.previous();
+            let server = {
+                let client = target.client.lock().await;
+                client.detached_server()
+            };
             log_file::log(&format!(
                 "lsp[{}] workspace/diagnostic pull, {} previous result id(s)",
                 target.name,

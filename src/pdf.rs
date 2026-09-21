@@ -483,12 +483,15 @@ const EXIT_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// `O_NONBLOCK` onto one descriptor, reporting whether it is set now.
 ///
-/// Split out so a test can provoke the fcntl failure on a descriptor it
-/// controls: doing it to a live `ChildStderr` means closing the fd under the
+/// This is the whole of `set_nonblocking`'s unix arm, which does nothing but
+/// hand it a descriptor. It exists as a seam because provoking the fcntl
+/// failure through a live `ChildStderr` means closing the fd under the
 /// handle, which trips Rust's IO-safety check and aborts the process instead
-/// of failing an assertion.
+/// of failing an assertion - so the test drives the failure path here and the
+/// success path through `set_nonblocking`, and between them every line of
+/// both is executed.
 #[cfg(unix)]
-fn nonblocking_on_fd(fd: std::os::fd::RawFd) -> bool {
+fn set_nonblocking_on(fd: std::os::fd::RawFd) -> bool {
     // SAFETY: both calls only read and set the status flags of `fd`, and
     // neither takes ownership of it. An invalid `fd` is reported as EBADF
     // rather than being undefined.
@@ -511,8 +514,12 @@ fn nonblocking_on_fd(fd: std::os::fd::RawFd) -> bool {
 /// exact hang this change removes. Callers must not drain a pipe this
 /// returned `false` for until the child has exited.
 ///
-/// `false` off unix, where the fd type does not exist: no pipe is made
-/// non-blocking there, and the caller keeps to the after-exit drain.
+/// With no pipe at all the answer is `true`: there is nothing to block on,
+/// and every drain returns at once on `None`.
+///
+/// Off unix the fd type does not exist, so no pipe is ever made non-blocking
+/// and a real pipe always answers `false` - the caller then keeps to the
+/// single after-exit read.
 fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
     #[cfg(unix)]
     {
@@ -522,7 +529,7 @@ fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
             return true;
         };
         use std::os::fd::AsRawFd;
-        nonblocking_on_fd(pipe.as_raw_fd())
+        set_nonblocking_on(pipe.as_raw_fd())
     }
     #[cfg(not(unix))]
     {
@@ -554,6 +561,29 @@ fn drain_available(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+    }
+}
+
+/// ONE read, for a pipe that could not be made non-blocking.
+///
+/// `drain_available` reads until `WouldBlock`, which a blocking pipe never
+/// reports - so on that pipe it is a loop with no exit until every holder of
+/// the write end is gone. A single read has no such problem once the child is
+/// reaped: what the child wrote is buffered and comes back immediately. Only
+/// a SECOND read would wait on a surviving descendant, so there isn't one.
+///
+/// The cost is a message truncated at one buffer rather than a hang, and a
+/// renderer that wrote nothing before dying still blocks here until its
+/// descendants exit - which is why the caller only reaches this after
+/// `try_wait` has already returned.
+fn read_once(pipe: Option<&mut std::process::ChildStderr>, into: &mut Vec<u8>) {
+    let Some(pipe) = pipe else {
+        return;
+    };
+    use std::io::Read;
+    let mut chunk = [0u8; 4096];
+    if let Ok(n) = pipe.read(&mut chunk) {
+        into.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -733,19 +763,24 @@ fn run_pdftoppm(
         //
         // ...but only on a pipe that reads without blocking. Reaping the
         // child does not close the write end if a DESCENDANT still holds it,
-        // and on a blocking pipe the read then waits on that descendant
-        // rather than returning. Measured: after the child is reaped, the
-        // first read returns its output and the SECOND blocks until the
-        // grandchild exits, because end of file waits for every holder.
+        // and on a blocking pipe a read then waits on that descendant rather
+        // than returning EOF.
         //
-        // So when the fcntl failed, both reads are skipped and only what the
-        // loop already buffered is reported. A truncated message beats a
-        // hang - and with the in-loop drain skipped too, that buffer is
-        // empty, leaving the exit status as the whole of the report.
+        // Measured on a blocking pipe whose grandchild outlives the child:
+        // the FIRST read after the reap returns what the child wrote, and the
+        // SECOND blocks until the grandchild exits, because end of file waits
+        // for every holder of the write end. So one read is safe here and a
+        // loop is not - which is exactly the asymmetry `drain_available`
+        // cannot exploit, since it reads until EAGAIN and EAGAIN never comes.
+        //
+        // Hence one bounded read on the blocking path: the renderer's own
+        // message is what the user needs, and skipping the read entirely
+        // would report the exit status with no text at all.
         let text = if nonblocking {
             drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
             settle_late_writes(stderr_pipe.as_mut(), &mut stderr_bytes, STDERR_SETTLE_GRACE)
         } else {
+            read_once(stderr_pipe.as_mut(), &mut stderr_bytes);
             String::from_utf8_lossy(&stderr_bytes).trim().to_string()
         };
         return Err(std::io::Error::other(format!(
@@ -1696,6 +1731,39 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(7));
     }
 
+    /// The blocking-pipe fallback must still report the renderer's message.
+    ///
+    /// This is the regression the first cut of the fix shipped: with both
+    /// drains skipped, the error read `"... exited with exit status: 1: "`
+    /// with no text, because every write to the buffer sat behind the
+    /// non-blocking branch. `read_once` is what puts the message back, so
+    /// the assertion is on CONTENT - an `is_empty` check either way would
+    /// pass against both the bug and the fix.
+    ///
+    /// The pipe here is left BLOCKING on purpose: that is the state a failed
+    /// fcntl leaves, and the whole point is that one read still works in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_blocking_pipe_still_yields_what_the_renderer_wrote() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "echo 'Syntax Error: no trailer' >&2; exit 1"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut pipe = child.stderr.take().expect("piped stderr");
+        let status = child.wait().expect("wait");
+        assert!(!status.success(), "the fixture must fail");
+
+        // Deliberately NOT made non-blocking - this is the failed-fcntl state.
+        let mut buf = Vec::new();
+        read_once(Some(&mut pipe), &mut buf);
+        let text = String::from_utf8_lossy(&buf).trim().to_string();
+        assert_eq!(
+            text, "Syntax Error: no trailer",
+            "the renderer's own line must survive the blocking path"
+        );
+    }
+
     /// `set_nonblocking` must REPORT the outcome, because the caller reads
     /// the pipe before reaping the child and only a non-blocking pipe makes
     /// that read safe. A bare `true` would pass the live-pipe case, so the
@@ -1723,13 +1791,17 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
         );
 
         // -1 is never a valid descriptor, so F_GETFL fails with EBADF - the
-        // same branch a real fcntl failure takes. This is the shared helper
-        // the function's unix arm uses, so the branch under test is the one
-        // that runs in production.
+        // same branch a real fcntl failure takes. `set_nonblocking`'s unix
+        // arm is a call to this and nothing else, so this IS its failure
+        // path, reached without closing an fd under a live handle.
         assert!(
-            !nonblocking_on_fd(-1),
+            !set_nonblocking_on(-1),
             "a bad descriptor must report failure, not be ignored"
         );
+
+        // And the no-pipe case the doc promises, so the contract is pinned on
+        // every input shape rather than only the one with a pipe.
+        assert!(set_nonblocking(None), "no pipe means nothing to block on");
 
         let _ = child.wait();
     }
