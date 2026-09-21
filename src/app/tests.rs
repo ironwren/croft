@@ -23284,6 +23284,56 @@ fn diagnostics_store_applies_to_the_active_editor_on_drain() {
 }
 
 #[test]
+fn sync_markdown_lint_flags_a_second_top_level_heading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.md");
+    std::fs::write(&file, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let changed = app.sync_markdown_lint();
+    assert!(changed, "a fresh markdown tab must lint on first sync");
+    assert_eq!(app.editor.diagnostics_path(), Some(file.as_path()));
+    assert!(
+        app.editor
+            .diagnostic_spans_for_test()
+            .iter()
+            .any(|line| !line.is_empty()),
+        "MD025 should have produced at least one squiggle"
+    );
+    let merged = app.merged_diagnostics(&file);
+    assert!(merged.iter().any(|d| d.message.contains("MD025")));
+}
+
+#[test]
+fn sync_markdown_lint_is_quiet_for_a_clean_document_and_reruns_only_on_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("clean.md");
+    std::fs::write(&file, "# Title\n\nA clean paragraph.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    // A clean document has nothing to apply, so the first sync reports no
+    // change even though it did run the linter once.
+    assert!(!app.sync_markdown_lint());
+    assert!(
+        app.merged_diagnostics(&file).is_empty(),
+        "a clean document must not be flagged"
+    );
+    // Re-syncing an unchanged buffer must be a no-op (gated by edit_seq).
+    assert!(!app.sync_markdown_lint());
+}
+
+#[test]
+fn sync_markdown_lint_skips_non_markdown_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "#Not a heading, this is Rust\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    assert!(!app.sync_markdown_lint());
+    assert!(app.merged_diagnostics(&file).is_empty());
+}
+
+#[test]
 fn merged_diagnostics_layers_every_server_for_a_file() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();
