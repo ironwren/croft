@@ -22,14 +22,17 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
     let mut seen_h1 = false;
     let mut blank_run_start: Option<usize> = None;
 
-    let mut in_fence: Option<&str> = None;
+    let mut in_fence: Option<(char, usize)> = None;
 
     for (i, line) in lines.iter().enumerate() {
         // A fenced block's contents are literal, so no heading rule applies
         // inside one: `#NoSpace` in a shell snippet is a comment and a
         // `# Title` in a Markdown example is not this document's heading.
-        // The closing fence must be at least as long as the opener and use
-        // the same character, which is what lets a ``` block quote ```.
+        // The closing fence must use the same character AND be at least as
+        // long as the opener, which is what lets a ```` ```` ```` block quote
+        // a ``` one. Binding the opener's length and discarding it let a
+        // 3-tick line close a 4-tick fence, so the real close re-opened a
+        // fence that swallowed the rest of the document.
         let fence_indent = line.len() - line.trim_start().len();
         let fence = if fence_indent <= 3 {
             let t = line.trim_start();
@@ -39,18 +42,47 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
         } else {
             None
         };
-        match (in_fence, fence) {
-            (None, Some((c, _))) => {
-                in_fence = Some(if c == '`' { "`" } else { "~" });
-                continue;
+        let is_fence_line = match (in_fence, fence) {
+            (None, Some((c, n))) => {
+                in_fence = Some((c, n));
+                true
             }
-            (Some(open), Some((c, _))) if open.starts_with(c) => {
+            (Some((oc, on)), Some((c, n))) if oc == c && n >= on => {
                 in_fence = None;
-                continue;
+                true
             }
-            _ => {}
+            _ => false,
+        };
+
+        // A fence line is Markdown STRUCTURE, not code content, so MD009
+        // applies to it (markdownlint flags a trailing space on a ```sh info
+        // string). Only the lines BETWEEN fences are exempt.
+        if is_fence_line {
+            check_md009(line, i, &mut out);
         }
-        if in_fence.is_some() {
+
+        // MD012 bookkeeping has to happen for fence lines and in-fence lines
+        // alike, before the `continue` below. Skipping it left the blank run
+        // open across a whole code block, so ONE blank line before a fence was
+        // reported as "multiple consecutive blank lines" - 7 false hits on
+        // this repo's own README, 17 on CONTRIBUTING.md.
+        //
+        // A fence line is a non-blank line, so it closes any open run. Lines
+        // INSIDE a fence are content: they neither open nor extend a run,
+        // which keeps blank lines in a code block unreported.
+        if is_fence_line || in_fence.is_some() {
+            if let Some(start) = blank_run_start
+                && i - start > 1
+            {
+                out.push(diag(
+                    start + 1,
+                    0,
+                    0,
+                    DiagnosticSeverity::Hint,
+                    "MD012: multiple consecutive blank lines",
+                ));
+            }
+            blank_run_start = None;
             continue;
         }
 
@@ -106,21 +138,7 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
 
         // MD009: trailing whitespace, excluding Markdown's two-space hard
         // line break (exactly two trailing spaces) and blank lines.
-        // MD009 is trailing WHITESPACE, so a tab counts; trimming only `' '`
-        // let `foo\t` through. The hard-break exemption stays exactly two
-        // ASCII spaces - `" \t"` is not a hard break.
-        let trimmed_end = line.trim_end();
-        let trailing = &line[trimmed_end.len()..];
-        let hard_break = trailing == "  ";
-        if !trailing.is_empty() && !hard_break && !trimmed_end.is_empty() {
-            out.push(diag(
-                i,
-                trimmed_end.encode_utf16().count(),
-                line.encode_utf16().count(),
-                DiagnosticSeverity::Hint,
-                "MD009: trailing whitespace",
-            ));
-        }
+        check_md009(line, i, &mut out);
 
         // MD012: more than one consecutive blank line.
         if line.trim().is_empty() {
@@ -153,6 +171,25 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
     }
 
     out
+}
+
+/// MD009: trailing WHITESPACE, so a tab counts; trimming only `' '` let
+/// `foo\t` through. The hard-break exemption is exactly two ASCII spaces -
+/// `" \t"` is not a hard break. Shared by the fence path and the ordinary
+/// one, because a fence line is structure and markdownlint flags it too.
+fn check_md009(line: &str, i: usize, out: &mut Vec<Diagnostic>) {
+    let trimmed_end = line.trim_end();
+    let trailing = &line[trimmed_end.len()..];
+    let hard_break = trailing == "  ";
+    if !trailing.is_empty() && !hard_break && !trimmed_end.is_empty() {
+        out.push(diag(
+            i,
+            trimmed_end.encode_utf16().count(),
+            line.encode_utf16().count(),
+            DiagnosticSeverity::Hint,
+            "MD009: trailing whitespace",
+        ));
+    }
 }
 
 fn diag(
@@ -325,8 +362,90 @@ mod tests {
     }
 
     #[test]
+    fn repro_readme_has_no_false_md012() {
+        let text = include_str!("../README.md");
+        let md012: Vec<_> = lint(text)
+            .into_iter()
+            .filter(|d| d.message.contains("MD012"))
+            .collect();
+        assert!(
+            md012.is_empty(),
+            "false MD012 on the repo README: {md012:?}"
+        );
+    }
+
+    #[test]
+    fn repro_four_tick_fence_not_closed_by_three() {
+        let diags = lint("````\n```\n````\n#RealTypo\n");
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD018")),
+            "a 3-tick line must not close a 4-tick fence: {diags:?}"
+        );
+    }
+
+    /// The realistic-document control. It carries a FENCED BLOCK with the
+    /// blank lines a real document puts around one, because without that this
+    /// test passed while every code block in the repo drew a false MD012.
+    #[test]
     fn clean_document_has_no_diagnostics() {
-        let text = "# Title\n\nA paragraph with *emphasis* and a [link](https://example.com).\n\n## Section\n\nMore text.\n";
+        let text = "# Title\n\nA paragraph with *emphasis* and a [link](https://example.com).\n\n## Section\n\n```sh\ncargo install croft\n```\n\nMore text.\n";
         assert!(lint(text).is_empty(), "found: {:?}", lint(text));
+    }
+
+    /// MD012 still fires on a genuine double blank - the control proving the
+    /// fence fix above did not simply disable the rule.
+    #[test]
+    fn md012_still_fires_outside_a_fence() {
+        let diags = lint("# T\n\n```sh\nx\n```\n\n\ntext\n");
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD012")),
+            "two blanks after a fence is still a violation: {diags:?}"
+        );
+    }
+
+    /// Blank lines INSIDE a fence are code content, never MD012.
+    #[test]
+    fn blank_lines_inside_a_fence_are_not_md012() {
+        let diags = lint("# T\n\n```sh\none\n\n\n\ntwo\n```\n");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD012")),
+            "blank lines in a code block are content: {diags:?}"
+        );
+    }
+
+    /// A fence line is Markdown structure, so trailing whitespace on it is
+    /// still MD009 - on the info string and on the closing fence alike.
+    #[test]
+    fn md009_applies_to_the_fence_lines_themselves() {
+        let opening = lint("```sh   \nx\n```\n");
+        assert!(
+            opening.iter().any(|d| d.message.contains("MD009")),
+            "trailing space on an info string: {opening:?}"
+        );
+        let closing = lint("```\nx\n```   \n");
+        assert!(
+            closing.iter().any(|d| d.message.contains("MD009")),
+            "trailing space on a closing fence: {closing:?}"
+        );
+    }
+
+    /// ...but NOT to the code inside it, which is literal text.
+    #[test]
+    fn md009_does_not_apply_inside_a_fence() {
+        let diags = lint("```sh\ntrailing spaces are code   \n```\n");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD009")),
+            "code content is literal: {diags:?}"
+        );
+    }
+
+    /// A tilde fence is not closed by a backtick line.
+    #[test]
+    fn a_backtick_line_does_not_close_a_tilde_fence() {
+        let diags = lint("~~~\n```\n~~~\n#RealTypo\n");
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD018")),
+            "the ~~~ close ends the block, so line 4 is linted: {diags:?}"
+        );
     }
 }
