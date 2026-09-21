@@ -755,8 +755,13 @@ impl<S> DebugSessions<S> {
         }
         let gone = self.sessions.remove(index);
         // Keep the focus on a session that exists, and prefer to stay where
-        // the user was looking: only shift when the one they were watching is
-        // the one that ended, or sat after it.
+        // the user was looking. The rule is positional, not identity-based:
+        // removing a session BEFORE the focused one shifts the index down so
+        // the same session stays focused, and removing the focused one itself
+        // leaves the index where it was - which lands on the session that
+        // moved up into that slot, or steps back when it was the last. So
+        // retiring the middle of [A, B, C] while watching B leaves the user
+        // on C, the next live session, rather than jumping back to A.
         if self.focused > index || self.focused >= self.sessions.len() {
             self.focused = self.focused.saturating_sub(1);
         }
@@ -1429,6 +1434,24 @@ mod session_set_tests {
         assert_eq!(set.focused_name(), Some("client"), "still the same session");
 
         assert!(set.remove(5).is_none(), "a missing index removes nothing");
+
+        // The MIDDLE case, which neither arm above reaches: the focused
+        // session has a live sibling on each side. Focus is positional, so
+        // the user lands on the one that moved up into the slot rather than
+        // being thrown back to the start of the set.
+        let mut three: DebugSessions<&str> = DebugSessions::default();
+        three.replace_with("a", "1");
+        three.push("b", "2");
+        three.push("c", "3");
+        three.focus(1);
+        assert_eq!(three.remove(1).map(|s| s.name), Some(String::from("b")));
+        assert_eq!(three.names(), vec!["a", "c"]);
+        assert_eq!(
+            three.focused_name(),
+            Some("c"),
+            "the next live session, not the first"
+        );
+
         assert_eq!(set.len(), 1);
 
         set.remove(0);

@@ -488,14 +488,30 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // deleting the whole `presentation` block, taking a working
             // `group` with it.
             let mut unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
-            // Only at `true`, and only where there ARE siblings to stop.
-            if configurations.len() > 1 && obj.get("stopAll") == Some(&Value::Bool(true)) {
-                unsupported_keys.push("stopAll");
+            // Only where there ARE siblings to stop, and for anything that is
+            // not the default. `false` and absence describe what croft does;
+            // everything else - `true`, and the `"true"` quoted-bool typo the
+            // presentation keys already guard against - asks for something
+            // croft will not deliver, and launching as the opposite in silence
+            // is the outcome this whole list exists to prevent.
+            if configurations.len() > 1 {
+                match obj.get("stopAll") {
+                    None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+                    Some(_) => unsupported_keys.push("stopAll"),
+                }
             }
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
                 .flatten()
                 .map(str::to_string);
+            // A non-STRING `preLaunchTask` asks for something and cannot be
+            // read: `asks_for_something` passes `true` or `7`, and `as_str`
+            // then drops it, so the compound would launch with the task
+            // silently not run - debugging whatever the last build left
+            // behind, the exact hazard the task exists to prevent.
+            if pre_launch_task.is_none() && asks_for_something("preLaunchTask") {
+                unsupported_keys.push("preLaunchTask");
+            }
             Some(Compound {
                 name,
                 configurations,
@@ -1482,13 +1498,14 @@ mod tests {
                 { "name": "TrueStopAll", "configurations": ["A"], "stopAll": true },
                 { "name": "NulledTask", "configurations": ["A"], "preLaunchTask": null },
                 { "name": "EmptyTask", "configurations": ["A"], "preLaunchTask": "" },
+                { "name": "BoolTask", "configurations": ["A"], "preLaunchTask": true },
                 { "name": "EmptyPresentation", "configurations": ["A"], "presentation": {} },
                 { "name": "RealPresentation", "configurations": ["A"], "presentation": { "order": 1 } },
                 { "name": "Malformed", "configurations": ["A"], "presentation": 7 }
             ]
         }"#;
         let cs = parse_compounds(text, ".vscode/launch.json");
-        assert_eq!(cs.len(), 7, "precondition: every compound parsed");
+        assert_eq!(cs.len(), 8, "precondition: every compound parsed");
         let by = |n: &str| {
             cs.iter()
                 .find(|c| c.name == n)
@@ -1500,6 +1517,20 @@ mod tests {
             "stopAll:false is VS Code's default and cannot change a one-member \
              outcome: {:?}",
             by("DefaultStopAll").unsupported_keys
+        );
+        // A task that asks for something croft cannot READ is refused, unlike
+        // one that asks for nothing. Without this pair the rule reads as
+        // "preLaunchTask is never recorded", which was the bug.
+        assert_eq!(
+            by("BoolTask").unsupported_keys,
+            vec!["preLaunchTask"],
+            "a non-string task cannot be named or run, so it is refused \
+             rather than skipped in silence"
+        );
+        assert!(
+            by("NulledTask").unsupported_keys.is_empty(),
+            "while a null one asks for nothing: {:?}",
+            by("NulledTask").unsupported_keys
         );
         assert!(
             by("TrueStopAll").unsupported_keys.is_empty(),
@@ -1558,12 +1589,13 @@ mod tests {
             "compounds": [
                 { "name": "OneTrue", "configurations": ["A"], "stopAll": true },
                 { "name": "TwoTrue", "configurations": ["A", "B"], "stopAll": true },
+                { "name": "TwoQuoted", "configurations": ["A", "B"], "stopAll": "true" },
                 { "name": "TwoFalse", "configurations": ["A", "B"], "stopAll": false },
                 { "name": "TwoAbsent", "configurations": ["A", "B"] }
             ]
         }"#;
         let cs = parse_compounds(text, ".vscode/launch.json");
-        assert_eq!(cs.len(), 4, "precondition: every compound parsed");
+        assert_eq!(cs.len(), 5, "precondition: every compound parsed");
         let by = |n: &str| cs.iter().find(|c| c.name == n).expect("parsed");
 
         assert_eq!(
@@ -1571,6 +1603,12 @@ mod tests {
             vec!["stopAll"],
             "at two members `true` asks for a teardown croft does not do, so \
              it is refused rather than launched as its opposite"
+        );
+        assert_eq!(
+            by("TwoQuoted").unsupported_keys,
+            vec!["stopAll"],
+            "and `\"true\"` is the same typo the presentation keys already \
+             refuse - matching only the BOOL let it launch as `false`"
         );
         assert!(
             by("OneTrue").unsupported_keys.is_empty(),
