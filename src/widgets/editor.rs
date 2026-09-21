@@ -2652,6 +2652,11 @@ pub struct Editor {
     /// clear preference, `None` when it gave no signal. The manual
     /// status-bar override always wins over this.
     detected_indent: Option<IndentStyle>,
+    /// Properties from the `.editorconfig` files covering this buffer's
+    /// path, resolved on open. They outrank `detected_indent` (a project
+    /// that states its style must beat a guess at it) but not the manual
+    /// status-bar `indent_override`, which is the user overruling both.
+    editorconfig: crate::editorconfig::Props,
     /// Line-ending style, detected on open and applied on save. Surfaced in the
     /// status bar; the user can switch it there.
     pub eol: LineEnding,
@@ -2945,6 +2950,7 @@ impl Editor {
             lang: None,
             indent_override: None,
             detected_indent: None,
+            editorconfig: crate::editorconfig::Props::default(),
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
@@ -4131,6 +4137,17 @@ impl Editor {
         // VS Code's editor.detectIndentation: the freshly loaded content
         // decides the buffer's indent style unless the user overrides it.
         self.detected_indent = detect_indentation(&self.lines);
+        // `.editorconfig` is read here, before the sniffed EOL above can be
+        // relied on: a project that states `end_of_line` means it, and a
+        // file whose current content disagrees is exactly the case the
+        // property exists to fix.
+        self.editorconfig = crate::editorconfig::for_file(path);
+        if let Some(eol) = self.editorconfig.eol {
+            self.eol = match eol {
+                crate::editorconfig::Eol::Lf => LineEnding::Lf,
+                crate::editorconfig::Eol::Crlf => LineEnding::Crlf,
+            };
+        }
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.scroll_sub = 0;
@@ -5845,16 +5862,28 @@ impl Editor {
         n
     }
 
-    /// The buffer's active indentation style: the status-bar override if
-    /// set, else the style detected from the file's content on open, else
-    /// the language default (2 spaces for YAML, 4 spaces otherwise).
+    /// The buffer's active indentation style, in precedence order: the
+    /// status-bar override if set, then `.editorconfig`, then the style
+    /// detected from the file's content on open, then the language default
+    /// (2 spaces for YAML, 4 spaces otherwise).
+    ///
+    /// `.editorconfig` outranks detection because a project that STATES its
+    /// style must beat a guess at it — including on a file whose current
+    /// content is inconsistent with the rule, which is the case the property
+    /// exists to correct. The two properties are resolved independently: a
+    /// config naming only `indent_style` keeps the detected width.
     pub fn indent_style(&self) -> IndentStyle {
-        self.indent_override
-            .or(self.detected_indent)
-            .unwrap_or(IndentStyle {
-                width: indent_unit_for(self.lang).chars().count() as u32,
-                use_spaces: true,
-            })
+        if let Some(pinned) = self.indent_override {
+            return pinned;
+        }
+        let base = self.detected_indent.unwrap_or(IndentStyle {
+            width: indent_unit_for(self.lang).chars().count() as u32,
+            use_spaces: true,
+        });
+        IndentStyle {
+            width: self.editorconfig.indent_width.unwrap_or(base.width),
+            use_spaces: self.editorconfig.use_spaces.unwrap_or(base.use_spaces),
+        }
     }
 
     /// Pin the buffer's indentation style (status-bar "Indent Using …" /
@@ -8002,6 +8031,7 @@ impl Editor {
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
         }
+        self.apply_editorconfig_on_save();
         let path = self
             .path
             .as_ref()
@@ -8710,6 +8740,39 @@ impl Editor {
         self.mark_buffer_changed();
         self.recompute_highlights();
         true
+    }
+
+    /// Apply the `.editorconfig` properties that act at save time, from the
+    /// single write choke point so every save path (explicit, force, auto,
+    /// format-on-save) gets them.
+    ///
+    /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
+    /// rewriting someone's whitespace on an unconfigured project would be a
+    /// surprise, and a noisy diff.
+    fn apply_editorconfig_on_save(&mut self) -> bool {
+        let mut changed = false;
+        if self.editorconfig.trim_trailing_whitespace == Some(true) {
+            changed |= self.trim_trailing_whitespace();
+        }
+        if self.editorconfig.insert_final_newline == Some(true) {
+            // `lines` joins with the EOL on write, so a trailing empty
+            // element IS the final newline. An empty buffer is left alone:
+            // a zero-byte file has no last line to terminate.
+            let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
+            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+                self.push_undo(EditKind::InsertChar);
+                self.lines.push(String::new());
+                self.mark_buffer_changed();
+                self.recompute_highlights();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The `.editorconfig` properties in force for this buffer.
+    pub fn editorconfig_props(&self) -> crate::editorconfig::Props {
+        self.editorconfig
     }
 
     /// The character at `(row, char_col)`, or None when out of range. Used by
@@ -24129,6 +24192,196 @@ mod tests {
             use_spaces: true,
         });
         assert_eq!(o.indent_style().width, 8, "override beats detection");
+    }
+
+    /// `.editorconfig` outranks content detection: a project that STATES its
+    /// style beats a guess at it, including on a file whose current content
+    /// disagrees — which is the case the property exists to correct.
+    #[test]
+    fn editorconfig_indent_beats_detection_but_not_the_manual_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 2\n",
+        )
+        .unwrap();
+        // Content is unambiguously 4-space, so detection and the config
+        // genuinely disagree and the winner is observable.
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        assert_eq!(
+            e.indent_style(),
+            IndentStyle {
+                width: 2,
+                use_spaces: true
+            },
+            ".editorconfig must beat the 4-space content detection"
+        );
+        assert_eq!(e.indent_style().unit(), "  ");
+
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: true,
+        });
+        assert_eq!(
+            e.indent_style().width,
+            8,
+            "the manual status-bar override still beats .editorconfig"
+        );
+    }
+
+    /// A section naming only one of the two indent properties leaves the
+    /// other one to detection, rather than resetting it to a default.
+    #[test]
+    fn editorconfig_resolves_indent_style_and_width_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = tab\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn main() {\n  let a = 1;\n  let b = 2;\n}\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        let s = e.indent_style();
+        assert!(!s.use_spaces, "indent_style = tab must apply");
+        assert_eq!(s.width, 2, "the unnamed width stays with detection");
+    }
+
+    /// A per-glob section beats the `[*]` catch-all, and files the section
+    /// does not match are unaffected.
+    #[test]
+    fn editorconfig_per_language_section_applies_to_matching_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 2\n\n[*.py]\nindent_size = 8\n",
+        )
+        .unwrap();
+        let rs = tmp.path().join("a.rs");
+        std::fs::write(&rs, "fn main() {}\n").unwrap();
+        let py = tmp.path().join("a.py");
+        std::fs::write(&py, "def f():\n    pass\n").unwrap();
+
+        let mut r = Editor::new();
+        r.open(&rs).unwrap();
+        assert_eq!(r.indent_style().label(), "Spaces: 2");
+
+        let mut p = Editor::new();
+        p.open(&py).unwrap();
+        assert_eq!(p.indent_style().label(), "Spaces: 8");
+    }
+
+    /// `end_of_line` overrides the CRLF sniff, so a file that currently
+    /// disagrees with the project is rewritten to match it on save.
+    #[test]
+    fn editorconfig_end_of_line_overrides_the_sniffed_eol() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nend_of_line = crlf\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        assert_eq!(e.eol, LineEnding::Crlf, "the config must beat the sniff");
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        let on_disk = std::fs::read_to_string(&f).unwrap();
+        assert!(on_disk.contains("\r\n"), "saved as CRLF: {on_disk:?}");
+    }
+
+    /// The two save-time properties both fire from the single write choke
+    /// point, and the whole normalisation is undoable.
+    #[test]
+    fn editorconfig_trims_whitespace_and_adds_a_final_newline_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one   \ntwo\t\nthree").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "one\ntwo\nthree\n",
+            "trailing whitespace trimmed and a final newline added"
+        );
+    }
+
+    /// Neither save-time property fires unless a `.editorconfig` asked for
+    /// it: rewriting whitespace on an unconfigured project is a surprise.
+    #[test]
+    fn editorconfig_save_normalisation_is_off_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `root = true` with no properties, so no ancestor config can leak
+        // in and make this pass for the wrong reason.
+        std::fs::write(tmp.path().join(".editorconfig"), "root = true\n").unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one   \ntwo").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "!one   \ntwo",
+            "untouched whitespace and no newline appended"
+        );
+    }
+
+    /// An empty buffer has no last line to terminate, so
+    /// `insert_final_newline` must not turn a zero-byte file into a
+    /// one-byte one on every save.
+    #[test]
+    fn editorconfig_final_newline_leaves_an_empty_buffer_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
+    }
+
+    /// A file already ending in a newline must not collect another one on
+    /// each save.
+    #[test]
+    fn editorconfig_final_newline_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\n");
     }
 
     /// The pure detector: majority rules between tabs and spaces, and the

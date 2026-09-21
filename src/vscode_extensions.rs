@@ -566,9 +566,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "editorconfig.editorconfig",
-        croft: "",
-        status: Status::None,
-        note: "no .editorconfig support",
+        croft: ".editorconfig support",
+        status: Status::Builtin,
+        note: "indent_style/indent_size/tab_width, end_of_line, trim_trailing_whitespace and insert_final_newline are applied per file",
     },
     Mapping {
         vscode: "sonarsource.sonarlint-vscode",
