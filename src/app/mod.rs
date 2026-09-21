@@ -34917,6 +34917,14 @@ impl App {
                     self.status = String::from("Trimmed final newlines");
                 }
             }
+            Cmd::ToggleOverviewRuler => {
+                self.editor.overview_ruler = !self.editor.overview_ruler;
+                self.status = if self.editor.overview_ruler {
+                    String::from("Overview ruler on")
+                } else {
+                    String::from("Overview ruler off")
+                };
+            }
             Cmd::SaveFile => self.save(),
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
