@@ -481,6 +481,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Trim final newlines",
                 handler: "is_trim_final_newlines_key",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+E",
+                description: "Expand the Emmet abbreviation before the cursor",
+                handler: "is_emmet_expand_key",
+            },
         ],
     },
     ShortcutGroup {
