@@ -397,6 +397,80 @@ fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
     }
 }
 
+/// Tags recolored inside comments (the "Better Comments" convention), each
+/// with a fixed, theme-independent color chosen for contrast against every
+/// bundled theme's comment gray, and bold so it reads as a flag rather than
+/// prose. Matched case-sensitively at a word boundary so `todo!()` (a Rust
+/// macro, not a comment tag) and `Autodocking` are left alone.
+const COMMENT_KEYWORDS: &[(&str, Color)] = &[
+    ("TODO", rgb(0x4F, 0xC1, 0xFF)),
+    ("FIXME", rgb(0xFF, 0x6B, 0x6B)),
+    ("XXX", rgb(0xFF, 0x6B, 0x6B)),
+    ("BUG", rgb(0xFF, 0x6B, 0x6B)),
+    ("HACK", rgb(0xC7, 0x8D, 0xFF)),
+    ("NOTE", rgb(0x4F, 0xC1, 0xFF)),
+    ("WARNING", rgb(0xFF, 0xC1, 0x4F)),
+];
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Split a comment's byte range `[start, end)` of `text` into sub-ranges,
+/// recoloring any [`COMMENT_KEYWORDS`] hit (at a word boundary) with a bold
+/// tag style and leaving the rest at the comment's own `base_style`. Adjacent
+/// same-style ranges are merged so ordinary comments emit exactly one span,
+/// matching the pre-existing cost for a comment with no tags.
+fn comment_keyword_spans(
+    text: &[u8],
+    start: usize,
+    end: usize,
+    base_style: Style,
+) -> Vec<(usize, usize, Style)> {
+    let mut out: Vec<(usize, usize, Style)> = Vec::new();
+    let mut push = |s: usize, e: usize, st: Style| {
+        if s >= e {
+            return;
+        }
+        match out.last_mut() {
+            Some((_, last_e, last_st)) if *last_e == s && *last_st == st => *last_e = e,
+            _ => out.push((s, e, st)),
+        }
+    };
+    let mut i = start;
+    while i < end {
+        let before_ok = i == start || !is_word_byte(text[i - 1]);
+        let mut matched = None;
+        if before_ok {
+            for &(kw, color) in COMMENT_KEYWORDS {
+                let kw_end = i + kw.len();
+                if kw_end <= end
+                    && &text[i..kw_end] == kw.as_bytes()
+                    && (kw_end == end || !is_word_byte(text[kw_end]))
+                {
+                    matched = Some((kw_end, color));
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some((kw_end, color)) => {
+                push(i, kw_end, base_style.fg(color).add_modifier(Modifier::BOLD));
+                i = kw_end;
+            }
+            None => {
+                // Advance one byte (not a decoded char) since the keyword
+                // table is ASCII-only and byte-level scanning is enough to
+                // find every match; UTF-8 continuation bytes never satisfy
+                // `before_ok` against an ASCII keyword's first byte anyway.
+                push(i, i + 1, base_style);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LangKind {
     Rust,
@@ -841,7 +915,16 @@ fn highlight_text_with_palette(
                     // as the `variable`/`punctuation` arm — never a literal.
                     None => palette_style_for_name(palette, ""),
                 };
-                project_range(start, end, style, line_starts, &mut per_line);
+                if name.starts_with("comment") {
+                    // Recolor TODO/FIXME/NOTE/HACK/XXX/BUG tags inside the
+                    // comment body (the "Better Comments" convention) so they
+                    // stand out from ordinary comment prose.
+                    for (s, e, st) in comment_keyword_spans(text, start, end, style) {
+                        project_range(s, e, st, line_starts, &mut per_line);
+                    }
+                } else {
+                    project_range(start, end, style, line_starts, &mut per_line);
+                }
             }
             Err(_) => {}
         }
@@ -1269,6 +1352,73 @@ def f() -> Config:\n\
         assert!(
             Arc::ptr_eq(&ca, &cb),
             "every editor must share one built highlight config"
+        );
+    }
+
+    #[test]
+    fn comment_todo_tag_gets_its_own_bold_span() {
+        let mut reg = LangRegistry::new();
+        let src = "// TODO: fix this\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        // Line 0 is "// TODO: fix this" — expect at least two spans on that
+        // line: the plain comment prose and the recolored TODO tag.
+        let line0 = &h[0];
+        assert!(
+            line0.len() >= 2,
+            "expected the TODO tag split out of the comment span, got {line0:?}"
+        );
+        let tag_span = line0
+            .iter()
+            .find(|sp| &src.as_bytes()[sp.start..sp.end] == b"TODO")
+            .expect("a span covering exactly \"TODO\"");
+        assert!(
+            tag_span.style.add_modifier.contains(Modifier::BOLD),
+            "TODO tag must be bold"
+        );
+        assert_ne!(
+            tag_span.style.fg,
+            palette_style_for_name(&crate::theme::SyntaxPalette::BASE16, "comment").fg,
+            "TODO tag must use a distinct color from plain comment prose"
+        );
+    }
+
+    #[test]
+    fn todo_macro_call_is_not_mistaken_for_a_comment_tag() {
+        // `todo!()` is a Rust macro invocation, not a comment — it must not
+        // pick up the bold tag color reserved for `// TODO` comments.
+        let mut reg = LangRegistry::new();
+        let src = "fn f() { todo!() }\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let hit = h[0]
+            .iter()
+            .find(|sp| src.as_bytes()[sp.start..sp.end].eq_ignore_ascii_case(b"todo"));
+        if let Some(sp) = hit {
+            assert!(
+                !sp.style.add_modifier.contains(Modifier::BOLD)
+                    || sp.style.fg != Some(rgb(0x4F, 0xC1, 0xFF)),
+                "todo!() must not be recolored as a comment tag"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_comment_with_no_tag_emits_a_single_merged_span() {
+        // No regression on the common case: a comment with no keyword must
+        // still collapse to one span, not one per byte.
+        let mut reg = LangRegistry::new();
+        let src = "// just a normal comment\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let comment_spans: Vec<_> = h[0]
+            .iter()
+            .filter(|sp| src.as_bytes()[sp.start..sp.end].starts_with(b"//"))
+            .collect();
+        assert_eq!(
+            comment_spans.len(),
+            1,
+            "a tag-free comment must stay a single span"
         );
     }
 
