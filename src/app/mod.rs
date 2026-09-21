@@ -27533,8 +27533,54 @@ impl App {
         !self.editor.has_non_text_view() && self.editor.markdown_preview.is_none()
     }
 
-    /// Markdown: Toggle Preview — flips the active tab between source and the
-    /// rendered view; explains itself on a non-Markdown tab.
+    /// Toggle a bookmark on the cursor's line and report the new state in the
+    /// status bar. A buffer with no path on disk cannot hold marks, and says so
+    /// rather than silently doing nothing.
+    fn toggle_bookmark(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.toggle_bookmark() {
+            Some(true) => format!("Bookmark set on line {line}"),
+            Some(false) => format!("Bookmark cleared on line {line}"),
+            None => String::from("Save the file before bookmarking a line"),
+        };
+    }
+
+    /// Jump to the next (`forward`) or previous bookmark in the open file,
+    /// wrapping at the ends. Explains an empty set instead of doing nothing.
+    fn goto_bookmark(&mut self, forward: bool) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let jumped = if forward {
+            self.editor.goto_next_bookmark()
+        } else {
+            self.editor.goto_prev_bookmark()
+        };
+        self.status = match jumped {
+            Some(line) => {
+                let total = self.editor.bookmarked_lines().len();
+                format!("Bookmark {line} of {total} in this file")
+            }
+            None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
+        };
+    }
+
+    /// Clear every bookmark in the open file, reporting how many went.
+    fn clear_bookmarks(&mut self) {
+        let gone = self.editor.clear_bookmarks();
+        self.status = if gone == 0 {
+            String::from("No bookmarks in this file")
+        } else if gone == 1 {
+            String::from("Cleared 1 bookmark")
+        } else {
+            format!("Cleared {gone} bookmarks")
+        };
+    }
+
+    /// Markdown: Toggle Preview — flips the active tab between source and the    /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
         if self.editor.toggle_markdown_preview() {
             self.status = if self.editor.markdown_preview.is_some() {
@@ -27839,6 +27885,20 @@ impl App {
             if self.editor_is_text() && self.editor.trim_final_newlines() {
                 self.status = String::from("Trimmed final newlines");
             }
+            return;
+        }
+        // Bookmarks: toggle on the cursor's line, then walk them with
+        // Cmd+Opt+. / Cmd+Opt+, (VS Code's Bookmarks extension, nvim marks).
+        if is_toggle_bookmark_key(key) {
+            self.toggle_bookmark();
+            return;
+        }
+        if is_next_bookmark_key(key) {
+            self.goto_bookmark(true);
+            return;
+        }
+        if is_prev_bookmark_key(key) {
+            self.goto_bookmark(false);
             return;
         }
         // Formerly palette-only editor commands, now each on a chord so none
@@ -34917,6 +34977,10 @@ impl App {
                     self.status = String::from("Trimmed final newlines");
                 }
             }
+            Cmd::ToggleBookmark => self.toggle_bookmark(),
+            Cmd::NextBookmark => self.goto_bookmark(true),
+            Cmd::PreviousBookmark => self.goto_bookmark(false),
+            Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
@@ -46375,6 +46439,31 @@ fn is_indentation_to_tabs_key(key: KeyEvent) -> bool {
 /// surfaced as a command).
 fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
+}
+
+/// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
+/// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
+fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'k')
+}
+
+/// `Cmd+Opt+.`: jump to the next bookmark below the cursor, wrapping to the
+/// top of the file. `Cmd+.` alone is Quick Fix, which excludes Alt, so the
+/// two never collide.
+fn is_next_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('.') | KeyCode::Char('>'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Opt+,`: mirror of [`is_next_bookmark_key`] walking upwards. The
+/// shifted glyph `<` is accepted for terminals that pre-apply the shift.
+fn is_prev_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(',') | KeyCode::Char('<'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// `Cmd+Opt+Shift+J`: Join Lines (`editor.action.joinLines`).

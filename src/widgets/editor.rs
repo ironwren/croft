@@ -2381,6 +2381,12 @@ pub struct Editor {
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
+    /// keyed by file path as 1-based line numbers — the same shape as
+    /// [`breakpoints`](Self::breakpoints), so switching tabs and coming back
+    /// keeps a file's marks. They are navigation aids only: nothing in the
+    /// debugger or the LSP reads them.
+    pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -2875,6 +2881,7 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            bookmarks: std::collections::HashMap::new(),
             edit_seq: 0,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
@@ -3124,10 +3131,14 @@ impl Editor {
 
     /// Whether the sign cell of 0-based `line` is claimed by a glyph that
     /// outranks the test play bead: the debugger's stop arrow, any
-    /// breakpoint glyph (dot, diamond, hollow ring), or the AI-stream stop
-    /// square — the same precedence the render pass applies.
+    /// breakpoint glyph (dot, diamond, hollow ring), the AI-stream stop
+    /// square, or a bookmark flag — the same precedence the render pass
+    /// applies.
     fn sign_cell_taken(&self, line: usize) -> bool {
         if self.stream_stop_line == Some(line) {
+            return true;
+        }
+        if self.is_bookmarked(line) {
             return true;
         }
         let Some(path) = self.path.as_deref() else {
@@ -3169,6 +3180,99 @@ impl Editor {
             .iter()
             .position(|r| matches!(r, VisRow::Text { line: l, .. } if *l == line))
             .map(|idx| self.last_inner.y.saturating_add(idx as u16))
+    }
+
+    /// Toggle a bookmark on the cursor's line in the open file. Returns
+    /// `Some(true)` when a bookmark was added, `Some(false)` when one was
+    /// removed, and `None` when no file is open (a scratch buffer has no
+    /// path to key the set by).
+    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+        let path = self.path.clone()?;
+        let here = self.cursor_row + 1; // bookmarks are 1-based, like breakpoints
+        let set = self.bookmarks.entry(path.clone()).or_default();
+        let added = if set.contains(&here) {
+            set.remove(&here);
+            false
+        } else {
+            set.insert(here);
+            true
+        };
+        // Drop the empty set so `bookmarked_lines` and the gutter never walk
+        // a map full of hollow entries for files whose marks were all cleared.
+        if set.is_empty() {
+            self.bookmarks.remove(&path);
+        }
+        Some(added)
+    }
+
+    /// 1-based bookmark lines for the open file, ascending. Empty when no
+    /// file is open or the file has no marks.
+    pub fn bookmarked_lines(&self) -> Vec<usize> {
+        self.path
+            .as_deref()
+            .and_then(|p| self.bookmarks.get(p))
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether 0-based `line` carries a bookmark in the open file.
+    pub fn is_bookmarked(&self, line: usize) -> bool {
+        self.path
+            .as_deref()
+            .and_then(|p| self.bookmarks.get(p))
+            .is_some_and(|s| s.contains(&(line + 1)))
+    }
+
+    /// Move the cursor to the next bookmark below it, wrapping to the first
+    /// one at the top of the file. Returns the 1-based line jumped to, or
+    /// `None` when the file has no bookmarks. A file with a single bookmark
+    /// on the cursor's own line stays put and reports that line, so the key
+    /// never looks broken.
+    pub fn goto_next_bookmark(&mut self) -> Option<usize> {
+        let marks = self.bookmarked_lines();
+        let here = self.cursor_row + 1;
+        let target = *marks
+            .iter()
+            .find(|&&l| l > here)
+            .or_else(|| marks.first())?;
+        self.jump_to_bookmark(target);
+        Some(target)
+    }
+
+    /// Mirror of [`goto_next_bookmark`](Self::goto_next_bookmark) walking
+    /// upwards, wrapping to the last bookmark in the file.
+    pub fn goto_prev_bookmark(&mut self) -> Option<usize> {
+        let marks = self.bookmarked_lines();
+        let here = self.cursor_row + 1;
+        let target = *marks
+            .iter()
+            .rev()
+            .find(|&&l| l < here)
+            .or_else(|| marks.last())?;
+        self.jump_to_bookmark(target);
+        Some(target)
+    }
+
+    /// Drop every bookmark in the open file. Returns how many were removed.
+    pub fn clear_bookmarks(&mut self) -> usize {
+        self.path
+            .clone()
+            .and_then(|p| self.bookmarks.remove(&p))
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
+    /// anything hiding it and centring it in the viewport — a bookmark
+    /// inside a collapsed region must still be reachable.
+    fn jump_to_bookmark(&mut self, line: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.selection = None;
+        self.goto_line_centered(line.saturating_sub(1));
+        self.reveal_cursor_fold();
+        self.ensure_cursor_col_visible();
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -11207,6 +11311,19 @@ impl Widget for &mut Editor {
                 sign_taken = true;
             }
 
+            // Bookmark flag: a reader's own mark, ranked below every debugger
+            // glyph and the AI-stream square (those report machine state and
+            // must never be hidden) but above the test play bead.
+            if (!wrap || row_start == 0) && !sign_taken && self.is_bookmarked(line_idx) {
+                buf.set_string(
+                    sign_x,
+                    y,
+                    "\u{2691}", // ⚑, a plain-Unicode flag: no Nerd Font needed
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x4f, 0xc1, 0xff))),
+                );
+                sign_taken = true;
+            }
+
             // Testing gutter glyph: the play button beside a test fn's
             // definition (VS Code's run bead, in its testing green), sharing
             // the sign cell with the debugger — whose stop arrow and
@@ -14789,6 +14906,226 @@ mod tests {
             e.gutter_line_at(1, 0),
             Some(2),
             "the top visible gutter row is buffer line scroll = 2"
+        );
+    }
+
+    /// A bookmark editor over a real temp file: bookmarks are keyed by path,
+    /// so an unsaved scratch buffer cannot carry any.
+    fn bookmark_editor(lines: usize) -> (Editor, tempfile::NamedTempFile) {
+        let f = NamedTempFile::new().unwrap();
+        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(f.path(), &body).unwrap();
+        let mut e = Editor::new();
+        e.open(f.path()).unwrap();
+        (e, f)
+    }
+
+    #[test]
+    fn toggling_a_bookmark_adds_then_removes_the_cursor_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 3; // 0-based; the mark is stored 1-based
+        assert_eq!(e.toggle_bookmark(), Some(true), "first toggle sets it");
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+        assert_eq!(e.toggle_bookmark(), Some(false), "second toggle clears it");
+        assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn clearing_the_last_bookmark_drops_the_files_entry_entirely() {
+        let (mut e, f) = bookmark_editor(10);
+        e.cursor_row = 0;
+        e.toggle_bookmark();
+        e.toggle_bookmark();
+        assert!(
+            !e.bookmarks.contains_key(f.path()),
+            "an emptied set must be removed, not left as a hollow entry"
+        );
+    }
+
+    #[test]
+    fn a_scratch_buffer_with_no_path_cannot_be_bookmarked() {
+        let mut e = editor_with("a\nb\n");
+        assert_eq!(e.toggle_bookmark(), None);
+        assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn bookmarks_report_ascending_regardless_of_the_order_they_were_set() {
+        let (mut e, _f) = bookmark_editor(30);
+        for row in [20, 4, 11] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        assert_eq!(e.bookmarked_lines(), vec![5, 12, 21]);
+    }
+
+    #[test]
+    fn next_bookmark_walks_down_and_wraps_to_the_first() {
+        let (mut e, _f) = bookmark_editor(40);
+        for row in [4, 14, 29] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        e.cursor_row = 0;
+        assert_eq!(e.goto_next_bookmark(), Some(5));
+        assert_eq!(e.cursor_row, 4);
+        assert_eq!(e.goto_next_bookmark(), Some(15));
+        assert_eq!(e.goto_next_bookmark(), Some(30));
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(5),
+            "past the last mark it wraps to the top of the file"
+        );
+        assert_eq!(e.cursor_row, 4);
+    }
+
+    #[test]
+    fn previous_bookmark_walks_up_and_wraps_to_the_last() {
+        let (mut e, _f) = bookmark_editor(40);
+        for row in [4, 14, 29] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        e.cursor_row = 39;
+        assert_eq!(e.goto_prev_bookmark(), Some(30));
+        assert_eq!(e.goto_prev_bookmark(), Some(15));
+        assert_eq!(e.goto_prev_bookmark(), Some(5));
+        assert_eq!(
+            e.goto_prev_bookmark(),
+            Some(30),
+            "above the first mark it wraps to the bottom of the file"
+        );
+    }
+
+    #[test]
+    fn navigating_with_no_bookmarks_reports_none_and_leaves_the_cursor() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 6;
+        assert_eq!(e.goto_next_bookmark(), None);
+        assert_eq!(e.goto_prev_bookmark(), None);
+        assert_eq!(e.cursor_row, 6, "a failed jump must not move the cursor");
+    }
+
+    #[test]
+    fn a_lone_bookmark_on_the_cursors_own_line_still_reports_itself() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 5;
+        e.toggle_bookmark();
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(6),
+            "wrapping onto the only mark must report it, not look broken"
+        );
+        assert_eq!(e.goto_prev_bookmark(), Some(6));
+    }
+
+    #[test]
+    fn jumping_to_a_bookmark_drops_any_selection() {
+        let (mut e, _f) = bookmark_editor(20);
+        e.cursor_row = 15;
+        e.toggle_bookmark();
+        e.cursor_row = 0;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        e.goto_next_bookmark();
+        assert!(
+            e.selection.is_none(),
+            "a jump is a navigation, not an extend"
+        );
+    }
+
+    #[test]
+    fn clear_bookmarks_reports_how_many_it_removed() {
+        let (mut e, _f) = bookmark_editor(20);
+        for row in [1, 5, 9] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        assert_eq!(e.clear_bookmarks(), 3);
+        assert!(e.bookmarked_lines().is_empty());
+        assert_eq!(e.clear_bookmarks(), 0, "clearing twice is a no-op");
+    }
+
+    #[test]
+    fn bookmarks_are_per_file_so_switching_tabs_keeps_each_files_marks() {
+        let (mut e, first) = bookmark_editor(10);
+        e.cursor_row = 2;
+        e.toggle_bookmark();
+        let second = NamedTempFile::new().unwrap();
+        std::fs::write(second.path(), "x\ny\nz\n").unwrap();
+        e.open(second.path()).unwrap();
+        assert!(
+            e.bookmarked_lines().is_empty(),
+            "the second file starts unmarked"
+        );
+        e.cursor_row = 0;
+        e.toggle_bookmark();
+        e.open(first.path()).unwrap();
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3],
+            "coming back restores the first file's marks"
+        );
+    }
+
+    #[test]
+    fn is_bookmarked_is_zero_based_to_match_the_render_loop() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 4; // stored as line 5
+        e.toggle_bookmark();
+        assert!(e.is_bookmarked(4), "0-based row 4 is the bookmarked line");
+        assert!(
+            !e.is_bookmarked(5),
+            "off-by-one would light up the wrong row"
+        );
+    }
+
+    #[test]
+    fn the_bookmark_flag_is_painted_in_the_left_glyph_margin() {
+        let (mut e, _f) = bookmark_editor(5);
+        e.cursor_row = 1; // line 2
+        e.toggle_bookmark();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let row = e.last_inner.y + 1; // line 2 is the 2nd content row
+        assert_eq!(
+            buf[(e.last_inner.x, row)].symbol(),
+            "\u{2691}",
+            "the flag belongs in the sign margin at inner.x"
+        );
+        let unmarked = e.last_inner.y + 2; // line 3 carries no mark
+        assert_ne!(buf[(e.last_inner.x, unmarked)].symbol(), "\u{2691}");
+    }
+
+    #[test]
+    fn a_breakpoint_outranks_a_bookmark_in_the_shared_sign_cell() {
+        let (mut e, f) = bookmark_editor(5);
+        e.cursor_row = 1;
+        e.toggle_bookmark();
+        e.breakpoints
+            .entry(f.path().to_path_buf())
+            .or_default()
+            .insert(2); // same line
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        assert_eq!(
+            buf[(e.last_inner.x, e.last_inner.y + 1)].symbol(),
+            "\u{25cf}",
+            "debugger state must never be hidden behind a reader's own mark"
         );
     }
 

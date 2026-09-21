@@ -26651,6 +26651,104 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     assert!(applied, "the reply matching the newest request must apply");
 }
 
+// --- Bookmarks ------------------------------------------------------------
+
+#[test]
+fn bookmark_chords_are_disjoint_from_the_chords_they_sit_beside() {
+    // Toggle is Cmd+Opt+Shift+K; plain Cmd+Shift+K is still Delete Line.
+    assert!(is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_delete_line_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+
+    // Next/previous are Cmd+Opt+. and Cmd+Opt+, — Quick Fix (Cmd+.) excludes
+    // Alt, so the two dot chords never fire together.
+    assert!(is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    assert!(!is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::ALT
+    )));
+}
+
+#[test]
+fn the_toggle_chord_marks_the_cursor_line_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "a\nb\nc\nd\n");
+    app.editor.cursor_row = 2;
+    app.handle_editor_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.bookmarked_lines(), vec![3]);
+    assert!(
+        app.status.contains("line 3"),
+        "the status must name the line; was {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn the_navigation_chords_move_the_cursor_between_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 4);
+    app.handle_editor_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+#[test]
+fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    app.editor.cursor_row = 1;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
 // --- In-editor Find & Replace ---------------------------------------------
 
 /// The Cmd+Opt+F chord as crossterm decodes the forwarded CSI-u sequence
