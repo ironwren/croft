@@ -2417,6 +2417,13 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
+    /// `javascript.autoClosingTags`, filling the "no tag auto-close" gap
+    /// in `src/vscode_extensions.rs`): typing `>` at the end of an opening
+    /// HTML/XML/JSX tag inserts the matching `</tag>` after the caret.
+    /// Separate from `auto_close_pairs` because `>` is not a bracket pair
+    /// here — it only closes a tag when the text before it parses as one.
+    pub auto_close_tags: bool,
     /// The caret position and `edit_seq` recorded by the LAST auto-close
     /// insertion. Pair-backspace fires only while the caret still sits
     /// there with no edits since — a pre-existing `()` in the file must
@@ -2883,6 +2890,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            auto_close_tags: true,
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
@@ -5710,6 +5718,12 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.auto_close_tags && c == '>' && self.insert_closing_tag() {
+            // Still a keystroke, like the pair path below: on-type
+            // formatting (#254) keys off the typed character.
+            self.last_typed = Some((c, self.edit_seq));
+            return;
+        }
         if self.auto_close_pairs && self.insert_char_with_pairs(c) {
             // Still a keystroke: on-type formatting (#254) keys off the
             // typed character, whether or not the pair machinery handled it.
@@ -5743,6 +5757,40 @@ impl Editor {
         // in insert_char_raw: paste and snippet expansion go through the
         // raw path and must never count as typing.
         self.last_typed = Some((c, self.edit_seq));
+    }
+
+    /// Tag auto-close: the `>` keystroke, when the text before the caret is
+    /// an unterminated opening HTML/XML/JSX tag, types the `>` AND appends
+    /// the matching `</tag>` after it, leaving the caret between the two —
+    /// VS Code's `html.autoClosingTags` / `javascript.autoClosingTags`.
+    /// Returns true when it handled the keystroke.
+    fn insert_closing_tag(&mut self) -> bool {
+        if self.lines.is_empty() {
+            return false;
+        }
+        // A selection-replace is the ordinary insert's job, not this one.
+        if self.selection.is_some_and(|s| s.has_area()) {
+            return false;
+        }
+        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        let name = match self.lines.get(self.cursor_row) {
+            Some(line) => tag_auto_close_name(line, byte, self.lang),
+            None => None,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        self.pin_on_edit();
+        self.push_undo(EditKind::InsertChar);
+        let row = self.cursor_row;
+        self.lines[row].insert_str(byte, &format!("></{name}>"));
+        // The caret lands just past the `>` the user typed, i.e. between the
+        // opening and closing tags, which is where they will type next.
+        self.cursor_col += 1;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
     }
 
     /// The auto-closing-pairs behaviors, returning true when the keystroke
@@ -12489,6 +12537,87 @@ fn paint_bracket_match(
 /// VS Code's default auto-closing set: the partner a typed opener/quote
 /// pairs with, `None` for everything else (closers included — they only
 /// type over).
+/// HTML void elements: they never take a closing tag, so typing `>` after
+/// one must not produce `</br>` and friends.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Languages where `>` closes a tag. TypeScript (`.ts`) is deliberately
+/// absent — it has no JSX, so every `<` there is a comparison or a generic.
+fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(LangKind::Html | LangKind::Xml | LangKind::Tsx | LangKind::JavaScript)
+    )
+}
+
+/// The tag name a `>` typed at `byte` in `line` should close, or `None` when
+/// the text before the caret is not an unterminated opening tag.
+///
+/// Heuristic, not a parse: the editor decides this on one keystroke against
+/// one line, so every rule below exists to make a FALSE POSITIVE impossible
+/// rather than to catch every true one. In particular the "`<` may not
+/// follow a word character" rule is what keeps generic calls (`foo<T>`,
+/// `Array<string>`) and comparisons (`a<b`) from sprouting closing tags.
+fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Option<String> {
+    if !lang_auto_closes_tags(lang) {
+        return None;
+    }
+    let before = line.get(..byte)?;
+    let lt = before.rfind('<')?;
+    let inner = &before[lt + 1..];
+    // A closing tag (`</p`), a comment or doctype (`<!`), or an XML
+    // processing instruction (`<?`) closes nothing.
+    if inner.starts_with(['/', '!', '?']) {
+        return None;
+    }
+    // The author is self-closing it themselves: `<br/`, `<Foo /`.
+    if inner.ends_with('/') {
+        return None;
+    }
+    // `<` directly after a word character is a comparison or a generic
+    // argument list, never markup: `a<b`, `foo<T`, `Array<string`.
+    if before[..lt]
+        .chars()
+        .next_back()
+        .is_some_and(|p| p.is_alphanumeric() || p == '_')
+    {
+        return None;
+    }
+    let name: String = inner
+        .chars()
+        .take_while(|&c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .collect();
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|f| f.is_alphabetic() || f == '_')
+    {
+        return None;
+    }
+    // Whatever follows the name must look like the inside of a tag: nothing
+    // at all, or attributes after whitespace. This rejects the standalone
+    // generic declaration `<T,>(x: T) => x`, whose `,` is not tag syntax.
+    let rest = &inner[name.len()..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // A `>` already inside means that `<` is closed and the caret is past
+    // the tag (or inside an attribute value holding a `>`); either way this
+    // keystroke is not closing THIS tag.
+    if rest.contains('>') {
+        return None;
+    }
+    if matches!(lang, Some(LangKind::Html))
+        && VOID_ELEMENTS.contains(&name.to_ascii_lowercase().as_str())
+    {
+        return None;
+    }
+    Some(name)
+}
+
 fn auto_close_partner(c: char) -> Option<char> {
     match c {
         '(' => Some(')'),
@@ -24712,6 +24841,130 @@ mod tests {
         assert_eq!(e.lines[0], "()");
         e.backspace();
         assert_eq!(e.lines[0], "", "the empty pair dies together");
+    }
+
+    fn tag_editor(text: &str, lang: LangKind) -> Editor {
+        let mut e = editor_with(text);
+        e.lang = Some(lang);
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e
+    }
+
+    #[test]
+    fn typing_the_closing_angle_of_an_html_tag_inserts_the_closing_tag() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+        assert_eq!(e.cursor_col, 5, "the caret sits between the two tags");
+    }
+
+    #[test]
+    fn tag_auto_close_carries_attributes_but_closes_on_the_name_only() {
+        let mut e = tag_editor("<a href=\"/x\" class=\"link\"", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<a href=\"/x\" class=\"link\"></a>");
+    }
+
+    #[test]
+    fn tag_auto_close_is_one_undo_step() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+        e.undo();
+        assert_eq!(e.lines[0], "<div", "undo restores the pre-keystroke text");
+    }
+
+    #[test]
+    fn void_elements_never_get_a_closing_tag() {
+        for void in ["<br", "<img src=\"a.png\"", "<input", "<hr", "<meta"] {
+            let mut e = tag_editor(void, LangKind::Html);
+            e.insert_char('>');
+            assert_eq!(
+                e.lines[0],
+                format!("{void}>"),
+                "a void element takes no closing tag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closing_tag_does_not_close_again() {
+        let mut e = tag_editor("<div></div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+    }
+
+    #[test]
+    fn a_self_closed_tag_is_left_alone() {
+        let mut e = tag_editor("<Foo /", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<Foo />");
+    }
+
+    #[test]
+    fn jsx_components_and_namespaced_tags_close_with_their_full_name() {
+        let mut e = tag_editor("<Foo.Bar", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<Foo.Bar></Foo.Bar>");
+        // A void element name is HTML's rule, not JSX's: `<Input>` is an
+        // ordinary component there and does take a closing tag.
+        let mut e = tag_editor("<input", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<input></input>");
+    }
+
+    #[test]
+    fn generics_and_comparisons_never_sprout_a_closing_tag() {
+        // A `<` right after a word character is a generic or a comparison,
+        // which is what these all are — none may auto-close.
+        for src in ["const a = b<c", "let x: Array<string", "foo<Bar"] {
+            let mut e = tag_editor(src, LangKind::Tsx);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // A standalone generic declaration: the `,` is not tag syntax.
+        let mut e = tag_editor("const f = <T,", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "const f = <T,>");
+    }
+
+    #[test]
+    fn tag_auto_close_only_runs_in_markup_languages() {
+        // The same text in Rust or TypeScript is a comparison or a generic.
+        for lang in [LangKind::Rust, LangKind::TypeScript, LangKind::Python] {
+            let mut e = tag_editor("<div", lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], "<div>", "{lang:?} must not auto-close tags");
+        }
+    }
+
+    #[test]
+    fn tag_auto_close_can_be_switched_off() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.auto_close_tags = false;
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div>");
+    }
+
+    #[test]
+    fn comments_doctypes_and_processing_instructions_are_left_alone() {
+        for src in ["<!-- note --", "<!DOCTYPE html", "<?xml version=\"1.0\"?"] {
+            let mut e = tag_editor(src, LangKind::Xml);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+    }
+
+    #[test]
+    fn typing_the_angle_with_a_selection_replaces_it_without_closing() {
+        let mut e = tag_editor("<div>old</div>", LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 5),
+            head: (0, 8),
+        }); // "old"
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div>></div>");
     }
 
     #[test]
