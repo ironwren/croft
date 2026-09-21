@@ -2011,6 +2011,9 @@ enum EditKind {
     /// Find-bar Replace / Replace All. Never coalesces, so each replace is
     /// its own undo step like VS Code.
     Replace,
+    /// Expand an Emmet abbreviation into markup. Its own step, so one undo
+    /// puts the abbreviation back.
+    EmmetExpand,
 }
 
 /// The three case transforms VS Code exposes as
@@ -8929,6 +8932,95 @@ impl Editor {
         true
     }
 
+    /// VS Code "Emmet: Expand Abbreviation"
+    /// (`editor.emmet.action.expandAbbreviation`): replace the abbreviation
+    /// ending at the cursor with the markup it stands for, and leave the
+    /// caret in the first empty element.
+    ///
+    /// Only runs in markup buffers, and only when what sits left of the
+    /// cursor actually parses as an abbreviation — so the chord is inert in
+    /// prose and in code rather than mangling either. Returns whether
+    /// anything expanded, which the caller reports in the status bar.
+    pub fn expand_emmet_abbreviation(&mut self) -> bool {
+        if !lang_supports_emmet(self.lang) {
+            return false;
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let line = match self.lines.get(row) {
+            Some(l) => l.clone(),
+            None => return false,
+        };
+        let (start_col, abbr) = match crate::emmet::abbreviation_before(&line, col) {
+            Some(v) => v,
+            None => return false,
+        };
+        let unit = self.indent_unit();
+        let (markup, caret) = match crate::emmet::expand(&abbr, &unit) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // The abbreviation's own indentation prefixes every line of the
+        // expansion, so an abbreviation typed inside a nested block stays
+        // inside it.
+        let lead: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let lead = if start_col == lead.chars().count() {
+            lead
+        } else {
+            String::new()
+        };
+
+        self.push_undo(EditKind::EmmetExpand);
+        self.last_edit_kind = None;
+
+        let chars: Vec<char> = line.chars().collect();
+        let before: String = chars[..start_col].iter().collect();
+        let after: String = chars[col.min(chars.len())..].iter().collect();
+
+        // `markup` always ends in a newline; the trailing line merges with
+        // whatever followed the abbreviation.
+        let body = markup.strip_suffix('\n').unwrap_or(&markup);
+        let mut out: Vec<String> = Vec::new();
+        let mut caret_row = row;
+        let mut caret_col = 0usize;
+        let mut consumed = 0usize;
+        for (i, seg) in body.split('\n').enumerate() {
+            let mut l = String::new();
+            if i == 0 {
+                l.push_str(&before);
+            } else {
+                l.push_str(&lead);
+            }
+            let text_start = l.chars().count();
+            l.push_str(seg);
+            // `caret` is a byte offset into `markup`; find the line holding
+            // it and convert to a char column on the rebuilt line.
+            let seg_end = consumed + seg.len();
+            if caret >= consumed && caret <= seg_end {
+                caret_row = row + i;
+                caret_col = text_start + seg[..caret - consumed].chars().count();
+            }
+            consumed = seg_end + 1; // the '\n' we split on
+            out.push(l);
+        }
+        if let Some(last) = out.last_mut() {
+            last.push_str(&after);
+        }
+
+        self.lines.splice(row..=row, out);
+        self.cursor_row = caret_row;
+        self.cursor_col = caret_col;
+        self.clear_selection();
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
     /// VS Code "Transpose Characters around the Cursor"
     /// (`editor.action.transpose`): swap the character before the cursor with
     /// the one after it and advance the cursor (emacs `transpose-chars`). At
@@ -10333,6 +10425,16 @@ fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Yaml) => "  ",
         _ => "    ",
     }
+}
+
+/// Buffers where Emmet abbreviation expansion is offered, matching VS Code's
+/// default `emmet.includeLanguages` set: the markup grammars, plus the two
+/// JSX ones where abbreviations expand into JSX.
+fn lang_supports_emmet(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(LangKind::Html) | Some(LangKind::Xml) | Some(LangKind::Tsx)
+    )
 }
 
 /// Display name for a language mode, matching VS Code's status-bar labels.
@@ -24051,6 +24153,145 @@ mod tests {
         e.transpose_chars();
         assert_eq!(e.lines, vec!["abc"]);
         assert_eq!((e.cursor_row, e.cursor_col), (0, 3));
+    }
+
+    // ---- Emmet: Expand Abbreviation ----
+
+    fn html_editor(text: &str, col: usize) -> Editor {
+        let mut e = editor_with(text);
+        e.lang = Some(LangKind::Html);
+        e.cursor_row = e.lines.len() - 1;
+        e.cursor_col = col;
+        e
+    }
+
+    #[test]
+    fn emmet_replaces_the_abbreviation_with_markup() {
+        let mut e = html_editor("ul>li*2", 7);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+        );
+    }
+
+    /// The caret has to end up somewhere useful, or the user just has to go
+    /// looking for the hole they meant to type into.
+    #[test]
+    fn emmet_leaves_the_caret_in_the_first_empty_element() {
+        let mut e = html_editor("div>span", 8);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.cursor_row, 1);
+        let line = &e.lines[1];
+        let byte = byte_index_of_char(line, e.cursor_col);
+        assert_eq!(&line[byte..], "</span>");
+    }
+
+    #[test]
+    fn emmet_uses_the_buffers_indent_style() {
+        let mut e = html_editor("div>p", 5);
+        e.set_indent_style(IndentStyle {
+            width: 2,
+            use_spaces: true,
+        });
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines[1], "  <p></p>");
+    }
+
+    /// An abbreviation typed inside a nested block must stay inside it, so
+    /// the expansion is prefixed with the line's own indentation.
+    #[test]
+    fn emmet_keeps_the_lines_existing_indentation() {
+        let mut e = html_editor("        ul>li", 13);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(
+            e.lines,
+            vec!["        <ul>", "            <li></li>", "        </ul>"]
+        );
+    }
+
+    #[test]
+    fn emmet_keeps_text_that_followed_the_cursor() {
+        let mut e = html_editor("br</div>", 2);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<br></div>"]);
+    }
+
+    #[test]
+    fn emmet_keeps_text_that_preceded_the_abbreviation() {
+        let mut e = html_editor("<p>strong", 9);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<p><strong></strong>"]);
+    }
+
+    /// One undo step, and it restores the abbreviation rather than peeling
+    /// the markup off a character at a time.
+    #[test]
+    fn emmet_expansion_undoes_in_one_step() {
+        let mut e = html_editor("ul>li*3", 7);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines.len(), 5);
+        e.undo();
+        assert_eq!(e.lines, vec!["ul>li*3"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_outside_markup_buffers() {
+        let mut e = html_editor("ul>li*2", 7);
+        e.lang = Some(LangKind::Rust);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["ul>li*2"]);
+    }
+
+    #[test]
+    fn emmet_runs_in_xml_and_jsx_too() {
+        for lang in [LangKind::Xml, LangKind::Tsx] {
+            let mut e = html_editor("div", 3);
+            e.lang = Some(lang);
+            assert!(e.expand_emmet_abbreviation(), "{lang:?}");
+            assert_eq!(e.lines, vec!["<div></div>"], "{lang:?}");
+        }
+    }
+
+    /// Prose in an HTML buffer must not turn into tags.
+    #[test]
+    fn emmet_is_inert_on_prose() {
+        let mut e = html_editor("the quick brown fox", 19);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["the quick brown fox"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_on_an_unparseable_abbreviation() {
+        let mut e = html_editor("div>(span", 9);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["div>(span"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_at_the_start_of_a_line() {
+        let mut e = html_editor("div", 0);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["div"]);
+    }
+
+    #[test]
+    fn emmet_marks_the_buffer_dirty() {
+        let mut e = html_editor("div", 3);
+        e.dirty = false;
+        assert!(e.expand_emmet_abbreviation());
+        assert!(e.dirty, "an expansion is an edit");
+    }
+
+    #[test]
+    fn emmet_drops_any_active_selection() {
+        let mut e = html_editor("div", 3);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        assert!(e.expand_emmet_abbreviation());
+        assert!(e.selection.is_none());
     }
 
     // ---- Convert Indentation to Spaces / Tabs ----

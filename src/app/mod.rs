@@ -27533,6 +27533,20 @@ impl App {
         !self.editor.has_non_text_view() && self.editor.markdown_preview.is_none()
     }
 
+    /// Emmet: Expand Abbreviation. Says why nothing happened rather than
+    /// failing silently — the two reasons (wrong language, unparseable
+    /// abbreviation) need different fixes from the user.
+    fn expand_emmet_abbreviation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.status = if self.editor.expand_emmet_abbreviation() {
+            String::from("Emmet: expanded abbreviation")
+        } else {
+            String::from("Emmet: no abbreviation at the cursor")
+        };
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -27879,6 +27893,10 @@ impl App {
             if self.editor_is_text() && self.editor.trim_trailing_whitespace() {
                 self.status = String::from("Trimmed trailing whitespace");
             }
+            return;
+        }
+        if is_emmet_expand_key(key) {
+            self.expand_emmet_abbreviation();
             return;
         }
         // VS Code "Format Document" (Cmd+Opt+Shift+F): reformat the whole buffer
@@ -34631,6 +34649,7 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
@@ -46420,6 +46439,15 @@ fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
 /// `Shift+Alt+F`). Reformats the whole buffer through the language server.
 fn is_format_document_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'f')
+}
+
+/// `Cmd+Opt+Shift+E`: Emmet Expand Abbreviation
+/// (`editor.emmet.action.expandAbbreviation`). VS Code binds this to Tab,
+/// which croft cannot reuse — Tab is indentation here, and an abbreviation
+/// that only sometimes expands on Tab is worse than one that always expands
+/// on its own chord.
+fn is_emmet_expand_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'e')
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
