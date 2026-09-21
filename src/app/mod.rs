@@ -27533,6 +27533,18 @@ impl App {
         !self.editor.has_non_text_view() && self.editor.markdown_preview.is_none()
     }
 
+    /// Increment (`delta` 1) or decrement (`delta` -1) the number under the
+    /// cursor, reporting in the status bar when there is nothing to bump so
+    /// the keystroke never looks broken.
+    fn bump_number_under_cursor(&mut self, delta: i64) {
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.bump_number(delta) {
+            self.status = String::from("No number at or after the cursor on this line");
+        }
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -27879,6 +27891,14 @@ impl App {
             if self.editor_is_text() && self.editor.trim_trailing_whitespace() {
                 self.status = String::from("Trimmed trailing whitespace");
             }
+            return;
+        }
+        if is_increment_number_key(key) {
+            self.bump_number_under_cursor(1);
+            return;
+        }
+        if is_decrement_number_key(key) {
+            self.bump_number_under_cursor(-1);
             return;
         }
         // VS Code "Format Document" (Cmd+Opt+Shift+F): reformat the whole buffer
@@ -34626,6 +34646,8 @@ impl App {
             Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
             Cmd::SortLinesAscending => self.editor.sort_lines(true),
             Cmd::SortLinesDescending => self.editor.sort_lines(false),
+            Cmd::IncrementNumber => self.bump_number_under_cursor(1),
+            Cmd::DecrementNumber => self.bump_number_under_cursor(-1),
             Cmd::TrimTrailingWhitespace => {
                 if self.editor.trim_trailing_whitespace() {
                     self.status = String::from("Trimmed trailing whitespace");
@@ -46414,6 +46436,35 @@ fn is_sort_lines_desc_key(key: KeyEvent) -> bool {
 /// `Cmd+Opt+Shift+W`: Trim Trailing Whitespace (`editor.action.trimTrailingWhitespace`).
 fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'w')
+}
+
+/// `Cmd+Opt+=`: Increment the number under the cursor.
+///
+/// vim's own chord is `Ctrl-A`, which cannot be taken here — it is Select
+/// All, and on a terminal it is also the tmux/screen prefix. `Cmd+Opt` with
+/// the `=`/`-` pair keeps the two halves adjacent on the keyboard and free
+/// of every existing binding. `+` is accepted alongside `=` so a shifted
+/// press works on layouts that report it.
+fn is_increment_number_key(key: KeyEvent) -> bool {
+    is_cmd_alt_char(key, &['=', '+'])
+}
+
+/// `Cmd+Opt+-`: Decrement the number under the cursor (vim's `Ctrl-X`).
+fn is_decrement_number_key(key: KeyEvent) -> bool {
+    is_cmd_alt_char(key, &['-', '_'])
+}
+
+fn is_cmd_alt_char(key: KeyEvent, chars: &[char]) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !chars.contains(&c) {
+        return false;
+    }
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+    let has_cmd_or_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    has_alt && has_cmd_or_ctrl
 }
 
 /// `Cmd+Opt+Shift+F`: Format Document (`editor.action.formatDocument`, VS Code's
