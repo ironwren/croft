@@ -481,27 +481,56 @@ const SETTLE_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 /// order of magnitude beyond anything a page render produces.
 const EXIT_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// `O_NONBLOCK` onto one descriptor, reporting whether it is set now.
+///
+/// Split out so a test can provoke the fcntl failure on a descriptor it
+/// controls: doing it to a live `ChildStderr` means closing the fd under the
+/// handle, which trips Rust's IO-safety check and aborts the process instead
+/// of failing an assertion.
+#[cfg(unix)]
+fn nonblocking_on_fd(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: both calls only read and set the status flags of `fd`, and
+    // neither takes ownership of it. An invalid `fd` is reported as EBADF
+    // rather than being undefined.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return false;
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+    }
+}
+
 /// Put the pipe in non-blocking mode so a read returns what is there rather
 /// than waiting for more (#553).
 ///
-/// A no-op off unix, where the fd type does not exist; the caller's reads
-/// then behave as they always did.
-fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) {
+/// Reports whether the pipe is actually non-blocking now, because the answer
+/// decides whether the caller may read BEFORE the child is reaped. A blocking
+/// read there waits on a renderer that is still running, and the budget and
+/// the kill path both sit after it - so a failed `fcntl` would reinstate the
+/// exact hang this change removes. Callers must not drain a pipe this
+/// returned `false` for until the child has exited.
+///
+/// `false` off unix, where the fd type does not exist: no pipe is made
+/// non-blocking there, and the caller keeps to the after-exit drain.
+fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
     #[cfg(unix)]
-    if let Some(pipe) = pipe {
+    {
+        let Some(pipe) = pipe else {
+            // No pipe is vacuously safe to drain: `drain_available` returns
+            // at once on `None`, so it can never block.
+            return true;
+        };
         use std::os::fd::AsRawFd;
-        // SAFETY: `pipe` owns the descriptor for as long as this borrow
-        // lasts, and both calls only read and set its status flags.
-        unsafe {
-            let fd = pipe.as_raw_fd();
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
+        nonblocking_on_fd(pipe.as_raw_fd())
     }
     #[cfg(not(unix))]
-    let _ = pipe;
+    {
+        // Nothing is made non-blocking here, so the answer is yes only when
+        // there is no pipe to block on: `drain_available` returns at once on
+        // `None`. With a pipe, the caller keeps to the after-exit read.
+        pipe.is_none()
+    }
 }
 
 /// Append everything the pipe has RIGHT NOW, and stop.
@@ -661,13 +690,20 @@ fn run_pdftoppm(
     // wrote is in the pipe by the time it exits, so a drain-until-EAGAIN
     // after the exit takes all of it, with no window to lose and nothing to
     // schedule.
-    set_nonblocking(stderr_pipe.as_ref());
+    // Whether the in-loop drain below is safe at all. If the pipe could not
+    // be made non-blocking, a read here waits on a live renderer and the
+    // budget check and kill path never run - worse than the buffer pressure
+    // the in-loop drain exists to relieve, so it is skipped rather than
+    // risked. The after-exit drain is unaffected: the child is gone by then.
+    let nonblocking = set_nonblocking(stderr_pipe.as_ref());
     let mut stderr_bytes: Vec<u8> = Vec::new();
     let deadline = std::time::Instant::now() + budget;
     let status = loop {
         // Drained every tick as well, so a renderer spraying more than a
         // pipeful cannot block on a full buffer waiting for us.
-        drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
+        if nonblocking {
+            drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
@@ -692,10 +728,26 @@ fn run_pdftoppm(
     };
     if !status.success() {
         // Everything the renderer itself wrote is readable NOW - it exited,
-        // so it has written all it will. Take that first, unconditionally,
-        // before any timing question is asked (#553).
-        drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
-        let text = settle_late_writes(stderr_pipe.as_mut(), &mut stderr_bytes, STDERR_SETTLE_GRACE);
+        // so it has written all it will. Take that first, before any timing
+        // question is asked (#553).
+        //
+        // ...but only on a pipe that reads without blocking. Reaping the
+        // child does not close the write end if a DESCENDANT still holds it,
+        // and on a blocking pipe the read then waits on that descendant
+        // rather than returning. Measured: after the child is reaped, the
+        // first read returns its output and the SECOND blocks until the
+        // grandchild exits, because end of file waits for every holder.
+        //
+        // So when the fcntl failed, both reads are skipped and only what the
+        // loop already buffered is reported. A truncated message beats a
+        // hang - and with the in-loop drain skipped too, that buffer is
+        // empty, leaving the exit status as the whole of the report.
+        let text = if nonblocking {
+            drain_available(stderr_pipe.as_mut(), &mut stderr_bytes);
+            settle_late_writes(stderr_pipe.as_mut(), &mut stderr_bytes, STDERR_SETTLE_GRACE)
+        } else {
+            String::from_utf8_lossy(&stderr_bytes).trim().to_string()
+        };
         return Err(std::io::Error::other(format!(
             "{} exited with {status}: {text}",
             program.display()
@@ -1642,5 +1694,43 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
     fn pdfinfo_handles_extra_whitespace() {
         let sample = "Pages:    7\n";
         assert_eq!(parse_pdfinfo_pages(sample), Some(7));
+    }
+
+    /// `set_nonblocking` must REPORT the outcome, because the caller reads
+    /// the pipe before reaping the child and only a non-blocking pipe makes
+    /// that read safe. A bare `true` would pass the live-pipe case, so the
+    /// bad-descriptor case is what gives the assertion teeth: the two
+    /// together pin a return value that actually tracks the fcntl.
+    ///
+    /// The failure is provoked on a RAW fd rather than a real pipe, because
+    /// closing one out from under a `ChildStderr` aborts the process under
+    /// Rust's IO-safety checks - which would "detect" a regression by
+    /// crashing rather than failing, and abort a passing run just as readily.
+    #[cfg(unix)]
+    #[test]
+    fn set_nonblocking_reports_whether_the_pipe_is_now_non_blocking() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let pipe = child.stderr.take().expect("piped stderr");
+
+        // A live pipe: the fcntl pair succeeds and the answer is yes.
+        assert!(
+            set_nonblocking(Some(&pipe)),
+            "a live pipe must report non-blocking"
+        );
+
+        // -1 is never a valid descriptor, so F_GETFL fails with EBADF - the
+        // same branch a real fcntl failure takes. This is the shared helper
+        // the function's unix arm uses, so the branch under test is the one
+        // that runs in production.
+        assert!(
+            !nonblocking_on_fd(-1),
+            "a bad descriptor must report failure, not be ignored"
+        );
+
+        let _ = child.wait();
     }
 }

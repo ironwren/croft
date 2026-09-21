@@ -56,6 +56,7 @@ def matrix_targets(text: str) -> set[str]:
     lines = text.splitlines()
     matrix_indent = None
     section = None
+    item_indent = None
     out = set()
     for line in lines:
         if matrix_indent is None:
@@ -70,11 +71,25 @@ def matrix_targets(text: str) -> set[str]:
         m = re.match(r"^\s*([A-Za-z_-]+):\s*$", line)
         if m and indent == matrix_indent + 2:
             section = m.group(1)
+            item_indent = None
             continue
         if section == "include":
-            m = re.match(r"^\s*-\s*target:\s*(\S+)\s*$", line)
+            # A list ITEM starts at the dash; `target:` is one of its keys and
+            # YAML does not order them, so `- os: ...` with `target:` on a
+            # later line is the same entry. Matching only `- target:` drops
+            # such an entry and the checker then reports a target it builds as
+            # missing - or misses one that really went away (#554 again).
+            m = re.match(r"^(\s*)-\s*(.*)$", line)
             if m:
-                out.add(m.group(1))
+                item_indent = len(m.group(1))
+                rest = m.group(2)
+            else:
+                rest = line.strip()
+                if item_indent is None or indent <= item_indent:
+                    continue
+            k = re.match(r"^target:\s*(\S+)\s*$", rest)
+            if k:
+                out.add(k.group(1))
         elif section == "target":
             m = re.match(r"^\s*-\s*(\S+)\s*$", line)
             if m:
