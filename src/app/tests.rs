@@ -38992,6 +38992,76 @@ fn problem_scope_config_tokens_round_trip() {
 ///
 /// `parse_compounds` rejects only an EMPTY member list, so a one-member
 /// compound parses and reaches the launch site, where the `Ok(_)` arm reports
+/// "N of M started" must count sessions, not call sites.
+///
+/// `launch_resolved_into_set` returns `()` on every validation, spawn and
+/// attach failure, so the member launcher reported `Launched` unconditionally
+/// and the summary counted members that never started. CI caught the extreme
+/// form of it on a runner with no Python adapter: "2 session(s), showing ?"
+/// over an entirely empty set.
+///
+/// The assertion is the INVARIANT, not a number: a session exists for each
+/// one the report claims. A literal count would only restate whichever host
+/// ran it - this Mac starts the good member, CI starts nothing.
+#[test]
+fn a_member_that_fails_to_start_is_not_counted_as_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    // `Broken` names an adapter croft cannot resolve, so it can never start
+    // on any host; `Server` starts wherever debugpy exists.
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Broken", "type": "no-such-debugger", "request": "launch", "program": "b.py" }
+        ],
+        "compounds": [
+            { "name": "Mixed", "configurations": ["Server", "Broken"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let row = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Mixed"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = row;
+    app.confirm_list_picker();
+
+    let live = app.debug_sessions.names();
+    assert!(
+        !live.contains(&"Broken".to_string()),
+        "the unresolvable member never joins the set: {live:?}"
+    );
+    let reported = app
+        .run_debug
+        .feedback
+        .clone()
+        .unwrap_or_else(|| app.status.clone());
+    if live.is_empty() {
+        assert!(
+            reported.contains("started no sessions"),
+            "an empty set is reported as empty, never as live sessions: {reported}"
+        );
+    } else {
+        assert!(
+            reported.contains(&format!("{} of 2", live.len())),
+            "the count names the sessions that exist ({}), not the members attempted: {reported}",
+            live.len()
+        );
+    }
+    assert!(
+        !reported.contains("showing ?"),
+        "no session is described that cannot be named: {reported}"
+    );
+}
+
 /// A member croft declines to start must be NAMED where the user will see it.
 ///
 /// `launch_compound_members` builds that line into `run_debug.feedback`, and
@@ -39147,22 +39217,42 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     // the count - and the premise behind it ("no adapter is installed, so
     // every member fails to start") is simply false here: the compound really
     // does launch two sessions on this host.
-    assert_eq!(
-        app.debug_sessions.names(),
-        vec!["Server", "Client"],
-        "both members run, in the order launch.json lists them: {}",
-        app.status
-    );
-    assert_eq!(
-        app.debug_sessions.focused_name(),
-        Some("Server"),
-        "the FIRST member takes focus"
-    );
-    assert!(
-        app.status.starts_with("Debugging compound"),
-        "the multi-member compound went down the launch path: {}",
-        app.status
-    );
+    // The REPORT must agree with the SET, whatever the host can start. CI has
+    // no Python adapter and starts zero; this Mac has debugpy and starts two.
+    // Pinning either number makes the test a statement about the runner, so
+    // pin the invariant that was actually broken: the count came from the
+    // number of members attempted rather than from the sessions that exist,
+    // and said "2 session(s), showing ?" over an empty set.
+    let live = app.debug_sessions.names();
+    if live.is_empty() {
+        assert!(
+            app.status.contains("started no sessions"),
+            "no adapter: the compound says so rather than claiming sessions: {}",
+            app.status
+        );
+    } else {
+        assert_eq!(
+            live,
+            vec!["Server", "Client"],
+            "with an adapter, both members run in launch.json order: {}",
+            app.status
+        );
+        assert_eq!(
+            app.debug_sessions.focused_name(),
+            Some("Server"),
+            "the FIRST member takes focus"
+        );
+        assert!(
+            app.status.contains(&format!("{} session(s)", live.len())),
+            "the count names the sessions that exist: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("showing ?"),
+            "and the focused session is identified: {}",
+            app.status
+        );
+    }
     assert!(
         !app.status.contains("#310"),
         "and no longer defers to the session limit: {}",

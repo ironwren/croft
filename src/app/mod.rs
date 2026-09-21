@@ -20921,8 +20921,18 @@ impl App {
             // is drawn. The caller collects the name and says so.
             return MemberOutcome::TaskUnrun;
         }
+        // Ask the SET whether a session appeared, rather than trusting the
+        // call to have made one: `launch_resolved_into_set` returns `()` on
+        // every validation, spawn and attach failure alike, so reporting
+        // `Launched` unconditionally counted members that never started and
+        // made "N of M started" name an N the user does not have.
+        let before = self.debug_sessions.len();
         self.launch_resolved_into_set(rc);
-        MemberOutcome::Launched
+        if self.debug_sessions.len() > before {
+            MemberOutcome::Launched
+        } else {
+            MemberOutcome::Failed
+        }
     }
 
     /// Park a whole compound behind its own `preLaunchTask` (#310).
