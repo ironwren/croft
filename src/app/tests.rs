@@ -38985,13 +38985,6 @@ fn problem_scope_config_tokens_round_trip() {
     );
 }
 
-/// #310 defers compounds that need SEVERAL debug sessions at once. A compound
-/// naming ONE configuration needs exactly one session, which croft has run
-/// since #250 — so refusing it cites a limitation that does not apply and
-/// tells the user something false about their own launch.json.
-///
-/// `parse_compounds` rejects only an EMPTY member list, so a one-member
-/// compound parses and reaches the launch site, where the `Ok(_)` arm reports
 /// "N of M started" must count sessions, not call sites.
 ///
 /// `launch_resolved_into_set` returns `()` on every validation, spawn and
@@ -39133,6 +39126,13 @@ fn a_compound_member_skipped_for_its_own_task_is_named_in_the_feedback() {
     );
 }
 
+/// #310 defers compounds that need SEVERAL debug sessions at once. A compound
+/// naming ONE configuration needs exactly one session, which croft has run
+/// since #250 — so refusing it cites a limitation that does not apply and
+/// tells the user something false about their own launch.json.
+///
+/// `parse_compounds` rejects only an EMPTY member list, so a one-member
+/// compound parses and reaches the launch site, where the `Ok(_)` arm reports
 /// the #310 message without ever consulting `configurations.len()`. This is a
 /// relocated-decision leftover: the member list is resolved, then the arm that
 /// consumes it answers a question about session count without reading it.

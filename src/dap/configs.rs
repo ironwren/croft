@@ -450,10 +450,16 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // croft honours both perfectly by doing nothing, so refusing to
             // launch would name a key whose behaviour it is already delivering.
             //
-            // `stopAll` is excluded from the ONE-member gate entirely, at either
-            // value: it governs whether ending one session ends the others, and
-            // with a single session there are no others. It cannot change a
-            // one-member outcome, so it cannot be a reason to refuse one.
+            // `stopAll` depends on ARITY. With one member it governs whether
+            // ending a session ends the others, and there are no others, so
+            // neither value can change the outcome and neither is a reason to
+            // refuse. With several - which #310 made possible - `true` asks
+            // for a teardown croft does not implement, and the siblings keep
+            // running after a member ends. Documenting that mismatch does not
+            // stop the launch, so it is recorded as unsupported below and
+            // refused with a message naming the key, exactly as a malformed
+            // one is. `false` and omission stay silent: both describe what
+            // croft already does.
             let asks_for_something = |k: &str| match obj.get(k) {
                 None | Some(Value::Null) => false,
                 Some(Value::String(s)) => !s.is_empty(),
@@ -481,7 +487,11 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // telling the user to "remove that key" would otherwise read as
             // deleting the whole `presentation` block, taking a working
             // `group` with it.
-            let unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
+            let mut unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
+            // Only at `true`, and only where there ARE siblings to stop.
+            if configurations.len() > 1 && obj.get("stopAll") == Some(&Value::Bool(true)) {
+                unsupported_keys.push("stopAll");
+            }
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
                 .flatten()
@@ -1456,12 +1466,17 @@ mod tests {
     /// of them perfectly by doing nothing, so naming them in a refusal tells
     /// the user croft cannot do what it is already doing.
     ///
-    /// `stopAll` is excluded at EITHER value: it decides whether ending one
-    /// session ends the others, and a one-member compound has no others.
+    /// `stopAll` is excluded at either value for ONE member: it decides whether
+    /// ending one session ends the others, and a one-member compound has no
+    /// others. At two it is recorded at `true` only - see
+    /// `stop_all_true_is_refused_only_where_there_are_siblings_to_stop`.
     #[test]
     fn a_compound_key_that_requests_nothing_is_not_recorded_as_unsupported() {
         let text = r#"{
-            "configurations": [ { "name": "A", "type": "node", "program": "a.js" } ],
+            "configurations": [
+                { "name": "A", "type": "node", "program": "a.js" },
+                { "name": "B", "type": "node", "program": "b.js" }
+            ],
             "compounds": [
                 { "name": "DefaultStopAll", "configurations": ["A"], "stopAll": false },
                 { "name": "TrueStopAll", "configurations": ["A"], "stopAll": true },
@@ -1522,6 +1537,56 @@ mod tests {
             by("RealPresentation").unsupported_keys,
             Vec::<&str>::new(),
             "while a well-formed order is honoured rather than refused"
+        );
+    }
+
+    /// `stopAll: true` is refused at two members and silent at one.
+    ///
+    /// The pair is the point. Recording it at either arity would refuse a
+    /// one-member compound over a key that cannot change its outcome; at two
+    /// members, NOT recording it launches a compound whose siblings keep
+    /// running after a member ends - the opposite of what the file asked for,
+    /// with nothing said. Only asserting the refusal would pass a rule that
+    /// fires everywhere, so the one-member arm is the control.
+    #[test]
+    fn stop_all_true_is_refused_only_where_there_are_siblings_to_stop() {
+        let text = r#"{
+            "configurations": [
+                { "name": "A", "type": "node", "program": "a.js" },
+                { "name": "B", "type": "node", "program": "b.js" }
+            ],
+            "compounds": [
+                { "name": "OneTrue", "configurations": ["A"], "stopAll": true },
+                { "name": "TwoTrue", "configurations": ["A", "B"], "stopAll": true },
+                { "name": "TwoFalse", "configurations": ["A", "B"], "stopAll": false },
+                { "name": "TwoAbsent", "configurations": ["A", "B"] }
+            ]
+        }"#;
+        let cs = parse_compounds(text, ".vscode/launch.json");
+        assert_eq!(cs.len(), 4, "precondition: every compound parsed");
+        let by = |n: &str| cs.iter().find(|c| c.name == n).expect("parsed");
+
+        assert_eq!(
+            by("TwoTrue").unsupported_keys,
+            vec!["stopAll"],
+            "at two members `true` asks for a teardown croft does not do, so \
+             it is refused rather than launched as its opposite"
+        );
+        assert!(
+            by("OneTrue").unsupported_keys.is_empty(),
+            "but one member has no siblings to stop, so the same value is \
+             honoured by doing nothing: {:?}",
+            by("OneTrue").unsupported_keys
+        );
+        assert!(
+            by("TwoFalse").unsupported_keys.is_empty(),
+            "and `false` is VS Code's default, which croft already does: {:?}",
+            by("TwoFalse").unsupported_keys
+        );
+        assert!(
+            by("TwoAbsent").unsupported_keys.is_empty(),
+            "as is omitting it: {:?}",
+            by("TwoAbsent").unsupported_keys
         );
     }
 
