@@ -7043,7 +7043,18 @@ impl App {
     pub fn sync_markdown_lint(&mut self) -> bool {
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut to_lint: Vec<(PathBuf, String, u64)> = Vec::new();
-        for tab in self.editor.iter_tabs() {
+        // Both collections: `self.editor` is the ACTIVE group's tabs, and a
+        // split's other panes live in `editor_layout`. Walking only the
+        // active one left a `.md` open in an inactive pane unlinted, and the
+        // `closed` sweep below then dropped its diagnostics as though the tab
+        // had gone - squiggles vanishing from a pane in plain sight.
+        let inactive_tabs: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        for tab in self.editor.iter_tabs().chain(inactive_tabs) {
             if tab.has_non_text_view() {
                 continue;
             }
@@ -7055,7 +7066,12 @@ impl App {
             }
             current.insert(path.clone());
             let seq = tab.edit_seq;
-            if self.markdown_lint_last_seen.get(path).copied() != Some(seq) {
+            // The same file can be open in several panes; lint the first tab
+            // whose seq is unseen and let the rest fall through, so one
+            // buffer is not linted twice in a tick.
+            if self.markdown_lint_last_seen.get(path).copied() != Some(seq)
+                && !to_lint.iter().any(|(p, _, _)| p == path)
+            {
                 to_lint.push((path.clone(), tab.lines.join("\n"), seq));
             }
         }

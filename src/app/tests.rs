@@ -23320,6 +23320,82 @@ fn sync_markdown_lint_is_quiet_for_a_clean_document_and_reruns_only_on_edit() {
     );
     // Re-syncing an unchanged buffer must be a no-op (gated by edit_seq).
     assert!(!app.sync_markdown_lint());
+
+    // The other half of this test's name: an EDIT must bump edit_seq, get the
+    // buffer re-linted, and surface the new violation. Without this the test
+    // passed on a linter that never ran a second time.
+    app.editor.goto_bottom();
+    app.editor
+        .insert_str_as("\n# Second Title\n", crate::provenance::Seat::Navigator);
+    assert!(
+        app.sync_markdown_lint(),
+        "an edit that introduces a second H1 must re-lint and report a change"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the second H1 must be flagged after the edit"
+    );
+}
+
+/// A `.md` held by an INACTIVE split group must still be linted. The gather
+/// loop used to walk only `self.editor`, so such a tab was never linted and
+/// the cleanup below then dropped its stored diagnostics while it was still
+/// open - the squiggles vanished from a pane that was plainly visible.
+#[test]
+fn sync_markdown_lint_covers_inactive_split_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor(); // both groups hold doc.md; the new one is focused
+    // Move the ACTIVE group off the markdown file, so doc.md lives only in
+    // the inactive group - the case the gather loop missed. `open_pinned`
+    // ADDS a tab, so the old one has to be closed or the active group still
+    // holds doc.md and the bug never shows.
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "plain\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    let md_idx = app
+        .editor
+        .iter_tabs()
+        .position(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the active group still holds doc.md before the close");
+    app.editor.close_tab(md_idx);
+    assert!(
+        !app
+            .editor
+            .iter_tabs()
+            .any(|e| e.path.as_deref() == Some(file.as_path())),
+        "doc.md must now live ONLY in the inactive group"
+    );
+
+    let held_inactive = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .any(|e| e.path.as_deref() == Some(file.as_path()));
+    assert!(held_inactive, "the inactive group holds doc.md");
+
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "a markdown tab in an inactive pane must still be linted"
+    );
+
+    // And a second sync must not retire those diagnostics as "closed".
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the tab is still open, so its diagnostics must survive the sweep"
+    );
 }
 
 #[test]

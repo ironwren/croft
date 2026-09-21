@@ -1,6 +1,6 @@
 //! A small, dependency-free Markdown linter (VS Code has no bundled
 //! Markdown linter of its own; `davidanson.vscode-markdownlint` is the
-//! popular third-party fill — see `src/vscode_extensions.rs`). Runs
+//! popular third-party extension — see `src/vscode_extensions.rs`). Runs
 //! entirely on the buffer text, no LSP server required, so it works the
 //! moment a `.md` file is opened.
 //!
@@ -22,9 +22,48 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
     let mut seen_h1 = false;
     let mut blank_run_start: Option<usize> = None;
 
+    let mut in_fence: Option<&str> = None;
+
     for (i, line) in lines.iter().enumerate() {
+        // A fenced block's contents are literal, so no heading rule applies
+        // inside one: `#NoSpace` in a shell snippet is a comment and a
+        // `# Title` in a Markdown example is not this document's heading.
+        // The closing fence must be at least as long as the opener and use
+        // the same character, which is what lets a ``` block quote ```.
+        let fence_indent = line.len() - line.trim_start().len();
+        let fence = if fence_indent <= 3 {
+            let t = line.trim_start();
+            let c = t.chars().next().filter(|&c| c == '`' || c == '~');
+            c.map(|c| (c, t.chars().take_while(|&x| x == c).count()))
+                .filter(|&(_, n)| n >= 3)
+        } else {
+            None
+        };
+        match (in_fence, fence) {
+            (None, Some((c, _))) => {
+                in_fence = Some(if c == '`' { "`" } else { "~" });
+                continue;
+            }
+            (Some(open), Some((c, _))) if open.starts_with(c) => {
+                in_fence = None;
+                continue;
+            }
+            _ => {}
+        }
+        if in_fence.is_some() {
+            continue;
+        }
+
         let trimmed_start = line.trim_start();
-        let heading_hashes = trimmed_start.chars().take_while(|&c| c == '#').count();
+        // CommonMark: an ATX heading takes 0-3 leading spaces. Four or more
+        // makes the line an indented code block, so `trim_start()` alone
+        // linted code as headings.
+        let indent = line.len() - trimmed_start.len();
+        let heading_hashes = if indent <= 3 {
+            trimmed_start.chars().take_while(|&c| c == '#').count()
+        } else {
+            0
+        };
 
         // MD025: more than one top-level (`# `) heading in a document.
         if heading_hashes == 1 && trimmed_start[1..].starts_with(' ') {
@@ -32,7 +71,11 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
                 out.push(diag(
                     i,
                     0,
-                    line.len(),
+                    // `Diagnostic`'s char fields are LSP UTF-16 offsets, which
+                    // `Editor::recompute_diagnostic_spans` decodes with
+                    // `utf16_to_char_col`. A byte length overshoots the line on
+                    // any non-ASCII text.
+                    line.encode_utf16().count(),
                     DiagnosticSeverity::Warning,
                     "MD025: multiple top-level headings in the same document",
                 ));
@@ -45,7 +88,12 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
         if (1..=6).contains(&heading_hashes) {
             let rest = &trimmed_start[heading_hashes..];
             if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('#') {
-                let col = line.len() - trimmed_start.len();
+                // UTF-16 units, as above: the indent is ASCII spaces here,
+                // but keeping the same unit everywhere is what stops the next
+                // edit reintroducing a byte offset.
+                let col = line[..line.len() - trimmed_start.len()]
+                    .encode_utf16()
+                    .count();
                 out.push(diag(
                     i,
                     col,
@@ -58,13 +106,17 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
 
         // MD009: trailing whitespace, excluding Markdown's two-space hard
         // line break (exactly two trailing spaces) and blank lines.
-        let trimmed_end = line.trim_end_matches(' ');
-        let trailing = line.len() - trimmed_end.len();
-        if trailing > 0 && trailing != 2 && !trimmed_end.is_empty() {
+        // MD009 is trailing WHITESPACE, so a tab counts; trimming only `' '`
+        // let `foo\t` through. The hard-break exemption stays exactly two
+        // ASCII spaces - `" \t"` is not a hard break.
+        let trimmed_end = line.trim_end();
+        let trailing = &line[trimmed_end.len()..];
+        let hard_break = trailing == "  ";
+        if !trailing.is_empty() && !hard_break && !trimmed_end.is_empty() {
             out.push(diag(
                 i,
-                trimmed_end.len(),
-                line.len(),
+                trimmed_end.encode_utf16().count(),
+                line.encode_utf16().count(),
                 DiagnosticSeverity::Hint,
                 "MD009: trailing whitespace",
             ));
@@ -175,6 +227,101 @@ mod tests {
         let text = "one\n\ntwo\n";
         let diags = lint(text);
         assert!(!diags.iter().any(|d| d.message.contains("MD012")));
+    }
+
+    /// A fenced code block is not Markdown structure: its contents are
+    /// literal. A `#NoSpace` line inside one is shell/Python syntax, not a
+    /// malformed heading, and a second `# Title` inside one is not a second
+    /// document heading. Linting them produces false positives on the most
+    /// common thing a Markdown file contains.
+    #[test]
+    fn fenced_code_is_not_linted_as_headings() {
+        let text = "# Title\n\n```sh\n#!/bin/sh\n#NoSpace\n# Title\n```\n";
+        let diags = lint(text);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD018")),
+            "a comment inside a fence is not a heading: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD025")),
+            "a heading inside a fence is not a document heading: {diags:?}"
+        );
+    }
+
+    /// CommonMark allows an ATX heading 0-3 leading spaces; four or more
+    /// makes it an indented code block. `trim_start()` accepts any amount,
+    /// so indented code was linted as headings.
+    #[test]
+    fn four_space_indented_code_is_not_a_heading() {
+        let text = "# Title\n\nExample:\n\n    # Title\n    #NoSpace\n";
+        let diags = lint(text);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD025")),
+            "4-space indented text is code, not a second H1: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD018")),
+            "4-space indented text is code, not a heading: {diags:?}"
+        );
+    }
+
+    /// A heading indented 0-3 spaces IS a heading - the control proving the
+    /// bound above rejects only what it should.
+    #[test]
+    fn three_space_indented_heading_still_counts() {
+        let text = "# Title\n\n   # Second\n";
+        let diags = lint(text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD025")),
+            "3 spaces is still a heading: {diags:?}"
+        );
+    }
+
+    /// `Diagnostic`'s char fields are LSP UTF-16 offsets - the editor decodes
+    /// them with `utf16_to_char_col`. Handing it `line.len()` (UTF-8 bytes)
+    /// overshoots on any non-ASCII line, so the squiggle runs past the text.
+    #[test]
+    fn md025_end_is_a_utf16_offset_not_a_byte_count() {
+        let text = "# Title\n\n# Héllo wörld\n";
+        let diags = lint(text);
+        let md025 = diags
+            .iter()
+            .find(|d| d.message.contains("MD025"))
+            .expect("second heading flagged");
+        let line = "# Héllo wörld";
+        assert_eq!(
+            md025.end_char as usize,
+            line.encode_utf16().count(),
+            "end_char must be UTF-16 units ({}), not bytes ({})",
+            line.encode_utf16().count(),
+            line.len()
+        );
+    }
+
+    /// MD009 is trailing WHITESPACE. Trimming only `' '` let a line ending in
+    /// a tab through.
+    #[test]
+    fn md009_catches_a_trailing_tab() {
+        let text = "a line ending in a tab\t\n";
+        let diags = lint(text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD009")),
+            "a trailing tab is trailing whitespace: {diags:?}"
+        );
+    }
+
+    /// The hard-break exemption is exactly two ASCII spaces; a tab plus a
+    /// space is not a hard break and must still be flagged.
+    #[test]
+    fn md009_hard_break_exemption_is_two_spaces_only() {
+        let text = "hard break  \nnot a break \t\n";
+        let diags = lint(text);
+        let md009: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("MD009"))
+            .collect();
+        assert_eq!(md009.len(), 1, "only the tab line: {diags:?}");
+        assert_eq!(md009[0].start_line, 1);
     }
 
     #[test]
