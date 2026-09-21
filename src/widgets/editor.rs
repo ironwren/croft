@@ -10663,7 +10663,44 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
             });
         }
     }
-    out.extend_from_slice(over);
+    // The overlay normally wins outright, but a BOLD base span is a comment
+    // tag (`TODO`, `FIXME`, ...), which the tag pass deliberately marked so
+    // it stands out. A server that reports the whole comment as one
+    // `comment` token would otherwise repaint the tag in ordinary comment
+    // grey, so tag highlighting would silently stop the moment an LSP
+    // attached. Carve those ranges out of each overlay span instead.
+    let keep: Vec<&HiSpan> = base
+        .iter()
+        .filter(|b| b.style.add_modifier.contains(Modifier::BOLD))
+        .collect();
+    for o in over {
+        let mut cur = o.start;
+        for k in keep.iter().filter(|k| k.end > o.start && k.start < o.end) {
+            if k.start > cur {
+                out.push(HiSpan {
+                    start: cur,
+                    end: k.start,
+                    style: o.style,
+                });
+            }
+            out.push(HiSpan {
+                start: k.start.max(o.start),
+                end: k.end.min(o.end),
+                style: k.style,
+            });
+            cur = cur.max(k.end);
+            if cur >= o.end {
+                break;
+            }
+        }
+        if cur < o.end {
+            out.push(HiSpan {
+                start: cur,
+                end: o.end,
+                style: o.style,
+            });
+        }
+    }
     out.sort_by_key(|s| s.start);
     out
 }
@@ -19678,6 +19715,56 @@ mod tests {
         let spans = build_line_spans("abcde", &hi);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
+    }
+
+    /// A semantic `comment` token covering a tag must not erase the tag's
+    /// colour. `merge_overlay` gives the overlay precedence, so a server that
+    /// reports the whole comment as one token would repaint TODO in ordinary
+    /// comment grey - the tag highlighting would silently stop working the
+    /// moment an LSP attached.
+    #[test]
+    fn a_semantic_comment_token_does_not_erase_a_tag_colour() {
+        use ratatui::style::Color;
+        let comment = Style::default().fg(Color::Rgb(0x65, 0x73, 0x7e));
+        // BOLD is what the tag pass adds (src/highlight.rs, the
+        // `base_style.fg(color).add_modifier(Modifier::BOLD)` push), and it
+        // is the marker merge_overlay keys on. A fixture without it would
+        // not exercise the real path.
+        let tag = Style::default()
+            .fg(Color::Rgb(0x4F, 0xC1, 0xFF))
+            .add_modifier(Modifier::BOLD);
+        // What the tree-sitter pass produces for `// TODO x`: grey, then the
+        // tag in its own colour, then grey.
+        let base = vec![
+            HiSpan {
+                start: 0,
+                end: 3,
+                style: comment,
+            },
+            HiSpan {
+                start: 3,
+                end: 7,
+                style: tag,
+            },
+            HiSpan {
+                start: 7,
+                end: 9,
+                style: comment,
+            },
+        ];
+        // What a server reports: one `comment` token over the whole line.
+        let over = vec![HiSpan {
+            start: 0,
+            end: 9,
+            style: comment,
+        }];
+        let merged = merge_overlay(&base, &over);
+        assert!(
+            merged
+                .iter()
+                .any(|sp| sp.style.fg == Some(Color::Rgb(0x4F, 0xC1, 0xFF))),
+            "the TODO span must survive the semantic overlay: {merged:?}"
+        );
     }
 
     #[test]
