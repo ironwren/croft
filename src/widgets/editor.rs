@@ -12525,18 +12525,6 @@ fn paint_bracket_match(
     cell.set_style(cell.style().bg(theme.bracket_match_bg()));
 }
 
-/// Apply the selection background colour to columns `[start_char..end_char)`
-/// of row `y`, where columns are character indices within the editor's text
-/// area.  Clamps to the visible width.
-/// The background tint for a row inside a merge-conflict block, or `None`
-/// outside one. Header / footer marker rows tint stronger than their
-/// content, mirroring VS Code's current(green) / incoming(blue) scheme; the
-/// diff3 base section and the `=======` separator sit on a neutral grey.
-/// Fixed dark tints, like the selection band: both bundled themes are dark,
-/// and the hues are semantic (green = yours, blue = theirs), not accents.
-/// VS Code's default auto-closing set: the partner a typed opener/quote
-/// pairs with, `None` for everything else (closers included — they only
-/// type over).
 /// HTML void elements: they never take a closing tag, so typing `>` after
 /// one must not produce `</br>` and friends.
 const VOID_ELEMENTS: &[&str] = &[
@@ -12618,6 +12606,18 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     Some(name)
 }
 
+/// Apply the selection background colour to columns `[start_char..end_char)`
+/// of row `y`, where columns are character indices within the editor's text
+/// area.  Clamps to the visible width.
+/// The background tint for a row inside a merge-conflict block, or `None`
+/// outside one. Header / footer marker rows tint stronger than their
+/// content, mirroring VS Code's current(green) / incoming(blue) scheme; the
+/// diff3 base section and the `=======` separator sit on a neutral grey.
+/// Fixed dark tints, like the selection band: both bundled themes are dark,
+/// and the hues are semantic (green = yours, blue = theirs), not accents.
+/// VS Code's default auto-closing set: the partner a typed opener/quote
+/// pairs with, `None` for everything else (closers included — they only
+/// type over).
 fn auto_close_partner(c: char) -> Option<char> {
     match c {
         '(' => Some(')'),
