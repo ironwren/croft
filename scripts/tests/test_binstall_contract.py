@@ -132,6 +132,61 @@ class BinstallContract(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("aarch64-apple-darwin", r.stderr)
 
+    def test_excluded_targets_do_not_count_as_built(self):
+        """A sibling matrix key must not be read as more built targets.
+
+        The exclude entry repeats a target the include list no longer carries.
+        Reading `exclude` as a build would put that triple back and the run
+        would pass, so the assertion is the MISSING-target failure: this only
+        goes green when exclude is genuinely ignored. An exclude naming some
+        triple nobody expects would pass either way and prove nothing.
+        """
+        tree = self.build_tree(
+            workflow_sub=(
+                "          - target: x86_64-apple-darwin\n"
+                "            os: macos-latest\n"
+                "            cross: false\n",
+                "",
+            )
+        )
+        workflow = tree / ".github" / "workflows" / "release.yml"
+        text = workflow.read_text()
+        self.assertNotIn("x86_64-apple-darwin", text.split("steps:")[0])
+        workflow.write_text(
+            text.replace(
+                "    steps:\n",
+                "        exclude:\n"
+                "          - target: x86_64-apple-darwin\n"
+                "    steps:\n",
+                1,
+            )
+        )
+
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("x86_64-apple-darwin", r.stderr)
+
+    def test_target_after_another_include_key_still_counts(self):
+        """YAML mapping keys are unordered, so `os:` may come first.
+
+        Matching only `- target:` drops such an entry from the built set. That
+        is the checker's own false green: the triple IS built, the checker
+        cannot see it, and it reports a missing target - or, worse, stays
+        green when a different target really does go missing.
+        """
+        tree = self.build_tree(
+            workflow_sub=(
+                "          - target: x86_64-unknown-linux-musl\n"
+                "            os: ubuntu-latest\n"
+                "            cross: true\n",
+                "          - os: ubuntu-latest\n"
+                "            target: x86_64-unknown-linux-musl\n"
+                "            cross: true\n",
+            )
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_losing_the_tag_trigger_is_caught(self):
         """pkg-url hard-codes the v-prefixed tag; without the trigger no
         release is ever produced at that URL."""
