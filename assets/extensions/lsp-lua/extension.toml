@@ -9,7 +9,7 @@ api_version = 1
 [[languages]]
 id = "lua"
 extensions = ["lua"]
-root_markers = [".luarc.json", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml"]
+root_markers = [".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml"]
 
 [[language_servers]]
 name = "lua-language-server"

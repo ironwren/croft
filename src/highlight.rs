@@ -1929,7 +1929,11 @@ def f() -> Config:\n\
         let src = "local function greet(name)\n    -- comment\n    if name then\n        return 42\n    end\nend\n";
         let ls = compute_line_starts(src.as_bytes());
         let h = highlight_text(&mut reg, LangKind::Lua, src.as_bytes(), &ls);
-        assert_eq!(h.len(), 7);
+        // One entry per line START, which is what `compute_line_starts`
+        // yields - the trailing newline means that is one more than
+        // `src.lines()`. Asserting the relationship rather than the literal
+        // keeps the two from drifting apart on a newline change.
+        assert_eq!(h.len(), ls.len());
         let lines: Vec<&str> = src.lines().collect();
         assert!(span_at(&h[0], lines[0], "local").is_some());
         assert!(span_at(&h[0], lines[0], "greet").is_some());
