@@ -1502,7 +1502,12 @@ def f() -> Config:\n\
         // Counting spans that START with `//` cannot see a per-byte
         // regression: only the first would match either way. Assert the whole
         // line is one span, and that it covers the comment end to end.
-        assert_eq!(h[0].len(), 1, "the whole comment line is one span: {:?}", h[0]);
+        assert_eq!(
+            h[0].len(),
+            1,
+            "the whole comment line is one span: {:?}",
+            h[0]
+        );
         assert_eq!(h[0][0].start, 0);
         assert_eq!(
             h[0][0].end,
