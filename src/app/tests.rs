@@ -23365,8 +23365,7 @@ fn sync_markdown_lint_covers_inactive_split_groups() {
         .expect("the active group still holds doc.md before the close");
     app.editor.close_tab(md_idx);
     assert!(
-        !app
-            .editor
+        !app.editor
             .iter_tabs()
             .any(|e| e.path.as_deref() == Some(file.as_path())),
         "doc.md must now live ONLY in the inactive group"
