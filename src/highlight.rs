@@ -397,23 +397,99 @@ fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
     }
 }
 
-/// Tags recolored inside comments (the "Better Comments" convention), each
-/// with a fixed, theme-independent color chosen for contrast against every
-/// bundled theme's comment gray, and bold so it reads as a flag rather than
-/// prose. Matched case-sensitively at a word boundary so `todo!()` (a Rust
-/// macro, not a comment tag) and `Autodocking` are left alone.
-const COMMENT_KEYWORDS: &[(&str, Color)] = &[
-    ("TODO", rgb(0x4F, 0xC1, 0xFF)),
-    ("FIXME", rgb(0xFF, 0x6B, 0x6B)),
-    ("XXX", rgb(0xFF, 0x6B, 0x6B)),
-    ("BUG", rgb(0xFF, 0x6B, 0x6B)),
-    ("HACK", rgb(0xC7, 0x8D, 0xFF)),
-    ("NOTE", rgb(0x4F, 0xC1, 0xFF)),
-    ("WARNING", rgb(0xFF, 0xC1, 0x4F)),
+/// Which tag gets which of the four hues below. Matched case-sensitively at
+/// a word boundary so `todo!()` (a Rust macro, not a comment tag) and
+/// `Autodocking` are left alone.
+const COMMENT_KEYWORDS: &[(&str, TagHue)] = &[
+    ("TODO", TagHue::Info),
+    ("FIXME", TagHue::Alarm),
+    ("XXX", TagHue::Alarm),
+    ("BUG", TagHue::Alarm),
+    ("HACK", TagHue::Odd),
+    ("NOTE", TagHue::Info),
+    ("WARNING", TagHue::Warn),
 ];
 
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TagHue {
+    Info,
+    Alarm,
+    Odd,
+    Warn,
+}
+
+impl TagHue {
+    /// The tag colour for a light or a dark theme.
+    ///
+    /// One fixed palette cannot serve both. The original four were picked
+    /// against dark backgrounds and, measured against Croft Light's `#ffffff`
+    /// editor, scored 2.02:1 (cyan), 2.78:1 (red), 2.42:1 (purple) and
+    /// 1.62:1 (yellow) - `WARNING`, the one that most needs reading, was the
+    /// worst. Darkening them for light themes fixes that and would ruin them
+    /// on dark ones, so the choice follows the theme. The dark set is
+    /// unchanged, so no dark theme shifts colour.
+    fn color(self, light: bool) -> Color {
+        match (self, light) {
+            (TagHue::Info, false) => rgb(0x4F, 0xC1, 0xFF),
+            (TagHue::Alarm, false) => rgb(0xFF, 0x6B, 0x6B),
+            (TagHue::Odd, false) => rgb(0xC7, 0x8D, 0xFF),
+            (TagHue::Warn, false) => rgb(0xFF, 0xC1, 0x4F),
+            // 5.0:1 or better on #ffffff, all four.
+            (TagHue::Info, true) => rgb(0x00, 0x5F, 0xB8),
+            (TagHue::Alarm, true) => rgb(0xC0, 0x26, 0x26),
+            (TagHue::Odd, true) => rgb(0x6D, 0x28, 0xD9),
+            (TagHue::Warn, true) => rgb(0x8B, 0x5A, 0x00),
+        }
+    }
+}
+
+/// Whether the active theme is a light one, inferred from its foreground.
+///
+/// A light theme paints dark text on a light background, so a DARK `fg` means
+/// the background behind it is light. The palette carries no background
+/// field, and this is the signal it does carry.
+fn palette_is_light(p: &SyntaxPalette) -> bool {
+    let (r, g, b) = p.fg;
+    // Rec. 601 luma, the cheap perceptual brightness the rest of the TUI uses.
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    luma < 128.0
+}
+
+/// Whether the character ENDING at byte `i` is a word character.
+///
+/// The byte-level test was not enough: in UTF-8 prose the continuation bytes
+/// of a letter like `\u{4fee}` are all >= 0x80, so a byte-level test called them
+/// non-word and `\u{4fee}TODO\u{5fa9}` highlighted a tag that is plainly
+/// inside a word. Decoding the neighbour and asking `is_alphanumeric` gets
+/// every script right, not just Latin.
+fn word_char_ends_at(text: &[u8], i: usize) -> bool {
+    // Walk back off any continuation bytes to the character's first byte.
+    let mut s = i;
+    while s > 0 && text[s - 1] & 0b1100_0000 == 0b1000_0000 {
+        s -= 1;
+    }
+    if s == 0 {
+        return false;
+    }
+    s -= 1;
+    std::str::from_utf8(&text[s..i])
+        .ok()
+        .and_then(|t| t.chars().next_back())
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether the character STARTING at byte `i` is a word character.
+fn word_char_starts_at(text: &[u8], i: usize) -> bool {
+    // A character is at most 4 bytes; decode the shortest valid prefix.
+    let upto = (i + 4).min(text.len());
+    for e in i + 1..=upto {
+        if let Ok(t) = std::str::from_utf8(&text[i..e])
+            && let Some(c) = t.chars().next()
+        {
+            return c.is_alphanumeric() || c == '_';
+        }
+    }
+    false
 }
 
 /// Split a comment's byte range `[start, end)` of `text` into sub-ranges,
@@ -426,6 +502,7 @@ fn comment_keyword_spans(
     start: usize,
     end: usize,
     base_style: Style,
+    light: bool,
 ) -> Vec<(usize, usize, Style)> {
     let mut out: Vec<(usize, usize, Style)> = Vec::new();
     let mut push = |s: usize, e: usize, st: Style| {
@@ -439,16 +516,16 @@ fn comment_keyword_spans(
     };
     let mut i = start;
     while i < end {
-        let before_ok = i == start || !is_word_byte(text[i - 1]);
+        let before_ok = i == start || !word_char_ends_at(text, i);
         let mut matched = None;
         if before_ok {
-            for &(kw, color) in COMMENT_KEYWORDS {
+            for &(kw, hue) in COMMENT_KEYWORDS {
                 let kw_end = i + kw.len();
                 if kw_end <= end
                     && &text[i..kw_end] == kw.as_bytes()
-                    && (kw_end == end || !is_word_byte(text[kw_end]))
+                    && (kw_end == end || !word_char_starts_at(text, kw_end))
                 {
-                    matched = Some((kw_end, color));
+                    matched = Some((kw_end, hue.color(light)));
                     break;
                 }
             }
@@ -919,7 +996,9 @@ fn highlight_text_with_palette(
                     // Recolor TODO/FIXME/NOTE/HACK/XXX/BUG tags inside the
                     // comment body (the "Better Comments" convention) so they
                     // stand out from ordinary comment prose.
-                    for (s, e, st) in comment_keyword_spans(text, start, end, style) {
+                    for (s, e, st) in
+                        comment_keyword_spans(text, start, end, style, palette_is_light(palette))
+                    {
                         project_range(s, e, st, line_starts, &mut per_line);
                     }
                 } else {
@@ -1419,6 +1498,104 @@ def f() -> Config:\n\
             comment_spans.len(),
             1,
             "a tag-free comment must stay a single span"
+        );
+        // Counting spans that START with `//` cannot see a per-byte
+        // regression: only the first would match either way. Assert the whole
+        // line is one span, and that it covers the comment end to end.
+        assert_eq!(h[0].len(), 1, "the whole comment line is one span: {:?}", h[0]);
+        assert_eq!(h[0][0].start, 0);
+        assert_eq!(
+            h[0][0].end,
+            "// just a normal comment".len(),
+            "the span must cover the complete comment"
+        );
+    }
+
+    /// Every tag colour must be readable on the background its theme implies.
+    /// The original fixed palette scored as low as 1.62:1 on Croft Light's
+    /// white editor; WCAG AA wants 4.5:1 for body text. This pins both sets.
+    #[test]
+    fn tag_colours_are_readable_on_their_own_theme() {
+        fn luminance(c: (u8, u8, u8)) -> f64 {
+            fn ch(v: u8) -> f64 {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * ch(c.0) + 0.7152 * ch(c.1) + 0.0722 * ch(c.2)
+        }
+        fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        fn parts(c: Color) -> (u8, u8, u8) {
+            match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("tag colour is not rgb: {other:?}"),
+            }
+        }
+        // Croft Light's editor background, and a representative dark one.
+        let white = (0xff, 0xff, 0xff);
+        let dark = (0x28, 0x2a, 0x36);
+        for &(kw, hue) in COMMENT_KEYWORDS {
+            let on_light = contrast(parts(hue.color(true)), white);
+            assert!(
+                on_light >= 4.5,
+                "{kw} on a light theme is {on_light:.2}:1, want >= 4.5:1"
+            );
+            let on_dark = contrast(parts(hue.color(false)), dark);
+            assert!(
+                on_dark >= 4.5,
+                "{kw} on a dark theme is {on_dark:.2}:1, want >= 4.5:1"
+            );
+        }
+    }
+
+    /// The light/dark decision comes from the palette's foreground: a dark
+    /// `fg` means a light background behind it.
+    #[test]
+    fn palette_lightness_is_read_from_the_foreground() {
+        let mut light = SyntaxPalette::BASE16;
+        light.fg = (0x24, 0x29, 0x2e);
+        assert!(palette_is_light(&light), "dark fg implies a light theme");
+        let mut dark = SyntaxPalette::BASE16;
+        dark.fg = (0xc0, 0xc5, 0xce);
+        assert!(!palette_is_light(&dark), "light fg implies a dark theme");
+    }
+
+    /// The word-boundary test is byte-level, so in UTF-8 prose the
+    /// continuation bytes either side of a tag both read as non-word and the
+    /// tag is highlighted although it is embedded in a word.
+    #[test]
+    fn a_tag_embedded_in_non_ascii_prose_is_not_a_tag() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}TODO\u{5fa9}\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert_eq!(
+            h[0].len(),
+            1,
+            "TODO between CJK letters is inside a word, so the comment stays \
+             one span: {:?}",
+            h[0]
+        );
+    }
+
+    /// The control: the same tag with ordinary boundaries IS highlighted, so
+    /// the test above cannot pass by disabling tag highlighting entirely.
+    #[test]
+    fn a_tag_with_non_ascii_prose_around_it_still_highlights() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}\u{5fa9} TODO here\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert!(
+            h[0].len() > 1,
+            "a space-delimited TODO after CJK text is still a tag: {:?}",
+            h[0]
         );
     }
 

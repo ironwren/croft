@@ -470,9 +470,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "aaron-bond.better-comments",
-        croft: "",
-        status: Status::None,
-        note: "no comment-keyword highlighting",
+        croft: "comment tag highlighting",
+        status: Status::Builtin,
+        note: "TODO/FIXME/XXX/BUG/HACK/NOTE/WARNING recoloured in comments",
     },
     Mapping {
         vscode: "coenraads.bracket-pair-colorizer-2",
