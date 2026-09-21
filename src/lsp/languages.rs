@@ -173,6 +173,10 @@ mod tests {
             root_markers(Language::LUA),
             &[
                 ".luarc.json",
+                // lua-language-server reads the JSONC spelling too, and a
+                // project carrying only that one would otherwise fall through
+                // to the linter/formatter markers or get no root at all.
+                ".luarc.jsonc",
                 ".luacheckrc",
                 ".stylua.toml",
                 "stylua.toml",
