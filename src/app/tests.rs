@@ -38992,6 +38992,73 @@ fn problem_scope_config_tokens_round_trip() {
 ///
 /// `parse_compounds` rejects only an EMPTY member list, so a one-member
 /// compound parses and reaches the launch site, where the `Ok(_)` arm reports
+/// A member croft declines to start must be NAMED where the user will see it.
+///
+/// `launch_compound_members` builds that line into `run_debug.feedback`, and
+/// it is the only place the skipped member's name appears - `status` carries
+/// the compound and a count, never which member is missing. `reveal_debug_view`
+/// runs `refresh_run_debug`, which clears `feedback`, so calling it AFTER the
+/// assignment wiped the line before it could be drawn and the compound ran
+/// fewer sessions than asked for with nothing said about it.
+///
+/// The assertion is on the member's NAME in the surviving feedback. Asserting
+/// `feedback.is_some()` would pass on the all-started line too, which names no
+/// skipped member and is exactly the case this must distinguish from.
+#[test]
+fn a_compound_member_skipped_for_its_own_task_is_named_in_the_feedback() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    // `Client` declares its own preLaunchTask, so croft refuses to debug it
+    // against whatever the last build left behind. `Server` has none and runs.
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py",
+              "preLaunchTask": "build-client" }
+        ],
+        "compounds": [
+            { "name": "Pair", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let row = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Pair"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = row;
+    app.confirm_list_picker();
+
+    let feedback = app
+        .run_debug
+        .feedback
+        .clone()
+        .expect("the compound reports what it did");
+    assert!(
+        feedback.contains("Client"),
+        "the skipped member is named: {feedback}"
+    );
+    assert!(
+        feedback.contains("preLaunchTask"),
+        "and why it was skipped: {feedback}"
+    );
+    // The control for the assertions above: the member that DID start is
+    // named too, so `contains("Client")` is not passing on some line that
+    // merely lists every configuration in the file.
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec!["Server"],
+        "only the member without its own task runs"
+    );
+}
+
 /// the #310 message without ever consulting `configurations.len()`. This is a
 /// relocated-decision leftover: the member list is resolved, then the arm that
 /// consumes it answers a question about session count without reading it.
@@ -39072,12 +39139,27 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     app.list_picker.as_mut().unwrap().selected = multi;
     app.confirm_list_picker();
     // Asserting the ABSENCE of the old message proves nothing - any refusal
-    // omits it, and so does an empty status. Pin the branch by what only the
-    // launch path says. No adapter is installed in a test environment, so
-    // every member fails to start and the compound reports that, which is
-    // still the compound PATH rather than the refusal it replaced.
+    // omits it, and so does an empty status. Pin the OUTCOME: both members
+    // are running, in file order, with the first focused.
+    //
+    // Not a disjunction over "started no sessions". That arm is satisfied by
+    // the zero-session early return, so it passed without ever constraining
+    // the count - and the premise behind it ("no adapter is installed, so
+    // every member fails to start") is simply false here: the compound really
+    // does launch two sessions on this host.
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec!["Server", "Client"],
+        "both members run, in the order launch.json lists them: {}",
+        app.status
+    );
+    assert_eq!(
+        app.debug_sessions.focused_name(),
+        Some("Server"),
+        "the FIRST member takes focus"
+    );
     assert!(
-        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        app.status.starts_with("Debugging compound"),
         "the multi-member compound went down the launch path: {}",
         app.status
     );

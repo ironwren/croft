@@ -373,9 +373,10 @@ pub struct Compound {
     ///
     /// Recorded rather than silently dropped because a ONE-member compound now
     /// launches, and launching it via its member alone would run neither the
-    /// compound's own pre-launch task nor respect its presentation. Note the
-    /// MULTI-member path still discards these silently: it refuses for the
-    /// session count first, and #310 is the blocker the user must clear.
+    /// compound's own pre-launch task nor respect its presentation. Both
+    /// arities consult this list now: the multi-member path used to discard
+    /// it silently because it refused for the session count first, and #310
+    /// removed that refusal.
     pub unsupported_keys: Vec<&'static str>,
     /// Which file declared it. A compound's members name configurations in
     /// ITS OWN file first: both files may declare the same name, and binding

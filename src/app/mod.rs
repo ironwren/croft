@@ -21011,6 +21011,15 @@ impl App {
         // written server-first, and landing the user on whichever happened to
         // start last would put them in the wrong one.
         self.debug_sessions.focus(0);
+        // Reveal FIRST, then write the feedback: `reveal_debug_view` runs
+        // `refresh_run_debug`, which clears `feedback` unconditionally, so
+        // doing it afterwards wiped every line built below - including the
+        // only place a skipped member is ever named - before it was drawn.
+        //
+        // Once for the compound, not once per member: each member's launch
+        // reveals the view too, and doing it per member clears the console
+        // and re-focuses the pane for every one of them.
+        self.reveal_debug_view();
         // Name them. With one session "the debugger" was unambiguous; with
         // several the user has to be told which are running and which one the
         // call stack and variables belong to, or the view describes a session
@@ -21038,10 +21047,6 @@ impl App {
         self.status = format!(
             "Debugging compound {compound} — {started} session(s), showing {focused} · Shift+F5 stops all"
         );
-        // Once for the compound, not once per member: each member's launch
-        // reveals the view too, and doing it per member clears the console
-        // and re-focuses the pane for every one of them.
-        self.reveal_debug_view();
     }
 
     /// Continue a parked launch whose `preLaunchTask` has finished.
