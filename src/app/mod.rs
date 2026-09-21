@@ -24696,13 +24696,25 @@ impl App {
                                 } else {
                                     "that key"
                                 };
+                                // Name EVERY member, not `members[0]`. The
+                                // guard now covers both arities, and telling
+                                // the user of a three-member compound to run
+                                // the first one directly is advice to launch
+                                // a SUBSET - the precise outcome this arm
+                                // refuses to produce itself.
+                                let all = members
+                                    .iter()
+                                    .map(|m| format!("\"{}\"", m.name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let run_them = if members.len() > 1 {
+                                    format!("or run {all} directly, in that order")
+                                } else {
+                                    format!("or run {all} directly")
+                                };
                                 self.debug_error(format!(
-                                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch \"{}\" through the compound, or run \"{}\" directly",
-                                    compound.name,
-                                    keys,
-                                    plural,
-                                    members[0].name,
-                                    members[0].name
+                                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch {} through the compound, {}",
+                                    compound.name, keys, plural, all, run_them
                                 ));
                             }
                             Ok(members) if members.len() == 1 => {

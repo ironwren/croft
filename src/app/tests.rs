@@ -39106,26 +39106,30 @@ fn a_compound_member_skipped_for_its_own_task_is_named_in_the_feedback() {
     app.list_picker.as_mut().unwrap().selected = row;
     app.confirm_list_picker();
 
-    let feedback = app
+    // Whether `Server` can START depends on the host's adapters - CI has none
+    // and this Mac does - but the SKIP is decided at parse time and happens
+    // either way. So the naming is what this pins, and it reads whichever
+    // field carries the report on this path.
+    let reported = app
         .run_debug
         .feedback
         .clone()
-        .expect("the compound reports what it did");
+        .unwrap_or_else(|| app.status.clone());
     assert!(
-        feedback.contains("Client"),
-        "the skipped member is named: {feedback}"
+        reported.contains("Client"),
+        "the skipped member is named: {reported}"
     );
     assert!(
-        feedback.contains("preLaunchTask"),
-        "and why it was skipped: {feedback}"
+        reported.contains("preLaunchTask"),
+        "and why it was skipped: {reported}"
     );
-    // The control for the assertions above: the member that DID start is
-    // named too, so `contains("Client")` is not passing on some line that
-    // merely lists every configuration in the file.
-    assert_eq!(
-        app.debug_sessions.names(),
-        vec!["Server"],
-        "only the member without its own task runs"
+    // The control for the assertions above: `Client` is never in the running
+    // set, so `contains("Client")` above is not passing on a line that merely
+    // lists every configuration in the file.
+    assert!(
+        !app.debug_sessions.names().contains(&"Client".to_string()),
+        "the skipped member is not running: {:?}",
+        app.debug_sessions.names()
     );
 }
 
@@ -39324,11 +39328,14 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     std::fs::write(
         tmp.path().join(".vscode/launch.json"),
         r#"{ "configurations": [
-            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
         ],
         "compounds": [
             { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
             { "name": "Presented", "configurations": ["Server"],
+              "presentation": { "hidden": "true" } },
+            { "name": "PresentedPair", "configurations": ["Server", "Client"],
               "presentation": { "hidden": "true" } }
         ]}"#,
     )
@@ -39414,6 +39421,25 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.pending_debug_launch.is_none() && fresh.debug_sessions.is_empty(),
         "and nothing ran"
     );
+
+    // The same refusal on a MULTI-member compound must not tell the user to
+    // run one member directly. The guard covers both arities now, and naming
+    // only the first is advice to launch a SUBSET - the very outcome this arm
+    // refuses to produce itself. Both names, or the remedy is worse than the
+    // refusal.
+    let mut pair = App::new(tmp.path().to_path_buf()).unwrap();
+    select(&mut pair, "PresentedPair");
+    assert!(
+        pair.run_debug.feedback_is_error,
+        "a malformed key still refuses at two members: {:?}",
+        pair.run_debug.feedback
+    );
+    assert!(
+        pair.status.contains("Server") && pair.status.contains("Client"),
+        "and the remedy names EVERY member, not just the first: {}",
+        pair.status
+    );
+    assert!(pair.debug_sessions.is_empty(), "and still nothing ran");
 }
 
 /// #318, the half a parked-launch assertion cannot see: what happens when the
