@@ -492,15 +492,31 @@ const EXIT_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 /// both is executed.
 #[cfg(unix)]
 fn set_nonblocking_on(fd: std::os::fd::RawFd) -> bool {
+    // `EINTR` is a signal arriving mid-call, not a verdict about the
+    // descriptor: retrying is the documented response, and treating it as
+    // permanent would disable the in-loop drain over a transient the next
+    // call resolves - reintroducing the pipe-full stall this change removes.
+    // Bounded rather than unbounded, so a pathological signal storm cannot
+    // spin here instead of getting on with the render.
+    fn retry_on_eintr(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
+        for _ in 0..4 {
+            let rc = call();
+            if rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return rc;
+            }
+        }
+        -1
+    }
+
     // SAFETY: both calls only read and set the status flags of `fd`, and
     // neither takes ownership of it. An invalid `fd` is reported as EBADF
     // rather than being undefined.
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
+        let flags = retry_on_eintr(|| libc::fcntl(fd, libc::F_GETFL));
         if flags < 0 {
             return false;
         }
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        retry_on_eintr(|| libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK)) >= 0
     }
 }
 
@@ -533,9 +549,20 @@ fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Nothing is made non-blocking here, so the answer is yes only when
-        // there is no pipe to block on: `drain_available` returns at once on
-        // `None`. With a pipe, the caller keeps to the after-exit read.
+        // No fd type, so nothing is made non-blocking and a real pipe must
+        // answer `false`. The caller then skips the in-loop drain, which
+        // trades one hazard for a smaller one: a renderer writing more than a
+        // pipeful before exiting can stall on a full buffer, where the unix
+        // path would have drained it. The alternative is worse - a blocking
+        // read BEFORE `try_wait` waits on a live renderer and takes the
+        // budget and the kill path down with it, so the stall would be
+        // unbounded rather than bounded by the budget.
+        //
+        // Reachable only on a non-unix target, and croft has none: there is
+        // no Windows job in ci.yml and no windows dependency in Cargo.toml,
+        // and the PDF path documents WSL2 - itself unix - as the Windows
+        // story. Worth fixing with an overlapped/thread reader if that ever
+        // changes; not worth a reader thread on every platform today.
         pipe.is_none()
     }
 }
