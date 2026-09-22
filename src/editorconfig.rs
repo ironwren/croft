@@ -49,6 +49,38 @@ impl Props {
     }
 }
 
+/// `indent_size` as written: a width, or `tab` to defer to `tab_width`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndentSize {
+    Width(u32),
+    Tab,
+}
+
+/// Properties as parsed, before the indent width is derived. `indent_size`
+/// and `tab_width` are held apart because their precedence is not "last one
+/// read wins": a numeric `indent_size` beats `tab_width` whichever line or
+/// file comes later, so the width can only be settled once every file has
+/// been folded in.
+#[derive(Debug, Clone, Copy, Default)]
+struct Raw {
+    props: Props,
+    indent_size: Option<IndentSize>,
+    tab_width: Option<u32>,
+}
+
+impl Raw {
+    fn resolve(self) -> Props {
+        let indent_width = match self.indent_size {
+            Some(IndentSize::Width(n)) => Some(n),
+            Some(IndentSize::Tab) | None => self.tab_width,
+        };
+        Props {
+            indent_width,
+            ..self.props
+        }
+    }
+}
+
 /// The filename the spec fixes.
 const FILENAME: &str = ".editorconfig";
 
@@ -75,11 +107,11 @@ pub fn for_file(path: &Path) -> Props {
         dir = d.parent();
     }
     // Apply outermost-first so the nearest file's sections land last and win.
-    let mut props = Props::default();
+    let mut raw = Raw::default();
     for (dir, text) in chain.iter().rev() {
-        apply_file(&mut props, dir, text, path);
+        apply_file(&mut raw, dir, text, path);
     }
-    props
+    raw.resolve()
 }
 
 /// Whether the preamble (everything before the first `[section]`) sets
@@ -101,7 +133,7 @@ fn parse_is_root(text: &str) -> bool {
 
 /// Fold every matching section of one `.editorconfig` into `props`, in file
 /// order, so a later section overrides an earlier one (the spec's rule).
-fn apply_file(props: &mut Props, config_dir: &Path, text: &str, path: &Path) {
+fn apply_file(raw: &mut Raw, config_dir: &Path, text: &str, path: &Path) {
     let Some(rel) = relative_slash_path(config_dir, path) else {
         return;
     };
@@ -119,17 +151,19 @@ fn apply_file(props: &mut Props, config_dir: &Path, text: &str, path: &Path) {
             continue;
         }
         if let Some((k, v)) = split_pair(line) {
-            set_prop(props, &k.to_ascii_lowercase(), v.trim());
+            set_prop(raw, &k.to_ascii_lowercase(), v.trim());
         }
     }
 }
 
-fn set_prop(props: &mut Props, key: &str, value: &str) {
+fn set_prop(raw: &mut Raw, key: &str, value: &str) {
+    let props = &mut raw.props;
     // `unset` explicitly clears a property inherited from an outer file.
     if value.eq_ignore_ascii_case("unset") {
         match key {
             "indent_style" => props.use_spaces = None,
-            "indent_size" | "tab_width" => props.indent_width = None,
+            "indent_size" => raw.indent_size = None,
+            "tab_width" => raw.tab_width = None,
             "end_of_line" => props.eol = None,
             "trim_trailing_whitespace" => props.trim_trailing_whitespace = None,
             "insert_final_newline" => props.insert_final_newline = None,
@@ -145,21 +179,18 @@ fn set_prop(props: &mut Props, key: &str, value: &str) {
                 props.use_spaces = Some(false);
             }
         }
-        // `indent_size = tab` defers to `tab_width`, which either already
-        // landed or will overwrite this when its own line is read.
+        // `indent_size = tab` defers to `tab_width`; `Raw::resolve` applies
+        // the precedence once every file has been read.
         "indent_size" => {
-            if !value.eq_ignore_ascii_case("tab")
-                && let Ok(n) = value.parse::<u32>()
-                && (1..=16).contains(&n)
-            {
-                props.indent_width = Some(n);
+            if value.eq_ignore_ascii_case("tab") {
+                raw.indent_size = Some(IndentSize::Tab);
+            } else if let Some(n) = parse_width(value) {
+                raw.indent_size = Some(IndentSize::Width(n));
             }
         }
         "tab_width" => {
-            if let Ok(n) = value.parse::<u32>()
-                && (1..=16).contains(&n)
-            {
-                props.indent_width = Some(n);
+            if let Some(n) = parse_width(value) {
+                raw.tab_width = Some(n);
             }
         }
         "end_of_line" => {
@@ -176,6 +207,11 @@ fn set_prop(props: &mut Props, key: &str, value: &str) {
         "insert_final_newline" => props.insert_final_newline = parse_bool(value),
         _ => {}
     }
+}
+
+/// A width croft will honour; anything else is ignored like an unknown value.
+fn parse_width(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|n| (1..=16).contains(n))
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -378,11 +414,11 @@ fn for_file_with(files: &HashMap<PathBuf, String>, path: &Path) -> Props {
         }
         dir = d.parent();
     }
-    let mut props = Props::default();
+    let mut raw = Raw::default();
     for (dir, text) in chain.iter().rev() {
-        apply_file(&mut props, dir, text, path);
+        apply_file(&mut raw, dir, text, path);
     }
-    props
+    raw.resolve()
 }
 
 #[cfg(test)]
