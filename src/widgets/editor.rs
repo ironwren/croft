@@ -2008,6 +2008,10 @@ enum EditKind {
     IndentConvert,
     /// Remove trailing blank lines at end of file. Its own step.
     TrimFinalNewlines,
+    /// Terminate the last line on save (`.editorconfig`
+    /// `insert_final_newline`). Its own step, so it never coalesces into
+    /// the typing burst that preceded the save.
+    InsertFinalNewline,
     /// Find-bar Replace / Replace All. Never coalesces, so each replace is
     /// its own undo step like VS Code.
     Replace,
@@ -8760,7 +8764,7 @@ impl Editor {
             // a zero-byte file has no last line to terminate.
             let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
             if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
-                self.push_undo(EditKind::InsertChar);
+                self.push_undo(EditKind::InsertFinalNewline);
                 self.lines.push(String::new());
                 self.mark_buffer_changed();
                 self.recompute_highlights();
