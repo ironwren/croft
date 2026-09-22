@@ -473,6 +473,70 @@ mod tests {
         );
     }
 
+    /// `tab_width` only stands in for an `indent_size` that is absent or
+    /// `tab`; a numeric `indent_size` wins wherever `tab_width` appears.
+    #[test]
+    fn a_numeric_indent_size_beats_tab_width_in_either_order() {
+        for body in [
+            "[*]\nindent_style = space\nindent_size = 2\ntab_width = 8\n",
+            "[*]\nindent_style = space\ntab_width = 8\nindent_size = 2\n",
+        ] {
+            let f = files(&[("/w/.editorconfig", &format!("root = true\n{body}"))]);
+            assert_eq!(
+                for_file_with(&f, Path::new("/w/a.rs")).indent_width,
+                Some(2),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// The precedence holds across files too: a nearer file naming only
+    /// `tab_width` does not override an outer file's numeric `indent_size`.
+    #[test]
+    fn a_nearer_tab_width_does_not_override_an_outer_indent_size() {
+        let f = files(&[
+            ("/w/.editorconfig", "root = true\n[*]\nindent_size = 2\n"),
+            ("/w/sub/.editorconfig", "[*]\ntab_width = 8\n"),
+        ]);
+        assert_eq!(
+            for_file_with(&f, Path::new("/w/sub/a.rs")).indent_width,
+            Some(2)
+        );
+    }
+
+    /// `tab_width = unset` clears `tab_width` alone, not `indent_size`.
+    #[test]
+    fn unsetting_tab_width_keeps_indent_size() {
+        let f = files(&[(
+            "/w/.editorconfig",
+            "root = true\n[*]\nindent_size = 2\ntab_width = 8\n[*.rs]\ntab_width = unset\n",
+        )]);
+        assert_eq!(
+            for_file_with(&f, Path::new("/w/a.rs")).indent_width,
+            Some(2)
+        );
+    }
+
+    /// Backtracking without memoisation is exponential in the number of
+    /// stars, and the pattern comes from whatever repo the user opened a
+    /// file in. This one took minutes before; it must be instant.
+    #[test]
+    fn a_many_star_glob_does_not_backtrack_exponentially() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let name = format!("{}.rs", "a".repeat(40));
+            let _ = tx.send(section_matches("*a*a*a*a*a*a*a*a*a*a*a*b", &name));
+        });
+        let hit = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("glob matching must not take seconds");
+        assert!(!hit, "no `b` in the name, so no match");
+        assert!(
+            section_matches("*a*a*a*b.rs", "xaayaazab.rs"),
+            "the same shape still matches when it should"
+        );
+    }
+
     #[test]
     fn eol_and_the_on_save_flags_are_read() {
         let f = files(&[(

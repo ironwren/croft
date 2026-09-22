@@ -24364,6 +24364,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
     }
 
+    /// The save-time final newline is its own undo step: it must not
+    /// coalesce into the typing burst before the save, or one Cmd+Z would
+    /// take the user's keystrokes along with the newline.
+    #[test]
+    fn editorconfig_final_newline_is_its_own_undo_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        assert_eq!(e.lines, vec!["!one", ""]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["!one"], "undo removes only the newline");
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["one"], "the next undo removes the typing");
+    }
+
     /// A file already ending in a newline must not collect another one on
     /// each save.
     #[test]
