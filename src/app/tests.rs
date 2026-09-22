@@ -48843,7 +48843,10 @@ fn restart_relaunches_the_selected_compound_not_a_stale_config() {
 
     pick_debug_row(&mut app, "Tasked");
     assert_eq!(app.selected_debug_compound.as_deref(), Some("Tasked"));
-    assert_eq!(app.selected_debug_config, None, "the compound replaces the old target");
+    assert_eq!(
+        app.selected_debug_config, None,
+        "the compound replaces the old target"
+    );
     app.refresh_run_debug();
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("Tasked"));
 
@@ -48872,7 +48875,10 @@ fn a_direct_compound_launch_drops_an_older_parked_task() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
 
     pick_debug_row(&mut app, "Tasked");
-    assert!(app.pending_debug_launch.is_some(), "the task-gated launch is parked");
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "the task-gated launch is parked"
+    );
 
     pick_debug_row(&mut app, "Both");
     assert!(
@@ -48891,4 +48897,115 @@ fn a_zero_config_launch_drops_an_older_parked_task() {
 
     pick_debug_row(&mut app, "Debug active file");
     assert!(app.pending_debug_launch.is_none());
+}
+
+/// A stand-in adapter that emits one DAP `terminated` event and then idles,
+/// or (with `ends: false`) never says anything. Real processes, so the test
+/// drives the same transport and `poll` the app does.
+fn stub_member(ends: bool) -> crate::dap::session::DapSession {
+    let script = if ends {
+        "printf 'Content-Length: %d\r\n\r\n%s' 45 '{\"seq\":1,\"type\":\"event\",\"event\":\"terminated\"}'; sleep 30"
+    } else {
+        "sleep 30"
+    };
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), String::from(script)],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// Poll until the set shrinks below `from` members or two seconds pass.
+fn poll_until_shrinks(app: &mut App, from: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.debug_sessions.len() >= from && std::time::Instant::now() < deadline {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stop_all_true_stops_the_set_when_a_background_member_ends() {
+    // #567 item 4: `stopAll: true` was refused; it is honoured now.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "A ending takes B with it: {:?}",
+        app.debug_sessions.names()
+    );
+    assert!(
+        app.status.contains("stopAll"),
+        "and says why: {}",
+        app.status
+    );
+}
+
+#[test]
+fn stop_all_false_leaves_the_siblings_running() {
+    // The control: without stopAll only the member that ended goes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    app.debug_stop();
+}
+
+#[test]
+fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
+    // #567 items 2 and 3: the status and panel line kept naming the ended
+    // session. Both now say what ended, what is shown, and what still runs.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_compound = Some(String::from("Stack"));
+    app.run_debug.feedback = Some(String::from("Debugging compound Stack: A, B"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debugging compound Stack: B (A ended)")
+    );
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
+    assert_eq!(app.debug_compound, None, "a full stop forgets the compound");
+}
+
+#[test]
+fn the_focused_member_ending_names_the_session_now_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_compound = Some(String::from("Stack"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
 }

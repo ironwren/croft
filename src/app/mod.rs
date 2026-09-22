@@ -3700,6 +3700,14 @@ pub struct App {
     /// compound. Exclusive with `selected_debug_config`: a compound and a
     /// configuration may share a name, so one string cannot say which (#567).
     selected_debug_compound: Option<String>,
+    /// The launched compound asked for `stopAll: true` (#567): the first
+    /// member to end stops the rest. Set on every compound launch, so a
+    /// single-config launch (one session, no siblings) never reads a stale
+    /// value in a way that matters.
+    debug_stop_all: bool,
+    /// The running compound's name, kept past launch so the report rebuilt
+    /// when one member ends can still say which compound is live (#567).
+    debug_compound: Option<String>,
     /// A config launch parked behind its `preLaunchTask`: the task runs in
     /// its pane, and the FinishedCommand sweep launches (exit 0) or aborts
     /// (non-zero) when the matching command completes. Replaced by a newer
@@ -4947,6 +4955,8 @@ impl App {
             debug_compounds: Vec::new(),
             selected_debug_config: None,
             selected_debug_compound: None,
+            debug_stop_all: false,
+            debug_compound: None,
             pending_debug_launch: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -20293,10 +20303,25 @@ impl App {
             }
         }
         // Highest index first, so removing one does not move the next.
+        let mut ended_names = Vec::new();
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
                 gone.session.disconnect();
+                ended_names.push(gone.name);
             }
+        }
+        // `stopAll: true` (#567): a background member ending takes the set
+        // down with it, the same as the focused one ending does below.
+        if self.debug_stop_all && !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.debug_stop();
+            self.status = format!(
+                "{} ended — stopAll stopped the rest of the compound",
+                ended_names.join(", ")
+            );
+            return true;
+        }
+        if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.report_member_ended(&ended_names.join(", "));
         }
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
@@ -20419,13 +20444,17 @@ impl App {
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
                     gone.session.disconnect();
                 }
+                // `stopAll: true` (#567): the siblings go too, and the rest
+                // of this arm reports the ended run as for a lone session.
+                if self.debug_stop_all && !self.debug_sessions.is_empty() {
+                    self.debug_stop();
+                    self.status =
+                        format!("{ended_name} ended — stopAll stopped the rest of the compound");
+                }
                 if !self.debug_sessions.is_empty() {
                     // Siblings are still running, so the debugger is not torn
                     // down: the view moves to one of them.
-                    self.status = format!(
-                        "{ended_name} ended — {} session(s) still running · Shift+F5 stops all",
-                        self.debug_sessions.len()
-                    );
+                    self.report_member_ended(&ended_name);
                     return true;
                 }
                 // The watchdog reparents to init the moment the server dies;
@@ -20817,7 +20846,12 @@ impl App {
         if let Some(name) = self.selected_debug_compound.clone() {
             let root = self.active_workspace_root();
             self.debug_compounds = crate::dap::configs::discover_compounds(&root);
-            if let Some(compound) = self.debug_compounds.iter().find(|c| c.name == name).cloned() {
+            if let Some(compound) = self
+                .debug_compounds
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
                 self.launch_compound(&compound);
                 return;
             }
@@ -20851,6 +20885,7 @@ impl App {
     /// one or several sessions. Shared by the picker and by F5/restart once
     /// the compound is the selected target (#567).
     fn launch_compound(&mut self, compound: &crate::dap::configs::Compound) {
+        self.debug_stop_all = compound.stop_all;
         // Resolve first: a compound naming a configuration no
         // launch.json declares is a config error worth
         // reporting now, separately from the unbuilt feature.
@@ -20858,9 +20893,7 @@ impl App {
         // display list and drops a lower-precedence duplicate by
         // name, which is the very entry a `.vscode` compound
         // naming that name has to bind.
-        let all = crate::dap::configs::discover_configs_all(
-            &self.active_workspace_root(),
-        );
+        let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
         // #310 defers compounds that need SEVERAL sessions at
         // once. A compound naming ONE configuration needs one,
         // which croft has run since #250 — so the arity has to
@@ -20965,9 +20998,7 @@ impl App {
                 // the members are owned from here on.
                 let members: Vec<_> = members.into_iter().cloned().collect();
                 match compound.pre_launch_task.clone() {
-                    Some(task) => {
-                        self.launch_after_compound_task_all(&task, members, label)
-                    }
+                    Some(task) => self.launch_after_compound_task_all(&task, members, label),
                     None => self.launch_compound_members(members, label),
                 }
             }
@@ -21176,6 +21207,7 @@ impl App {
         // written server-first, and landing the user on whichever happened to
         // start last would put them in the wrong one.
         self.debug_sessions.focus(0);
+        self.debug_compound = Some(compound.clone());
         // Reveal FIRST, then write the feedback: `reveal_debug_view` runs
         // `refresh_run_debug`, which clears `feedback` unconditionally, so
         // doing it afterwards wiped every line built below - including the
@@ -22101,6 +22133,27 @@ impl App {
     }
 
     /// Shift+F5: stop debugging and tear the session down.
+    /// A compound member ended and siblings survive (#567): rebuild the
+    /// status and the panel line from the live set, naming what ended, which
+    /// session the view now shows, and every one still running. Without this
+    /// both kept naming the ended session.
+    fn report_member_ended(&mut self, ended: &str) {
+        let running = self.debug_sessions.names().join(", ");
+        let focused = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let what = self
+            .debug_compound
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" compound {c}"));
+        self.run_debug.feedback = Some(format!("Debugging{what}: {running} ({ended} ended)"));
+        self.run_debug.feedback_is_error = false;
+        self.status =
+            format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
     pub fn debug_stop(&mut self) {
         // EVERY session, not the focused one (#310). A compound launches
         // several; disconnecting only the one the user happens to be looking
@@ -22110,6 +22163,7 @@ impl App {
             session.disconnect();
         }
         self.debug_sessions.clear();
+        self.debug_compound = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in

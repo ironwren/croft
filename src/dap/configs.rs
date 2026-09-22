@@ -367,9 +367,9 @@ pub struct Compound {
     /// purpose: enumerating unknown keys would refuse whatever VS Code adds
     /// next.
     ///
-    /// `stopAll` is deliberately absent at either value: it decides whether
-    /// ending one session ends the others, which is meaningless for the
-    /// single-session launch this list gates.
+    /// `stopAll` is honoured as a bool (#567) and recorded here only when
+    /// its value is not one: `"true"` is the quoted-bool typo the
+    /// presentation keys also refuse.
     ///
     /// Recorded rather than silently dropped because a ONE-member compound now
     /// launches, and launching it via its member alone would run neither the
@@ -383,6 +383,9 @@ pub struct Compound {
     /// a `.vscode` compound to a `.croft` config of that name would debug a
     /// different program than the compound was written against.
     pub source: &'static str,
+    /// `stopAll: true` (#567): one member ending stops the whole set. VS
+    /// Code's default, `false`, lets the siblings keep running.
+    pub stop_all: bool,
 }
 
 impl Compound {
@@ -488,17 +491,19 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // deleting the whole `presentation` block, taking a working
             // `group` with it.
             let mut unsupported_keys: Vec<&'static str> = malformed_presentation_keys(obj);
-            // Only where there ARE siblings to stop, and for anything that is
-            // not the default. `false` and absence describe what croft does;
-            // everything else - `true`, and the `"true"` quoted-bool typo the
-            // presentation keys already guard against - asks for something
-            // croft will not deliver, and launching as the opposite in silence
-            // is the outcome this whole list exists to prevent.
-            if configurations.len() > 1 {
-                match obj.get("stopAll") {
-                    None | Some(Value::Null) | Some(Value::Bool(false)) => {}
-                    Some(_) => unsupported_keys.push("stopAll"),
-                }
+            // A bool is honoured at any arity (#567): `true` tears the set
+            // down when one member ends, `false` leaves the siblings running.
+            // Anything else - the `"true"` quoted-bool typo above all - cannot
+            // be read, and only matters where there ARE siblings to stop, so
+            // it is refused there rather than launched as `false`.
+            let stop_all = matches!(obj.get("stopAll"), Some(Value::Bool(true)));
+            if configurations.len() > 1
+                && !matches!(
+                    obj.get("stopAll"),
+                    None | Some(Value::Null) | Some(Value::Bool(_))
+                )
+            {
+                unsupported_keys.push("stopAll");
             }
             let pre_launch_task = asks_for_something("preLaunchTask")
                 .then(|| obj.get("preLaunchTask").and_then(|v| v.as_str()))
@@ -519,6 +524,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
                 pre_launch_task,
                 presentation,
                 unsupported_keys,
+                stop_all,
             })
         })
         .collect()
@@ -1571,16 +1577,10 @@ mod tests {
         );
     }
 
-    /// `stopAll: true` is refused at two members and silent at one.
-    ///
-    /// The pair is the point. Recording it at either arity would refuse a
-    /// one-member compound over a key that cannot change its outcome; at two
-    /// members, NOT recording it launches a compound whose siblings keep
-    /// running after a member ends - the opposite of what the file asked for,
-    /// with nothing said. Only asserting the refusal would pass a rule that
-    /// fires everywhere, so the one-member arm is the control.
+    /// `stopAll: true` is honoured, not refused (#567); only an unreadable
+    /// value is refused, and only where there are siblings to stop.
     #[test]
-    fn stop_all_true_is_refused_only_where_there_are_siblings_to_stop() {
+    fn stop_all_true_is_honoured_and_only_an_unreadable_value_refused() {
         let text = r#"{
             "configurations": [
                 { "name": "A", "type": "node", "program": "a.js" },
@@ -1598,12 +1598,11 @@ mod tests {
         assert_eq!(cs.len(), 5, "precondition: every compound parsed");
         let by = |n: &str| cs.iter().find(|c| c.name == n).expect("parsed");
 
-        assert_eq!(
-            by("TwoTrue").unsupported_keys,
-            vec!["stopAll"],
-            "at two members `true` asks for a teardown croft does not do, so \
-             it is refused rather than launched as its opposite"
+        assert!(
+            by("TwoTrue").unsupported_keys.is_empty() && by("TwoTrue").stop_all,
+            "`true` is honoured: the set is torn down when a member ends"
         );
+        assert!(!by("TwoFalse").stop_all && !by("TwoAbsent").stop_all);
         assert_eq!(
             by("TwoQuoted").unsupported_keys,
             vec!["stopAll"],
