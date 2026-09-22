@@ -334,64 +334,99 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 /// A glob matcher with EditorConfig's semantics: `*` stops at `/`, `**`
 /// crosses it, `?` is one non-`/` character, and `[abc]` / `[!abc]` are
 /// character classes.
+///
+/// Backtracking is memoised on `(pattern index, text index)`: the pattern
+/// comes from whatever repository the user opened a file in, and plain
+/// backtracking over a run of stars is exponential, which would freeze
+/// `open`. With the memo each pair is decided once, so the cost is bounded
+/// by `|p| * |t|` states.
 fn glob_match(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
-    }
-    match p[0] {
-        '*' if p.get(1) == Some(&'*') => {
-            let rest = &p[2..];
-            // `**/` must also match zero directories, so `**/x` matches `x`.
-            if rest.first() == Some(&'/') && glob_match(&rest[1..], t) {
-                return true;
-            }
-            (0..=t.len()).any(|i| glob_match(rest, &t[i..]))
-        }
-        '*' => {
-            let limit = t.iter().position(|&c| c == '/').unwrap_or(t.len());
-            (0..=limit).any(|i| glob_match(&p[1..], &t[i..]))
-        }
-        '?' => !t.is_empty() && t[0] != '/' && glob_match(&p[1..], &t[1..]),
-        '[' => match_class(p, t),
-        c => !t.is_empty() && t[0] == c && glob_match(&p[1..], &t[1..]),
-    }
+    let mut memo = vec![None; (p.len() + 1) * (t.len() + 1)];
+    Glob { p, t, memo: &mut memo }.at(0, 0)
 }
 
-fn match_class(p: &[char], t: &[char]) -> bool {
-    let negated = p.get(1) == Some(&'!');
-    let start = if negated { 2 } else { 1 };
-    let Some(end) = p
-        .iter()
-        .skip(start)
-        .position(|&c| c == ']')
-        .map(|i| i + start)
-    else {
-        // Unterminated `[` is a literal one.
-        return !t.is_empty() && t[0] == '[' && glob_match(&p[1..], &t[1..]);
-    };
-    if t.is_empty() || t[0] == '/' {
-        return false;
+struct Glob<'a> {
+    p: &'a [char],
+    t: &'a [char],
+    memo: &'a mut [Option<bool>],
+}
+
+impl Glob<'_> {
+    fn at(&mut self, pi: usize, ti: usize) -> bool {
+        let slot = pi * (self.t.len() + 1) + ti;
+        if let Some(hit) = self.memo[slot] {
+            return hit;
+        }
+        let hit = self.step(pi, ti);
+        self.memo[slot] = Some(hit);
+        hit
     }
-    let set = &p[start..end];
-    let mut hit = false;
-    let mut i = 0;
-    while i < set.len() {
-        if i + 2 < set.len() && set[i + 1] == '-' {
-            if t[0] >= set[i] && t[0] <= set[i + 2] {
-                hit = true;
+
+    fn step(&mut self, pi: usize, ti: usize) -> bool {
+        let (p, t) = (self.p, self.t);
+        if pi == p.len() {
+            return ti == t.len();
+        }
+        match p[pi] {
+            '*' if p.get(pi + 1) == Some(&'*') => {
+                let rest = pi + 2;
+                // `**/` must also match zero directories, so `**/x` matches `x`.
+                if p.get(rest) == Some(&'/') && self.at(rest + 1, ti) {
+                    return true;
+                }
+                (ti..=t.len()).any(|i| self.at(rest, i))
             }
-            i += 3;
-        } else {
-            if t[0] == set[i] {
-                hit = true;
+            '*' => {
+                let limit = t[ti..]
+                    .iter()
+                    .position(|&c| c == '/')
+                    .map_or(t.len(), |i| ti + i);
+                (ti..=limit).any(|i| self.at(pi + 1, i))
             }
-            i += 1;
+            '?' => ti < t.len() && t[ti] != '/' && self.at(pi + 1, ti + 1),
+            '[' => self.class(pi, ti),
+            c => ti < t.len() && t[ti] == c && self.at(pi + 1, ti + 1),
         }
     }
-    if hit == negated {
-        return false;
+
+    fn class(&mut self, pi: usize, ti: usize) -> bool {
+        let (p, t) = (self.p, self.t);
+        let negated = p.get(pi + 1) == Some(&'!');
+        let start = if negated { pi + 2 } else { pi + 1 };
+        let Some(end) = p
+            .iter()
+            .skip(start)
+            .position(|&c| c == ']')
+            .map(|i| i + start)
+        else {
+            // Unterminated `[` is a literal one.
+            return ti < t.len() && t[ti] == '[' && self.at(pi + 1, ti + 1);
+        };
+        if ti == t.len() || t[ti] == '/' {
+            return false;
+        }
+        let c = t[ti];
+        let set = &p[start..end];
+        let mut hit = false;
+        let mut i = 0;
+        while i < set.len() {
+            if i + 2 < set.len() && set[i + 1] == '-' {
+                if c >= set[i] && c <= set[i + 2] {
+                    hit = true;
+                }
+                i += 3;
+            } else {
+                if c == set[i] {
+                    hit = true;
+                }
+                i += 1;
+            }
+        }
+        if hit == negated {
+            return false;
+        }
+        self.at(end + 1, ti + 1)
     }
-    glob_match(&p[end + 1..], &t[1..])
 }
 
 /// Test seam: resolve against an in-memory set of `(dir, contents)` instead
