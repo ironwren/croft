@@ -5774,7 +5774,7 @@ impl Editor {
         }
         let byte = self.byte_index(self.cursor_row, self.cursor_col);
         let name = match self.lines.get(self.cursor_row) {
-            Some(line) => tag_auto_close_name(line, byte, self.lang),
+            Some(line) => tag_auto_close_name(line, byte, self.lang).map(str::to_owned),
             None => None,
         };
         let Some(name) = name else {
@@ -12545,11 +12545,13 @@ fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
 /// the text before the caret is not an unterminated opening tag.
 ///
 /// Heuristic, not a parse: the editor decides this on one keystroke against
-/// one line, so every rule below exists to make a FALSE POSITIVE impossible
-/// rather than to catch every true one. In particular the "`<` may not
-/// follow a word character" rule is what keeps generic calls (`foo<T>`,
-/// `Array<string>`) and comparisons (`a<b`) from sprouting closing tags.
-fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Option<String> {
+/// one line, so every rule below errs toward NOT closing — a missed close
+/// costs one typed `</tag>`, a spurious one corrupts code. In particular the
+/// "`<` may not follow a word character" rule is what keeps generic calls
+/// (`foo<T>`, `Array<string>`) and comparisons (`a<b`) from sprouting closing
+/// tags. What one line cannot show (a string or block comment opened on an
+/// earlier line) is not seen.
+fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Option<&str> {
     if !lang_auto_closes_tags(lang) {
         return None;
     }
@@ -12574,10 +12576,17 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     {
         return None;
     }
-    let name: String = inner
-        .chars()
-        .take_while(|&c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-        .collect();
+    // In script, a `<` inside a string literal or a comment is text, not
+    // JSX: `"<div"`, `// renders <div`.
+    if matches!(lang, Some(LangKind::Tsx | LangKind::JavaScript))
+        && ends_in_script_string_or_comment(&before[..lt])
+    {
+        return None;
+    }
+    let name_len = inner
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
+        .unwrap_or(inner.len());
+    let name = &inner[..name_len];
     if !name
         .chars()
         .next()
@@ -12599,11 +12608,47 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
         return None;
     }
     if matches!(lang, Some(LangKind::Html))
-        && VOID_ELEMENTS.contains(&name.to_ascii_lowercase().as_str())
+        && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
     {
         return None;
     }
     Some(name)
+}
+
+/// Whether the end of `prefix`, one line of JavaScript/TSX, sits inside a
+/// string literal (`'`, `"` or a template literal), a `//` comment or an
+/// unclosed `/* */` comment. A backslash escapes the next character inside a
+/// string. JSX text containing an apostrophe (`<p>Don't <b`) reads as an open
+/// string, which only ever suppresses a close — the safe direction.
+fn ends_in_script_string_or_comment(prefix: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut block_comment = false;
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
+        if block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
+            }
+        } else if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '/' if chars.peek() == Some(&'/') => return true,
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    block_comment = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    quote.is_some() || block_comment
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -24927,6 +24972,30 @@ mod tests {
         let mut e = tag_editor("const f = <T,", LangKind::Tsx);
         e.insert_char('>');
         assert_eq!(e.lines[0], "const f = <T,>");
+    }
+
+    #[test]
+    fn a_tag_inside_a_script_string_or_comment_never_auto_closes() {
+        // The caret sits before the partner quote auto-pairing inserted.
+        for (src, lang) in [
+            ("const s = \"<div\"", LangKind::JavaScript),
+            ("const s = '<div'", LangKind::Tsx),
+            ("const s = `<div`", LangKind::Tsx),
+            ("const s = \"a\\\"<div\"", LangKind::Tsx),
+        ] {
+            let mut e = tag_editor(src, lang);
+            e.cursor_col -= 1;
+            e.insert_char('>');
+            let want = format!("{}>{}", &src[..src.len() - 1], &src[src.len() - 1..]);
+            assert_eq!(e.lines[0], want, "{src} is a string, not markup");
+        }
+        let mut e = tag_editor("// render <div", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "// render <div>", "a comment is not markup");
+        // Control: balanced strings earlier on the line do not suppress it.
+        let mut e = tag_editor("f(\"x\", 'y', <div", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "f(\"x\", 'y', <div></div>");
     }
 
     #[test]
