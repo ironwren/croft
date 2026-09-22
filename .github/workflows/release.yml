@@ -113,8 +113,8 @@ jobs:
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-musl)  file "$bin" | grep -qE 'ELF 64-bit LSB.*x86-64' ;;
             aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
-            x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*x86_64' ;;
-            aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64' ;;
+            x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*(x86_64|x86-64)' ;;
+            aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64e?' ;;
             # A `case` with no match exits 0, so without this arm the whole
             # assertion becomes a silent no-op for any target the list does
             # not name - green step, unchecked artifact (#551). Adding a

@@ -43,7 +43,7 @@ EXPECTED_TARGETS = {
 }
 
 
-def matrix_targets(text: str) -> set:
+def matrix_targets(text: str) -> set[str]:
     """The triples the build matrix actually names.
 
     Searching the whole file for each triple answers a different question:
@@ -53,14 +53,51 @@ def matrix_targets(text: str) -> set:
     (#554). The matrix block is the corpus; a mention outside it is not a
     build.
     """
-    block = re.search(
-        r"^\s*matrix:\s*$(.*?)(?=^\s{0,6}\S)",
-        text,
-        re.M | re.S,
-    )
-    if not block:
+    lines = text.splitlines()
+    matrix_indent = None
+    section = None
+    item_indent = None
+    out = set()
+    for line in lines:
+        if matrix_indent is None:
+            m = re.match(r"^(\s*)matrix:\s*$", line)
+            if m:
+                matrix_indent = len(m.group(1))
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= matrix_indent:
+            break
+        m = re.match(r"^\s*([A-Za-z_-]+):\s*$", line)
+        if m and indent == matrix_indent + 2:
+            section = m.group(1)
+            item_indent = None
+            continue
+        if section == "include":
+            # A list ITEM starts at the dash; `target:` is one of its keys and
+            # YAML does not order them, so `- os: ...` with `target:` on a
+            # later line is the same entry. Matching only `- target:` drops
+            # such an entry and the checker then reports a target it builds as
+            # missing - or misses one that really went away (#554 again).
+            m = re.match(r"^(\s*)-\s*(.*)$", line)
+            if m:
+                item_indent = len(m.group(1))
+                rest = m.group(2)
+            else:
+                rest = line.strip()
+                if item_indent is None or indent <= item_indent:
+                    continue
+            k = re.match(r"^target:\s*(\S+)\s*$", rest)
+            if k:
+                out.add(k.group(1))
+        elif section == "target":
+            m = re.match(r"^\s*-\s*(\S+)\s*$", line)
+            if m:
+                out.add(m.group(1))
+
+    if matrix_indent is None:
         fail("no build matrix in release.yml")
-    return set(re.findall(r"^\s*-\s*target:\s*(\S+)\s*$", block.group(1), re.M))
+    return out
 
 
 def fail(msg: str) -> None:
