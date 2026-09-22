@@ -10663,15 +10663,16 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
             });
         }
     }
-    // The overlay normally wins outright, but a BOLD base span is a comment
-    // tag (`TODO`, `FIXME`, ...), which the tag pass deliberately marked so
-    // it stands out. A server that reports the whole comment as one
-    // `comment` token would otherwise repaint the tag in ordinary comment
-    // grey, so tag highlighting would silently stop the moment an LSP
-    // attached. Carve those ranges out of each overlay span instead.
+    // The overlay normally wins outright, except over a comment tag (`TODO`,
+    // `FIXME`, ...), which the tag pass deliberately marked so it stands out.
+    // A server that reports the whole comment as one `comment` token would
+    // otherwise repaint the tag in ordinary comment grey, so tag highlighting
+    // would silently stop the moment an LSP attached. Carve those ranges out
+    // of each overlay span instead. Keywords are BOLD as well, so the tag
+    // test is the tag hue, not BOLD alone.
     let keep: Vec<&HiSpan> = base
         .iter()
-        .filter(|b| b.style.add_modifier.contains(Modifier::BOLD))
+        .filter(|b| crate::highlight::is_comment_tag_style(b.style))
         .collect();
     for o in over {
         let mut cur = o.start;
@@ -19764,6 +19765,34 @@ mod tests {
                 .iter()
                 .any(|sp| sp.style.fg == Some(Color::Rgb(0x4F, 0xC1, 0xFF))),
             "the TODO span must survive the semantic overlay: {merged:?}"
+        );
+    }
+
+    /// Keywords are BOLD too (`palette_style_for_name`, "keyword"), so the tag
+    /// carve-out must not key on BOLD alone: a semantic token over a keyword
+    /// (rust-analyzer's inactive-code dimming, `selfKeyword`) still wins.
+    #[test]
+    fn a_semantic_token_still_repaints_a_bold_keyword() {
+        use ratatui::style::Color;
+        let keyword = Style::default()
+            .fg(Color::Rgb(0xc6, 0x78, 0xdd))
+            .add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::Rgb(0x5c, 0x63, 0x70));
+        let base = vec![HiSpan {
+            start: 0,
+            end: 2,
+            style: keyword,
+        }];
+        let over = vec![HiSpan {
+            start: 0,
+            end: 9,
+            style: inactive,
+        }];
+        let merged = merge_overlay(&base, &over);
+        assert_eq!(
+            merged.iter().map(|sp| sp.style).collect::<Vec<_>>(),
+            vec![inactive],
+            "the overlay must repaint the keyword: {merged:?}"
         );
     }
 

@@ -446,6 +446,19 @@ impl TagHue {
     }
 }
 
+/// Whether `style` is one [`comment_keyword_spans`] paints on a tag: BOLD over
+/// one of the tag hues. BOLD alone does not identify a tag - keywords are
+/// BOLD too - so a caller that must keep tags must not key on it alone.
+pub(crate) fn is_comment_tag_style(style: Style) -> bool {
+    let Some(fg) = style.fg else {
+        return false;
+    };
+    style.add_modifier.contains(Modifier::BOLD)
+        && COMMENT_KEYWORDS
+            .iter()
+            .any(|&(_, hue)| fg == hue.color(false) || fg == hue.color(true))
+}
+
 /// Whether the active theme is a light one, inferred from its foreground.
 ///
 /// A light theme paints dark text on a light background, so a DARK `fg` means
