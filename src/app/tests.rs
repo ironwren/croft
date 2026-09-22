@@ -39173,15 +39173,14 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
          deferral does not apply to it: {}",
         app.status
     );
-    assert_eq!(
-        app.selected_debug_config.as_deref(),
-        Some("Server"),
-        "it selects its single member, exactly as selecting that \
-         configuration directly would"
-    );
-    // `selected_debug_config` is assigned BEFORE `launch_debug_config`, which
-    // has several early-return error paths — so the assertion above proves only
-    // that the launch BRANCH was reached. Assert the launch was not refused.
+    // #567: it selects the COMPOUND, not its member. Selecting the member
+    // made F5 relaunch the bare configuration, skipping anything the compound
+    // itself declares (its preLaunchTask).
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Just Server"));
+    assert_eq!(app.selected_debug_config, None);
+    // The selection is assigned BEFORE the launch, which has several
+    // early-return error paths — so the assertion above proves only that the
+    // launch BRANCH was reached. Assert the launch was not refused.
     // The launch reached a real adapter, so what it does next depends on the
     // machine: the GitHub runner has no `uv`, and "Debugger setup failed:
     // running `uv venv`" is a true report about that box, not this fix
@@ -48790,4 +48789,106 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
         ),
         other => panic!("an oversized request must not be accepted: {other:?}"),
     }
+}
+
+/// Open the debug picker and confirm the row whose label starts with `label`.
+fn pick_debug_row(app: &mut App, label: &str) {
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with(label))
+        .unwrap_or_else(|| panic!("{label} is listed"));
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+}
+
+/// A workspace with two configs and compounds with and without a task. The
+/// task never finishes on its own, so a parked launch stays parked.
+fn compound_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "build", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
+        ],
+        "compounds": [
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
+            { "name": "Both", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn restart_relaunches_the_selected_compound_not_a_stale_config() {
+    // #567 item 6: a compound launch never became the F5 target, so restart
+    // (and F5 after the sessions end) ran whatever was selected before.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.selected_debug_config = Some(String::from("Client"));
+
+    pick_debug_row(&mut app, "Tasked");
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Tasked"));
+    assert_eq!(app.selected_debug_config, None, "the compound replaces the old target");
+    app.refresh_run_debug();
+    assert_eq!(app.run_debug.selected_config.as_deref(), Some("Tasked"));
+
+    // Restart goes back through the compound, so its task parks the launch
+    // again. Launching "Client" (the stale target) or bare "Server" (its
+    // member) would clear the parking instead.
+    app.pending_debug_launch = None;
+    app.debug_restart();
+    assert!(
+        app.pending_debug_launch.is_some() && app.status.contains("compound preLaunchTask"),
+        "restart re-runs the compound behind its own task: {}",
+        app.status
+    );
+
+    // Choosing a configuration afterwards drops the compound selection.
+    pick_debug_row(&mut app, "Server");
+    assert_eq!(app.selected_debug_compound, None);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Server"));
+}
+
+#[test]
+fn a_direct_compound_launch_drops_an_older_parked_task() {
+    // #567 item 5: the parked launch outlived a newer compound launch, and
+    // its task's exit would later start its config and stop the compound.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(app.pending_debug_launch.is_some(), "the task-gated launch is parked");
+
+    pick_debug_row(&mut app, "Both");
+    assert!(
+        app.pending_debug_launch.is_none(),
+        "the newer compound launch supersedes the parked one"
+    );
+}
+
+#[test]
+fn a_zero_config_launch_drops_an_older_parked_task() {
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(app.pending_debug_launch.is_some());
+
+    pick_debug_row(&mut app, "Debug active file");
+    assert!(app.pending_debug_launch.is_none());
 }
