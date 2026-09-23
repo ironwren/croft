@@ -2440,6 +2440,15 @@ pub struct Editor {
     /// did_change to the LSP server, so building lines.join("\n") only
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
+    /// Overview ruler: the lines the search highlight matches, keyed by
+    /// `(edit_seq, needle, options)`. The ruler renders every frame, and
+    /// re-running the search (a regex compile included) over the whole buffer
+    /// per frame is input lag on a large file.
+    ruler_search_cache: Option<(u64, String, crate::widgets::search::SearchOpts, Vec<usize>)>,
+    /// Overview ruler: each line's first visual row in wrap mode, text rows
+    /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
+    /// change without an edit, so they are added at mapping time instead.
+    ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
     /// ops only when `edit_seq` has moved past this, and it is re-pinned
@@ -2937,6 +2946,8 @@ impl Editor {
             bookmark_shadow: None,
             bookmark_sync_paused: false,
             edit_seq: 0,
+            ruler_search_cache: None,
+            ruler_starts_cache: None,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
             git_head_lines: None,
@@ -3687,27 +3698,90 @@ impl Editor {
         if rows == 0 || self.lines.is_empty() {
             return out;
         }
-        // Content position of each line's first row, plus the total.
-        let starts: Vec<usize> = match wrap_width {
+        // Content position of each line's first row, plus the total. In wrap
+        // mode the text rows come from a cache that only an edit or a width
+        // change invalidates; comment-box rows (few) are added per call.
+        let n = self.lines.len();
+        let (starts, boxes): (Vec<usize>, Vec<(usize, usize)>) = match wrap_width {
             Some(w) => {
-                let mut acc = 0;
-                (0..=self.lines.len())
-                    .map(|l| {
-                        let at = acc;
-                        if l < self.lines.len() {
-                            acc += self.group_visual_rows(l, w);
-                        }
-                        at
-                    })
-                    .collect()
+                let fresh = matches!(
+                    &self.ruler_starts_cache,
+                    Some((seq, cw, _)) if *seq == self.edit_seq && *cw == w
+                );
+                if !fresh {
+                    let mut acc = 0;
+                    let text: Vec<usize> = (0..=n)
+                        .map(|l| {
+                            let at = acc;
+                            if l < n {
+                                acc += self.line_visual_rows(l, w);
+                            }
+                            at
+                        })
+                        .collect();
+                    self.ruler_starts_cache = Some((self.edit_seq, w, text));
+                }
+                let mut boxes: Vec<(usize, usize)> = (0..self.comment_boxes.len())
+                    .map(|i| (self.comment_boxes[i].line, self.comment_box_height(i, w)))
+                    .collect();
+                boxes.sort_unstable();
+                let starts = self
+                    .ruler_starts_cache
+                    .as_ref()
+                    .map(|(_, _, t)| t.clone())
+                    .unwrap_or_default();
+                (starts, boxes)
             }
-            None => (0..=self.lines.len()).collect(),
+            None => ((0..=n).collect(), Vec::new()),
         };
-        let total = starts[self.lines.len()].max(1);
-        let last = self.lines.len() - 1;
+        // Box rows hang under their line, so they push down every later line.
+        let box_rows_before = |line: usize| -> usize {
+            boxes
+                .iter()
+                .take_while(|(l, _)| *l < line)
+                .map(|(_, h)| h)
+                .sum()
+        };
+        let total = (starts[n] + box_rows_before(n)).max(1);
+        let last = n - 1;
+        // Only lines the search panel would actually highlight count, so the
+        // ruler and the yellow runs in the text can never disagree: both ask
+        // `split_for_highlight` the same question with the same options.
+        let search_hits: Vec<usize> = match self.search_highlight.clone().filter(|n| !n.is_empty())
+        {
+            Some(needle) => {
+                let opts = self.search_highlight_opts;
+                let fresh = matches!(
+                    &self.ruler_search_cache,
+                    Some((seq, cn, co, _)) if *seq == self.edit_seq && *cn == needle && *co == opts
+                );
+                if !fresh {
+                    let hits = self
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            crate::widgets::search::split_for_highlight(line, &needle, opts)
+                                .iter()
+                                // A zero-width match (`^`, `\b`, `q*`) paints no
+                                // cell in the text, so it gets no tick either.
+                                .any(|(text, is_match)| *is_match && !text.is_empty())
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    self.ruler_search_cache = Some((self.edit_seq, needle, opts, hits));
+                }
+                self.ruler_search_cache
+                    .as_ref()
+                    .map(|(_, _, _, h)| h.clone())
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         self.refresh_git_marks();
         let mut put = |line: usize, mark: OverviewMark| {
-            let row = (starts[line.min(last)] * rows / total).min(rows - 1);
+            let line = line.min(last);
+            let row = ((starts[line] + box_rows_before(line)) * rows / total).min(rows - 1);
             out[row] = Some(out[row].map_or(mark, |cur: OverviewMark| cur.max(mark)));
         };
 
@@ -3725,18 +3799,8 @@ impl Editor {
         // Only lines the search panel would actually highlight count, so the
         // ruler and the yellow runs in the text can never disagree: both ask
         // `split_for_highlight` the same question with the same options.
-        if let Some(needle) = self.search_highlight.as_deref().filter(|n| !n.is_empty()) {
-            let opts = self.search_highlight_opts;
-            for (i, line) in self.lines.iter().enumerate() {
-                if crate::widgets::search::split_for_highlight(line, needle, opts)
-                    .iter()
-                    // A zero-width match (`^`, `\b`, `q*`) paints no cell
-                    // in the text, so it gets no tick either.
-                    .any(|(text, is_match)| *is_match && !text.is_empty())
-                {
-                    put(i, OverviewMark::SearchMatch);
-                }
-            }
+        for &i in &search_hits {
+            put(i, OverviewMark::SearchMatch);
         }
 
         // Diagnostics outrank everything, so they are applied last — `put`
@@ -17224,6 +17288,29 @@ mod tests {
         for c in "needle ".chars() {
             e.insert_char(c);
         }
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+    }
+
+    /// The search ticks are cached per `(edit, needle, options)`, so a new
+    /// needle or a flipped option must be a miss, not a stale answer.
+    #[test]
+    fn a_new_needle_or_option_recomputes_the_cached_search_ticks() {
+        let mut e = ruler_editor();
+        e.lines[30] = String::from("Needle");
+        e.search_highlight = Some(String::from("needle"));
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+        e.search_highlight_opts.case_sensitive = true;
+        assert!(
+            e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+            "case-sensitive `needle` does not match `Needle`"
+        );
+        e.search_highlight = Some(String::from("Needle"));
         assert_eq!(
             e.overview_ruler_rows(10)[3],
             Some(OverviewMark::SearchMatch)
