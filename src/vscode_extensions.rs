@@ -445,6 +445,12 @@ pub const TABLE: &[Mapping] = &[
         note: "run through tasks.json or the terminal; runnable Markdown fences are tracked in #353",
     },
     Mapping {
+        vscode: "vscode.emmet",
+        croft: "emmet",
+        status: Status::Builtin,
+        note: "Emmet abbreviations expand with Cmd+Opt+Shift+E in HTML, XML and JSX buffers",
+    },
+    Mapping {
         vscode: "formulahendry.auto-rename-tag",
         croft: "lsp-html",
         status: Status::Builtin,
