@@ -3461,15 +3461,46 @@ impl Editor {
     /// mapping the scrollbar thumb uses, so a tick sits beside the part of the
     /// thumb's travel that would bring it on screen.
     pub fn overview_ruler_rows(&mut self, track_rows: u16) -> Vec<Option<OverviewMark>> {
+        self.overview_ruler_rows_wrapped(track_rows, None)
+    }
+
+    /// [`overview_ruler_rows`](Self::overview_ruler_rows) for a buffer
+    /// soft-wrapped at `wrap_width` columns. The thumb travels over visual
+    /// rows, not lines, so a tick goes where its line's first visual row
+    /// sits: with long lines above it, line 50 of 100 can start near the
+    /// bottom of the content, and a line-count mapping would put it where
+    /// the thumb reveals something else.
+    pub fn overview_ruler_rows_wrapped(
+        &mut self,
+        track_rows: u16,
+        wrap_width: Option<usize>,
+    ) -> Vec<Option<OverviewMark>> {
         let rows = track_rows as usize;
         let mut out = vec![None; rows];
-        let total = self.lines.len();
-        if rows == 0 || total == 0 {
+        if rows == 0 || self.lines.is_empty() {
             return out;
         }
+        // Content position of each line's first row, plus the total.
+        let starts: Vec<usize> = match wrap_width {
+            Some(w) => {
+                let mut acc = 0;
+                (0..=self.lines.len())
+                    .map(|l| {
+                        let at = acc;
+                        if l < self.lines.len() {
+                            acc += self.group_visual_rows(l, w);
+                        }
+                        at
+                    })
+                    .collect()
+            }
+            None => (0..=self.lines.len()).collect(),
+        };
+        let total = starts[self.lines.len()].max(1);
+        let last = self.lines.len() - 1;
         self.refresh_git_marks();
         let mut put = |line: usize, mark: OverviewMark| {
-            let row = (line.min(total - 1) * rows / total).min(rows - 1);
+            let row = (starts[line.min(last)] * rows / total).min(rows - 1);
             out[row] = Some(out[row].map_or(mark, |cur: OverviewMark| cur.max(mark)));
         };
 
@@ -3492,7 +3523,9 @@ impl Editor {
             for (i, line) in self.lines.iter().enumerate() {
                 if crate::widgets::search::split_for_highlight(line, needle, opts)
                     .iter()
-                    .any(|(_, is_match)| *is_match)
+                    // A zero-width match (`^`, `\b`, `q*`) paints no cell
+                    // in the text, so it gets no tick either.
+                    .any(|(text, is_match)| *is_match && !text.is_empty())
                 {
                     put(i, OverviewMark::SearchMatch);
                 }
@@ -12004,7 +12037,10 @@ impl Widget for &mut Editor {
             // the thumb rides on, so problems and search hits off screen are
             // still visible. Computed first so `self` is free while painting.
             if self.overview_ruler {
-                let ticks = self.overview_ruler_rows(metrics.area.height);
+                let ticks = self.overview_ruler_rows_wrapped(
+                    metrics.area.height,
+                    wrap.then_some(text_width as usize),
+                );
                 paint_overview_ruler(buf, metrics.area, &ticks, self.theme);
             }
         }
@@ -16246,13 +16282,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_ticks_paint_over_the_track_without_erasing_the_thumb() {
-        use crate::lsp::manager::DiagnosticSeverity;
-        use ratatui::style::Color;
-        let mut e = ruler_editor();
-        let p = e.path.clone().unwrap();
-        e.apply_diagnostics(p, vec![diag(99, 0, 99, 1, DiagnosticSeverity::Error)]);
+    /// Render `e` into a 40x12 buffer and return it with the track-relative
+    /// rows that carry a ruler tick.
+    fn rendered_ruler_ticks(e: &mut Editor) -> (ratatui::buffer::Buffer, Vec<u16>) {
         let area = Rect {
             x: 0,
             y: 0,
@@ -16260,21 +16292,101 @@ mod tests {
             height: 12,
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
-        let bar_x = e.last_scrollbar.x;
-        let ticks: Vec<u16> = (e.last_scrollbar.y..e.last_scrollbar.y + e.last_scrollbar.height)
-            .filter(|&y| buf[(bar_x, y)].symbol() == "\u{2501}")
+        ratatui::widgets::Widget::render(&mut *e, area, &mut buf);
+        let bar = e.last_scrollbar;
+        let ticks = (0..bar.height)
+            .filter(|&r| buf[(bar.x, bar.y + r)].symbol() == "\u{2501}")
             .collect();
-        assert_eq!(
-            ticks.len(),
-            1,
-            "exactly one error tick belongs on the track"
+        (buf, ticks)
+    }
+
+    #[test]
+    fn the_ticks_paint_over_the_track_without_erasing_the_thumb() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Scrolled to the top, line 0's tick sits on the thumb and line 99's
+        // on the bare track: each must keep the background it was painted on.
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(0, 0, 0, 1, DiagnosticSeverity::Error),
+                diag(99, 0, 99, 1, DiagnosticSeverity::Error),
+            ],
         );
-        let cell = &buf[(bar_x, ticks[0])];
-        assert_ne!(
-            cell.style().bg,
-            Some(Color::Reset),
-            "the tick is a foreground glyph: the track/thumb background stays"
+        let (buf, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(ticks, vec![0, bar.height - 1], "one tick per error");
+        let thumb = if e.focused {
+            e.theme.scrollbar_thumb_focused()
+        } else {
+            e.theme.scrollbar_thumb()
+        };
+        assert_eq!(
+            buf[(bar.x, bar.y)].style().bg,
+            Some(thumb),
+            "a tick on the thumb must not erase it"
+        );
+        assert_eq!(
+            buf[(bar.x, bar.y + bar.height - 1)].style().bg,
+            Some(e.theme.scrollbar_track()),
+            "a tick on the track keeps the track colour"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_file_places_ticks_where_the_thumb_would_reveal_them() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        e.wrap_override = Some(true);
+        // The first half wraps to many rows each, so line 50 starts near the
+        // bottom of the content the thumb travels over — not at its middle.
+        for l in 0..50 {
+            e.lines[l] = "x".repeat(400);
+        }
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(50, 0, 50, 1, DiagnosticSeverity::Error)]);
+        let (_, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(
+            ticks,
+            vec![bar.height - 1],
+            "line 50 starts past 90% of the visual rows, so on the last track row; \
+             a line-count mapping puts it halfway, at {}",
+            bar.height / 2
+        );
+    }
+
+    #[test]
+    fn a_zero_width_regex_match_ticks_nothing() {
+        let mut e = ruler_editor();
+        e.search_highlight_opts.use_regex = true;
+        // Each matches every line at zero width; the text highlighter paints
+        // no cell for any of them, so the ruler must not either.
+        for needle in ["^", "\\b", "q*", "needle|"] {
+            e.search_highlight = Some(String::from(needle));
+            assert!(
+                e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+                "{needle} highlights no text"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_after_a_search_moves_the_search_ticks() {
+        let mut e = ruler_editor();
+        e.search_highlight = Some(String::from("needle"));
+        assert!(e.overview_ruler_rows(10).iter().all(|r| r.is_none()));
+        // Through the real insert path, so a result cached per frame must
+        // notice the buffer changed under it.
+        e.cursor_row = 30;
+        e.cursor_col = 0;
+        for c in "needle ".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
         );
     }
 
