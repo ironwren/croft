@@ -26651,6 +26651,97 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     assert!(applied, "the reply matching the newest request must apply");
 }
 
+// --- Emmet: Expand Abbreviation -------------------------------------------
+
+#[test]
+fn cmd_opt_shift_e_is_the_emmet_expand_chord() {
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Termux / Linux forward SUPER as CONTROL.
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Each modifier is load-bearing: dropping any one must not expand.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::NONE
+    )));
+    // And it is the E chord specifically, not any Cmd+Opt+Shift letter.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// Silence would leave the user unable to tell "wrong language" from
+/// "typo in the abbreviation".
+#[test]
+fn the_emmet_chord_says_so_when_there_is_nothing_to_expand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "div>(span\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["div>(span"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
+}
+
+/// A buffer Emmet does not run in gets a status naming the language, not
+/// the "no abbreviation" message that sends the user hunting for a typo.
+#[test]
+fn the_emmet_chord_names_an_unsupported_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["ul>li*2"]);
+    assert_eq!(app.status, "Emmet: not available in Rust files");
+}
+
 // --- In-editor Find & Replace ---------------------------------------------
 
 /// The Cmd+Opt+F chord as crossterm decodes the forwarded CSI-u sequence
