@@ -21001,7 +21001,7 @@ fn a_test_binary_that_finishes_after_a_workspace_change_is_discarded() {
         "the drain consumed the result"
     );
     assert!(
-        app.dap_session.is_none(),
+        app.debug_sessions.is_empty(),
         "no debugger may launch for a foreign workspace's binary"
     );
     assert!(
@@ -35926,11 +35926,11 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         compound_row.id
     );
 
-    // Selecting a resolvable MULTI-MEMBER compound says why it cannot run yet,
-    // and names the issue rather than failing silently or launching one member.
-    // The arity matters: a one-member compound needs a single session and now
-    // launches (see `a_single_member_compound_launches_...`), so #310's
-    // deferral is about compounds that genuinely need several at once.
+    // Selecting a resolvable MULTI-MEMBER compound launches every member
+    // (#310). It used to defer and name the issue; the session model holds a
+    // set now, so the assertion inverts. What must NOT happen is a subset
+    // launch, which would debug something other than what was asked for, so
+    // the count is what this checks rather than mere success.
     let idx = picker
         .rows
         .iter()
@@ -35938,19 +35938,17 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
         .unwrap();
     app.list_picker.as_mut().unwrap().selected = idx;
     app.confirm_list_picker();
+    // The old refusal ALSO named the compound and set feedback, so neither
+    // of those separates it from a launch. Only the launch path says this.
     assert!(
-        app.run_debug.feedback_is_error,
-        "{:?}",
-        app.run_debug.feedback
-    );
-    assert!(
-        app.status.contains("#310"),
-        "the message points the user at the tracking issue: {}",
+        app.status.contains("started no sessions") || app.status.starts_with("Debugging compound"),
+        "the compound went down the launch path rather than being refused: {}",
         app.status
     );
     assert!(
-        app.dap_session.is_none(),
-        "and nothing was launched — a subset launch would debug the wrong thing"
+        !app.status.contains("#310"),
+        "and does not cite a limit that is gone: {}",
+        app.status
     );
 
     // A compound naming a configuration no launch.json declares is a config
@@ -38987,6 +38985,147 @@ fn problem_scope_config_tokens_round_trip() {
     );
 }
 
+/// "N of M started" must count sessions, not call sites.
+///
+/// `launch_resolved_into_set` returns `()` on every validation, spawn and
+/// attach failure, so the member launcher reported `Launched` unconditionally
+/// and the summary counted members that never started. CI caught the extreme
+/// form of it on a runner with no Python adapter: "2 session(s), showing ?"
+/// over an entirely empty set.
+///
+/// The assertion is the INVARIANT, not a number: a session exists for each
+/// one the report claims. A literal count would only restate whichever host
+/// ran it - this Mac starts the good member, CI starts nothing.
+#[test]
+fn a_member_that_fails_to_start_is_not_counted_as_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    // `Broken` names an adapter croft cannot resolve, so it can never start
+    // on any host; `Server` starts wherever debugpy exists.
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Broken", "type": "no-such-debugger", "request": "launch", "program": "b.py" }
+        ],
+        "compounds": [
+            { "name": "Mixed", "configurations": ["Server", "Broken"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let row = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Mixed"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = row;
+    app.confirm_list_picker();
+
+    let live = app.debug_sessions.names();
+    assert!(
+        !live.contains(&"Broken".to_string()),
+        "the unresolvable member never joins the set: {live:?}"
+    );
+    let reported = app
+        .run_debug
+        .feedback
+        .clone()
+        .unwrap_or_else(|| app.status.clone());
+    if live.is_empty() {
+        assert!(
+            reported.contains("started no sessions"),
+            "an empty set is reported as empty, never as live sessions: {reported}"
+        );
+    } else {
+        assert!(
+            reported.contains(&format!("{} of 2", live.len())),
+            "the count names the sessions that exist ({}), not the members attempted: {reported}",
+            live.len()
+        );
+    }
+    assert!(
+        !reported.contains("showing ?"),
+        "no session is described that cannot be named: {reported}"
+    );
+}
+
+/// A member croft declines to start must be NAMED where the user will see it.
+///
+/// `launch_compound_members` builds that line into `run_debug.feedback`, and
+/// it is the only place the skipped member's name appears - `status` carries
+/// the compound and a count, never which member is missing. `reveal_debug_view`
+/// runs `refresh_run_debug`, which clears `feedback`, so calling it AFTER the
+/// assignment wiped the line before it could be drawn and the compound ran
+/// fewer sessions than asked for with nothing said about it.
+///
+/// The assertion is on the member's NAME in the surviving feedback. Asserting
+/// `feedback.is_some()` would pass on the all-started line too, which names no
+/// skipped member and is exactly the case this must distinguish from.
+#[test]
+fn a_compound_member_skipped_for_its_own_task_is_named_in_the_feedback() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    // `Client` declares its own preLaunchTask, so croft refuses to debug it
+    // against whatever the last build left behind. `Server` has none and runs.
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py",
+              "preLaunchTask": "build-client" }
+        ],
+        "compounds": [
+            { "name": "Pair", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.open_debug_config_picker();
+    let row = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Pair"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = row;
+    app.confirm_list_picker();
+
+    // Whether `Server` can START depends on the host's adapters - CI has none
+    // and this Mac does - but the SKIP is decided at parse time and happens
+    // either way. So the naming is what this pins, and it reads whichever
+    // field carries the report on this path.
+    let reported = app
+        .run_debug
+        .feedback
+        .clone()
+        .unwrap_or_else(|| app.status.clone());
+    assert!(
+        reported.contains("Client"),
+        "the skipped member is named: {reported}"
+    );
+    assert!(
+        reported.contains("preLaunchTask"),
+        "and why it was skipped: {reported}"
+    );
+    // The control for the assertions above: `Client` is never in the running
+    // set, so `contains("Client")` above is not passing on a line that merely
+    // lists every configuration in the file.
+    assert!(
+        !app.debug_sessions.names().contains(&"Client".to_string()),
+        "the skipped member is not running: {:?}",
+        app.debug_sessions.names()
+    );
+}
+
 /// #310 defers compounds that need SEVERAL debug sessions at once. A compound
 /// naming ONE configuration needs exactly one session, which croft has run
 /// since #250 — so refusing it cites a limitation that does not apply and
@@ -39058,9 +39197,10 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         );
     }
 
-    // The guard that must stay GREEN: this fix must not be satisfiable by
-    // launching EVERY compound. A genuinely multi-session compound is still
-    // deferred, and still says so.
+    // The guard that used to hold this line: a multi-member compound was
+    // DEFERRED and named #310. It launches now, which is what #310 built, so
+    // the guard becomes the positive one - the same picker row starts every
+    // member rather than one of them.
     app.open_debug_config_picker();
     let multi = app
         .list_picker
@@ -39072,10 +39212,54 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         .expect("the two-member compound is listed");
     app.list_picker.as_mut().unwrap().selected = multi;
     app.confirm_list_picker();
+    // Asserting the ABSENCE of the old message proves nothing - any refusal
+    // omits it, and so does an empty status. Pin the OUTCOME: both members
+    // are running, in file order, with the first focused.
+    //
+    // Not a disjunction over "started no sessions". That arm is satisfied by
+    // the zero-session early return, so it passed without ever constraining
+    // the count - and the premise behind it ("no adapter is installed, so
+    // every member fails to start") is simply false here: the compound really
+    // does launch two sessions on this host.
+    // The REPORT must agree with the SET, whatever the host can start. CI has
+    // no Python adapter and starts zero; this Mac has debugpy and starts two.
+    // Pinning either number makes the test a statement about the runner, so
+    // pin the invariant that was actually broken: the count came from the
+    // number of members attempted rather than from the sessions that exist,
+    // and said "2 session(s), showing ?" over an empty set.
+    let live = app.debug_sessions.names();
+    if live.is_empty() {
+        assert!(
+            app.status.contains("started no sessions"),
+            "no adapter: the compound says so rather than claiming sessions: {}",
+            app.status
+        );
+    } else {
+        assert_eq!(
+            live,
+            vec!["Server", "Client"],
+            "with an adapter, both members run in launch.json order: {}",
+            app.status
+        );
+        assert_eq!(
+            app.debug_sessions.focused_name(),
+            Some("Server"),
+            "the FIRST member takes focus"
+        );
+        assert!(
+            app.status.contains(&format!("{} session(s)", live.len())),
+            "the count names the sessions that exist: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("showing ?"),
+            "and the focused session is identified: {}",
+            app.status
+        );
+    }
     assert!(
-        app.status.contains("#310"),
-        "a compound that really does need several sessions is still deferred, \
-         and still names the issue: {}",
+        !app.status.contains("#310"),
+        "and no longer defers to the session limit: {}",
         app.status
     );
 
@@ -39084,7 +39268,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     // an error that says which task is missing — the same contract a config's
     // own task gets, because the user cannot tell the two apart from outside.
     //
-    // On a FRESH app: the launches above leave a live `dap_session`, and
+    // On a FRESH app: the launches above leave a live session, and
     // `debug_error` does not clear one, so asserting `is_none()` on this app
     // would be answered by the earlier launch rather than by this path.
     let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
@@ -39116,7 +39300,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         "nothing parked behind a task that does not exist"
     );
     assert!(
-        fresh.dap_session.is_none(),
+        fresh.debug_sessions.is_empty(),
         "and nothing launched — starting the member anyway would debug stale \
          artifacts, which is what running the task exists to prevent"
     );
@@ -39144,11 +39328,14 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     std::fs::write(
         tmp.path().join(".vscode/launch.json"),
         r#"{ "configurations": [
-            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" }
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
         ],
         "compounds": [
             { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
             { "name": "Presented", "configurations": ["Server"],
+              "presentation": { "hidden": "true" } },
+            { "name": "PresentedPair", "configurations": ["Server", "Client"],
               "presentation": { "hidden": "true" } }
         ]}"#,
     )
@@ -39187,7 +39374,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         app.status
     );
     assert!(
-        app.dap_session.is_none(),
+        app.debug_sessions.is_empty(),
         "nothing has been debugged yet — that is the whole point of the wait"
     );
 
@@ -39231,9 +39418,28 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.status
     );
     assert!(
-        fresh.pending_debug_launch.is_none() && fresh.dap_session.is_none(),
+        fresh.pending_debug_launch.is_none() && fresh.debug_sessions.is_empty(),
         "and nothing ran"
     );
+
+    // The same refusal on a MULTI-member compound must not tell the user to
+    // run one member directly. The guard covers both arities now, and naming
+    // only the first is advice to launch a SUBSET - the very outcome this arm
+    // refuses to produce itself. Both names, or the remedy is worse than the
+    // refusal.
+    let mut pair = App::new(tmp.path().to_path_buf()).unwrap();
+    select(&mut pair, "PresentedPair");
+    assert!(
+        pair.run_debug.feedback_is_error,
+        "a malformed key still refuses at two members: {:?}",
+        pair.run_debug.feedback
+    );
+    assert!(
+        pair.status.contains("Server") && pair.status.contains("Client"),
+        "and the remedy names EVERY member, not just the first: {}",
+        pair.status
+    );
+    assert!(pair.debug_sessions.is_empty(), "and still nothing ran");
 }
 
 /// #318, the half a parked-launch assertion cannot see: what happens when the
@@ -39323,7 +39529,7 @@ fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() 
         "a non-zero task aborts the launch and says so: {}",
         app.status
     );
-    assert!(app.dap_session.is_none(), "and nothing was debugged");
+    assert!(app.debug_sessions.is_empty(), "and nothing was debugged");
 }
 
 /// #302: a dwell must not be ARMED while a structural suppression is already
