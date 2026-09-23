@@ -35340,6 +35340,14 @@ impl App {
                     self.status = String::from("Trimmed final newlines");
                 }
             }
+            Cmd::ToggleOverviewRuler => {
+                self.editor.overview_ruler = !self.editor.overview_ruler;
+                self.status = if self.editor.overview_ruler {
+                    String::from("Overview ruler on")
+                } else {
+                    String::from("Overview ruler off")
+                };
+            }
             Cmd::ToggleBookmark => self.toggle_bookmark(),
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),

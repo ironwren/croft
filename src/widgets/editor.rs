@@ -2306,6 +2306,41 @@ pub enum GitMark {
     Deleted,
 }
 
+/// One tick on the editor's overview ruler: the whole-file summary VS Code and
+/// Zed paint down the scrollbar track, so a problem or a search hit outside the
+/// viewport is still visible.
+///
+/// The terminal gives the ruler a single column, where VS Code has three lanes,
+/// so a row that several marks land on shows only the most urgent one. `Ord` IS
+/// that priority — declaration order runs least to most urgent, and the render
+/// takes the `max` of everything mapping to a row. A broken build must never be
+/// hidden behind a whitespace change.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum OverviewMark {
+    GitAdded,
+    GitModified,
+    GitDeleted,
+    SearchMatch,
+    Warning,
+    Error,
+}
+
+impl OverviewMark {
+    /// The tick's colour, matching the in-editor decoration it summarises:
+    /// the git gutter's own three colours, the diagnostic underline's red and
+    /// amber, and the search panel's highlight hue.
+    fn color(self, theme: crate::theme::Theme) -> Color {
+        match self {
+            OverviewMark::GitAdded => theme.git_added(),
+            OverviewMark::GitModified => theme.git_modified(),
+            OverviewMark::GitDeleted => theme.git_deleted(),
+            OverviewMark::SearchMatch => theme.ui(Color::Rgb(0xea, 0x9c, 0x2a)),
+            OverviewMark::Warning => theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
+            OverviewMark::Error => theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+        }
+    }
+}
+
 /// An in-progress snippet expansion: the caret is cycling the tab stops of a
 /// just-expanded snippet. See [`Editor::expand_snippet`].
 #[derive(Debug, Clone)]
@@ -2405,6 +2440,15 @@ pub struct Editor {
     /// did_change to the LSP server, so building lines.join("\n") only
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
+    /// Overview ruler: the lines the search highlight matches, keyed by
+    /// `(edit_seq, needle, options)`. The ruler renders every frame, and
+    /// re-running the search (a regex compile included) over the whole buffer
+    /// per frame is input lag on a large file.
+    ruler_search_cache: Option<(u64, String, crate::widgets::search::SearchOpts, Vec<usize>)>,
+    /// Overview ruler: each line's first visual row in wrap mode, text rows
+    /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
+    /// change without an edit, so they are added at mapping time instead.
+    ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
     /// ops only when `edit_seq` has moved past this, and it is re-pinned
@@ -2692,6 +2736,10 @@ pub struct Editor {
     /// never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Whether the overview ruler paints its whole-file ticks over the
+    /// vertical scrollbar track. On by default, like VS Code's; the palette's
+    /// `View: Toggle Overview Ruler` turns it off for a plain bar.
+    pub overview_ruler: bool,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
     /// Starting ignore-whitespace mode for diffs opened in this editor
@@ -2898,6 +2946,8 @@ impl Editor {
             bookmark_shadow: None,
             bookmark_sync_paused: false,
             edit_seq: 0,
+            ruler_search_cache: None,
+            ruler_starts_cache: None,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
             git_head_lines: None,
@@ -2995,6 +3045,7 @@ impl Editor {
             color_infos: Vec::new(),
             color_path: None,
             registry: LangRegistry::new(),
+            overview_ruler: true,
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
@@ -3617,6 +3668,157 @@ impl Editor {
                 .entry(self.lines.len() - 1)
                 .or_insert(GitMark::Deleted);
         }
+    }
+
+    /// The overview ruler's ticks for a track `track_rows` cells tall: one
+    /// slot per track row, holding the most urgent mark of every buffer line
+    /// that maps to it (see [`OverviewMark`]'s `Ord`).
+    ///
+    /// The whole file is summarised, not just the viewport — that is the point
+    /// of a ruler. Lines are compressed onto the track proportionally, the same
+    /// mapping the scrollbar thumb uses, so a tick sits beside the part of the
+    /// thumb's travel that would bring it on screen.
+    pub fn overview_ruler_rows(&mut self, track_rows: u16) -> Vec<Option<OverviewMark>> {
+        self.overview_ruler_rows_wrapped(track_rows, None)
+    }
+
+    /// [`overview_ruler_rows`](Self::overview_ruler_rows) for a buffer
+    /// soft-wrapped at `wrap_width` columns. The thumb travels over visual
+    /// rows, not lines, so a tick goes where its line's first visual row
+    /// sits: with long lines above it, line 50 of 100 can start near the
+    /// bottom of the content, and a line-count mapping would put it where
+    /// the thumb reveals something else.
+    pub fn overview_ruler_rows_wrapped(
+        &mut self,
+        track_rows: u16,
+        wrap_width: Option<usize>,
+    ) -> Vec<Option<OverviewMark>> {
+        let rows = track_rows as usize;
+        let mut out = vec![None; rows];
+        if rows == 0 || self.lines.is_empty() {
+            return out;
+        }
+        // Content position of each line's first row, plus the total. In wrap
+        // mode the text rows come from a cache that only an edit or a width
+        // change invalidates; comment-box rows (few) are added per call.
+        let n = self.lines.len();
+        let (starts, boxes): (Vec<usize>, Vec<(usize, usize)>) = match wrap_width {
+            Some(w) => {
+                let fresh = matches!(
+                    &self.ruler_starts_cache,
+                    Some((seq, cw, _)) if *seq == self.edit_seq && *cw == w
+                );
+                if !fresh {
+                    let mut acc = 0;
+                    let text: Vec<usize> = (0..=n)
+                        .map(|l| {
+                            let at = acc;
+                            if l < n {
+                                acc += self.line_visual_rows(l, w);
+                            }
+                            at
+                        })
+                        .collect();
+                    self.ruler_starts_cache = Some((self.edit_seq, w, text));
+                }
+                let mut boxes: Vec<(usize, usize)> = (0..self.comment_boxes.len())
+                    .map(|i| (self.comment_boxes[i].line, self.comment_box_height(i, w)))
+                    .collect();
+                boxes.sort_unstable();
+                let starts = self
+                    .ruler_starts_cache
+                    .as_ref()
+                    .map(|(_, _, t)| t.clone())
+                    .unwrap_or_default();
+                (starts, boxes)
+            }
+            None => ((0..=n).collect(), Vec::new()),
+        };
+        // Box rows hang under their line, so they push down every later line.
+        let box_rows_before = |line: usize| -> usize {
+            boxes
+                .iter()
+                .take_while(|(l, _)| *l < line)
+                .map(|(_, h)| h)
+                .sum()
+        };
+        let total = (starts[n] + box_rows_before(n)).max(1);
+        let last = n - 1;
+        // Only lines the search panel would actually highlight count, so the
+        // ruler and the yellow runs in the text can never disagree: both ask
+        // `split_for_highlight` the same question with the same options.
+        let search_hits: Vec<usize> = match self.search_highlight.clone().filter(|n| !n.is_empty())
+        {
+            Some(needle) => {
+                let opts = self.search_highlight_opts;
+                let fresh = matches!(
+                    &self.ruler_search_cache,
+                    Some((seq, cn, co, _)) if *seq == self.edit_seq && *cn == needle && *co == opts
+                );
+                if !fresh {
+                    let hits = self
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            crate::widgets::search::split_for_highlight(line, &needle, opts)
+                                .iter()
+                                // A zero-width match (`^`, `\b`, `q*`) paints no
+                                // cell in the text, so it gets no tick either.
+                                .any(|(text, is_match)| *is_match && !text.is_empty())
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    self.ruler_search_cache = Some((self.edit_seq, needle, opts, hits));
+                }
+                self.ruler_search_cache
+                    .as_ref()
+                    .map(|(_, _, _, h)| h.clone())
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        self.refresh_git_marks();
+        let mut put = |line: usize, mark: OverviewMark| {
+            let line = line.min(last);
+            let row = ((starts[line] + box_rows_before(line)) * rows / total).min(rows - 1);
+            out[row] = Some(out[row].map_or(mark, |cur: OverviewMark| cur.max(mark)));
+        };
+
+        for (&line, mark) in &self.git_marks {
+            put(
+                line,
+                match mark {
+                    GitMark::Added => OverviewMark::GitAdded,
+                    GitMark::Modified => OverviewMark::GitModified,
+                    GitMark::Deleted => OverviewMark::GitDeleted,
+                },
+            );
+        }
+
+        // Only lines the search panel would actually highlight count, so the
+        // ruler and the yellow runs in the text can never disagree: both ask
+        // `split_for_highlight` the same question with the same options.
+        for &i in &search_hits {
+            put(i, OverviewMark::SearchMatch);
+        }
+
+        // Diagnostics outrank everything, so they are applied last — `put`
+        // keeps the max, but ordering the loops this way keeps the intent
+        // readable rather than relying on the comparison alone.
+        for (i, spans) in self.diagnostic_spans.iter().enumerate() {
+            for (_, _, severity) in spans {
+                let mark = match severity {
+                    crate::lsp::manager::DiagnosticSeverity::Error => OverviewMark::Error,
+                    crate::lsp::manager::DiagnosticSeverity::Warning => OverviewMark::Warning,
+                    // Information and Hint are advisory; they would crowd the
+                    // one column they share with real problems.
+                    _ => continue,
+                };
+                put(i, mark);
+            }
+        }
+        out
     }
 
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
@@ -12341,6 +12543,16 @@ impl Widget for &mut Editor {
 
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            // Overview ruler: ticks for the whole file painted over the track
+            // the thumb rides on, so problems and search hits off screen are
+            // still visible. Computed first so `self` is free while painting.
+            if self.overview_ruler {
+                let ticks = self.overview_ruler_rows_wrapped(
+                    metrics.area.height,
+                    wrap.then_some(text_width as usize),
+                );
+                paint_overview_ruler(buf, metrics.area, &ticks, self.theme);
+            }
         }
         if let Some(metrics) = hbar_metrics {
             scrollbar::render_horizontal(buf, metrics, self.focused, self.theme);
@@ -12725,6 +12937,32 @@ fn search_highlight_styles(theme: crate::theme::Theme) -> (Style, Style) {
         .bg(theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
         .add_modifier(Modifier::BOLD);
     (inactive, active)
+}
+
+/// Paint the overview ruler's ticks over an already-rendered scrollbar track.
+///
+/// The tick is a foreground glyph, not a background fill, so the thumb still
+/// shows through underneath it: the ruler must not cost you the ability to see
+/// where you are in the file, which is what the scrollbar is for.
+fn paint_overview_ruler(
+    buf: &mut Buffer,
+    area: Rect,
+    ticks: &[Option<OverviewMark>],
+    theme: crate::theme::Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    for (row, tick) in ticks.iter().enumerate() {
+        let Some(mark) = tick else { continue };
+        let y = area.y.saturating_add(row as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        let cell = &mut buf[(area.x, y)];
+        cell.set_symbol("\u{2501}"); // ━ heavy horizontal: a tick across the track
+        cell.set_fg(mark.color(theme));
+    }
 }
 
 // Render helper: each argument is an independent painting input (buffer,
@@ -16778,6 +17016,328 @@ mod tests {
             severity,
             message: String::from("test diagnostic"),
         }
+    }
+
+    // --- Overview ruler ---------------------------------------------------
+
+    /// A 100-line buffer with a path, so git marks and diagnostics can attach.
+    fn ruler_editor() -> Editor {
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let mut e = editor_with(&body);
+        e.path = Some(std::path::PathBuf::from("/tmp/ruler.rs"));
+        e
+    }
+
+    #[test]
+    fn an_unmarked_file_produces_an_empty_ruler() {
+        let mut e = ruler_editor();
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(rows.len(), 20, "one slot per track row");
+        assert!(rows.iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn a_zero_height_track_asks_for_no_slots() {
+        let mut e = ruler_editor();
+        assert!(e.overview_ruler_rows(0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_buffer_does_not_divide_by_its_line_count() {
+        let mut e = Editor::new();
+        e.lines.clear();
+        assert_eq!(e.overview_ruler_rows(10).len(), 10);
+    }
+
+    #[test]
+    fn a_diagnostic_lands_on_the_track_row_its_line_maps_to() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Line 51 (0-based 50) of 100 lines on a 20-row track => row 10.
+        e.apply_diagnostics(p, vec![diag(50, 0, 50, 4, DiagnosticSeverity::Error)]);
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(rows[10], Some(OverviewMark::Error));
+        assert_eq!(
+            rows.iter().filter(|r| r.is_some()).count(),
+            1,
+            "one diagnostic must not smear across the track"
+        );
+    }
+
+    #[test]
+    fn the_last_line_maps_inside_the_track_rather_than_one_past_it() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(99, 0, 99, 1, DiagnosticSeverity::Error)]);
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(
+            rows[19],
+            Some(OverviewMark::Error),
+            "the final line belongs on the final track row, not out of bounds"
+        );
+    }
+
+    #[test]
+    fn an_error_outranks_a_warning_sharing_a_track_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Lines 0 and 1 both compress onto track row 0 (100 lines / 10 rows).
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(0, 0, 0, 1, DiagnosticSeverity::Warning),
+                diag(1, 0, 1, 1, DiagnosticSeverity::Error),
+            ],
+        );
+        assert_eq!(
+            e.overview_ruler_rows(10)[0],
+            Some(OverviewMark::Error),
+            "a broken build must not be hidden behind a warning on the next line"
+        );
+    }
+
+    #[test]
+    fn hints_and_information_stay_off_the_ruler() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(10, 0, 10, 1, DiagnosticSeverity::Hint),
+                diag(30, 0, 30, 1, DiagnosticSeverity::Information),
+            ],
+        );
+        assert!(
+            e.overview_ruler_rows(20).iter().all(|r| r.is_none()),
+            "advisory diagnostics would crowd the one column real problems use"
+        );
+    }
+
+    #[test]
+    fn search_matches_are_ticked_only_where_the_highlighter_agrees() {
+        let mut e = ruler_editor();
+        e.lines[20] = String::from("needle here");
+        e.lines[60] = String::from("NEEDLE shouting");
+        e.search_highlight = Some(String::from("needle"));
+        // Case-insensitive by default: both lines match.
+        let rows = e.overview_ruler_rows(10);
+        assert_eq!(rows[2], Some(OverviewMark::SearchMatch));
+        assert_eq!(rows[6], Some(OverviewMark::SearchMatch));
+
+        e.search_highlight_opts.case_sensitive = true;
+        let rows = e.overview_ruler_rows(10);
+        assert_eq!(rows[2], Some(OverviewMark::SearchMatch));
+        assert_eq!(
+            rows[6], None,
+            "the ruler must agree with the yellow runs in the text, not guess"
+        );
+    }
+
+    #[test]
+    fn an_empty_needle_ticks_nothing() {
+        let mut e = ruler_editor();
+        e.search_highlight = Some(String::new());
+        assert!(e.overview_ruler_rows(10).iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn a_diagnostic_outranks_a_search_hit_on_the_same_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.lines[5] = String::from("needle");
+        e.search_highlight = Some(String::from("needle"));
+        e.apply_diagnostics(p, vec![diag(5, 0, 5, 1, DiagnosticSeverity::Warning)]);
+        assert_eq!(e.overview_ruler_rows(10)[0], Some(OverviewMark::Warning));
+    }
+
+    #[test]
+    fn the_mark_priority_order_is_the_declared_one() {
+        // The render relies on `Ord`, so pin it rather than the comparison
+        // silently inverting when a variant is inserted in the middle.
+        assert!(OverviewMark::Error > OverviewMark::Warning);
+        assert!(OverviewMark::Warning > OverviewMark::SearchMatch);
+        assert!(OverviewMark::SearchMatch > OverviewMark::GitDeleted);
+        assert!(OverviewMark::GitDeleted > OverviewMark::GitModified);
+        assert!(OverviewMark::GitModified > OverviewMark::GitAdded);
+    }
+
+    #[test]
+    fn git_marks_reach_the_ruler_in_their_own_three_colours() {
+        let mut e = ruler_editor();
+        // A HEAD baseline that differs from the buffer on known lines.
+        let mut head: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        head[10] = String::from("line 11 as committed");
+        e.git_head_lines = Some(head);
+        e.git_baseline_for = e.path.clone();
+        let rows = e.overview_ruler_rows(100);
+        assert_eq!(
+            rows[10],
+            Some(OverviewMark::GitModified),
+            "an edited line must show as modified on the ruler; rows were {:?}",
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.is_some())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Render `e` into a 40x12 buffer and return it with the track-relative
+    /// rows that carry a ruler tick.
+    fn rendered_ruler_ticks(e: &mut Editor) -> (ratatui::buffer::Buffer, Vec<u16>) {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut *e, area, &mut buf);
+        let bar = e.last_scrollbar;
+        let ticks = (0..bar.height)
+            .filter(|&r| buf[(bar.x, bar.y + r)].symbol() == "\u{2501}")
+            .collect();
+        (buf, ticks)
+    }
+
+    #[test]
+    fn the_ticks_paint_over_the_track_without_erasing_the_thumb() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Scrolled to the top, line 0's tick sits on the thumb and line 99's
+        // on the bare track: each must keep the background it was painted on.
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(0, 0, 0, 1, DiagnosticSeverity::Error),
+                diag(99, 0, 99, 1, DiagnosticSeverity::Error),
+            ],
+        );
+        let (buf, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(ticks, vec![0, bar.height - 1], "one tick per error");
+        let thumb = if e.focused {
+            e.theme.scrollbar_thumb_focused()
+        } else {
+            e.theme.scrollbar_thumb()
+        };
+        assert_eq!(
+            buf[(bar.x, bar.y)].style().bg,
+            Some(thumb),
+            "a tick on the thumb must not erase it"
+        );
+        assert_eq!(
+            buf[(bar.x, bar.y + bar.height - 1)].style().bg,
+            Some(e.theme.scrollbar_track()),
+            "a tick on the track keeps the track colour"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_file_places_ticks_where_the_thumb_would_reveal_them() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        e.wrap_override = Some(true);
+        // The first half wraps to many rows each, so line 50 starts near the
+        // bottom of the content the thumb travels over — not at its middle.
+        for l in 0..50 {
+            e.lines[l] = "x".repeat(400);
+        }
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(50, 0, 50, 1, DiagnosticSeverity::Error)]);
+        let (_, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(
+            ticks,
+            vec![bar.height - 1],
+            "line 50 starts past 90% of the visual rows, so on the last track row; \
+             a line-count mapping puts it halfway, at {}",
+            bar.height / 2
+        );
+    }
+
+    #[test]
+    fn a_zero_width_regex_match_ticks_nothing() {
+        let mut e = ruler_editor();
+        e.search_highlight_opts.use_regex = true;
+        // Each matches every line at zero width; the text highlighter paints
+        // no cell for any of them, so the ruler must not either.
+        for needle in ["^", "\\b", "q*", "needle|"] {
+            e.search_highlight = Some(String::from(needle));
+            assert!(
+                e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+                "{needle} highlights no text"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_after_a_search_moves_the_search_ticks() {
+        let mut e = ruler_editor();
+        e.search_highlight = Some(String::from("needle"));
+        assert!(e.overview_ruler_rows(10).iter().all(|r| r.is_none()));
+        // Through the real insert path, so a result cached per frame must
+        // notice the buffer changed under it.
+        e.cursor_row = 30;
+        e.cursor_col = 0;
+        for c in "needle ".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+    }
+
+    /// The search ticks are cached per `(edit, needle, options)`, so a new
+    /// needle or a flipped option must be a miss, not a stale answer.
+    #[test]
+    fn a_new_needle_or_option_recomputes_the_cached_search_ticks() {
+        let mut e = ruler_editor();
+        e.lines[30] = String::from("Needle");
+        e.search_highlight = Some(String::from("needle"));
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+        e.search_highlight_opts.case_sensitive = true;
+        assert!(
+            e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+            "case-sensitive `needle` does not match `Needle`"
+        );
+        e.search_highlight = Some(String::from("Needle"));
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+    }
+
+    #[test]
+    fn toggling_the_ruler_off_leaves_a_plain_scrollbar() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(99, 0, 99, 1, DiagnosticSeverity::Error)]);
+        e.overview_ruler = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let bar_x = e.last_scrollbar.x;
+        assert!(
+            (e.last_scrollbar.y..e.last_scrollbar.y + e.last_scrollbar.height)
+                .all(|y| buf[(bar_x, y)].symbol() != "\u{2501}"),
+            "the toggle must actually stop the paint, not just dim it"
+        );
     }
 
     #[test]
