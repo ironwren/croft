@@ -27898,6 +27898,12 @@ impl App {
 
     /// Clear every bookmark in the open file, reporting how many went.
     fn clear_bookmarks(&mut self) {
+        // Every path in (chord and palette) goes through here, so the guard
+        // lives here: a preview or non-text view must not clear marks it does
+        // not show.
+        if !self.editor_is_text() {
+            return;
+        }
         let gone = self.editor.clear_bookmarks();
         self.status = if gone == 0 {
             String::from("No bookmarks in this file")
@@ -28231,9 +28237,7 @@ impl App {
             return;
         }
         if is_clear_bookmarks_key(key) {
-            if self.editor_is_text() {
-                self.clear_bookmarks();
-            }
+            self.clear_bookmarks();
             return;
         }
         // Formerly palette-only editor commands, now each on a chord so none

@@ -26780,6 +26780,25 @@ fn bookmark_clear_chord_is_cmd_opt_shift_b_and_clears_the_file() {
     assert_eq!(app.status, "Cleared 2 bookmarks");
 }
 
+/// The palette command reaches `clear_bookmarks` without the chord's
+/// handler, so the non-text guard has to hold on that path too.
+#[test]
+fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.md", "# a\n\nb\n");
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert_eq!(app.editor.bookmarked_lines(), vec![3], "the preview hides them");
+    // Back on the source, the same command clears, so the assertion above is
+    // the guard and not a command that does nothing.
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert!(app.editor.bookmarked_lines().is_empty());
+}
+
 #[test]
 fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
     let tmp = tempfile::tempdir().unwrap();

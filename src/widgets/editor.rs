@@ -2393,6 +2393,10 @@ pub struct Editor {
     /// deletes, undo and reloads (see [`shift_bookmark_lines`]). Held only
     /// while the open file has marks, so an unmarked file pays nothing.
     bookmark_shadow: Option<(PathBuf, Vec<String>)>,
+    /// Set while a multi-character insert (a paste) runs its per-character
+    /// helpers, so the bookmark sync runs once at the end instead of once per
+    /// character.
+    bookmark_sync_paused: bool,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -2889,6 +2893,7 @@ impl Editor {
             breakpoint_logs: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
             bookmark_shadow: None,
+            bookmark_sync_paused: false,
             edit_seq: 0,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
@@ -3313,6 +3318,9 @@ impl Editor {
     /// is dropped, so a change whose mapping is unknown (a reload with no
     /// shadow) still never leaves a mark beyond the buffer.
     fn sync_bookmarks_to_buffer(&mut self) {
+        if self.bookmark_sync_paused {
+            return;
+        }
         let Some(path) = self.path.clone() else {
             self.bookmark_shadow = None;
             return;
@@ -3321,19 +3329,34 @@ impl Editor {
             self.bookmark_shadow = None;
             return;
         };
-        if let Some((shadow_path, old)) = self.bookmark_shadow.take()
-            && shadow_path == path
-            && old.len() != self.lines.len()
-        {
-            *set = shift_bookmark_lines(set, &old, &self.lines);
-        }
+        let mut shadow = match self.bookmark_shadow.take() {
+            Some((shadow_path, old)) if shadow_path == path => {
+                if old.len() != self.lines.len() {
+                    *set = shift_bookmark_lines(set, &old, &self.lines);
+                }
+                old
+            }
+            _ => Vec::new(),
+        };
         let len = self.lines.len();
         set.retain(|&l| (1..=len).contains(&l));
         if set.is_empty() {
             self.bookmarks.remove(&path);
             return;
         }
-        self.bookmark_shadow = Some((path, self.lines.clone()));
+        // Bring the shadow up to date in place rather than cloning the whole
+        // buffer: this runs on every keystroke in a marked file, and a
+        // keystroke changes one row. Only differing rows are copied, into
+        // the allocations they already have.
+        shadow.truncate(len);
+        for (old, new) in shadow.iter_mut().zip(&self.lines) {
+            if old != new {
+                old.clone_from(new);
+            }
+        }
+        let have = shadow.len();
+        shadow.extend(self.lines[have..].iter().cloned());
+        self.bookmark_shadow = Some((path, shadow));
     }
 
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
@@ -6180,6 +6203,9 @@ impl Editor {
         }
         let start_line = self.cursor_row;
         let before = self.lines.len();
+        // One bookmark sync for the whole paste, diffed against the text
+        // `push_undo` recorded above, not one per character.
+        self.bookmark_sync_paused = true;
         for c in s.chars() {
             if c == '\n' {
                 self.insert_newline_raw();
@@ -6187,6 +6213,8 @@ impl Editor {
                 self.insert_char_raw(c);
             }
         }
+        self.bookmark_sync_paused = false;
+        self.sync_bookmarks_to_buffer();
         // The line the insertion started on is rewritten too, so it counts as
         // written by this seat — hence the `+ 1`. But clamp to the lines that
         // actually EXIST: inserting into an empty buffer pushes the first
