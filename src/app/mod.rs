@@ -27540,7 +27540,12 @@ impl App {
         if !self.editor_is_text() {
             return;
         }
-        self.status = if self.editor.expand_emmet_abbreviation() {
+        self.status = if !self.editor.emmet_available() {
+            format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            )
+        } else if self.editor.expand_emmet_abbreviation() {
             String::from("Emmet: expanded abbreviation")
         } else {
             String::from("Emmet: no abbreviation at the cursor")

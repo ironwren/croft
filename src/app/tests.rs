@@ -26723,6 +26723,25 @@ fn the_emmet_chord_says_so_when_there_is_nothing_to_expand() {
     assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
 }
 
+/// A buffer Emmet does not run in gets a status naming the language, not
+/// the "no abbreviation" message that sends the user hunting for a typo.
+#[test]
+fn the_emmet_chord_names_an_unsupported_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["ul>li*2"]);
+    assert_eq!(app.status, "Emmet: not available in Rust files");
+}
+
 // --- In-editor Find & Replace ---------------------------------------------
 
 /// The Cmd+Opt+F chord as crossterm decodes the forwarded CSI-u sequence

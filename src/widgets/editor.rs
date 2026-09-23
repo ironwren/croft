@@ -8932,6 +8932,18 @@ impl Editor {
         true
     }
 
+    /// The Emmet dialect this buffer expands into, or `None` where the chord
+    /// is not offered.
+    fn emmet_profile(&self) -> Option<crate::emmet::Profile> {
+        emmet_profile_for(self.lang, self.path.as_deref())
+    }
+
+    /// Whether Emmet expansion is offered in this buffer at all, so the
+    /// caller can tell "wrong language" apart from "nothing to expand".
+    pub fn emmet_available(&self) -> bool {
+        self.emmet_profile().is_some()
+    }
+
     /// VS Code "Emmet: Expand Abbreviation"
     /// (`editor.emmet.action.expandAbbreviation`): replace the abbreviation
     /// ending at the cursor with the markup it stands for, and leave the
@@ -8942,9 +8954,9 @@ impl Editor {
     /// prose and in code rather than mangling either. Returns whether
     /// anything expanded, which the caller reports in the status bar.
     pub fn expand_emmet_abbreviation(&mut self) -> bool {
-        if !lang_supports_emmet(self.lang) {
+        let Some(profile) = self.emmet_profile() else {
             return false;
-        }
+        };
         let row = self.cursor_row;
         let col = self.cursor_col;
         let line = match self.lines.get(row) {
@@ -8956,7 +8968,7 @@ impl Editor {
             None => return false,
         };
         let unit = self.indent_unit();
-        let (markup, caret) = match crate::emmet::expand(&abbr, &unit) {
+        let (markup, caret) = match crate::emmet::expand(&abbr, &unit, profile) {
             Some(v) => v,
             None => return false,
         };
@@ -8974,6 +8986,7 @@ impl Editor {
             String::new()
         };
 
+        self.pin_on_edit();
         self.push_undo(EditKind::EmmetExpand);
         self.last_edit_kind = None;
 
@@ -10427,14 +10440,28 @@ fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
     }
 }
 
-/// Buffers where Emmet abbreviation expansion is offered, matching VS Code's
-/// default `emmet.includeLanguages` set: the markup grammars, plus the two
-/// JSX ones where abbreviations expand into JSX.
-fn lang_supports_emmet(lang: Option<LangKind>) -> bool {
-    matches!(
-        lang,
-        Some(LangKind::Html) | Some(LangKind::Xml) | Some(LangKind::Tsx)
-    )
+/// The Emmet dialect for a buffer, or `None` where expansion is not offered,
+/// matching VS Code's default `emmet.includeLanguages`. `.jsx` shares
+/// `LangKind::JavaScript` with plain `.js`, so the extension tells them
+/// apart: an abbreviation in ordinary JavaScript is code, not markup.
+fn emmet_profile_for(
+    lang: Option<LangKind>,
+    path: Option<&std::path::Path>,
+) -> Option<crate::emmet::Profile> {
+    use crate::emmet::Profile;
+    match lang {
+        Some(LangKind::Html) => Some(Profile::Html),
+        Some(LangKind::Xml) => Some(Profile::Xml),
+        Some(LangKind::Tsx) => Some(Profile::Jsx),
+        Some(LangKind::JavaScript)
+            if path
+                .and_then(|p| p.extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsx")) =>
+        {
+            Some(Profile::Jsx)
+        }
+        _ => None,
+    }
 }
 
 /// Display name for a language mode, matching VS Code's status-bar labels.
@@ -24233,6 +24260,51 @@ mod tests {
         assert_eq!(e.lines.len(), 5);
         e.undo();
         assert_eq!(e.lines, vec!["ul>li*3"]);
+    }
+
+    /// With no empty element the caret goes to the end of the expansion,
+    /// not back to the start of the line.
+    #[test]
+    fn emmet_leaves_the_caret_after_the_expansion_when_nothing_is_empty() {
+        let mut e = html_editor("p{Hello}</div>", 8);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<p>Hello</p></div>"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 12));
+    }
+
+    /// An expansion is an edit like any other: it pins a preview tab so
+    /// the next preview open does not reuse the tab and discard it.
+    #[test]
+    fn emmet_expansion_pins_a_preview_tab() {
+        let mut e = html_editor("div", 3);
+        e.preview = true;
+        assert!(e.expand_emmet_abbreviation());
+        assert!(!e.preview);
+    }
+
+    /// `.jsx` shares `LangKind::JavaScript` with plain `.js`, so the file
+    /// extension decides: JSX expands, ordinary JavaScript does not.
+    #[test]
+    fn emmet_runs_in_jsx_files_but_not_plain_javascript() {
+        let mut e = html_editor("img", 3);
+        e.lang = Some(LangKind::JavaScript);
+        e.path = Some(PathBuf::from("App.jsx"));
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<img />"]);
+
+        let mut e = html_editor("img", 3);
+        e.lang = Some(LangKind::JavaScript);
+        e.path = Some(PathBuf::from("app.js"));
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["img"]);
+    }
+
+    #[test]
+    fn emmet_self_closes_void_elements_in_tsx() {
+        let mut e = html_editor("br", 2);
+        e.lang = Some(LangKind::Tsx);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<br />"]);
     }
 
     #[test]

@@ -30,6 +30,24 @@ const VOID_ELEMENTS: &[&str] = &[
 /// asked for.
 const MAX_REPEAT: usize = 1000;
 
+/// A cap on the elements one expansion renders. `MAX_REPEAT` bounds each
+/// node, not their product: nested, `div*1000>span*1000` would still render
+/// a million elements.
+const MAX_ELEMENTS: usize = 100_000;
+
+/// The markup dialect an expansion is written in. The three differ only in
+/// how a void element closes and in JSX's attribute spellings; everything
+/// else is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// `<img>` — HTML5 void elements take no closing slash.
+    Html,
+    /// `<img/>` — XML has no void elements, so an unclosed one is malformed.
+    Xml,
+    /// `<img />` with `className` — JSX rejects an unclosed tag outright.
+    Jsx,
+}
+
 /// One element in a parsed abbreviation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Node {
@@ -52,18 +70,35 @@ struct Node {
 /// The returned offset is where the caret belongs: the first empty element's
 /// content position, which is where typing continues. It is a byte offset
 /// into the returned string.
-pub fn expand(abbr: &str, indent: &str) -> Option<(String, usize)> {
+pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usize)> {
     let nodes = parse(abbr)?;
-    let mut out = String::new();
-    render_all(&nodes, None, indent, 0, 1, &mut out);
-    if out.is_empty() {
+    if element_count(&nodes) > MAX_ELEMENTS {
         return None;
     }
-    // The first empty element is where Emmet drops the caret. `></` can only
-    // occur between an element's own tags, because a nested child always has
-    // a newline between them.
-    let caret = out.find("></").map_or(out.len(), |i| i + 1);
-    Some((out, caret))
+    let mut r = Renderer {
+        indent,
+        profile,
+        out: String::new(),
+        caret: None,
+    };
+    r.render_all(&nodes, None, 0, 1)?;
+    if r.out.is_empty() {
+        return None;
+    }
+    // With no empty element the caret goes to the end of the last line, not
+    // past its newline: the editor drops that newline when it splices the
+    // expansion in.
+    let caret = r.caret.unwrap_or(r.out.len() - 1);
+    Some((r.out, caret))
+}
+
+/// How many elements `nodes` renders, saturating rather than overflowing on
+/// an absurd product of repeats.
+fn element_count(nodes: &[Node]) -> usize {
+    nodes.iter().fold(0usize, |acc, n| {
+        let own = usize::from(!n.group).saturating_add(element_count(&n.children));
+        acc.saturating_add(n.repeat.saturating_mul(own))
+    })
 }
 
 /// The abbreviation immediately left of `col` (a char index) in `line`, as a
@@ -433,7 +468,9 @@ impl Parser<'_> {
                 }
                 Some('[') => {
                     self.pos += 1;
-                    node.attrs = self.attrs()?;
+                    // `a[href=x][title=y]` keeps both groups.
+                    let attrs = self.attrs()?;
+                    node.attrs.extend(attrs);
                 }
                 Some('{') => {
                     self.pos += 1;
@@ -534,71 +571,108 @@ fn implicit_tag(parent: Option<&str>) -> &'static str {
     }
 }
 
-fn render_all(
-    nodes: &[Node],
-    parent: Option<&str>,
-    indent: &str,
-    depth: usize,
-    inherited: usize,
-    out: &mut String,
-) {
-    for node in nodes {
-        for i in 1..=node.repeat {
-            // A node without its own repetition numbers from the nearest
-            // repeated ancestor, so `li.item*3>a{Link $}` counts its links.
-            let index = if node.repeat > 1 { i } else { inherited };
-            render(node, parent, indent, depth, index, out);
-        }
-    }
+struct Renderer<'a> {
+    indent: &'a str,
+    profile: Profile,
+    out: String,
+    /// Byte offset of the first empty element's content, recorded as it is
+    /// rendered. Searching the output afterwards would mistake `></` inside
+    /// text or an attribute value for an element boundary.
+    caret: Option<usize>,
 }
 
-fn render(
-    node: &Node,
-    parent: Option<&str>,
-    indent: &str,
-    depth: usize,
-    index: usize,
-    out: &mut String,
-) {
-    if node.group {
-        render_all(&node.children, parent, indent, depth, index, out);
-        return;
-    }
-    let name = if node.name.is_empty() {
-        implicit_tag(parent).to_string()
-    } else {
-        number(&node.name, index)
-    };
-
-    let pad = indent.repeat(depth);
-    out.push_str(&pad);
-    out.push('<');
-    out.push_str(&name);
-    if let Some(id) = &node.id {
-        out.push_str(&format!(" id=\"{}\"", number(id, index)));
-    }
-    if !node.classes.is_empty() {
-        let classes: Vec<String> = node.classes.iter().map(|c| number(c, index)).collect();
-        out.push_str(&format!(" class=\"{}\"", classes.join(" ")));
-    }
-    for (k, v) in &node.attrs {
-        out.push_str(&format!(" {}=\"{}\"", k, number(v, index)));
-    }
-    out.push('>');
-
-    if VOID_ELEMENTS.contains(&name.as_str()) {
-        out.push('\n');
-        return;
+impl Renderer<'_> {
+    /// `None` when the abbreviation asks for something markup cannot hold.
+    fn render_all(
+        &mut self,
+        nodes: &[Node],
+        parent: Option<&str>,
+        depth: usize,
+        inherited: usize,
+    ) -> Option<()> {
+        for node in nodes {
+            for i in 1..=node.repeat {
+                // A node without its own repetition numbers from the nearest
+                // repeated ancestor, so `li.item*3>a{Link $}` counts its links.
+                let index = if node.repeat > 1 { i } else { inherited };
+                self.render(node, parent, depth, index)?;
+            }
+        }
+        Some(())
     }
 
-    if !node.children.is_empty() {
-        out.push('\n');
-        render_all(&node.children, Some(&name), indent, depth + 1, index, out);
-        out.push_str(&pad);
-    } else if let Some(t) = &node.text {
-        out.push_str(&number(t, index));
+    fn render(
+        &mut self,
+        node: &Node,
+        parent: Option<&str>,
+        depth: usize,
+        index: usize,
+    ) -> Option<()> {
+        if node.group {
+            return self.render_all(&node.children, parent, depth, index);
+        }
+        let name = if node.name.is_empty() {
+            implicit_tag(parent).to_string()
+        } else {
+            number(&node.name, index)
+        };
+        let void = VOID_ELEMENTS.contains(&name.as_str());
+        // A void element has nowhere to put content, so `img>span` would
+        // silently lose the `span`.
+        if void && (!node.children.is_empty() || node.text.is_some()) {
+            return None;
+        }
+        let jsx = self.profile == Profile::Jsx;
+
+        let pad = self.indent.repeat(depth);
+        self.out.push_str(&pad);
+        self.out.push('<');
+        self.out.push_str(&name);
+        if let Some(id) = &node.id {
+            self.out.push_str(&format!(" id=\"{}\"", number(id, index)));
+        }
+        if !node.classes.is_empty() {
+            let classes: Vec<String> = node.classes.iter().map(|c| number(c, index)).collect();
+            let key = if jsx { "className" } else { "class" };
+            self.out
+                .push_str(&format!(" {key}=\"{}\"", classes.join(" ")));
+        }
+        for (k, v) in &node.attrs {
+            let k = match (jsx, k.as_str()) {
+                (true, "class") => "className",
+                (true, "for") => "htmlFor",
+                _ => k,
+            };
+            self.out
+                .push_str(&format!(" {}=\"{}\"", k, number(v, index)));
+        }
+
+        if void {
+            self.out.push_str(match self.profile {
+                Profile::Html => ">\n",
+                Profile::Xml => "/>\n",
+                Profile::Jsx => " />\n",
+            });
+            return Some(());
+        }
+        self.out.push('>');
+
+        if !node.children.is_empty() {
+            self.out.push('\n');
+            self.render_all(&node.children, Some(&name), depth + 1, index)?;
+            self.out.push_str(&pad);
+        } else {
+            let text = node.text.as_deref().map(|t| number(t, index));
+            if text.as_deref().unwrap_or("").is_empty() && self.caret.is_none() {
+                self.caret = Some(self.out.len());
+            }
+            if let Some(t) = text {
+                self.out.push_str(&t);
+            }
+        }
+        self.out.push_str(&format!("</{name}>\n"));
+        Some(())
     }
-    out.push_str(&format!("</{name}>\n"));
 }
 
 /// Substitute `$` runs with `index`, zero-padded to the run's length —
@@ -630,6 +704,12 @@ fn number(s: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The HTML profile, which is what every test below means unless it
+    /// names another.
+    fn expand(abbr: &str, indent: &str) -> Option<(String, usize)> {
+        super::expand(abbr, indent, Profile::Html)
+    }
 
     fn ex(abbr: &str) -> String {
         expand(abbr, "  ").expect("should expand").0
@@ -789,10 +869,66 @@ mod tests {
         assert_eq!(&out[caret..caret + 7], "</span>");
     }
 
+    /// The end of the expansion's last line, not past its trailing newline:
+    /// the editor drops that newline when it splices the lines in, so an
+    /// offset beyond it lands on no line at all.
     #[test]
     fn the_caret_falls_to_the_end_when_nothing_is_empty() {
         let (out, caret) = expand("p{hi}", "  ").unwrap();
-        assert_eq!(caret, out.len());
+        assert_eq!(caret, out.len() - 1);
+        assert_eq!(&out[caret..], "\n");
+    }
+
+    /// The caret is placed from the element structure, so markup-like text
+    /// in a brace or an attribute value cannot pass for an empty element.
+    #[test]
+    fn markup_inside_text_does_not_capture_the_caret() {
+        let (out, caret) = expand("p{a></b}+span", "  ").unwrap();
+        assert_eq!(&out[caret..], "</span>\n");
+    }
+
+    #[test]
+    fn markup_inside_an_attribute_value_does_not_capture_the_caret() {
+        let (out, caret) = expand("a[title=\"></\"]", "  ").unwrap();
+        assert_eq!(out, "<a title=\"></\"></a>\n");
+        assert_eq!(&out[caret..], "</a>\n");
+    }
+
+    #[test]
+    fn every_attribute_group_is_kept() {
+        assert_eq!(ex("a[href=x][title=y]"), "<a href=\"x\" title=\"y\"></a>\n");
+    }
+
+    /// A void element has nowhere to put children, so accepting `img>span`
+    /// would silently throw the `span` away.
+    #[test]
+    fn a_void_element_with_content_does_not_expand() {
+        assert!(expand("img>span", "  ").is_none());
+        assert!(expand("br{text}", "  ").is_none());
+        // An implicit name resolving to a void element is caught too.
+        assert!(expand("map>.x>span", "  ").is_none());
+        assert!(expand("img+span", "  ").is_some());
+    }
+
+    #[test]
+    fn xml_self_closes_void_elements() {
+        assert_eq!(
+            super::expand("br+img[src=a]", "  ", Profile::Xml)
+                .unwrap()
+                .0,
+            "<br/>\n<img src=\"a\"/>\n"
+        );
+    }
+
+    /// JSX refuses an unclosed tag, and spells `class` and `for` its own way.
+    #[test]
+    fn jsx_self_closes_and_renames_attributes() {
+        assert_eq!(
+            super::expand("img.hero+label[for=q]", "  ", Profile::Jsx)
+                .unwrap()
+                .0,
+            "<img className=\"hero\" />\n<label htmlFor=\"q\"></label>\n"
+        );
     }
 
     // ---- Things that must NOT expand -------------------------------------
@@ -853,6 +989,15 @@ mod tests {
         assert!(expand("div*1000", "  ").is_some());
         assert!(expand("div*1001", "  ").is_none());
         assert!(expand("div*0", "  ").is_none());
+    }
+
+    /// The per-node cap does not bound a product of repeats: nested, it
+    /// would render a million spans. The total output is capped as well.
+    #[test]
+    fn a_nested_product_of_repeats_is_refused() {
+        assert!(expand("div*1000>span*1000", "  ").is_none());
+        assert!(expand("(div>(span*1000))*1000", "  ").is_none());
+        assert!(expand("div*100>span*100", "  ").is_some());
     }
 
     // ---- Locating the abbreviation in a line ------------------------------
