@@ -10924,19 +10924,24 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 }
 
 /// Map 1-based bookmark `marks` across a buffer change from `old` to `new`.
-/// The change is located as the span between the longest common prefix and
-/// suffix of the two buffers, which is exact for any single contiguous edit
-/// (a newline, a paste, a line delete, an undo step). Marks above the span
-/// stay; marks below it move by the line-count delta; marks inside it keep
-/// their row while that row still exists in the replacement. A mark whose
-/// row was deleted collapses onto the replacement's last line when there is
-/// one (the join line a backspace or a partial-line selection delete leaves
-/// behind) and is dropped when whole lines were removed outright.
+///
+/// The common prefix and suffix are trimmed first (cheap, and usually the
+/// whole answer for a keystroke), then the changed middle is line-diffed, so
+/// an edit that touched several places at once (multi-cursor line delete,
+/// LSP formatting, Replace All with newlines, or the undo of any of them)
+/// moves each mark by what changed above IT, not by one span's delta.
+///
+/// Per diff op: an unchanged line carries its mark to its new row; within a
+/// replaced run a mark keeps its offset while that row still exists and
+/// otherwise collapses onto the run's last new line (the join line a
+/// backspace or a partial-line selection delete leaves behind); a mark on a
+/// line deleted outright is dropped.
 fn shift_bookmark_lines(
     marks: &std::collections::BTreeSet<usize>,
     old: &[String],
     new: &[String],
 ) -> std::collections::BTreeSet<usize> {
+    use similar::DiffOp;
     let common = old.len().min(new.len());
     let prefix = old
         .iter()
@@ -10953,7 +10958,42 @@ fn shift_bookmark_lines(
         .min(common - prefix);
     let old_end = old.len() - suffix;
     let new_end = new.len() - suffix;
-    let replaced = new_end - prefix;
+    // A deadline bounds a pathological middle; past it the diff is coarser
+    // but still a valid diff, so marks still land on real rows.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let ops = similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &old[prefix..old_end],
+        &new[prefix..new_end],
+        Some(deadline),
+    );
+    let map_middle = |row: usize| -> Option<usize> {
+        let r = row - prefix;
+        for op in &ops {
+            match *op {
+                DiffOp::Equal {
+                    old_index,
+                    new_index,
+                    len,
+                } if (old_index..old_index + len).contains(&r) => {
+                    return Some(prefix + new_index + (r - old_index));
+                }
+                DiffOp::Delete {
+                    old_index, old_len, ..
+                } if (old_index..old_index + old_len).contains(&r) => return None,
+                DiffOp::Replace {
+                    old_index,
+                    old_len,
+                    new_index,
+                    new_len,
+                } if (old_index..old_index + old_len).contains(&r) => {
+                    return Some(prefix + new_index + (r - old_index).min(new_len - 1));
+                }
+                _ => {}
+            }
+        }
+        None
+    };
     marks
         .iter()
         .filter_map(|&line| {
@@ -10962,12 +11002,8 @@ fn shift_bookmark_lines(
                 row
             } else if row >= old_end {
                 row - old_end + new_end
-            } else if row - prefix < replaced {
-                row
-            } else if replaced > 0 {
-                new_end - 1
             } else {
-                return None;
+                map_middle(row)?
             };
             Some(mapped + 1)
         })
@@ -15370,6 +15406,30 @@ mod tests {
             e.cursor_col = 0;
             e.toggle_bookmark();
         }
+    }
+
+    /// Several edit paths change lines in more than one place and sync once
+    /// (multi-cursor line delete, LSP formatting, Replace All with newlines,
+    /// and their undo). A mark between two such regions must move by the
+    /// lines removed above it, not stay put because a single prefix/suffix
+    /// span swallowed it.
+    #[test]
+    fn bookmark_shift_follows_lines_through_a_multi_region_edit() {
+        let old: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        let new: Vec<String> = old
+            .iter()
+            .filter(|l| *l != "line 2" && *l != "line 7")
+            .cloned()
+            .collect();
+        let marks: std::collections::BTreeSet<usize> = [2, 5, 7, 9].into_iter().collect();
+        let moved: Vec<usize> = shift_bookmark_lines(&marks, &old, &new)
+            .into_iter()
+            .collect();
+        // `line 5` is now row 4 and `line 9` row 7; the marks on the two
+        // deleted lines go with them.
+        assert_eq!(moved, vec![4, 7]);
+        assert_eq!(new[3], "line 5");
+        assert_eq!(new[6], "line 9");
     }
 
     #[test]
