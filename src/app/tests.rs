@@ -26651,6 +26651,262 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     assert!(applied, "the reply matching the newest request must apply");
 }
 
+// --- Bookmarks ------------------------------------------------------------
+
+#[test]
+fn bookmark_chords_are_disjoint_from_the_chords_they_sit_beside() {
+    // Toggle is Cmd+Opt+Shift+K; plain Cmd+Shift+K is still Delete Line.
+    assert!(is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_delete_line_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+
+    // Next/previous are Cmd+Opt+. and Cmd+Opt+, — Quick Fix (Cmd+.) excludes
+    // Alt, so the two dot chords never fire together.
+    assert!(is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    assert!(!is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::ALT
+    )));
+}
+
+// --- Emmet: Expand Abbreviation -------------------------------------------
+
+#[test]
+fn cmd_opt_shift_e_is_the_emmet_expand_chord() {
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Termux / Linux forward SUPER as CONTROL.
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Each modifier is load-bearing: dropping any one must not expand.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::NONE
+    )));
+    // And it is the E chord specifically, not any Cmd+Opt+Shift letter.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn the_toggle_chord_marks_the_cursor_line_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "a\nb\nc\nd\n");
+    app.editor.cursor_row = 2;
+    app.handle_editor_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.bookmarked_lines(), vec![3]);
+    assert!(
+        app.status.contains("line 3"),
+        "the status must name the line; was {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn the_navigation_chords_move_the_cursor_between_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 4);
+    app.handle_editor_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+#[test]
+fn bookmark_status_counts_marks_and_names_the_line_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    let next = key(KeyCode::Char('.'), KeyModifiers::SUPER | KeyModifiers::ALT);
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 1 of 2 (line 2)");
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 2 of 2 (line 5)");
+}
+
+#[test]
+fn bookmark_clear_chord_is_cmd_opt_shift_b_and_clears_the_file() {
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('B'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    )));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    for row in [0, 2] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.handle_editor_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert!(app.editor.bookmarked_lines().is_empty());
+    assert_eq!(app.status, "Cleared 2 bookmarks");
+}
+
+/// The palette command reaches `clear_bookmarks` without the chord's
+/// handler, so the non-text guard has to hold on that path too.
+#[test]
+fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.md", "# a\n\nb\n");
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![3],
+        "the preview hides them"
+    );
+    // Back on the source, the same command clears, so the assertion above is
+    // the guard and not a command that does nothing.
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert!(app.editor.bookmarked_lines().is_empty());
+}
+
+#[test]
+fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    app.editor.cursor_row = 1;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
+#[test]
+fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// Silence would leave the user unable to tell "wrong language" from
+/// "typo in the abbreviation".
+#[test]
+fn the_emmet_chord_says_so_when_there_is_nothing_to_expand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "div>(span\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["div>(span"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
+}
+
+/// A buffer Emmet does not run in gets a status naming the language, not
+/// the "no abbreviation" message that sends the user hunting for a typo.
+#[test]
+fn the_emmet_chord_names_an_unsupported_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["ul>li*2"]);
+    assert_eq!(app.status, "Emmet: not available in Rust files");
+}
+
 // --- In-editor Find & Replace ---------------------------------------------
 
 /// The Cmd+Opt+F chord as crossterm decodes the forwarded CSI-u sequence

@@ -198,6 +198,26 @@ jobs:
           # so they are the input.
           cat ../staged/*/croft-*.tar.gz.sha256 > SHA256SUMS
           cat SHA256SUMS
+          # `sha256sum -c` verifies the lines that ARE there; it cannot report
+          # one that is missing. A leg whose .sha256 never arrived would ship
+          # its archive with no sum and this step would stay green (#557).
+          # So every archive must be named by exactly one line, and there
+          # must be no other lines. A bare line count is not enough: one
+          # duplicated sum plus one missing sum still counts to four.
+          fail=0
+          for a in croft-*.tar.gz; do
+            n=$(awk -v f="$a" '$2 == f || $2 == "*" f' SHA256SUMS | wc -l | tr -d ' ')
+            if [ "$n" -ne 1 ]; then
+              echo "::error::SHA256SUMS names $a $n times, expected once"
+              fail=1
+            fi
+          done
+          lines=$(wc -l < SHA256SUMS | tr -d ' ')
+          if [ "$lines" -ne "$count" ]; then
+            echo "::error::SHA256SUMS has $lines lines for $count archives"
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
           # Now the check has something to disagree with: these sums were
           # produced on the machine that built each artifact, and this runner
           # hashes the bytes that actually arrived.
