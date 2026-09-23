@@ -5236,7 +5236,10 @@ impl Editor {
         self.color_swatches = if total_bytes > COLOR_SWATCH_SCAN_MAX_BYTES {
             Vec::new()
         } else {
-            scan_color_swatches(&self.lines)
+            scan_color_swatches(
+                &self.lines,
+                matches!(self.lang, Some(LangKind::Css | LangKind::Html)),
+            )
         };
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
@@ -10376,8 +10379,17 @@ fn hex_digit(b: u8) -> Option<u8> {
 /// by 3/4/6/8 hex digits with no further hex digit (or word char) right
 /// after — so `#deadbeef123` (too long to be any CSS hex form) is left
 /// alone rather than truncated to a wrong prefix.
-fn parse_hex_color(bytes: &[u8], i: usize) -> Option<((u8, u8, u8), usize)> {
+///
+/// Two look-alikes are refused. A `#` glued to a word character or `&` is a
+/// URL fragment (`page#fade`) or an HTML entity (`&#123;`). A short run of
+/// decimal digits only (`#555`, `#1234`) is an issue or PR reference, which
+/// comments and Markdown are full of; it counts as a color only where
+/// `decimal_short` says the buffer is a stylesheet.
+fn parse_hex_color(bytes: &[u8], i: usize, decimal_short: bool) -> Option<((u8, u8, u8), usize)> {
     if bytes.get(i) != Some(&b'#') {
+        return None;
+    }
+    if i > 0 && (matches!(bytes[i - 1], b'&' | b'_') || bytes[i - 1].is_ascii_alphanumeric()) {
         return None;
     }
     let mut len = 0usize;
@@ -10402,6 +10414,12 @@ fn parse_hex_color(bytes: &[u8], i: usize) -> Option<((u8, u8, u8), usize)> {
     {
         return None;
     }
+    if !decimal_short
+        && matches!(len, 3 | 4)
+        && bytes[i + 1..=i + len].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
     let d = |k: usize| hex_digit(bytes[i + 1 + k]).unwrap();
     let rgb = match len {
         3 | 4 => (d(0) * 17, d(1) * 17, d(2) * 17),
@@ -10413,7 +10431,7 @@ fn parse_hex_color(bytes: &[u8], i: usize) -> Option<((u8, u8, u8), usize)> {
 /// Parse `rgb(`/`rgba(` (case-insensitive) starting at byte `i`, tolerating
 /// the CSS Color 4 comma-optional syntax and a trailing `/ alpha`. Returns
 /// the parsed RGB and the byte length of the whole `rgb(...)` call.
-fn parse_rgb_color(line: &str, bytes: &[u8], i: usize) -> Option<((u8, u8, u8), usize)> {
+fn parse_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
     let rest = &line[i..];
     let lower_prefix_len = if rest
         .get(..4)
@@ -10436,7 +10454,6 @@ fn parse_rgb_color(line: &str, bytes: &[u8], i: usize) -> Option<((u8, u8, u8), 
     let r: u8 = nums.next()?.parse().ok()?;
     let g: u8 = nums.next()?.parse().ok()?;
     let b: u8 = nums.next()?.parse().ok()?;
-    let _ = bytes;
     Some(((r, g, b), close + 1))
 }
 
@@ -10516,31 +10533,35 @@ const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
 /// alike, since (unlike syntax highlighting) a color swatch has no notion of
 /// "this isn't code here." A byte-position match is converted to a char
 /// column range so the renderer's column math (shared with bracket
-/// colorization and indent guides) applies unchanged.
-fn scan_color_swatches(lines: &[String]) -> Vec<Vec<(usize, usize, Color, Color)>> {
+/// colorization and indent guides) applies unchanged. `decimal_short` is
+/// passed through to [`parse_hex_color`]: true only for stylesheet buffers.
+fn scan_color_swatches(
+    lines: &[String],
+    decimal_short: bool,
+) -> Vec<Vec<(usize, usize, Color, Color)>> {
     let mut out = vec![Vec::new(); lines.len()];
     for (li, line) in lines.iter().enumerate() {
         let bytes = line.as_bytes();
-        let mut byte_to_col = std::collections::HashMap::new();
-        for (ci, (bi, _)) in line.char_indices().enumerate() {
-            byte_to_col.insert(bi, ci);
-        }
-        byte_to_col.insert(line.len(), line.chars().count());
+        // The char column of byte `i`, advanced alongside it: this runs on
+        // every recompute over the whole buffer, so no per-line lookup table.
+        let mut col = 0usize;
         let mut i = 0usize;
         while i < bytes.len() {
-            let hit = parse_hex_color(bytes, i)
-                .or_else(|| parse_rgb_color(line, bytes, i))
+            let hit = parse_hex_color(bytes, i, decimal_short)
+                .or_else(|| parse_rgb_color(line, i))
                 .or_else(|| parse_hsl_color(line, i));
             match hit {
                 Some(((r, g, b), consumed)) => {
-                    let start_col = byte_to_col[&i];
-                    let end_col = *byte_to_col.get(&(i + consumed)).unwrap_or(&start_col);
+                    // Every literal form is ASCII up to its closing `)`, but
+                    // `rgb(` may enclose anything, so count rather than assume.
+                    let width = line[i..i + consumed].chars().count();
                     out[li].push((
-                        start_col,
-                        end_col,
+                        col,
+                        col + width,
                         Color::Rgb(r, g, b),
                         swatch_fg_for_bg(r, g, b),
                     ));
+                    col += width;
                     i += consumed;
                 }
                 None => {
@@ -10549,6 +10570,7 @@ fn scan_color_swatches(lines: &[String]) -> Vec<Vec<(usize, usize, Color, Color)
                     // takes.
                     let step = line[i..].chars().next().map_or(1, char::len_utf8);
                     i += step;
+                    col += 1;
                 }
             }
         }
@@ -24011,7 +24033,7 @@ mod tests {
     #[test]
     fn scan_color_swatches_recognizes_hex_forms() {
         let lines = vec![String::from("bg: #f00; border: #00ff0080; a: #abcabcabc")];
-        let out = scan_color_swatches(&lines);
+        let out = scan_color_swatches(&lines, false);
         // #f00 -> (255,0,0); #00ff0080 -> (0,255,0); the trailing 9-digit
         // run is not any valid CSS hex length and must not match at all.
         assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
@@ -24024,7 +24046,7 @@ mod tests {
         let lines = vec![String::from(
             "color: rgb(255, 0, 0); fill: hsl(0, 100%, 50%);",
         )];
-        let out = scan_color_swatches(&lines);
+        let out = scan_color_swatches(&lines, false);
         assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
         assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
         // hsl(0, 100%, 50%) is pure red too.
@@ -24036,14 +24058,37 @@ mod tests {
         // A hex digit run of invalid CSS length (12 digits, immediately
         // followed by another hex digit) must not match as any color form.
         let lines = vec![String::from("let x = #abcdefabcdefg;")];
-        let out = scan_color_swatches(&lines);
+        let out = scan_color_swatches(&lines, false);
         assert!(out[0].is_empty(), "found: {:?}", out[0]);
+    }
+
+    #[test]
+    fn scan_color_swatches_skips_issue_refs_fragments_and_entities() {
+        let lines = vec![String::from(
+            "fixes #555 and #1234; see page#fade; &#123; but #fade and #000000",
+        )];
+        let out = scan_color_swatches(&lines, false);
+        let found: Vec<_> = out[0].iter().map(|h| h.0).collect();
+        // Only the free-standing `#fade` (col 48) and `#000000` (col 58).
+        assert_eq!(found, vec![48, 58], "found: {:?}", out[0]);
+
+        // In a stylesheet `#555` is a color.
+        let css = scan_color_swatches(&[String::from("color: #555;")], true);
+        assert_eq!(css[0].len(), 1);
+        assert_eq!(css[0][0].2, Color::Rgb(0x55, 0x55, 0x55));
+    }
+
+    #[test]
+    fn scan_color_swatches_counts_columns_past_multibyte_text() {
+        let lines = vec![String::from("é → #ff0000")];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!((out[0][0].0, out[0][0].1), (4, 11));
     }
 
     #[test]
     fn scan_color_swatches_picks_a_legible_foreground() {
         let lines = vec![String::from("#ffffff #000000")];
-        let out = scan_color_swatches(&lines);
+        let out = scan_color_swatches(&lines, false);
         assert_eq!(out[0][0].3, Color::Black, "white bg needs black text");
         assert_eq!(out[0][1].3, Color::White, "black bg needs white text");
     }
