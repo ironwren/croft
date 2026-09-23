@@ -98,7 +98,8 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
         };
 
         // MD025: more than one top-level (`# `) heading in a document.
-        if heading_hashes == 1 && trimmed_start[1..].starts_with(' ') {
+        // CommonMark separates the marker with a space OR a tab.
+        if heading_hashes == 1 && trimmed_start[1..].starts_with([' ', '\t']) {
             if seen_h1 {
                 out.push(diag(
                     i,
@@ -119,7 +120,7 @@ pub fn lint(text: &str) -> Vec<Diagnostic> {
         // is not a heading in CommonMark, a common authoring slip).
         if (1..=6).contains(&heading_hashes) {
             let rest = &trimmed_start[heading_hashes..];
-            if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('#') {
+            if !rest.is_empty() && !rest.starts_with([' ', '\t', '#']) {
                 // UTF-16 units, as above: the indent is ASCII spaces here,
                 // but keeping the same unit everywhere is what stops the next
                 // edit reintroducing a byte offset.
@@ -436,6 +437,21 @@ mod tests {
         assert!(
             !diags.iter().any(|d| d.message.contains("MD009")),
             "code content is literal: {diags:?}"
+        );
+    }
+
+    /// A tab after the marker is a valid separator in CommonMark: `#\tTitle`
+    /// is a heading, so it is not MD018 and it does count toward MD025.
+    #[test]
+    fn a_tab_separates_the_heading_marker() {
+        let diags = lint("#\tTitle\n\n#\tSecond\n");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("MD018")),
+            "a tab is a separator: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("MD025")),
+            "two tab-separated H1s are still two H1s: {diags:?}"
         );
     }
 
