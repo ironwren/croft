@@ -342,7 +342,12 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 /// by `|p| * |t|` states.
 fn glob_match(p: &[char], t: &[char]) -> bool {
     let mut memo = vec![None; (p.len() + 1) * (t.len() + 1)];
-    Glob { p, t, memo: &mut memo }.at(0, 0)
+    Glob {
+        p,
+        t,
+        memo: &mut memo,
+    }
+    .at(0, 0)
 }
 
 struct Glob<'a> {
