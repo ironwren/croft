@@ -8956,6 +8956,12 @@ impl Editor {
         let Some(replacement) = tok.bumped(line, delta) else {
             return false;
         };
+        // A clamped bump (`0x00` down) finds a number but changes nothing;
+        // recording it would dirty a clean buffer and leave an undo step
+        // that undoes nothing.
+        if replacement == line[tok.start..tok.end] {
+            return true;
+        }
 
         self.push_undo(EditKind::BumpNumber);
         // Never coalesce: a run of bumps must undo one at a time, the way
@@ -10495,7 +10501,10 @@ fn number_tokens(line: &str) -> Vec<NumberToken> {
             // it is a subtraction and `5` is positive.
             let signed = start > 0
                 && b[start - 1] == b'-'
-                && (start == 1 || !is_word_or_digit(b[start - 2]));
+                && !line[..start - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_word_or_digit);
             out.push(NumberToken {
                 start: if signed { start - 1 } else { start },
                 end: i,
@@ -10532,8 +10541,10 @@ fn radix_prefixed_token(b: &[u8], i: usize) -> Option<NumberToken> {
     })
 }
 
-fn is_word_or_digit(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+/// Checked on the character, not the byte: before the `-` in `λ-5` sits a
+/// UTF-8 continuation byte, which no byte test reads as a letter.
+fn is_word_or_digit(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Display name for a language mode, matching VS Code's status-bar labels.
@@ -24351,6 +24362,35 @@ mod tests {
         assert_eq!(e.lines, vec!["0x00"]);
     }
 
+    /// A clamped bump changes nothing, so it must not dirty a clean buffer
+    /// or leave an undo step that undoes nothing. It still reports true: a
+    /// number was found, and "no number here" would be the wrong message.
+    #[test]
+    fn a_clamped_bump_neither_dirties_the_buffer_nor_records_an_undo_step() {
+        let mut e = num_editor("mask = 0x00", 0);
+        assert!(!e.dirty);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["mask = 0x00"]);
+        assert!(!e.dirty, "an unchanged literal must not dirty the buffer");
+        assert!(e.undo_stack.is_empty(), "no undo step for a no-op");
+        // A bump that does change the literal still records both, so the
+        // two assertions above cannot pass vacuously.
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["mask = 0x01"]);
+        assert!(e.dirty);
+        assert_eq!(e.undo_stack.len(), 1);
+    }
+
+    /// vim ignores a leading `-` on hex and binary literals ("ignore leading
+    /// '-' for hex and octal and bin numbers" in `do_addsub`), treating them
+    /// as unsigned bit patterns: `-0x10` bumps to `-0x11`.
+    #[test]
+    fn a_minus_before_a_hex_literal_is_not_a_sign() {
+        let mut e = num_editor("x = -0x10", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = -0x11"]);
+    }
+
     #[test]
     fn a_decimal_can_cross_zero_into_negative() {
         let mut e = num_editor("delta = 0", 8);
@@ -24370,6 +24410,25 @@ mod tests {
         let mut e = num_editor("2026-09-21", 5);
         assert!(e.bump_number(1));
         assert_eq!(e.lines, vec!["2026-10-21"]);
+    }
+
+    /// The identifier rule holds for non-ASCII identifiers too: the byte
+    /// before the `-` in `λ-5` is a UTF-8 continuation byte, not a letter,
+    /// so the check has to look at the character.
+    #[test]
+    fn a_minus_after_a_non_ascii_identifier_is_subtraction_not_a_sign() {
+        let mut e = num_editor("λ-5", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["λ-6"]);
+
+        let mut cjk = num_editor("变量-5", 0);
+        assert!(cjk.bump_number(1));
+        assert_eq!(cjk.lines, vec!["变量-6"]);
+
+        // Non-ASCII punctuation is not an identifier, so the sign stands.
+        let mut dash = num_editor("x—-5", 0);
+        assert!(dash.bump_number(1));
+        assert_eq!(dash.lines, vec!["x—-4"]);
     }
 
     #[test]
