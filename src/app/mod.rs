@@ -27885,8 +27885,12 @@ impl App {
         };
         self.status = match jumped {
             Some(line) => {
-                let total = self.editor.bookmarked_lines().len();
-                format!("Bookmark {line} of {total} in this file")
+                // Position among the marks, 1-based, then the line itself:
+                // "Bookmark 2 of 3 (line 42)", never a line number over a count.
+                let marks = self.editor.bookmarked_lines();
+                let total = marks.len();
+                let idx = marks.iter().position(|&l| l == line).map_or(0, |i| i + 1);
+                format!("Bookmark {idx} of {total} (line {line})")
             }
             None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
         };
@@ -27904,7 +27908,8 @@ impl App {
         };
     }
 
-    /// Markdown: Toggle Preview — flips the active tab between source and the    /// rendered view; explains itself on a non-Markdown tab.
+    /// Markdown: Toggle Preview — flips the active tab between source and the
+    /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
         if self.editor.toggle_markdown_preview() {
             self.status = if self.editor.markdown_preview.is_some() {
@@ -28223,6 +28228,12 @@ impl App {
         }
         if is_prev_bookmark_key(key) {
             self.goto_bookmark(false);
+            return;
+        }
+        if is_clear_bookmarks_key(key) {
+            if self.editor_is_text() {
+                self.clear_bookmarks();
+            }
             return;
         }
         // Formerly palette-only editor commands, now each on a chord so none
@@ -46769,6 +46780,13 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
 /// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
 fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'k')
+}
+
+/// `Cmd+Opt+Shift+B`: clear every bookmark in the open file. `Cmd+Shift+B`
+/// (Run Build Task) and `Cmd+Opt+B` (secondary side bar) each exclude the
+/// other modifier, so the three chords on `b` never collide.
+fn is_clear_bookmarks_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'b')
 }
 
 /// `Cmd+Opt+.`: jump to the next bookmark below the cursor, wrapping to the

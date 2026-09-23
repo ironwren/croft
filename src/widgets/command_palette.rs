@@ -705,7 +705,7 @@ impl Command {
             Command::ToggleBookmark => "Cmd+Opt+Shift+K",
             Command::NextBookmark => "Cmd+Opt+.",
             Command::PreviousBookmark => "Cmd+Opt+,",
-            Command::ClearBookmarks => "",
+            Command::ClearBookmarks => "Cmd+Opt+Shift+B",
             Command::FormatDocument => "Cmd+Opt+Shift+F",
             Command::FormatSelection => "Cmd+K Cmd+F",
             Command::ChangeColorPresentation => "",

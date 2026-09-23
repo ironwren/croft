@@ -2387,6 +2387,12 @@ pub struct Editor {
     /// keeps a file's marks. They are navigation aids only: nothing in the
     /// debugger or the LSP reads them.
     pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// The text the open file's [`bookmarks`](Self::bookmarks) currently
+    /// describe, keyed by the path it was taken for. Every buffer change is
+    /// diffed against it so marks follow their lines through inserts,
+    /// deletes, undo and reloads (see [`shift_bookmark_lines`]). Held only
+    /// while the open file has marks, so an unmarked file pays nothing.
+    bookmark_shadow: Option<(PathBuf, Vec<String>)>,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
@@ -2882,6 +2888,7 @@ impl Editor {
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
             bookmarks: std::collections::HashMap::new(),
+            bookmark_shadow: None,
             edit_seq: 0,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
@@ -3188,6 +3195,9 @@ impl Editor {
     /// path to key the set by).
     pub fn toggle_bookmark(&mut self) -> Option<bool> {
         let path = self.path.clone()?;
+        // Settle the existing marks against the buffer before adding one, so
+        // the shadow seeded below describes every mark in the set.
+        self.sync_bookmarks_to_buffer();
         let here = self.cursor_row + 1; // bookmarks are 1-based, like breakpoints
         let set = self.bookmarks.entry(path.clone()).or_default();
         let added = if set.contains(&here) {
@@ -3202,16 +3212,27 @@ impl Editor {
         if set.is_empty() {
             self.bookmarks.remove(&path);
         }
+        self.seed_bookmark_shadow();
         Some(added)
     }
 
     /// 1-based bookmark lines for the open file, ascending. Empty when no
     /// file is open or the file has no marks.
     pub fn bookmarked_lines(&self) -> Vec<usize> {
+        // A mark past the last line is never a target: jumping to it would
+        // clamp back onto the last row, and from there `next` would pick it
+        // again forever instead of wrapping. The edit paths clamp the set
+        // already; this keeps navigation and the count honest regardless.
+        let len = self.lines.len();
         self.path
             .as_deref()
             .and_then(|p| self.bookmarks.get(p))
-            .map(|s| s.iter().copied().collect())
+            .map(|s| {
+                s.iter()
+                    .copied()
+                    .filter(|&l| (1..=len).contains(&l))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -3255,11 +3276,64 @@ impl Editor {
 
     /// Drop every bookmark in the open file. Returns how many were removed.
     pub fn clear_bookmarks(&mut self) -> usize {
+        self.bookmark_shadow = None;
         self.path
             .clone()
             .and_then(|p| self.bookmarks.remove(&p))
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    /// Record the text the open file's bookmarks describe, ahead of an edit
+    /// (called from [`push_undo`](Self::push_undo), which every user edit
+    /// passes through before it mutates). A no-op when the file has no marks
+    /// or the shadow already belongs to this file.
+    fn seed_bookmark_shadow(&mut self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if !self.bookmarks.contains_key(path)
+            || self
+                .bookmark_shadow
+                .as_ref()
+                .is_some_and(|(p, _)| p == path)
+        {
+            return;
+        }
+        self.bookmark_shadow = Some((path.clone(), self.lines.clone()));
+    }
+
+    /// Re-align the open file's bookmarks with the buffer after it changed.
+    /// The single choke point for line shifts: called from
+    /// [`mark_buffer_changed`](Self::mark_buffer_changed) (every edit),
+    /// [`restore_snapshot`](Self::restore_snapshot) (undo / redo) and the
+    /// file loaders (reload, reopen with encoding). When the line count moved
+    /// and the shadow describes this file, marks are mapped through
+    /// [`shift_bookmark_lines`]; either way, any mark left past the last line
+    /// is dropped, so a change whose mapping is unknown (a reload with no
+    /// shadow) still never leaves a mark beyond the buffer.
+    fn sync_bookmarks_to_buffer(&mut self) {
+        let Some(path) = self.path.clone() else {
+            self.bookmark_shadow = None;
+            return;
+        };
+        let Some(set) = self.bookmarks.get_mut(&path) else {
+            self.bookmark_shadow = None;
+            return;
+        };
+        if let Some((shadow_path, old)) = self.bookmark_shadow.take()
+            && shadow_path == path
+            && old.len() != self.lines.len()
+        {
+            *set = shift_bookmark_lines(set, &old, &self.lines);
+        }
+        let len = self.lines.len();
+        set.retain(|&l| (1..=len).contains(&l));
+        if set.is_empty() {
+            self.bookmarks.remove(&path);
+            return;
+        }
+        self.bookmark_shadow = Some((path, self.lines.clone()));
     }
 
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
@@ -3325,6 +3399,9 @@ impl Editor {
         // the user fixed by deleting the offending characters.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // Marks follow their lines through every edit (inserts, deletes,
+        // pastes, joins); see `sync_bookmarks_to_buffer`.
+        self.sync_bookmarks_to_buffer();
     }
 
     /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
@@ -4303,6 +4380,9 @@ impl Editor {
         // the bump the server keeps analysing the old text and never sends
         // fresh semantic tokens — codeberg issue #39).
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        // A same-path reload diffs the marks across the new text; opening a
+        // different file only clamps its marks and seeds its shadow.
+        self.sync_bookmarks_to_buffer();
         // A path CHANGE detaches the buffer from any collab doc it was
         // synced to: the old generation belongs to another file, and a
         // reused tab (the preview tab) keeping it would let the next collab
@@ -6052,6 +6132,7 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
         Ok(())
     }
@@ -7742,6 +7823,8 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        // The pre-edit text, for bookmarks to be diffed against afterwards.
+        self.seed_bookmark_shadow();
         // Where the edit about to happen begins — the linked-editing
         // mirror reads this to locate the keystroke (#254).
         self.last_edit_origin = (self.cursor_row, self.cursor_col);
@@ -7821,6 +7904,8 @@ impl Editor {
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
+        // Undo / redo move whole lines back and forth; marks follow them.
+        self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
     }
 
@@ -10679,6 +10764,57 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
         start = brk;
     }
     segs
+}
+
+/// Map 1-based bookmark `marks` across a buffer change from `old` to `new`.
+/// The change is located as the span between the longest common prefix and
+/// suffix of the two buffers, which is exact for any single contiguous edit
+/// (a newline, a paste, a line delete, an undo step). Marks above the span
+/// stay; marks below it move by the line-count delta; marks inside it keep
+/// their row while that row still exists in the replacement. A mark whose
+/// row was deleted collapses onto the replacement's last line when there is
+/// one (the join line a backspace or a partial-line selection delete leaves
+/// behind) and is dropped when whole lines were removed outright.
+fn shift_bookmark_lines(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    let common = old.len().min(new.len());
+    let prefix = old
+        .iter()
+        .zip(new)
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(common);
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(common - prefix);
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    let replaced = new_end - prefix;
+    marks
+        .iter()
+        .filter_map(|&line| {
+            let row = line.checked_sub(1)?;
+            let mapped = if row < prefix {
+                row
+            } else if row >= old_end {
+                row - old_end + new_end
+            } else if row - prefix < replaced {
+                row
+            } else if replaced > 0 {
+                new_end - 1
+            } else {
+                return None;
+            };
+            Some(mapped + 1)
+        })
+        .collect()
 }
 
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
@@ -15068,6 +15204,156 @@ mod tests {
             vec![3],
             "coming back restores the first file's marks"
         );
+    }
+
+    /// Set a bookmark on each 0-based row through the real toggle path.
+    fn mark_rows(e: &mut Editor, rows: &[usize]) {
+        for &row in rows {
+            e.cursor_row = row;
+            e.cursor_col = 0;
+            e.toggle_bookmark();
+        }
+    }
+
+    #[test]
+    fn bookmark_shift_a_newline_above_a_mark_pushes_it_down() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 5]); // lines 2 and 6
+        e.cursor_row = 2;
+        e.cursor_col = 0;
+        e.insert_newline();
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![2, 7],
+            "the mark above the edit stays, the one below follows its line"
+        );
+        assert!(e.is_bookmarked(6), "row 6 now holds `line 6`");
+        assert_eq!(e.lines[6], "line 6");
+    }
+
+    #[test]
+    fn bookmark_shift_a_multi_line_paste_moves_marks_by_the_pasted_count() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[5]); // `line 6`
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_str("a\nb\nc\n");
+        assert_eq!(e.lines[8], "line 6");
+        assert_eq!(e.bookmarked_lines(), vec![9]);
+    }
+
+    #[test]
+    fn bookmark_shift_deleting_lines_drops_marks_inside_and_pulls_up_the_rest() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[2, 4, 8]); // lines 3, 5, 9
+        e.cursor_row = 3;
+        e.delete_lines(3); // removes lines 4, 5, 6
+        assert_eq!(e.lines[5], "line 9");
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3, 6],
+            "line 5 went with its line; line 9 is now line 6"
+        );
+    }
+
+    #[test]
+    fn bookmark_shift_undo_and_redo_of_a_line_delete_move_marks_back_and_forth() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[8]); // `line 9`
+        e.cursor_row = 3;
+        e.delete_lines(3);
+        assert_eq!(e.bookmarked_lines(), vec![6]);
+        assert!(e.undo());
+        assert_eq!(e.lines[8], "line 9");
+        assert_eq!(e.bookmarked_lines(), vec![9], "undo restores the line");
+        assert!(e.redo());
+        assert_eq!(e.bookmarked_lines(), vec![6], "redo deletes it again");
+    }
+
+    #[test]
+    fn bookmark_shift_a_selection_delete_collapses_inner_marks_onto_the_join_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[3, 7]); // lines 4 and 8
+        e.selection = Some(EditorSelection {
+            anchor: (2, 2),
+            head: (5, 1),
+        });
+        e.cursor_row = 5;
+        e.cursor_col = 1;
+        assert!(e.delete_selection());
+        assert_eq!(e.lines[4], "line 8");
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3, 5],
+            "line 4 folded into the join line 3; line 8 moved up by 3"
+        );
+    }
+
+    #[test]
+    fn bookmark_shift_backspace_joining_lines_keeps_the_mark_on_the_join_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[4, 6]); // lines 5 and 7
+        e.cursor_row = 4;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines[3], "line 4line 5");
+        assert_eq!(e.bookmarked_lines(), vec![4, 6]);
+    }
+
+    #[test]
+    fn bookmark_shift_an_external_reload_that_shrinks_the_file_clamps_marks() {
+        let (mut e, f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 9]); // lines 2 and 10
+        std::fs::write(f.path(), "line 1\nline 2\nline 3\n").unwrap();
+        assert!(matches!(e.reload_if_clean(), Some(Ok(()))));
+        assert_eq!(e.lines.len(), 3);
+        let marks = e.bookmarked_lines();
+        assert!(
+            marks.iter().all(|&l| l <= e.lines.len()),
+            "no mark may outlive the buffer; was {marks:?}"
+        );
+        assert!(marks.contains(&2), "the untouched line keeps its mark");
+        assert!(
+            e.bookmarks.values().flatten().all(|&l| l <= 3),
+            "the stored set is clamped too, not only the view"
+        );
+    }
+
+    #[test]
+    fn bookmark_nav_next_wraps_after_a_delete_pulled_the_last_mark_up() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 9]); // lines 2 and 10
+        e.cursor_row = 3;
+        e.delete_lines(3);
+        e.cursor_row = e.lines.len() - 1; // `line 10`, now line 7
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(2),
+            "from the last mark, next wraps to the first"
+        );
+        assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn bookmark_nav_ignores_a_mark_past_the_end_of_the_buffer() {
+        // Defence in depth for navigation itself: a stale mark beyond the
+        // last line (however it got there) must not become a target the
+        // jump clamps back onto the cursor's own row, which froze the ring.
+        let (mut e, f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1]);
+        e.bookmarks
+            .get_mut(f.path())
+            .expect("marked above")
+            .insert(50);
+        e.cursor_row = 9;
+        assert_eq!(e.goto_next_bookmark(), Some(2), "wraps past the stale mark");
+        e.cursor_row = 0;
+        assert_eq!(
+            e.goto_prev_bookmark(),
+            Some(2),
+            "prev wraps to the last in-range mark, not line 50"
+        );
+        assert_eq!(e.bookmarked_lines(), vec![2]);
     }
 
     #[test]

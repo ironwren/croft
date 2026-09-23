@@ -26737,6 +26737,50 @@ fn the_navigation_chords_move_the_cursor_between_marks() {
 }
 
 #[test]
+fn bookmark_status_counts_marks_and_names_the_line_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    let next = key(KeyCode::Char('.'), KeyModifiers::SUPER | KeyModifiers::ALT);
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 1 of 2 (line 2)");
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 2 of 2 (line 5)");
+}
+
+#[test]
+fn bookmark_clear_chord_is_cmd_opt_shift_b_and_clears_the_file() {
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('B'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    )));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    for row in [0, 2] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.handle_editor_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert!(app.editor.bookmarked_lines().is_empty());
+    assert_eq!(app.status, "Cleared 2 bookmarks");
+}
+
+#[test]
 fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");

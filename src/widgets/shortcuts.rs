@@ -496,6 +496,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Jump to the previous bookmark, wrapping to the bottom",
                 handler: "is_prev_bookmark_key",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+B",
+                description: "Clear every bookmark in the file",
+                handler: "is_clear_bookmarks_key",
+            },
         ],
     },
     ShortcutGroup {
