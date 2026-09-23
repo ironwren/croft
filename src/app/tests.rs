@@ -26693,6 +26693,39 @@ fn bookmark_chords_are_disjoint_from_the_chords_they_sit_beside() {
     )));
 }
 
+// --- Emmet: Expand Abbreviation -------------------------------------------
+
+#[test]
+fn cmd_opt_shift_e_is_the_emmet_expand_chord() {
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Termux / Linux forward SUPER as CONTROL.
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Each modifier is load-bearing: dropping any one must not expand.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::NONE
+    )));
+    // And it is the E chord specifically, not any Cmd+Opt+Shift letter.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+}
+
 #[test]
 fn the_toggle_chord_marks_the_cursor_line_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
@@ -26791,7 +26824,11 @@ fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
     app.editor.toggle_bookmark();
     assert!(app.editor.toggle_markdown_preview());
     app.run_command(Command::ClearBookmarks);
-    assert_eq!(app.editor.bookmarked_lines(), vec![3], "the preview hides them");
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![3],
+        "the preview hides them"
+    );
     // Back on the source, the same command clears, so the assertion above is
     // the guard and not a command that does nothing.
     assert!(app.editor.toggle_markdown_preview());
@@ -26810,6 +26847,64 @@ fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
     ));
     assert_eq!(app.editor.cursor_row, 1);
     assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
+#[test]
+fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// Silence would leave the user unable to tell "wrong language" from
+/// "typo in the abbreviation".
+#[test]
+fn the_emmet_chord_says_so_when_there_is_nothing_to_expand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "div>(span\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["div>(span"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
+}
+
+/// A buffer Emmet does not run in gets a status naming the language, not
+/// the "no abbreviation" message that sends the user hunting for a typo.
+#[test]
+fn the_emmet_chord_names_an_unsupported_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["ul>li*2"]);
+    assert_eq!(app.status, "Emmet: not available in Rust files");
 }
 
 // --- In-editor Find & Replace ---------------------------------------------

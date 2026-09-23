@@ -501,6 +501,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Clear every bookmark in the file",
                 handler: "is_clear_bookmarks_key",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Opt+Shift+E",
+                description: "Expand the Emmet abbreviation before the cursor",
+                handler: "is_emmet_expand_key",
+            },
         ],
     },
     ShortcutGroup {
