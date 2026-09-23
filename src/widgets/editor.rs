@@ -12601,6 +12601,19 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
+    // The generic arrow's other two forms, `<T extends U>` and `<T = U>`,
+    // also put whitespace after the name. No attribute list opens with `=`,
+    // and `extends` is TypeScript's constraint keyword, not a JSX attribute.
+    if matches!(lang, Some(LangKind::Tsx | LangKind::JavaScript)) {
+        let attrs = rest.trim_start();
+        let first = attrs
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .next()
+            .unwrap_or("");
+        if attrs.starts_with('=') || first == "extends" {
+            return None;
+        }
+    }
     // A `>` already inside means that `<` is closed and the caret is past
     // the tag (or inside an attribute value holding a `>`); either way this
     // keystroke is not closing THIS tag.
@@ -24972,6 +24985,17 @@ mod tests {
         let mut e = tag_editor("const f = <T,", LangKind::Tsx);
         e.insert_char('>');
         assert_eq!(e.lines[0], "const f = <T,>");
+        // The other two generic arrow forms: a constraint and a default.
+        for src in ["const f = <T extends unknown", "const f = <T = unknown"] {
+            let mut e = tag_editor(src, LangKind::Tsx);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // An ordinary attribute after the name still closes, so the two
+        // assertions above cannot pass by closing nothing at all.
+        let mut e = tag_editor("return <Foo bar={1}", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "return <Foo bar={1}></Foo>");
     }
 
     #[test]
