@@ -7106,14 +7106,16 @@ impl App {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            current.insert(path.clone());
+            // The same file can be open in several panes, each its own
+            // buffer with its own `edit_seq`. Only the FIRST tab seen for a
+            // path (the active group comes first) is compared: judging each
+            // pane against one shared cursor made two panes with different
+            // seqs take turns, re-linting and redrawing on every tick.
+            if !current.insert(path.clone()) {
+                continue;
+            }
             let seq = tab.edit_seq;
-            // The same file can be open in several panes; lint the first tab
-            // whose seq is unseen and let the rest fall through, so one
-            // buffer is not linted twice in a tick.
-            if self.markdown_lint_last_seen.get(path).copied() != Some(seq)
-                && !to_lint.iter().any(|(p, _, _)| p == path)
-            {
+            if self.markdown_lint_last_seen.get(path).copied() != Some(seq) {
                 to_lint.push((path.clone(), tab.lines.join("\n"), seq));
             }
         }
@@ -7126,7 +7128,9 @@ impl App {
                 if by_server.is_empty() {
                     self.lsp_diagnostics.remove(&path);
                 }
-            } else {
+            } else if by_server.get("Markdown Lint") != Some(&diags) {
+                // Only a different set is a change: storing the same
+                // diagnostics again must not ask for a redraw.
                 by_server.insert("Markdown Lint".to_string(), diags);
                 changed = true;
             }

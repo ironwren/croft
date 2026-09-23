@@ -23339,6 +23339,39 @@ fn sync_markdown_lint_is_quiet_for_a_clean_document_and_reruns_only_on_edit() {
     );
 }
 
+/// Split panes hold separate buffers of one file, so after an edit in one
+/// they carry different `edit_seq`s. The sync must settle on one pane per
+/// path rather than alternate between the two, and must not report a change
+/// when the diagnostics it stores are the ones already there: either would
+/// re-lint and redraw on every tick forever.
+#[test]
+fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.editor.insert_char('!');
+    assert!(
+        app.sync_markdown_lint(),
+        "the first lint stores diagnostics"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the edited pane still has two H1s"
+    );
+    assert!(
+        !app.sync_markdown_lint(),
+        "nothing changed since the last tick"
+    );
+    assert!(!app.sync_markdown_lint(), "and it stays settled");
+}
+
 /// A `.md` held by an INACTIVE split group must still be linted. The gather
 /// loop used to walk only `self.editor`, so such a tab was never linted and
 /// the cleanup below then dropped its stored diagnostics while it was still

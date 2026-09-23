@@ -567,7 +567,7 @@ pub enum DiagnosticSeverity {
 /// converts them to character columns against its own buffer, exactly as it
 /// does for semantic tokens. A diagnostic can span several lines
 /// (`start_line..=end_line`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     pub start_line: u32,
     pub start_char: u32,
