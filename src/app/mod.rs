@@ -22132,7 +22132,6 @@ impl App {
         self.watch_baseline_pending = false;
     }
 
-    /// Shift+F5: stop debugging and tear the session down.
     /// A compound member ended and siblings survive (#567): rebuild the
     /// status and the panel line from the live set, naming what ended, which
     /// session the view now shows, and every one still running. Without this
@@ -22154,6 +22153,7 @@ impl App {
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
     }
 
+    /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         // EVERY session, not the focused one (#310). A compound launches
         // several; disconnecting only the one the user happens to be looking
