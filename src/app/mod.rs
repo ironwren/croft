@@ -1482,6 +1482,8 @@ enum PendingLaunchStep {
 struct CompoundLaunch {
     members: Vec<crate::dap::configs::DebugConfig>,
     compound: String,
+    /// The compound's `stopAll`, carried to the moment the set is replaced.
+    stop_all: bool,
 }
 
 /// What became of one compound member (#310).
@@ -3706,6 +3708,18 @@ pub struct App {
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
+    /// Name of the compound F5 starts, when the last picker launch was a
+    /// compound. Exclusive with `selected_debug_config`: a compound and a
+    /// configuration may share a name, so one string cannot say which (#567).
+    selected_debug_compound: Option<String>,
+    /// The launched compound asked for `stopAll: true` (#567): the first
+    /// member to end stops the rest. Set on every compound launch, so a
+    /// single-config launch (one session, no siblings) never reads a stale
+    /// value in a way that matters.
+    debug_stop_all: bool,
+    /// The running compound's name, kept past launch so the report rebuilt
+    /// when one member ends can still say which compound is live (#567).
+    debug_compound: Option<String>,
     /// A config launch parked behind its `preLaunchTask`: the task runs in
     /// its pane, and the FinishedCommand sweep launches (exit 0) or aborts
     /// (non-zero) when the matching command completes. Replaced by a newer
@@ -4953,6 +4967,9 @@ impl App {
             debug_configs: Vec::new(),
             debug_compounds: Vec::new(),
             selected_debug_config: None,
+            selected_debug_compound: None,
+            debug_stop_all: false,
+            debug_compound: None,
             pending_debug_launch: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -20295,7 +20312,10 @@ impl App {
                 .iter()
                 .filter(|c| !c.hidden())
                 .count();
-        self.run_debug.selected_config = self.selected_debug_config.clone();
+        self.run_debug.selected_config = self
+            .selected_debug_compound
+            .clone()
+            .or_else(|| self.selected_debug_config.clone());
     }
 
     /// Resolve how to run `file`: which command line to feed the PTY and
@@ -20401,10 +20421,25 @@ impl App {
             }
         }
         // Highest index first, so removing one does not move the next.
+        let mut ended_names = Vec::new();
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
                 gone.session.disconnect();
+                ended_names.push(gone.name);
             }
+        }
+        // `stopAll: true` (#567): a background member ending takes the set
+        // down with it, the same as the focused one ending does below.
+        if self.debug_stop_all && !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.debug_stop();
+            self.status = format!(
+                "{} ended — stopAll stopped the rest of the compound",
+                ended_names.join(", ")
+            );
+            return true;
+        }
+        if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.report_member_ended(&ended_names.join(", "));
         }
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
@@ -20527,13 +20562,17 @@ impl App {
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
                     gone.session.disconnect();
                 }
+                // `stopAll: true` (#567): the siblings go too, and the rest
+                // of this arm reports the ended run as for a lone session.
+                if self.debug_stop_all && !self.debug_sessions.is_empty() {
+                    self.debug_stop();
+                    self.status =
+                        format!("{ended_name} ended — stopAll stopped the rest of the compound");
+                }
                 if !self.debug_sessions.is_empty() {
                     // Siblings are still running, so the debugger is not torn
                     // down: the view moves to one of them.
-                    self.status = format!(
-                        "{ended_name} ended — {} session(s) still running · Shift+F5 stops all",
-                        self.debug_sessions.len()
-                    );
+                    self.report_member_ended(&ended_name);
                     return true;
                 }
                 // The watchdog reparents to init the moment the server dies;
@@ -20922,6 +20961,25 @@ impl App {
     /// Configs are re-read here so an edited launch.json applies on the next
     /// F5 without reopening the picker.
     fn start_selected_debug(&mut self) {
+        if let Some(name) = self.selected_debug_compound.clone() {
+            let root = self.active_workspace_root();
+            self.debug_compounds = crate::dap::configs::discover_compounds(&root);
+            if let Some(compound) = self
+                .debug_compounds
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
+                self.launch_compound(&compound);
+                return;
+            }
+            self.selected_debug_compound = None;
+            self.run_debug.selected_config = None;
+            self.status =
+                format!("Debug compound \"{name}\" no longer exists — debugging the active file");
+            self.start_debug_session();
+            return;
+        }
         if let Some(name) = self.selected_debug_config.clone() {
             let root = self.active_workspace_root();
             self.debug_configs = crate::dap::configs::discover_configs(&root);
@@ -20938,6 +20996,138 @@ impl App {
             );
         }
         self.start_debug_session();
+    }
+
+    /// Launch a launch.json compound: resolve its members against the
+    /// un-deduped config list, refuse what croft cannot honour, then start
+    /// one or several sessions. Shared by the picker and by F5/restart once
+    /// the compound is the selected target (#567).
+    fn launch_compound(&mut self, compound: &crate::dap::configs::Compound) {
+        // Resolve first: a compound naming a configuration no
+        // launch.json declares is a config error worth
+        // reporting now, separately from the unbuilt feature.
+        // The un-deduped list: `debug_configs` is the picker's
+        // display list and drops a lower-precedence duplicate by
+        // name, which is the very entry a `.vscode` compound
+        // naming that name has to bind.
+        let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
+        // #310 defers compounds that need SEVERAL sessions at
+        // once. A compound naming ONE configuration needs one,
+        // which croft has run since #250 — so the arity has to
+        // be READ here rather than assumed. Reporting the
+        // multi-session limit for a one-member compound cites
+        // a limitation that does not apply and tells the user
+        // something false about their own launch.json.
+        match crate::dap::configs::resolve_compound(compound, &all) {
+            Err(e) => self.debug_error(e),
+            // A one-member compound carrying keys croft does
+            // not honour is REFUSED rather than launched.
+            // Since #318 completed, only VALUES croft cannot
+            // READ remain: a `presentation` that is not an
+            // object, or a `hidden`/`group`/`order` that is
+            // not a bool/string/number. Every key that says
+            // something croft can act on is honoured -
+            // `preLaunchTask` by the branch below, `hidden`,
+            // `group` and `order` by the picker's sort.
+            // Launching while ignoring what the compound asked
+            // for is the "silently debug something other than
+            // what was asked for" outcome every guard here
+            // exists to prevent.
+            // Asked of BOTH arities (#310). It sat on the
+            // one-member arm because the other refused anyway;
+            // now that both launch, a malformed key would be
+            // refused at one member and ignored at two - the
+            // "silently debug something other than what was
+            // asked for" outcome this guard exists to prevent.
+            Ok(members) if !compound.unsupported_keys.is_empty() => {
+                // #318, NOT #310: this compound needs ONE
+                // session, which croft runs. What it cannot do
+                // is honour the key. Citing the multi-session
+                // limit here would be the same false claim the
+                // launching branch below exists to stop making.
+                //
+                // The remedy names both ways out: fix the
+                // value, or run the member directly. Running
+                // it directly DOES skip the compound's own
+                // preLaunchTask, which the message leaves
+                // unsaid on purpose - a test pins that the
+                // status never mentions preLaunchTask, since
+                // naming it here would read as advice to
+                // accept the skip.
+                // Up to three keys can be listed now, so
+                // "a and b and c" would read as one run-on;
+                // the last pair keeps the "and".
+                let keys = match compound.unsupported_keys.split_last() {
+                    Some((last, [])) => (*last).to_string(),
+                    Some((last, rest)) => {
+                        format!("{} and {last}", rest.join(", "))
+                    }
+                    None => String::new(),
+                };
+                let plural = if compound.unsupported_keys.len() > 1 {
+                    "those keys"
+                } else {
+                    "that key"
+                };
+                // Name EVERY member, not `members[0]`. The
+                // guard now covers both arities, and telling
+                // the user of a three-member compound to run
+                // the first one directly is advice to launch
+                // a SUBSET - the precise outcome this arm
+                // refuses to produce itself.
+                let all = members
+                    .iter()
+                    .map(|m| format!("\"{}\"", m.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let run_them = if members.len() > 1 {
+                    format!("or run {all} directly, in that order")
+                } else {
+                    format!("or run {all} directly")
+                };
+                self.debug_error(format!(
+                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch {} through the compound, {}",
+                    compound.name, keys, plural, all, run_them
+                ));
+            }
+            Ok(members) if members.len() == 1 => {
+                let cfg = members[0].clone();
+                // One member has no siblings to stop, so its `stopAll` is set
+                // false rather than inherited from whatever ran before.
+                self.debug_stop_all = false;
+                match compound.pre_launch_task.clone() {
+                    // #318: the compound's own task runs
+                    // first, and the member starts only if it
+                    // exits 0 - the same contract a config's
+                    // own task already gets. Chained rather
+                    // than merged: the member may declare a
+                    // task too, and VS Code runs both.
+                    Some(task) => self.launch_after_compound_task(&task, cfg),
+                    None => self.launch_debug_config(&cfg),
+                }
+            }
+            Ok(members) => {
+                // Several sessions at once: what #310 built
+                // the set for. Members start in DECLARATION
+                // order, which is the order the file asked
+                // for and the order a client-then-server
+                // compound depends on.
+                let label = compound.name.clone();
+                // `resolve_compound` borrows from the config
+                // list; the launch outlives that borrow, so
+                // the members are owned from here on.
+                let members: Vec<_> = members.into_iter().cloned().collect();
+                match compound.pre_launch_task.clone() {
+                    Some(task) => self.launch_after_compound_task_all(
+                        &task,
+                        members,
+                        label,
+                        compound.stop_all,
+                    ),
+                    None => self.launch_compound_members(members, label, compound.stop_all),
+                }
+            }
+        }
     }
 
     /// Debug: Select and Start Debugging — the launch.json configurations
@@ -21061,6 +21251,7 @@ impl App {
         task_label: &str,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
         self.pending_debug_launch = None;
@@ -21080,7 +21271,11 @@ impl App {
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members(Box::new(CompoundLaunch { members, compound })),
+            step: PendingLaunchStep::Members(Box::new(CompoundLaunch {
+                members,
+                compound,
+                stop_all,
+            })),
             started: std::time::Instant::now(),
         });
         self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
@@ -21106,8 +21301,18 @@ impl App {
         &mut self,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
+        // Set only here, once the old set is gone: a compound refused before
+        // this point leaves the running set untouched, and must leave its
+        // `stopAll` out of it too (#567).
+        self.debug_stop_all = stop_all;
+        // A launch supersedes any older one still parked behind its task:
+        // left in place, that task's exit would launch its config and stop
+        // this set (#567). The task-gated path reaches here via `take()`, so
+        // this only ever drops a STALE parking.
+        self.pending_debug_launch = None;
         let total = members.len();
         let mut started = 0usize;
         let mut unrun: Vec<String> = Vec::new();
@@ -21137,6 +21342,7 @@ impl App {
         // written server-first, and landing the user on whichever happened to
         // start last would put them in the wrong one.
         self.debug_sessions.focus(0);
+        self.debug_compound = Some(compound.clone());
         // Reveal FIRST, then write the feedback: `reveal_debug_view` runs
         // `refresh_run_debug`, which clears `feedback` unconditionally, so
         // doing it afterwards wiped every line built below - including the
@@ -21204,7 +21410,7 @@ impl App {
             // member - parking is one-at-a-time and a set of parked members
             // would interleave.
             PendingLaunchStep::Members(launch) => {
-                self.launch_compound_members(launch.members, launch.compound)
+                self.launch_compound_members(launch.members, launch.compound, launch.stop_all)
             }
         }
     }
@@ -21562,6 +21768,9 @@ impl App {
     /// languages route to lldb-dap.
     fn start_debug_session(&mut self) {
         use crate::dap::session::AdapterKind;
+        // Same as every other launch path: a parked older launch must not
+        // fire later and replace this one (#567).
+        self.pending_debug_launch = None;
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;
@@ -22058,6 +22267,27 @@ impl App {
         self.watch_baseline_pending = false;
     }
 
+    /// A compound member ended and siblings survive (#567): rebuild the
+    /// status and the panel line from the live set, naming what ended, which
+    /// session the view now shows, and every one still running. Without this
+    /// both kept naming the ended session.
+    fn report_member_ended(&mut self, ended: &str) {
+        let running = self.debug_sessions.names().join(", ");
+        let focused = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let what = self
+            .debug_compound
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" compound {c}"));
+        self.run_debug.feedback = Some(format!("Debugging{what}: {running} ({ended} ended)"));
+        self.run_debug.feedback_is_error = false;
+        self.status =
+            format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
     /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         // EVERY session, not the focused one (#310). A compound launches
@@ -22068,6 +22298,7 @@ impl App {
             session.disconnect();
         }
         self.debug_sessions.clear();
+        self.debug_compound = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
@@ -24743,133 +24974,15 @@ impl App {
                         .parse::<usize>()
                         .ok()
                         .and_then(|i| self.debug_compounds.get(i));
-                    if let Some(compound) = found {
-                        // Resolve first: a compound naming a configuration no
-                        // launch.json declares is a config error worth
-                        // reporting now, separately from the unbuilt feature.
-                        // The un-deduped list: `debug_configs` is the picker's
-                        // display list and drops a lower-precedence duplicate by
-                        // name, which is the very entry a `.vscode` compound
-                        // naming that name has to bind.
-                        let all = crate::dap::configs::discover_configs_all(
-                            &self.active_workspace_root(),
-                        );
-                        // #310 defers compounds that need SEVERAL sessions at
-                        // once. A compound naming ONE configuration needs one,
-                        // which croft has run since #250 — so the arity has to
-                        // be READ here rather than assumed. Reporting the
-                        // multi-session limit for a one-member compound cites
-                        // a limitation that does not apply and tells the user
-                        // something false about their own launch.json.
-                        match crate::dap::configs::resolve_compound(compound, &all) {
-                            Err(e) => self.debug_error(e),
-                            // A one-member compound carrying keys croft does
-                            // not honour is REFUSED rather than launched.
-                            // Since #318 completed, only VALUES croft cannot
-                            // READ remain: a `presentation` that is not an
-                            // object, or a `hidden`/`group`/`order` that is
-                            // not a bool/string/number. Every key that says
-                            // something croft can act on is honoured -
-                            // `preLaunchTask` by the branch below, `hidden`,
-                            // `group` and `order` by the picker's sort.
-                            // Launching while ignoring what the compound asked
-                            // for is the "silently debug something other than
-                            // what was asked for" outcome every guard here
-                            // exists to prevent.
-                            // Asked of BOTH arities (#310). It sat on the
-                            // one-member arm because the other refused anyway;
-                            // now that both launch, a malformed key would be
-                            // refused at one member and ignored at two - the
-                            // "silently debug something other than what was
-                            // asked for" outcome this guard exists to prevent.
-                            Ok(members) if !compound.unsupported_keys.is_empty() => {
-                                // #318, NOT #310: this compound needs ONE
-                                // session, which croft runs. What it cannot do
-                                // is honour the key. Citing the multi-session
-                                // limit here would be the same false claim the
-                                // launching branch below exists to stop making.
-                                //
-                                // The remedy names both ways out: fix the
-                                // value, or run the member directly. Running
-                                // it directly DOES skip the compound's own
-                                // preLaunchTask, which the message leaves
-                                // unsaid on purpose - a test pins that the
-                                // status never mentions preLaunchTask, since
-                                // naming it here would read as advice to
-                                // accept the skip.
-                                // Up to three keys can be listed now, so
-                                // "a and b and c" would read as one run-on;
-                                // the last pair keeps the "and".
-                                let keys = match compound.unsupported_keys.split_last() {
-                                    Some((last, [])) => (*last).to_string(),
-                                    Some((last, rest)) => {
-                                        format!("{} and {last}", rest.join(", "))
-                                    }
-                                    None => String::new(),
-                                };
-                                let plural = if compound.unsupported_keys.len() > 1 {
-                                    "those keys"
-                                } else {
-                                    "that key"
-                                };
-                                // Name EVERY member, not `members[0]`. The
-                                // guard now covers both arities, and telling
-                                // the user of a three-member compound to run
-                                // the first one directly is advice to launch
-                                // a SUBSET - the precise outcome this arm
-                                // refuses to produce itself.
-                                let all = members
-                                    .iter()
-                                    .map(|m| format!("\"{}\"", m.name))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let run_them = if members.len() > 1 {
-                                    format!("or run {all} directly, in that order")
-                                } else {
-                                    format!("or run {all} directly")
-                                };
-                                self.debug_error(format!(
-                                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch {} through the compound, {}",
-                                    compound.name, keys, plural, all, run_them
-                                ));
-                            }
-                            Ok(members) if members.len() == 1 => {
-                                let cfg = members[0].clone();
-                                self.selected_debug_config = Some(cfg.name.clone());
-                                self.run_debug.selected_config = Some(cfg.name.clone());
-                                match compound.pre_launch_task.clone() {
-                                    // #318: the compound's own task runs
-                                    // first, and the member starts only if it
-                                    // exits 0 - the same contract a config's
-                                    // own task already gets. Chained rather
-                                    // than merged: the member may declare a
-                                    // task too, and VS Code runs both.
-                                    Some(task) => self.launch_after_compound_task(&task, cfg),
-                                    None => self.launch_debug_config(&cfg),
-                                }
-                            }
-                            Ok(members) => {
-                                // Several sessions at once: what #310 built
-                                // the set for. Members start in DECLARATION
-                                // order, which is the order the file asked
-                                // for and the order a client-then-server
-                                // compound depends on.
-                                let label = compound.name.clone();
-                                // `resolve_compound` borrows from the config
-                                // list; the launch outlives that borrow, so
-                                // the members are owned from here on.
-                                let members: Vec<_> = members.into_iter().cloned().collect();
-                                match compound.pre_launch_task.clone() {
-                                    Some(task) => {
-                                        self.launch_after_compound_task_all(&task, members, label)
-                                    }
-                                    None => self.launch_compound_members(members, label),
-                                }
-                            }
-                        }
+                    if let Some(compound) = found.cloned() {
+                        self.selected_debug_config = None;
+                        self.selected_debug_compound = Some(compound.name.clone());
+                        self.run_debug.selected_config = Some(compound.name.clone());
+                        self.launch_compound(&compound);
                     }
                 } else if row.id == "active" {
                     self.selected_debug_config = None;
+                    self.selected_debug_compound = None;
                     self.run_debug.selected_config = None;
                     self.start_selected_debug();
                 } else if let Some(cfg) = row
@@ -24880,6 +24993,7 @@ impl App {
                     .cloned()
                 {
                     self.selected_debug_config = Some(cfg.name.clone());
+                    self.selected_debug_compound = None;
                     self.run_debug.selected_config = Some(cfg.name.clone());
                     self.launch_debug_config(&cfg);
                 }

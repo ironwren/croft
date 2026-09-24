@@ -39635,15 +39635,14 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
          deferral does not apply to it: {}",
         app.status
     );
-    assert_eq!(
-        app.selected_debug_config.as_deref(),
-        Some("Server"),
-        "it selects its single member, exactly as selecting that \
-         configuration directly would"
-    );
-    // `selected_debug_config` is assigned BEFORE `launch_debug_config`, which
-    // has several early-return error paths — so the assertion above proves only
-    // that the launch BRANCH was reached. Assert the launch was not refused.
+    // #567: it selects the COMPOUND, not its member. Selecting the member
+    // made F5 relaunch the bare configuration, skipping anything the compound
+    // itself declares (its preLaunchTask).
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Just Server"));
+    assert_eq!(app.selected_debug_config, None);
+    // The selection is assigned BEFORE the launch, which has several
+    // early-return error paths — so the assertion above proves only that the
+    // launch BRANCH was reached. Assert the launch was not refused.
     // The launch reached a real adapter, so what it does next depends on the
     // machine: the GitHub runner has no `uv`, and "Debugger setup failed:
     // running `uv venv`" is a true report about that box, not this fix
@@ -49252,4 +49251,261 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
         ),
         other => panic!("an oversized request must not be accepted: {other:?}"),
     }
+}
+
+/// Open the debug picker and confirm the row whose label starts with `label`.
+fn pick_debug_row(app: &mut App, label: &str) {
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with(label))
+        .unwrap_or_else(|| panic!("{label} is listed"));
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+}
+
+/// A workspace with two configs and compounds with and without a task. The
+/// task never finishes on its own, so a parked launch stays parked.
+fn compound_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "build", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
+        ],
+        "compounds": [
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
+            { "name": "Both", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn restart_relaunches_the_selected_compound_not_a_stale_config() {
+    // #567 item 6: a compound launch never became the F5 target, so restart
+    // (and F5 after the sessions end) ran whatever was selected before.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.selected_debug_config = Some(String::from("Client"));
+
+    pick_debug_row(&mut app, "Tasked");
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Tasked"));
+    assert_eq!(
+        app.selected_debug_config, None,
+        "the compound replaces the old target"
+    );
+    app.refresh_run_debug();
+    assert_eq!(app.run_debug.selected_config.as_deref(), Some("Tasked"));
+
+    // Restart goes back through the compound, so its task parks the launch
+    // again. Launching "Client" (the stale target) or bare "Server" (its
+    // member) would clear the parking instead.
+    app.pending_debug_launch = None;
+    app.debug_restart();
+    assert!(
+        app.pending_debug_launch.is_some() && app.status.contains("compound preLaunchTask"),
+        "restart re-runs the compound behind its own task: {}",
+        app.status
+    );
+
+    // Choosing a configuration afterwards drops the compound selection.
+    pick_debug_row(&mut app, "Server");
+    assert_eq!(app.selected_debug_compound, None);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Server"));
+}
+
+#[test]
+fn a_direct_compound_launch_drops_an_older_parked_task() {
+    // #567 item 5: the parked launch outlived a newer compound launch, and
+    // its task's exit would later start its config and stop the compound.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "the task-gated launch is parked"
+    );
+
+    pick_debug_row(&mut app, "Both");
+    assert!(
+        app.pending_debug_launch.is_none(),
+        "the newer compound launch supersedes the parked one"
+    );
+}
+
+#[test]
+fn a_zero_config_launch_drops_an_older_parked_task() {
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(app.pending_debug_launch.is_some());
+
+    pick_debug_row(&mut app, "Debug active file");
+    assert!(app.pending_debug_launch.is_none());
+}
+
+/// A stand-in adapter that emits one DAP `terminated` event and then idles,
+/// or (with `ends: false`) never says anything. Real processes, so the test
+/// drives the same transport and `poll` the app does.
+fn stub_member(ends: bool) -> crate::dap::session::DapSession {
+    let script = if ends {
+        "printf 'Content-Length: %d\r\n\r\n%s' 45 '{\"seq\":1,\"type\":\"event\",\"event\":\"terminated\"}'; sleep 30"
+    } else {
+        "sleep 30"
+    };
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), String::from(script)],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// Poll until the set shrinks below `from` members or two seconds pass.
+fn poll_until_shrinks(app: &mut App, from: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.debug_sessions.len() >= from && std::time::Instant::now() < deadline {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stop_all_true_stops_the_set_when_a_background_member_ends() {
+    // #567 item 4: `stopAll: true` was refused; it is honoured now.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "A ending takes B with it: {:?}",
+        app.debug_sessions.names()
+    );
+    assert!(
+        app.status.contains("stopAll"),
+        "and says why: {}",
+        app.status
+    );
+}
+
+#[test]
+fn stop_all_false_leaves_the_siblings_running() {
+    // The control: without stopAll only the member that ended goes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    app.debug_stop();
+}
+
+/// A compound that is REFUSED (here, it names a configuration no
+/// launch.json declares) leaves the running set alone, so it must not leave
+/// its `stopAll` behind either: that set never asked for it.
+#[test]
+fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{"version":"0.2.0","configurations":[],
+            "compounds":[{"name":"Bad","configurations":["Missing"],"stopAll":true}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    let compound = crate::dap::configs::discover_compounds(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Bad")
+        .expect("the compound parses");
+    assert!(compound.stop_all);
+    app.launch_compound(&compound);
+    assert_eq!(
+        app.debug_sessions.len(),
+        2,
+        "the refusal leaves the set running"
+    );
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec!["B"],
+        "A ending must not take B: the running set never asked for stopAll"
+    );
+    app.debug_stop();
+}
+
+#[test]
+fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
+    // #567 items 2 and 3: the status and panel line kept naming the ended
+    // session. Both now say what ended, what is shown, and what still runs.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_compound = Some(String::from("Stack"));
+    app.run_debug.feedback = Some(String::from("Debugging compound Stack: A, B"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debugging compound Stack: B (A ended)")
+    );
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
+    assert_eq!(app.debug_compound, None, "a full stop forgets the compound");
+}
+
+#[test]
+fn the_focused_member_ending_names_the_session_now_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_compound = Some(String::from("Stack"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
 }
