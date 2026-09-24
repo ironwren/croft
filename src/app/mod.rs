@@ -3268,6 +3268,16 @@ pub struct App {
         PathBuf,
         std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
     >,
+    /// Markdown-lint's own edit-seq cursor, mirroring `lsp_last_seen` but
+    /// independent of the LSP: `.md` files get linted whether or not any
+    /// language server is running (there is none for Markdown), so this
+    /// cannot share the LSP's cursor map. Keyed by path; a path's entry is
+    /// removed when its tab closes so a later re-open re-lints instead of
+    /// trusting a stale seq (a different file could reuse a `PathBuf` after
+    /// a rename-in-place on disk). Each entry holds the lines that were
+    /// linted as well as their seq, because two split panes count edits
+    /// separately and can share a seq while holding different text.
+    markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4837,6 +4847,7 @@ impl App {
             semantic_generation_seen: std::collections::HashMap::new(),
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
+            markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -7061,6 +7072,111 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Lints every open `.md` tab and folds the results into the same
+    /// diagnostics store a real language server writes to (`lsp_diagnostics`,
+    /// keyed by path then by "producer"), under the synthetic server name
+    /// `"Markdown Lint"`. There is no bundled Markdown language server (see
+    /// `src/vscode_extensions.rs`), so this runs independently of `self.lsp`
+    /// and `sync_lsp`'s extension gate, which only covers languages that
+    /// map to a real server. Gated by its own edit-seq cursor
+    /// (`markdown_lint_last_seen`) so an unchanged buffer isn't re-linted
+    /// every tick. Returns whether any editor's overlay or the PROBLEMS
+    /// panel changed, for the caller's redraw decision.
+    pub fn sync_markdown_lint(&mut self) -> bool {
+        let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
+        // Both collections: `self.editor` is the ACTIVE group's tabs, and a
+        // split's other panes live in `editor_layout`. Walking only the
+        // active one left a `.md` open in an inactive pane unlinted, and the
+        // `closed` sweep below then dropped its diagnostics as though the tab
+        // had gone - squiggles vanishing from a pane in plain sight.
+        let inactive_tabs: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        for tab in self.editor.iter_tabs().chain(inactive_tabs) {
+            if tab.has_non_text_view() {
+                continue;
+            }
+            let Some(path) = tab.path.as_ref() else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // The same file can be open in several panes, each its own
+            // buffer with its own `edit_seq`. Only the FIRST tab seen for a
+            // path (the active group comes first) is compared: judging each
+            // pane against one shared cursor made two panes with different
+            // seqs take turns, re-linting and redrawing on every tick.
+            if !current.insert(path.clone()) {
+                continue;
+            }
+            // The seq alone cannot tell two panes apart: each counts its own
+            // edits, so they can agree while holding different text. The
+            // lines last linted are kept too and compared when the seqs
+            // match (one comparison, no allocation), so switching to the
+            // other pane re-lints exactly when its text differs.
+            let seq = tab.edit_seq;
+            let seen = self
+                .markdown_lint_last_seen
+                .get(path)
+                .is_some_and(|(s, lines)| *s == seq && *lines == tab.lines);
+            if !seen {
+                to_lint.push((path.clone(), tab.lines.clone(), seq));
+            }
+        }
+        let mut changed = false;
+        for (path, lines, seq) in to_lint {
+            let diags = crate::markdown_lint::lint(&lines.join("\n"));
+            let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
+            if diags.is_empty() {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&path);
+                }
+            } else if by_server.get("Markdown Lint") != Some(&diags) {
+                // Only a different set is a change: storing the same
+                // diagnostics again must not ask for a redraw.
+                by_server.insert("Markdown Lint".to_string(), diags);
+                changed = true;
+            }
+            self.markdown_lint_last_seen
+                .insert(path.clone(), (seq, lines));
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                }
+            }
+        }
+        let closed: Vec<PathBuf> = self
+            .markdown_lint_last_seen
+            .keys()
+            .filter(|p| !current.contains(*p))
+            .cloned()
+            .collect();
+        for p in closed {
+            self.markdown_lint_last_seen.remove(&p);
+            if let Some(by_server) = self.lsp_diagnostics.get_mut(&p) {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&p);
+                }
+            }
+        }
+        if changed {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
+        changed
     }
 
     /// The repository toplevel owning the workspace, from the git worker's
@@ -50180,6 +50296,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        let markdown_lint_changed = app.sync_markdown_lint();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
@@ -50336,7 +50453,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || explorer_panels_changed
             || install_status_changed
             || blame_changed
-            || dap_changed;
+            || dap_changed
+            || markdown_lint_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);

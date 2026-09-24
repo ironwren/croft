@@ -23284,6 +23284,212 @@ fn diagnostics_store_applies_to_the_active_editor_on_drain() {
 }
 
 #[test]
+fn sync_markdown_lint_flags_a_second_top_level_heading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.md");
+    std::fs::write(&file, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let changed = app.sync_markdown_lint();
+    assert!(changed, "a fresh markdown tab must lint on first sync");
+    assert_eq!(app.editor.diagnostics_path(), Some(file.as_path()));
+    assert!(
+        app.editor
+            .diagnostic_spans_for_test()
+            .iter()
+            .any(|line| !line.is_empty()),
+        "MD025 should have produced at least one squiggle"
+    );
+    let merged = app.merged_diagnostics(&file);
+    assert!(merged.iter().any(|d| d.message.contains("MD025")));
+}
+
+#[test]
+fn sync_markdown_lint_is_quiet_for_a_clean_document_and_reruns_only_on_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("clean.md");
+    std::fs::write(&file, "# Title\n\nA clean paragraph.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    // A clean document has nothing to apply, so the first sync reports no
+    // change even though it did run the linter once.
+    assert!(!app.sync_markdown_lint());
+    assert!(
+        app.merged_diagnostics(&file).is_empty(),
+        "a clean document must not be flagged"
+    );
+    // Re-syncing an unchanged buffer must be a no-op (gated by edit_seq).
+    assert!(!app.sync_markdown_lint());
+
+    // The other half of this test's name: an EDIT must bump edit_seq, get the
+    // buffer re-linted, and surface the new violation. Without this the test
+    // passed on a linter that never ran a second time.
+    app.editor.goto_bottom();
+    app.editor
+        .insert_str_as("\n# Second Title\n", crate::provenance::Seat::Navigator);
+    assert!(
+        app.sync_markdown_lint(),
+        "an edit that introduces a second H1 must re-lint and report a change"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the second H1 must be flagged after the edit"
+    );
+}
+
+/// Split panes hold separate buffers of one file, so after an edit in one
+/// they carry different `edit_seq`s. The sync must settle on one pane per
+/// path rather than alternate between the two, and must not report a change
+/// when the diagnostics it stores are the ones already there: either would
+/// re-lint and redraw on every tick forever.
+#[test]
+fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.editor.insert_char('!');
+    assert!(
+        app.sync_markdown_lint(),
+        "the first lint stores diagnostics"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the edited pane still has two H1s"
+    );
+    assert!(
+        !app.sync_markdown_lint(),
+        "nothing changed since the last tick"
+    );
+    assert!(!app.sync_markdown_lint(), "and it stays settled");
+}
+
+/// Two panes can reach the same `edit_seq` with different text (one edit in
+/// each). Switching which pane is linted must still lint it: the cursor has
+/// to recognise a different buffer, not just a different sequence number.
+#[test]
+fn sync_markdown_lint_relints_a_pane_with_the_same_seq_but_other_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\nplain\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    // One edit per pane: the focused pane gains an MD018 heading
+    // (`#Bad`), the other a harmless character, so both seqs match.
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    for c in "#Bad".chars() {
+        app.editor.insert_char(c);
+    }
+    let seq_bad = app.editor.edit_seq;
+    // The split put the new, focused pane on the right; move to the left one.
+    app.focus_editor_group(true);
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 5;
+    // A split does not copy `edit_seq`, so type harmless text until this
+    // pane's count meets the other's.
+    while app.editor.edit_seq < seq_bad {
+        app.editor.insert_char('!');
+    }
+    assert_eq!(app.editor.edit_seq, seq_bad, "same seq, different text");
+    assert!(!app.editor.lines.iter().any(|l| l.starts_with("#B")));
+    let md018 = |app: &App| {
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD018"))
+    };
+    // Lint with the `#Bad` pane focused (it is walked first) ...
+    app.focus_editor_group(false);
+    app.sync_markdown_lint();
+    assert!(md018(&app), "the focused pane has `#Bad`");
+    // ... then with the clean pane focused: same seq, other text.
+    app.focus_editor_group(true);
+    app.sync_markdown_lint();
+    assert!(
+        !md018(&app),
+        "the other pane has no MD018, so it must be re-linted"
+    );
+}
+
+/// A `.md` held by an INACTIVE split group must still be linted. The gather
+/// loop used to walk only `self.editor`, so such a tab was never linted and
+/// the cleanup below then dropped its stored diagnostics while it was still
+/// open - the squiggles vanished from a pane that was plainly visible.
+#[test]
+fn sync_markdown_lint_covers_inactive_split_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor(); // both groups hold doc.md; the new one is focused
+    // Move the ACTIVE group off the markdown file, so doc.md lives only in
+    // the inactive group - the case the gather loop missed. `open_pinned`
+    // ADDS a tab, so the old one has to be closed or the active group still
+    // holds doc.md and the bug never shows.
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "plain\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    let md_idx = app
+        .editor
+        .iter_tabs()
+        .position(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the active group still holds doc.md before the close");
+    app.editor.close_tab(md_idx);
+    assert!(
+        !app.editor
+            .iter_tabs()
+            .any(|e| e.path.as_deref() == Some(file.as_path())),
+        "doc.md must now live ONLY in the inactive group"
+    );
+
+    let held_inactive = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .any(|e| e.path.as_deref() == Some(file.as_path()));
+    assert!(held_inactive, "the inactive group holds doc.md");
+
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "a markdown tab in an inactive pane must still be linted"
+    );
+
+    // And a second sync must not retire those diagnostics as "closed".
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the tab is still open, so its diagnostics must survive the sweep"
+    );
+}
+
+#[test]
+fn sync_markdown_lint_skips_non_markdown_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "#Not a heading, this is Rust\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    assert!(!app.sync_markdown_lint());
+    assert!(app.merged_diagnostics(&file).is_empty());
+}
+
+#[test]
 fn merged_diagnostics_layers_every_server_for_a_file() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();

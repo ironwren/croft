@@ -38,6 +38,7 @@ mod lsp;
 mod macros;
 mod magic;
 mod markdown;
+mod markdown_lint;
 mod marketplace;
 mod mcp;
 mod media;

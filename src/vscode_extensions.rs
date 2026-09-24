@@ -524,9 +524,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "davidanson.vscode-markdownlint",
-        croft: "",
-        status: Status::None,
-        note: "no Markdown linter",
+        croft: "Markdown lint diagnostics",
+        status: Status::Builtin,
+        note: "MD025/MD018/MD009/MD012 checks run on open .md tabs, surfacing as squiggles and PROBLEMS entries",
     },
     Mapping {
         vscode: "bierner.markdown-mermaid",
