@@ -397,6 +397,173 @@ fn palette_style_for_name(p: &SyntaxPalette, name: &str) -> Style {
     }
 }
 
+/// Which tag gets which of the four hues below. Matched case-sensitively at
+/// a word boundary so `todo!()` (a Rust macro, not a comment tag) and
+/// `Autodocking` are left alone.
+const COMMENT_KEYWORDS: &[(&str, TagHue)] = &[
+    ("TODO", TagHue::Info),
+    ("FIXME", TagHue::Alarm),
+    ("XXX", TagHue::Alarm),
+    ("BUG", TagHue::Alarm),
+    ("HACK", TagHue::Odd),
+    ("NOTE", TagHue::Info),
+    ("WARNING", TagHue::Warn),
+    ("OPTIMIZE", TagHue::Warn),
+    ("SAFETY", TagHue::Warn),
+    ("REVIEW", TagHue::Info),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TagHue {
+    Info,
+    Alarm,
+    Odd,
+    Warn,
+}
+
+impl TagHue {
+    /// The tag colour for a light or a dark theme.
+    ///
+    /// One fixed palette cannot serve both. The original four were picked
+    /// against dark backgrounds and, measured against Croft Light's `#ffffff`
+    /// editor, scored 2.02:1 (cyan), 2.78:1 (red), 2.42:1 (purple) and
+    /// 1.62:1 (yellow) - `WARNING`, the one that most needs reading, was the
+    /// worst. Darkening them for light themes fixes that and would ruin them
+    /// on dark ones, so the choice follows the theme. The dark set is
+    /// unchanged, so no dark theme shifts colour.
+    fn color(self, light: bool) -> Color {
+        match (self, light) {
+            (TagHue::Info, false) => rgb(0x4F, 0xC1, 0xFF),
+            (TagHue::Alarm, false) => rgb(0xFF, 0x6B, 0x6B),
+            (TagHue::Odd, false) => rgb(0xC7, 0x8D, 0xFF),
+            (TagHue::Warn, false) => rgb(0xFF, 0xC1, 0x4F),
+            // 5.0:1 or better on #ffffff, all four.
+            (TagHue::Info, true) => rgb(0x00, 0x5F, 0xB8),
+            (TagHue::Alarm, true) => rgb(0xC0, 0x26, 0x26),
+            (TagHue::Odd, true) => rgb(0x6D, 0x28, 0xD9),
+            (TagHue::Warn, true) => rgb(0x8B, 0x5A, 0x00),
+        }
+    }
+}
+
+/// Whether `style` is one [`comment_keyword_spans`] paints on a tag: BOLD over
+/// one of the tag hues. BOLD alone does not identify a tag - keywords are
+/// BOLD too - so a caller that must keep tags must not key on it alone.
+pub(crate) fn is_comment_tag_style(style: Style) -> bool {
+    let Some(fg) = style.fg else {
+        return false;
+    };
+    style.add_modifier.contains(Modifier::BOLD)
+        && COMMENT_KEYWORDS
+            .iter()
+            .any(|&(_, hue)| fg == hue.color(false) || fg == hue.color(true))
+}
+
+/// Whether the active theme is a light one, inferred from its foreground.
+///
+/// A light theme paints dark text on a light background, so a DARK `fg` means
+/// the background behind it is light. The palette carries no background
+/// field, and this is the signal it does carry.
+fn palette_is_light(p: &SyntaxPalette) -> bool {
+    let (r, g, b) = p.fg;
+    // Rec. 601 luma, the cheap perceptual brightness the rest of the TUI uses.
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    luma < 128.0
+}
+
+/// Whether the character ENDING at byte `i` is a word character.
+///
+/// The byte-level test was not enough: in UTF-8 prose the continuation bytes
+/// of a letter like `\u{4fee}` are all >= 0x80, so a byte-level test called them
+/// non-word and `\u{4fee}TODO\u{5fa9}` highlighted a tag that is plainly
+/// inside a word. Decoding the neighbour and asking `is_alphanumeric` gets
+/// every script right, not just Latin.
+fn word_char_ends_at(text: &[u8], i: usize) -> bool {
+    // Walk back off any continuation bytes to the character's first byte.
+    let mut s = i;
+    while s > 0 && text[s - 1] & 0b1100_0000 == 0b1000_0000 {
+        s -= 1;
+    }
+    if s == 0 {
+        return false;
+    }
+    s -= 1;
+    std::str::from_utf8(&text[s..i])
+        .ok()
+        .and_then(|t| t.chars().next_back())
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether the character STARTING at byte `i` is a word character.
+fn word_char_starts_at(text: &[u8], i: usize) -> bool {
+    // A character is at most 4 bytes; decode the shortest valid prefix.
+    let upto = (i + 4).min(text.len());
+    for e in i + 1..=upto {
+        if let Ok(t) = std::str::from_utf8(&text[i..e])
+            && let Some(c) = t.chars().next()
+        {
+            return c.is_alphanumeric() || c == '_';
+        }
+    }
+    false
+}
+
+/// Split a comment's byte range `[start, end)` of `text` into sub-ranges,
+/// recoloring any [`COMMENT_KEYWORDS`] hit (at a word boundary) with a bold
+/// tag style and leaving the rest at the comment's own `base_style`. Adjacent
+/// same-style ranges are merged so ordinary comments emit exactly one span,
+/// matching the pre-existing cost for a comment with no tags.
+fn comment_keyword_spans(
+    text: &[u8],
+    start: usize,
+    end: usize,
+    base_style: Style,
+    light: bool,
+) -> Vec<(usize, usize, Style)> {
+    let mut out: Vec<(usize, usize, Style)> = Vec::new();
+    let mut push = |s: usize, e: usize, st: Style| {
+        if s >= e {
+            return;
+        }
+        match out.last_mut() {
+            Some((_, last_e, last_st)) if *last_e == s && *last_st == st => *last_e = e,
+            _ => out.push((s, e, st)),
+        }
+    };
+    let mut i = start;
+    while i < end {
+        let before_ok = i == start || !word_char_ends_at(text, i);
+        let mut matched = None;
+        if before_ok {
+            for &(kw, hue) in COMMENT_KEYWORDS {
+                let kw_end = i + kw.len();
+                if kw_end <= end
+                    && &text[i..kw_end] == kw.as_bytes()
+                    && (kw_end == end || !word_char_starts_at(text, kw_end))
+                {
+                    matched = Some((kw_end, hue.color(light)));
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some((kw_end, color)) => {
+                push(i, kw_end, base_style.fg(color).add_modifier(Modifier::BOLD));
+                i = kw_end;
+            }
+            None => {
+                // Advance one byte (not a decoded char) since the keyword
+                // table is ASCII-only and byte-level scanning is enough to
+                // find every match; UTF-8 continuation bytes never satisfy
+                // `before_ok` against an ASCII keyword's first byte anyway.
+                push(i, i + 1, base_style);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LangKind {
     Rust,
@@ -841,7 +1008,18 @@ fn highlight_text_with_palette(
                     // as the `variable`/`punctuation` arm — never a literal.
                     None => palette_style_for_name(palette, ""),
                 };
-                project_range(start, end, style, line_starts, &mut per_line);
+                if name.starts_with("comment") {
+                    // Recolor TODO/FIXME/NOTE/HACK/XXX/BUG tags inside the
+                    // comment body (the "Better Comments" convention) so they
+                    // stand out from ordinary comment prose.
+                    for (s, e, st) in
+                        comment_keyword_spans(text, start, end, style, palette_is_light(palette))
+                    {
+                        project_range(s, e, st, line_starts, &mut per_line);
+                    }
+                } else {
+                    project_range(start, end, style, line_starts, &mut per_line);
+                }
             }
             Err(_) => {}
         }
@@ -1269,6 +1447,199 @@ def f() -> Config:\n\
         assert!(
             Arc::ptr_eq(&ca, &cb),
             "every editor must share one built highlight config"
+        );
+    }
+
+    #[test]
+    fn comment_todo_tag_gets_its_own_bold_span() {
+        let mut reg = LangRegistry::new();
+        let src = "// TODO: fix this\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        // Line 0 is "// TODO: fix this" — expect at least two spans on that
+        // line: the plain comment prose and the recolored TODO tag.
+        let line0 = &h[0];
+        assert!(
+            line0.len() >= 2,
+            "expected the TODO tag split out of the comment span, got {line0:?}"
+        );
+        let tag_span = line0
+            .iter()
+            .find(|sp| &src.as_bytes()[sp.start..sp.end] == b"TODO")
+            .expect("a span covering exactly \"TODO\"");
+        assert!(
+            tag_span.style.add_modifier.contains(Modifier::BOLD),
+            "TODO tag must be bold"
+        );
+        assert_ne!(
+            tag_span.style.fg,
+            palette_style_for_name(&crate::theme::SyntaxPalette::BASE16, "comment").fg,
+            "TODO tag must use a distinct color from plain comment prose"
+        );
+    }
+
+    #[test]
+    fn todo_macro_call_is_not_mistaken_for_a_comment_tag() {
+        // `todo!()` is a Rust macro invocation, not a comment — it must not
+        // pick up the bold tag color reserved for `// TODO` comments.
+        let mut reg = LangRegistry::new();
+        let src = "fn f() { todo!() }\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let hit = h[0]
+            .iter()
+            .find(|sp| src.as_bytes()[sp.start..sp.end].eq_ignore_ascii_case(b"todo"));
+        if let Some(sp) = hit {
+            assert!(
+                !sp.style.add_modifier.contains(Modifier::BOLD)
+                    || sp.style.fg != Some(rgb(0x4F, 0xC1, 0xFF)),
+                "todo!() must not be recolored as a comment tag"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_comment_with_no_tag_emits_a_single_merged_span() {
+        // No regression on the common case: a comment with no keyword must
+        // still collapse to one span, not one per byte.
+        let mut reg = LangRegistry::new();
+        let src = "// just a normal comment\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        let comment_spans: Vec<_> = h[0]
+            .iter()
+            .filter(|sp| src.as_bytes()[sp.start..sp.end].starts_with(b"//"))
+            .collect();
+        assert_eq!(
+            comment_spans.len(),
+            1,
+            "a tag-free comment must stay a single span"
+        );
+        // Counting spans that START with `//` cannot see a per-byte
+        // regression: only the first would match either way. Assert the whole
+        // line is one span, and that it covers the comment end to end.
+        assert_eq!(
+            h[0].len(),
+            1,
+            "the whole comment line is one span: {:?}",
+            h[0]
+        );
+        assert_eq!(h[0][0].start, 0);
+        assert_eq!(
+            h[0][0].end,
+            "// just a normal comment".len(),
+            "the span must cover the complete comment"
+        );
+    }
+
+    /// The release note names the tags by hand, so it can promise one the
+    /// table does not carry - it shipped claiming OPTIMIZE, SAFETY and
+    /// REVIEW while `COMMENT_KEYWORDS` had seven entries. Tie the prose to
+    /// the code: every ALL-CAPS word the note lists must be a real tag.
+    #[test]
+    fn the_release_note_promises_only_tags_that_exist() {
+        let note = include_str!("release_notes/0.1.954.md");
+        let promised: Vec<&str> = note
+            .split(|c: char| !c.is_ascii_uppercase())
+            .filter(|w| w.len() >= 3)
+            .collect();
+        assert!(
+            promised.len() >= 5,
+            "the note should name several tags, found {promised:?}"
+        );
+        for word in promised {
+            assert!(
+                COMMENT_KEYWORDS.iter().any(|(kw, _)| *kw == word),
+                "the note promises {word}, which is not a highlighted tag"
+            );
+        }
+    }
+
+    /// Every tag colour must be readable on the background its theme implies.
+    /// The original fixed palette scored as low as 1.62:1 on Croft Light's
+    /// white editor; WCAG AA wants 4.5:1 for body text. This pins both sets.
+    #[test]
+    fn tag_colours_are_readable_on_their_own_theme() {
+        fn luminance(c: (u8, u8, u8)) -> f64 {
+            fn ch(v: u8) -> f64 {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * ch(c.0) + 0.7152 * ch(c.1) + 0.0722 * ch(c.2)
+        }
+        fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        fn parts(c: Color) -> (u8, u8, u8) {
+            match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("tag colour is not rgb: {other:?}"),
+            }
+        }
+        // Croft Light's editor background, and a representative dark one.
+        let white = (0xff, 0xff, 0xff);
+        let dark = (0x28, 0x2a, 0x36);
+        for &(kw, hue) in COMMENT_KEYWORDS {
+            let on_light = contrast(parts(hue.color(true)), white);
+            assert!(
+                on_light >= 4.5,
+                "{kw} on a light theme is {on_light:.2}:1, want >= 4.5:1"
+            );
+            let on_dark = contrast(parts(hue.color(false)), dark);
+            assert!(
+                on_dark >= 4.5,
+                "{kw} on a dark theme is {on_dark:.2}:1, want >= 4.5:1"
+            );
+        }
+    }
+
+    /// The light/dark decision comes from the palette's foreground: a dark
+    /// `fg` means a light background behind it.
+    #[test]
+    fn palette_lightness_is_read_from_the_foreground() {
+        let mut light = SyntaxPalette::BASE16;
+        light.fg = (0x24, 0x29, 0x2e);
+        assert!(palette_is_light(&light), "dark fg implies a light theme");
+        let mut dark = SyntaxPalette::BASE16;
+        dark.fg = (0xc0, 0xc5, 0xce);
+        assert!(!palette_is_light(&dark), "light fg implies a dark theme");
+    }
+
+    /// The word-boundary test is byte-level, so in UTF-8 prose the
+    /// continuation bytes either side of a tag both read as non-word and the
+    /// tag is highlighted although it is embedded in a word.
+    #[test]
+    fn a_tag_embedded_in_non_ascii_prose_is_not_a_tag() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}TODO\u{5fa9}\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert_eq!(
+            h[0].len(),
+            1,
+            "TODO between CJK letters is inside a word, so the comment stays \
+             one span: {:?}",
+            h[0]
+        );
+    }
+
+    /// The control: the same tag with ordinary boundaries IS highlighted, so
+    /// the test above cannot pass by disabling tag highlighting entirely.
+    #[test]
+    fn a_tag_with_non_ascii_prose_around_it_still_highlights() {
+        let mut reg = LangRegistry::new();
+        let src = "// \u{4fee}\u{5fa9} TODO here\nfn main() {}\n";
+        let line_starts = compute_line_starts(src.as_bytes());
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
+        assert!(
+            h[0].len() > 1,
+            "a space-delimited TODO after CJK text is still a tag: {:?}",
+            h[0]
         );
     }
 

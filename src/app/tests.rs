@@ -23284,6 +23284,212 @@ fn diagnostics_store_applies_to_the_active_editor_on_drain() {
 }
 
 #[test]
+fn sync_markdown_lint_flags_a_second_top_level_heading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.md");
+    std::fs::write(&file, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let changed = app.sync_markdown_lint();
+    assert!(changed, "a fresh markdown tab must lint on first sync");
+    assert_eq!(app.editor.diagnostics_path(), Some(file.as_path()));
+    assert!(
+        app.editor
+            .diagnostic_spans_for_test()
+            .iter()
+            .any(|line| !line.is_empty()),
+        "MD025 should have produced at least one squiggle"
+    );
+    let merged = app.merged_diagnostics(&file);
+    assert!(merged.iter().any(|d| d.message.contains("MD025")));
+}
+
+#[test]
+fn sync_markdown_lint_is_quiet_for_a_clean_document_and_reruns_only_on_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("clean.md");
+    std::fs::write(&file, "# Title\n\nA clean paragraph.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    // A clean document has nothing to apply, so the first sync reports no
+    // change even though it did run the linter once.
+    assert!(!app.sync_markdown_lint());
+    assert!(
+        app.merged_diagnostics(&file).is_empty(),
+        "a clean document must not be flagged"
+    );
+    // Re-syncing an unchanged buffer must be a no-op (gated by edit_seq).
+    assert!(!app.sync_markdown_lint());
+
+    // The other half of this test's name: an EDIT must bump edit_seq, get the
+    // buffer re-linted, and surface the new violation. Without this the test
+    // passed on a linter that never ran a second time.
+    app.editor.goto_bottom();
+    app.editor
+        .insert_str_as("\n# Second Title\n", crate::provenance::Seat::Navigator);
+    assert!(
+        app.sync_markdown_lint(),
+        "an edit that introduces a second H1 must re-lint and report a change"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the second H1 must be flagged after the edit"
+    );
+}
+
+/// Split panes hold separate buffers of one file, so after an edit in one
+/// they carry different `edit_seq`s. The sync must settle on one pane per
+/// path rather than alternate between the two, and must not report a change
+/// when the diagnostics it stores are the ones already there: either would
+/// re-lint and redraw on every tick forever.
+#[test]
+fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.editor.insert_char('!');
+    assert!(
+        app.sync_markdown_lint(),
+        "the first lint stores diagnostics"
+    );
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the edited pane still has two H1s"
+    );
+    assert!(
+        !app.sync_markdown_lint(),
+        "nothing changed since the last tick"
+    );
+    assert!(!app.sync_markdown_lint(), "and it stays settled");
+}
+
+/// Two panes can reach the same `edit_seq` with different text (one edit in
+/// each). Switching which pane is linted must still lint it: the cursor has
+/// to recognise a different buffer, not just a different sequence number.
+#[test]
+fn sync_markdown_lint_relints_a_pane_with_the_same_seq_but_other_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\nplain\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    // One edit per pane: the focused pane gains an MD018 heading
+    // (`#Bad`), the other a harmless character, so both seqs match.
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    for c in "#Bad".chars() {
+        app.editor.insert_char(c);
+    }
+    let seq_bad = app.editor.edit_seq;
+    // The split put the new, focused pane on the right; move to the left one.
+    app.focus_editor_group(true);
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 5;
+    // A split does not copy `edit_seq`, so type harmless text until this
+    // pane's count meets the other's.
+    while app.editor.edit_seq < seq_bad {
+        app.editor.insert_char('!');
+    }
+    assert_eq!(app.editor.edit_seq, seq_bad, "same seq, different text");
+    assert!(!app.editor.lines.iter().any(|l| l.starts_with("#B")));
+    let md018 = |app: &App| {
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD018"))
+    };
+    // Lint with the `#Bad` pane focused (it is walked first) ...
+    app.focus_editor_group(false);
+    app.sync_markdown_lint();
+    assert!(md018(&app), "the focused pane has `#Bad`");
+    // ... then with the clean pane focused: same seq, other text.
+    app.focus_editor_group(true);
+    app.sync_markdown_lint();
+    assert!(
+        !md018(&app),
+        "the other pane has no MD018, so it must be re-linted"
+    );
+}
+
+/// A `.md` held by an INACTIVE split group must still be linted. The gather
+/// loop used to walk only `self.editor`, so such a tab was never linted and
+/// the cleanup below then dropped its stored diagnostics while it was still
+/// open - the squiggles vanished from a pane that was plainly visible.
+#[test]
+fn sync_markdown_lint_covers_inactive_split_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\n# Second Title\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor(); // both groups hold doc.md; the new one is focused
+    // Move the ACTIVE group off the markdown file, so doc.md lives only in
+    // the inactive group - the case the gather loop missed. `open_pinned`
+    // ADDS a tab, so the old one has to be closed or the active group still
+    // holds doc.md and the bug never shows.
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "plain\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    let md_idx = app
+        .editor
+        .iter_tabs()
+        .position(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the active group still holds doc.md before the close");
+    app.editor.close_tab(md_idx);
+    assert!(
+        !app.editor
+            .iter_tabs()
+            .any(|e| e.path.as_deref() == Some(file.as_path())),
+        "doc.md must now live ONLY in the inactive group"
+    );
+
+    let held_inactive = app
+        .editor_layout
+        .inactive_groups()
+        .into_iter()
+        .flat_map(|g| g.editors.iter())
+        .any(|e| e.path.as_deref() == Some(file.as_path()));
+    assert!(held_inactive, "the inactive group holds doc.md");
+
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "a markdown tab in an inactive pane must still be linted"
+    );
+
+    // And a second sync must not retire those diagnostics as "closed".
+    app.sync_markdown_lint();
+    assert!(
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025")),
+        "the tab is still open, so its diagnostics must survive the sweep"
+    );
+}
+
+#[test]
+fn sync_markdown_lint_skips_non_markdown_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "#Not a heading, this is Rust\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    assert!(!app.sync_markdown_lint());
+    assert!(app.merged_diagnostics(&file).is_empty());
+}
+
+#[test]
 fn merged_diagnostics_layers_every_server_for_a_file() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();
@@ -26649,6 +26855,262 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     // The reply answering the newest request (seq 7) refines the outline.
     let applied = app.apply_outline_symbols(file.clone(), 7, vec![stale_symbol]);
     assert!(applied, "the reply matching the newest request must apply");
+}
+
+// --- Bookmarks ------------------------------------------------------------
+
+#[test]
+fn bookmark_chords_are_disjoint_from_the_chords_they_sit_beside() {
+    // Toggle is Cmd+Opt+Shift+K; plain Cmd+Shift+K is still Delete Line.
+    assert!(is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_delete_line_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_toggle_bookmark_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+
+    // Next/previous are Cmd+Opt+. and Cmd+Opt+, — Quick Fix (Cmd+.) excludes
+    // Alt, so the two dot chords never fire together.
+    assert!(is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_quick_fix_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_next_bookmark_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    assert!(!is_prev_bookmark_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::ALT
+    )));
+}
+
+// --- Emmet: Expand Abbreviation -------------------------------------------
+
+#[test]
+fn cmd_opt_shift_e_is_the_emmet_expand_chord() {
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Termux / Linux forward SUPER as CONTROL.
+    assert!(is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    // Each modifier is load-bearing: dropping any one must not expand.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::NONE
+    )));
+    // And it is the E chord specifically, not any Cmd+Opt+Shift letter.
+    assert!(!is_emmet_expand_key(key(
+        KeyCode::Char('w'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+}
+
+#[test]
+fn the_toggle_chord_marks_the_cursor_line_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "a\nb\nc\nd\n");
+    app.editor.cursor_row = 2;
+    app.handle_editor_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.bookmarked_lines(), vec![3]);
+    assert!(
+        app.status.contains("line 3"),
+        "the status must name the line; was {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn the_navigation_chords_move_the_cursor_between_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 4);
+    app.handle_editor_key(key(
+        KeyCode::Char(','),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+#[test]
+fn bookmark_status_counts_marks_and_names_the_line_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n4\n5\n6\n");
+    for row in [1, 4] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.editor.cursor_row = 0;
+    let next = key(KeyCode::Char('.'), KeyModifiers::SUPER | KeyModifiers::ALT);
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 1 of 2 (line 2)");
+    app.handle_editor_key(next);
+    assert_eq!(app.status, "Bookmark 2 of 2 (line 5)");
+}
+
+#[test]
+fn bookmark_clear_chord_is_cmd_opt_shift_b_and_clears_the_file() {
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(is_clear_bookmarks_key(key(
+        KeyCode::Char('B'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_clear_bookmarks_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    )));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    for row in [0, 2] {
+        app.editor.cursor_row = row;
+        app.editor.toggle_bookmark();
+    }
+    app.handle_editor_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert!(app.editor.bookmarked_lines().is_empty());
+    assert_eq!(app.status, "Cleared 2 bookmarks");
+}
+
+/// The palette command reaches `clear_bookmarks` without the chord's
+/// handler, so the non-text guard has to hold on that path too.
+#[test]
+fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.md", "# a\n\nb\n");
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![3],
+        "the preview hides them"
+    );
+    // Back on the source, the same command clears, so the assertion above is
+    // the guard and not a command that does nothing.
+    assert!(app.editor.toggle_markdown_preview());
+    app.run_command(Command::ClearBookmarks);
+    assert!(app.editor.bookmarked_lines().is_empty());
+}
+
+#[test]
+fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.rs", "1\n2\n3\n");
+    app.editor.cursor_row = 1;
+    app.handle_editor_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
+#[test]
+fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// Silence would leave the user unable to tell "wrong language" from
+/// "typo in the abbreviation".
+#[test]
+fn the_emmet_chord_says_so_when_there_is_nothing_to_expand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "div>(span\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["div>(span"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
+}
+
+/// A buffer Emmet does not run in gets a status naming the language, not
+/// the "no abbreviation" message that sends the user hunting for a typo.
+#[test]
+fn the_emmet_chord_names_an_unsupported_language() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "ul>li*2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["ul>li*2"]);
+    assert_eq!(app.status, "Emmet: not available in Rust files");
 }
 
 // --- In-editor Find & Replace ---------------------------------------------
@@ -39173,15 +39635,14 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
          deferral does not apply to it: {}",
         app.status
     );
-    assert_eq!(
-        app.selected_debug_config.as_deref(),
-        Some("Server"),
-        "it selects its single member, exactly as selecting that \
-         configuration directly would"
-    );
-    // `selected_debug_config` is assigned BEFORE `launch_debug_config`, which
-    // has several early-return error paths — so the assertion above proves only
-    // that the launch BRANCH was reached. Assert the launch was not refused.
+    // #567: it selects the COMPOUND, not its member. Selecting the member
+    // made F5 relaunch the bare configuration, skipping anything the compound
+    // itself declares (its preLaunchTask).
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Just Server"));
+    assert_eq!(app.selected_debug_config, None);
+    // The selection is assigned BEFORE the launch, which has several
+    // early-return error paths — so the assertion above proves only that the
+    // launch BRANCH was reached. Assert the launch was not refused.
     // The launch reached a real adapter, so what it does next depends on the
     // machine: the GitHub runner has no `uv`, and "Debugger setup failed:
     // running `uv venv`" is a true report about that box, not this fix
@@ -48790,4 +49251,261 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
         ),
         other => panic!("an oversized request must not be accepted: {other:?}"),
     }
+}
+
+/// Open the debug picker and confirm the row whose label starts with `label`.
+fn pick_debug_row(app: &mut App, label: &str) {
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with(label))
+        .unwrap_or_else(|| panic!("{label} is listed"));
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+}
+
+/// A workspace with two configs and compounds with and without a task. The
+/// task never finishes on its own, so a parked launch stays parked.
+fn compound_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "build", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py" }
+        ],
+        "compounds": [
+            { "name": "Tasked", "configurations": ["Server"], "preLaunchTask": "build" },
+            { "name": "Both", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn restart_relaunches_the_selected_compound_not_a_stale_config() {
+    // #567 item 6: a compound launch never became the F5 target, so restart
+    // (and F5 after the sessions end) ran whatever was selected before.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.selected_debug_config = Some(String::from("Client"));
+
+    pick_debug_row(&mut app, "Tasked");
+    assert_eq!(app.selected_debug_compound.as_deref(), Some("Tasked"));
+    assert_eq!(
+        app.selected_debug_config, None,
+        "the compound replaces the old target"
+    );
+    app.refresh_run_debug();
+    assert_eq!(app.run_debug.selected_config.as_deref(), Some("Tasked"));
+
+    // Restart goes back through the compound, so its task parks the launch
+    // again. Launching "Client" (the stale target) or bare "Server" (its
+    // member) would clear the parking instead.
+    app.pending_debug_launch = None;
+    app.debug_restart();
+    assert!(
+        app.pending_debug_launch.is_some() && app.status.contains("compound preLaunchTask"),
+        "restart re-runs the compound behind its own task: {}",
+        app.status
+    );
+
+    // Choosing a configuration afterwards drops the compound selection.
+    pick_debug_row(&mut app, "Server");
+    assert_eq!(app.selected_debug_compound, None);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Server"));
+}
+
+#[test]
+fn a_direct_compound_launch_drops_an_older_parked_task() {
+    // #567 item 5: the parked launch outlived a newer compound launch, and
+    // its task's exit would later start its config and stop the compound.
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "the task-gated launch is parked"
+    );
+
+    pick_debug_row(&mut app, "Both");
+    assert!(
+        app.pending_debug_launch.is_none(),
+        "the newer compound launch supersedes the parked one"
+    );
+}
+
+#[test]
+fn a_zero_config_launch_drops_an_older_parked_task() {
+    let tmp = compound_workspace();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    pick_debug_row(&mut app, "Tasked");
+    assert!(app.pending_debug_launch.is_some());
+
+    pick_debug_row(&mut app, "Debug active file");
+    assert!(app.pending_debug_launch.is_none());
+}
+
+/// A stand-in adapter that emits one DAP `terminated` event and then idles,
+/// or (with `ends: false`) never says anything. Real processes, so the test
+/// drives the same transport and `poll` the app does.
+fn stub_member(ends: bool) -> crate::dap::session::DapSession {
+    let script = if ends {
+        "printf 'Content-Length: %d\r\n\r\n%s' 45 '{\"seq\":1,\"type\":\"event\",\"event\":\"terminated\"}'; sleep 30"
+    } else {
+        "sleep 30"
+    };
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), String::from(script)],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// Poll until the set shrinks below `from` members or two seconds pass.
+fn poll_until_shrinks(app: &mut App, from: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.debug_sessions.len() >= from && std::time::Instant::now() < deadline {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stop_all_true_stops_the_set_when_a_background_member_ends() {
+    // #567 item 4: `stopAll: true` was refused; it is honoured now.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "A ending takes B with it: {:?}",
+        app.debug_sessions.names()
+    );
+    assert!(
+        app.status.contains("stopAll"),
+        "and says why: {}",
+        app.status
+    );
+}
+
+#[test]
+fn stop_all_false_leaves_the_siblings_running() {
+    // The control: without stopAll only the member that ended goes.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    app.debug_stop();
+}
+
+/// A compound that is REFUSED (here, it names a configuration no
+/// launch.json declares) leaves the running set alone, so it must not leave
+/// its `stopAll` behind either: that set never asked for it.
+#[test]
+fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{"version":"0.2.0","configurations":[],
+            "compounds":[{"name":"Bad","configurations":["Missing"],"stopAll":true}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    let compound = crate::dap::configs::discover_compounds(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Bad")
+        .expect("the compound parses");
+    assert!(compound.stop_all);
+    app.launch_compound(&compound);
+    assert_eq!(
+        app.debug_sessions.len(),
+        2,
+        "the refusal leaves the set running"
+    );
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec!["B"],
+        "A ending must not take B: the running set never asked for stopAll"
+    );
+    app.debug_stop();
+}
+
+#[test]
+fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
+    // #567 items 2 and 3: the status and panel line kept naming the ended
+    // session. Both now say what ended, what is shown, and what still runs.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    app.debug_compound = Some(String::from("Stack"));
+    app.run_debug.feedback = Some(String::from("Debugging compound Stack: A, B"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debugging compound Stack: B (A ended)")
+    );
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
+    assert_eq!(app.debug_compound, None, "a full stop forgets the compound");
+}
+
+#[test]
+fn the_focused_member_ending_names_the_session_now_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_compound = Some(String::from("Stack"));
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert!(
+        app.status.starts_with("A ended — showing B; running: B"),
+        "{}",
+        app.status
+    );
+    app.debug_stop();
 }
