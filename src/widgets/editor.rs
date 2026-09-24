@@ -2008,9 +2008,19 @@ enum EditKind {
     IndentConvert,
     /// Remove trailing blank lines at end of file. Its own step.
     TrimFinalNewlines,
+    /// Terminate the last line on save (`.editorconfig`
+    /// `insert_final_newline`). Its own step, so it never coalesces into
+    /// the typing burst that preceded the save.
+    InsertFinalNewline,
     /// Find-bar Replace / Replace All. Never coalesces, so each replace is
     /// its own undo step like VS Code.
     Replace,
+    /// Increment / decrement the number under the cursor (vim's Ctrl-A /
+    /// Ctrl-X). Its own step, so a run of bumps undoes one at a time.
+    BumpNumber,
+    /// Expand an Emmet abbreviation into markup. Its own step, so one undo
+    /// puts the abbreviation back.
+    EmmetExpand,
 }
 
 /// The three case transforms VS Code exposes as
@@ -2303,6 +2313,41 @@ pub enum GitMark {
     Deleted,
 }
 
+/// One tick on the editor's overview ruler: the whole-file summary VS Code and
+/// Zed paint down the scrollbar track, so a problem or a search hit outside the
+/// viewport is still visible.
+///
+/// The terminal gives the ruler a single column, where VS Code has three lanes,
+/// so a row that several marks land on shows only the most urgent one. `Ord` IS
+/// that priority — declaration order runs least to most urgent, and the render
+/// takes the `max` of everything mapping to a row. A broken build must never be
+/// hidden behind a whitespace change.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum OverviewMark {
+    GitAdded,
+    GitModified,
+    GitDeleted,
+    SearchMatch,
+    Warning,
+    Error,
+}
+
+impl OverviewMark {
+    /// The tick's colour, matching the in-editor decoration it summarises:
+    /// the git gutter's own three colours, the diagnostic underline's red and
+    /// amber, and the search panel's highlight hue.
+    fn color(self, theme: crate::theme::Theme) -> Color {
+        match self {
+            OverviewMark::GitAdded => theme.git_added(),
+            OverviewMark::GitModified => theme.git_modified(),
+            OverviewMark::GitDeleted => theme.git_deleted(),
+            OverviewMark::SearchMatch => theme.ui(Color::Rgb(0xea, 0x9c, 0x2a)),
+            OverviewMark::Warning => theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
+            OverviewMark::Error => theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+        }
+    }
+}
+
 /// An in-progress snippet expansion: the caret is cycling the tab stops of a
 /// just-expanded snippet. See [`Editor::expand_snippet`].
 #[derive(Debug, Clone)]
@@ -2381,11 +2426,36 @@ pub struct Editor {
     /// of pausing. Rendered as an amber diamond in the gutter.
     pub breakpoint_logs:
         std::collections::HashMap<PathBuf, std::collections::HashMap<usize, String>>,
+    /// Reader bookmarks (VS Code's Bookmarks extension, nvim's `m` marks),
+    /// keyed by file path as 1-based line numbers — the same shape as
+    /// [`breakpoints`](Self::breakpoints), so switching tabs and coming back
+    /// keeps a file's marks. They are navigation aids only: nothing in the
+    /// debugger or the LSP reads them.
+    pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// The text the open file's [`bookmarks`](Self::bookmarks) currently
+    /// describe, keyed by the path it was taken for. Every buffer change is
+    /// diffed against it so marks follow their lines through inserts,
+    /// deletes, undo and reloads (see [`shift_bookmark_lines`]). Held only
+    /// while the open file has marks, so an unmarked file pays nothing.
+    bookmark_shadow: Option<(PathBuf, Vec<String>)>,
+    /// Set while a multi-character insert (a paste) runs its per-character
+    /// helpers, so the bookmark sync runs once at the end instead of once per
+    /// character.
+    bookmark_sync_paused: bool,
     /// Monotonic counter that bumps on every buffer mutation. The App's
     /// per-tick sync_lsp diff reads this to know when to forward a
     /// did_change to the LSP server, so building lines.join("\n") only
     /// happens on actual changes, not every frame.
     pub edit_seq: u64,
+    /// Overview ruler: the lines the search highlight matches, keyed by
+    /// `(edit_seq, needle, options)`. The ruler renders every frame, and
+    /// re-running the search (a regex compile included) over the whole buffer
+    /// per frame is input lag on a large file.
+    ruler_search_cache: Option<(u64, String, crate::widgets::search::SearchOpts, Vec<usize>)>,
+    /// Overview ruler: each line's first visual row in wrap mode, text rows
+    /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
+    /// change without an edit, so they are added at mapping time instead.
+    ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
     /// ops only when `edit_seq` has moved past this, and it is re-pinned
@@ -2417,6 +2487,13 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
+    /// `javascript.autoClosingTags`, filling the "no tag auto-close" gap
+    /// in `src/vscode_extensions.rs`): typing `>` at the end of an opening
+    /// HTML/XML/JSX tag inserts the matching `</tag>` after the caret.
+    /// Separate from `auto_close_pairs` because `>` is not a bracket pair
+    /// here — it only closes a tag when the text before it parses as one.
+    pub auto_close_tags: bool,
     /// The caret position and `edit_seq` recorded by the LAST auto-close
     /// insertion. Pair-backspace fires only while the caret still sits
     /// there with no edits since — a pre-existing `()` in the file must
@@ -2652,6 +2729,11 @@ pub struct Editor {
     /// clear preference, `None` when it gave no signal. The manual
     /// status-bar override always wins over this.
     detected_indent: Option<IndentStyle>,
+    /// Properties from the `.editorconfig` files covering this buffer's
+    /// path, resolved on open. They outrank `detected_indent` (a project
+    /// that states its style must beat a guess at it) but not the manual
+    /// status-bar `indent_override`, which is the user overruling both.
+    editorconfig: crate::editorconfig::Props,
     /// Line-ending style, detected on open and applied on save. Surfaced in the
     /// status bar; the user can switch it there.
     pub eol: LineEnding,
@@ -2673,6 +2755,21 @@ pub struct Editor {
     /// never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Inline color-literal decorations (the "no colour-swatch decorations"
+    /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
+    /// per line, the `(start char col, end char col, background, foreground)`
+    /// of every recognized `#hex` / `rgb()` / `hsl()` color literal, painted
+    /// as a background tint over the literal's own text. Language-agnostic
+    /// (a plain scan, not gated on any grammar) so it also lights up color
+    /// constants in Rust/Python/JSON/Markdown, unlike the LSP-driven
+    /// document-color `■` swatch (#254), which only fires where a language
+    /// server resolves one. Rebuilt in `recompute_highlights`, on by default.
+    show_color_swatches: bool,
+    color_swatches: Vec<Vec<(usize, usize, Color, Color)>>,
+    /// Whether the overview ruler paints its whole-file ticks over the
+    /// vertical scrollbar track. On by default, like VS Code's; the palette's
+    /// `View: Toggle Overview Ruler` turns it off for a plain bar.
+    pub overview_ruler: bool,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
     /// Starting ignore-whitespace mode for diffs opened in this editor
@@ -2875,7 +2972,12 @@ impl Editor {
             unverified_breakpoints: std::collections::HashMap::new(),
             breakpoint_conditions: std::collections::HashMap::new(),
             breakpoint_logs: std::collections::HashMap::new(),
+            bookmarks: std::collections::HashMap::new(),
+            bookmark_shadow: None,
+            bookmark_sync_paused: false,
             edit_seq: 0,
+            ruler_search_cache: None,
+            ruler_starts_cache: None,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
             git_head_lines: None,
@@ -2883,6 +2985,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            auto_close_tags: true,
             auto_pair_at: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
@@ -2945,12 +3048,15 @@ impl Editor {
             lang: None,
             indent_override: None,
             detected_indent: None,
+            editorconfig: crate::editorconfig::Props::default(),
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            show_color_swatches: true,
+            color_swatches: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
@@ -2973,6 +3079,7 @@ impl Editor {
             color_infos: Vec::new(),
             color_path: None,
             registry: LangRegistry::new(),
+            overview_ruler: true,
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
@@ -3124,10 +3231,14 @@ impl Editor {
 
     /// Whether the sign cell of 0-based `line` is claimed by a glyph that
     /// outranks the test play bead: the debugger's stop arrow, any
-    /// breakpoint glyph (dot, diamond, hollow ring), or the AI-stream stop
-    /// square — the same precedence the render pass applies.
+    /// breakpoint glyph (dot, diamond, hollow ring), the AI-stream stop
+    /// square, or a bookmark flag — the same precedence the render pass
+    /// applies.
     fn sign_cell_taken(&self, line: usize) -> bool {
         if self.stream_stop_line == Some(line) {
+            return true;
+        }
+        if self.is_bookmarked(line) {
             return true;
         }
         let Some(path) = self.path.as_deref() else {
@@ -3169,6 +3280,184 @@ impl Editor {
             .iter()
             .position(|r| matches!(r, VisRow::Text { line: l, .. } if *l == line))
             .map(|idx| self.last_inner.y.saturating_add(idx as u16))
+    }
+
+    /// Toggle a bookmark on the cursor's line in the open file. Returns
+    /// `Some(true)` when a bookmark was added, `Some(false)` when one was
+    /// removed, and `None` when no file is open (a scratch buffer has no
+    /// path to key the set by).
+    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+        let path = self.path.clone()?;
+        // Settle the existing marks against the buffer before adding one, so
+        // the shadow seeded below describes every mark in the set.
+        self.sync_bookmarks_to_buffer();
+        let here = self.cursor_row + 1; // bookmarks are 1-based, like breakpoints
+        let set = self.bookmarks.entry(path.clone()).or_default();
+        let added = if set.contains(&here) {
+            set.remove(&here);
+            false
+        } else {
+            set.insert(here);
+            true
+        };
+        // Drop the empty set so `bookmarked_lines` and the gutter never walk
+        // a map full of hollow entries for files whose marks were all cleared.
+        if set.is_empty() {
+            self.bookmarks.remove(&path);
+        }
+        self.seed_bookmark_shadow();
+        Some(added)
+    }
+
+    /// 1-based bookmark lines for the open file, ascending. Empty when no
+    /// file is open or the file has no marks.
+    pub fn bookmarked_lines(&self) -> Vec<usize> {
+        // A mark past the last line is never a target: jumping to it would
+        // clamp back onto the last row, and from there `next` would pick it
+        // again forever instead of wrapping. The edit paths clamp the set
+        // already; this keeps navigation and the count honest regardless.
+        let len = self.lines.len();
+        self.path
+            .as_deref()
+            .and_then(|p| self.bookmarks.get(p))
+            .map(|s| {
+                s.iter()
+                    .copied()
+                    .filter(|&l| (1..=len).contains(&l))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether 0-based `line` carries a bookmark in the open file.
+    pub fn is_bookmarked(&self, line: usize) -> bool {
+        self.path
+            .as_deref()
+            .and_then(|p| self.bookmarks.get(p))
+            .is_some_and(|s| s.contains(&(line + 1)))
+    }
+
+    /// Move the cursor to the next bookmark below it, wrapping to the first
+    /// one at the top of the file. Returns the 1-based line jumped to, or
+    /// `None` when the file has no bookmarks. A file with a single bookmark
+    /// on the cursor's own line stays put and reports that line, so the key
+    /// never looks broken.
+    pub fn goto_next_bookmark(&mut self) -> Option<usize> {
+        let marks = self.bookmarked_lines();
+        let here = self.cursor_row + 1;
+        let target = *marks
+            .iter()
+            .find(|&&l| l > here)
+            .or_else(|| marks.first())?;
+        self.jump_to_bookmark(target);
+        Some(target)
+    }
+
+    /// Mirror of [`goto_next_bookmark`](Self::goto_next_bookmark) walking
+    /// upwards, wrapping to the last bookmark in the file.
+    pub fn goto_prev_bookmark(&mut self) -> Option<usize> {
+        let marks = self.bookmarked_lines();
+        let here = self.cursor_row + 1;
+        let target = *marks
+            .iter()
+            .rev()
+            .find(|&&l| l < here)
+            .or_else(|| marks.last())?;
+        self.jump_to_bookmark(target);
+        Some(target)
+    }
+
+    /// Drop every bookmark in the open file. Returns how many were removed.
+    pub fn clear_bookmarks(&mut self) -> usize {
+        self.bookmark_shadow = None;
+        self.path
+            .clone()
+            .and_then(|p| self.bookmarks.remove(&p))
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Record the text the open file's bookmarks describe, ahead of an edit
+    /// (called from [`push_undo`](Self::push_undo), which every user edit
+    /// passes through before it mutates). A no-op when the file has no marks
+    /// or the shadow already belongs to this file.
+    fn seed_bookmark_shadow(&mut self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if !self.bookmarks.contains_key(path)
+            || self
+                .bookmark_shadow
+                .as_ref()
+                .is_some_and(|(p, _)| p == path)
+        {
+            return;
+        }
+        self.bookmark_shadow = Some((path.clone(), self.lines.clone()));
+    }
+
+    /// Re-align the open file's bookmarks with the buffer after it changed.
+    /// The single choke point for line shifts: called from
+    /// [`mark_buffer_changed`](Self::mark_buffer_changed) (every edit),
+    /// [`restore_snapshot`](Self::restore_snapshot) (undo / redo) and the
+    /// file loaders (reload, reopen with encoding). When the line count moved
+    /// and the shadow describes this file, marks are mapped through
+    /// [`shift_bookmark_lines`]; either way, any mark left past the last line
+    /// is dropped, so a change whose mapping is unknown (a reload with no
+    /// shadow) still never leaves a mark beyond the buffer.
+    fn sync_bookmarks_to_buffer(&mut self) {
+        if self.bookmark_sync_paused {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            self.bookmark_shadow = None;
+            return;
+        };
+        let Some(set) = self.bookmarks.get_mut(&path) else {
+            self.bookmark_shadow = None;
+            return;
+        };
+        let mut shadow = match self.bookmark_shadow.take() {
+            Some((shadow_path, old)) if shadow_path == path => {
+                if old.len() != self.lines.len() {
+                    *set = shift_bookmark_lines(set, &old, &self.lines);
+                }
+                old
+            }
+            _ => Vec::new(),
+        };
+        let len = self.lines.len();
+        set.retain(|&l| (1..=len).contains(&l));
+        if set.is_empty() {
+            self.bookmarks.remove(&path);
+            return;
+        }
+        // Bring the shadow up to date in place rather than cloning the whole
+        // buffer: this runs on every keystroke in a marked file, and a
+        // keystroke changes one row. Only differing rows are copied, into
+        // the allocations they already have.
+        shadow.truncate(len);
+        for (old, new) in shadow.iter_mut().zip(&self.lines) {
+            if old != new {
+                old.clone_from(new);
+            }
+        }
+        let have = shadow.len();
+        shadow.extend(self.lines[have..].iter().cloned());
+        self.bookmark_shadow = Some((path, shadow));
+    }
+
+    /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
+    /// anything hiding it and centring it in the viewport — a bookmark
+    /// inside a collapsed region must still be reachable.
+    fn jump_to_bookmark(&mut self, line: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        self.selection = None;
+        self.goto_line_centered(line.saturating_sub(1));
+        self.reveal_cursor_fold();
+        self.ensure_cursor_col_visible();
     }
 
     /// 1-based breakpoint lines for `path`, ascending, for a DAP
@@ -3221,6 +3510,9 @@ impl Editor {
         // the user fixed by deleting the offending characters.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // Marks follow their lines through every edit (inserts, deletes,
+        // pastes, joins); see `sync_bookmarks_to_buffer`.
+        self.sync_bookmarks_to_buffer();
     }
 
     /// Install (or clear) the git-gutter HEAD baseline for `path`. The app
@@ -3410,6 +3702,157 @@ impl Editor {
                 .entry(self.lines.len() - 1)
                 .or_insert(GitMark::Deleted);
         }
+    }
+
+    /// The overview ruler's ticks for a track `track_rows` cells tall: one
+    /// slot per track row, holding the most urgent mark of every buffer line
+    /// that maps to it (see [`OverviewMark`]'s `Ord`).
+    ///
+    /// The whole file is summarised, not just the viewport — that is the point
+    /// of a ruler. Lines are compressed onto the track proportionally, the same
+    /// mapping the scrollbar thumb uses, so a tick sits beside the part of the
+    /// thumb's travel that would bring it on screen.
+    pub fn overview_ruler_rows(&mut self, track_rows: u16) -> Vec<Option<OverviewMark>> {
+        self.overview_ruler_rows_wrapped(track_rows, None)
+    }
+
+    /// [`overview_ruler_rows`](Self::overview_ruler_rows) for a buffer
+    /// soft-wrapped at `wrap_width` columns. The thumb travels over visual
+    /// rows, not lines, so a tick goes where its line's first visual row
+    /// sits: with long lines above it, line 50 of 100 can start near the
+    /// bottom of the content, and a line-count mapping would put it where
+    /// the thumb reveals something else.
+    pub fn overview_ruler_rows_wrapped(
+        &mut self,
+        track_rows: u16,
+        wrap_width: Option<usize>,
+    ) -> Vec<Option<OverviewMark>> {
+        let rows = track_rows as usize;
+        let mut out = vec![None; rows];
+        if rows == 0 || self.lines.is_empty() {
+            return out;
+        }
+        // Content position of each line's first row, plus the total. In wrap
+        // mode the text rows come from a cache that only an edit or a width
+        // change invalidates; comment-box rows (few) are added per call.
+        let n = self.lines.len();
+        let (starts, boxes): (Vec<usize>, Vec<(usize, usize)>) = match wrap_width {
+            Some(w) => {
+                let fresh = matches!(
+                    &self.ruler_starts_cache,
+                    Some((seq, cw, _)) if *seq == self.edit_seq && *cw == w
+                );
+                if !fresh {
+                    let mut acc = 0;
+                    let text: Vec<usize> = (0..=n)
+                        .map(|l| {
+                            let at = acc;
+                            if l < n {
+                                acc += self.line_visual_rows(l, w);
+                            }
+                            at
+                        })
+                        .collect();
+                    self.ruler_starts_cache = Some((self.edit_seq, w, text));
+                }
+                let mut boxes: Vec<(usize, usize)> = (0..self.comment_boxes.len())
+                    .map(|i| (self.comment_boxes[i].line, self.comment_box_height(i, w)))
+                    .collect();
+                boxes.sort_unstable();
+                let starts = self
+                    .ruler_starts_cache
+                    .as_ref()
+                    .map(|(_, _, t)| t.clone())
+                    .unwrap_or_default();
+                (starts, boxes)
+            }
+            None => ((0..=n).collect(), Vec::new()),
+        };
+        // Box rows hang under their line, so they push down every later line.
+        let box_rows_before = |line: usize| -> usize {
+            boxes
+                .iter()
+                .take_while(|(l, _)| *l < line)
+                .map(|(_, h)| h)
+                .sum()
+        };
+        let total = (starts[n] + box_rows_before(n)).max(1);
+        let last = n - 1;
+        // Only lines the search panel would actually highlight count, so the
+        // ruler and the yellow runs in the text can never disagree: both ask
+        // `split_for_highlight` the same question with the same options.
+        let search_hits: Vec<usize> = match self.search_highlight.clone().filter(|n| !n.is_empty())
+        {
+            Some(needle) => {
+                let opts = self.search_highlight_opts;
+                let fresh = matches!(
+                    &self.ruler_search_cache,
+                    Some((seq, cn, co, _)) if *seq == self.edit_seq && *cn == needle && *co == opts
+                );
+                if !fresh {
+                    let hits = self
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            crate::widgets::search::split_for_highlight(line, &needle, opts)
+                                .iter()
+                                // A zero-width match (`^`, `\b`, `q*`) paints no
+                                // cell in the text, so it gets no tick either.
+                                .any(|(text, is_match)| *is_match && !text.is_empty())
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    self.ruler_search_cache = Some((self.edit_seq, needle, opts, hits));
+                }
+                self.ruler_search_cache
+                    .as_ref()
+                    .map(|(_, _, _, h)| h.clone())
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        self.refresh_git_marks();
+        let mut put = |line: usize, mark: OverviewMark| {
+            let line = line.min(last);
+            let row = ((starts[line] + box_rows_before(line)) * rows / total).min(rows - 1);
+            out[row] = Some(out[row].map_or(mark, |cur: OverviewMark| cur.max(mark)));
+        };
+
+        for (&line, mark) in &self.git_marks {
+            put(
+                line,
+                match mark {
+                    GitMark::Added => OverviewMark::GitAdded,
+                    GitMark::Modified => OverviewMark::GitModified,
+                    GitMark::Deleted => OverviewMark::GitDeleted,
+                },
+            );
+        }
+
+        // Only lines the search panel would actually highlight count, so the
+        // ruler and the yellow runs in the text can never disagree: both ask
+        // `split_for_highlight` the same question with the same options.
+        for &i in &search_hits {
+            put(i, OverviewMark::SearchMatch);
+        }
+
+        // Diagnostics outrank everything, so they are applied last — `put`
+        // keeps the max, but ordering the loops this way keeps the intent
+        // readable rather than relying on the comparison alone.
+        for (i, spans) in self.diagnostic_spans.iter().enumerate() {
+            for (_, _, severity) in spans {
+                let mark = match severity {
+                    crate::lsp::manager::DiagnosticSeverity::Error => OverviewMark::Error,
+                    crate::lsp::manager::DiagnosticSeverity::Warning => OverviewMark::Warning,
+                    // Information and Hint are advisory; they would crowd the
+                    // one column they share with real problems.
+                    _ => continue,
+                };
+                put(i, mark);
+            }
+        }
+        out
     }
 
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
@@ -4131,6 +4574,17 @@ impl Editor {
         // VS Code's editor.detectIndentation: the freshly loaded content
         // decides the buffer's indent style unless the user overrides it.
         self.detected_indent = detect_indentation(&self.lines);
+        // `.editorconfig` is read here, before the sniffed EOL above can be
+        // relied on: a project that states `end_of_line` means it, and a
+        // file whose current content disagrees is exactly the case the
+        // property exists to fix.
+        self.editorconfig = crate::editorconfig::for_file(path);
+        if let Some(eol) = self.editorconfig.eol {
+            self.eol = match eol {
+                crate::editorconfig::Eol::Lf => LineEnding::Lf,
+                crate::editorconfig::Eol::Crlf => LineEnding::Crlf,
+            };
+        }
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
         self.scroll_sub = 0;
@@ -4199,6 +4653,9 @@ impl Editor {
         // the bump the server keeps analysing the old text and never sends
         // fresh semantic tokens — codeberg issue #39).
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        // A same-path reload diffs the marks across the new text; opening a
+        // different file only clamps its marks and seeds its shadow.
+        self.sync_bookmarks_to_buffer();
         // A path CHANGE detaches the buffer from any collab doc it was
         // synced to: the old generation belongs to another file, and a
         // reused tab (the preview tab) keeping it would let the next collab
@@ -5219,6 +5676,15 @@ impl Editor {
                 };
             }
         }
+        let total_bytes: usize = self.lines.iter().map(String::len).sum();
+        self.color_swatches = if total_bytes > COLOR_SWATCH_SCAN_MAX_BYTES {
+            Vec::new()
+        } else {
+            scan_color_swatches(
+                &self.lines,
+                matches!(self.lang, Some(LangKind::Css | LangKind::Html)),
+            )
+        };
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
@@ -5710,6 +6176,12 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.auto_close_tags && c == '>' && self.insert_closing_tag() {
+            // Still a keystroke, like the pair path below: on-type
+            // formatting (#254) keys off the typed character.
+            self.last_typed = Some((c, self.edit_seq));
+            return;
+        }
         if self.auto_close_pairs && self.insert_char_with_pairs(c) {
             // Still a keystroke: on-type formatting (#254) keys off the
             // typed character, whether or not the pair machinery handled it.
@@ -5743,6 +6215,40 @@ impl Editor {
         // in insert_char_raw: paste and snippet expansion go through the
         // raw path and must never count as typing.
         self.last_typed = Some((c, self.edit_seq));
+    }
+
+    /// Tag auto-close: the `>` keystroke, when the text before the caret is
+    /// an unterminated opening HTML/XML/JSX tag, types the `>` AND appends
+    /// the matching `</tag>` after it, leaving the caret between the two —
+    /// VS Code's `html.autoClosingTags` / `javascript.autoClosingTags`.
+    /// Returns true when it handled the keystroke.
+    fn insert_closing_tag(&mut self) -> bool {
+        if self.lines.is_empty() {
+            return false;
+        }
+        // A selection-replace is the ordinary insert's job, not this one.
+        if self.selection.is_some_and(|s| s.has_area()) {
+            return false;
+        }
+        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        let name = match self.lines.get(self.cursor_row) {
+            Some(line) => tag_auto_close_name(line, byte, self.lang).map(str::to_owned),
+            None => None,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        self.pin_on_edit();
+        self.push_undo(EditKind::InsertChar);
+        let row = self.cursor_row;
+        self.lines[row].insert_str(byte, &format!("></{name}>"));
+        // The caret lands just past the `>` the user typed, i.e. between the
+        // opening and closing tags, which is where they will type next.
+        self.cursor_col += 1;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
     }
 
     /// The auto-closing-pairs behaviors, returning true when the keystroke
@@ -5845,16 +6351,28 @@ impl Editor {
         n
     }
 
-    /// The buffer's active indentation style: the status-bar override if
-    /// set, else the style detected from the file's content on open, else
-    /// the language default (2 spaces for YAML, 4 spaces otherwise).
+    /// The buffer's active indentation style, in precedence order: the
+    /// status-bar override if set, then `.editorconfig`, then the style
+    /// detected from the file's content on open, then the language default
+    /// (2 spaces for YAML, 4 spaces otherwise).
+    ///
+    /// `.editorconfig` outranks detection because a project that STATES its
+    /// style must beat a guess at it — including on a file whose current
+    /// content is inconsistent with the rule, which is the case the property
+    /// exists to correct. The two properties are resolved independently: a
+    /// config naming only `indent_style` keeps the detected width.
     pub fn indent_style(&self) -> IndentStyle {
-        self.indent_override
-            .or(self.detected_indent)
-            .unwrap_or(IndentStyle {
-                width: indent_unit_for(self.lang).chars().count() as u32,
-                use_spaces: true,
-            })
+        if let Some(pinned) = self.indent_override {
+            return pinned;
+        }
+        let base = self.detected_indent.unwrap_or(IndentStyle {
+            width: indent_unit_for(self.lang).chars().count() as u32,
+            use_spaces: true,
+        });
+        IndentStyle {
+            width: self.editorconfig.indent_width.unwrap_or(base.width),
+            use_spaces: self.editorconfig.use_spaces.unwrap_or(base.use_spaces),
+        }
     }
 
     /// Pin the buffer's indentation style (status-bar "Indent Using …" /
@@ -5948,6 +6466,7 @@ impl Editor {
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
         Ok(())
     }
@@ -5995,6 +6514,9 @@ impl Editor {
         }
         let start_line = self.cursor_row;
         let before = self.lines.len();
+        // One bookmark sync for the whole paste, diffed against the text
+        // `push_undo` recorded above, not one per character.
+        self.bookmark_sync_paused = true;
         for c in s.chars() {
             if c == '\n' {
                 self.insert_newline_raw();
@@ -6002,6 +6524,8 @@ impl Editor {
                 self.insert_char_raw(c);
             }
         }
+        self.bookmark_sync_paused = false;
+        self.sync_bookmarks_to_buffer();
         // The line the insertion started on is rewritten too, so it counts as
         // written by this seat — hence the `+ 1`. But clamp to the lines that
         // actually EXIST: inserting into an empty buffer pushes the first
@@ -7638,6 +8162,8 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        // The pre-edit text, for bookmarks to be diffed against afterwards.
+        self.seed_bookmark_shadow();
         // Where the edit about to happen begins — the linked-editing
         // mirror reads this to locate the keystroke (#254).
         self.last_edit_origin = (self.cursor_row, self.cursor_col);
@@ -7717,6 +8243,8 @@ impl Editor {
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.hscroll_content_cols = None;
         self.wrap_total_cache.clear();
+        // Undo / redo move whole lines back and forth; marks follow them.
+        self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
     }
 
@@ -8002,6 +8530,7 @@ impl Editor {
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
         }
+        self.apply_editorconfig_on_save();
         let path = self
             .path
             .as_ref()
@@ -8712,6 +9241,67 @@ impl Editor {
         true
     }
 
+    /// `trim_trailing_whitespace` for a save: every line except the ones a
+    /// caret sits on (primary and extra carets). Auto-save runs a second
+    /// after typing stops, so trimming the caret's own line would eat the
+    /// space just typed and glue the next word onto the previous one. The
+    /// caret lines are normalised by a later save once the caret has moved;
+    /// the explicit Trim Trailing Whitespace command still trims them all.
+    fn trim_trailing_whitespace_off_caret_lines(&mut self) -> bool {
+        let spared: std::collections::HashSet<usize> = std::iter::once(self.cursor_row)
+            .chain(self.carets.iter().map(|c| c.head.0))
+            .collect();
+        let dirty = |(i, l): (usize, &String)| {
+            !spared.contains(&i) && l.trim_end_matches([' ', '\t']).len() != l.len()
+        };
+        if !self.lines.iter().enumerate().any(dirty) {
+            return false;
+        }
+        self.push_undo(EditKind::TrimWhitespace);
+        for (i, line) in self.lines.iter_mut().enumerate() {
+            if !spared.contains(&i) {
+                let trimmed_len = line.trim_end_matches([' ', '\t']).len();
+                line.truncate(trimmed_len);
+            }
+        }
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
+    }
+
+    /// Apply the `.editorconfig` properties that act at save time, from the
+    /// single write choke point so every save path (explicit, force, auto,
+    /// format-on-save) gets them.
+    ///
+    /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
+    /// rewriting someone's whitespace on an unconfigured project would be a
+    /// surprise, and a noisy diff.
+    fn apply_editorconfig_on_save(&mut self) -> bool {
+        let mut changed = false;
+        if self.editorconfig.trim_trailing_whitespace == Some(true) {
+            changed |= self.trim_trailing_whitespace_off_caret_lines();
+        }
+        if self.editorconfig.insert_final_newline == Some(true) {
+            // `lines` joins with the EOL on write, so a trailing empty
+            // element IS the final newline. An empty buffer is left alone:
+            // a zero-byte file has no last line to terminate.
+            let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
+            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+                self.push_undo(EditKind::InsertFinalNewline);
+                self.lines.push(String::new());
+                self.mark_buffer_changed();
+                self.recompute_highlights();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The `.editorconfig` properties in force for this buffer.
+    pub fn editorconfig_props(&self) -> crate::editorconfig::Props {
+        self.editorconfig
+    }
+
     /// The character at `(row, char_col)`, or None when out of range. Used by
     /// the bracket-matching helpers, which work in char indices.
     fn char_at(&self, row: usize, col: usize) -> Option<char> {
@@ -8925,6 +9515,164 @@ impl Editor {
         self.cursor_row = head.0;
         self.cursor_col = head.1;
         self.last_edit_kind = None;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// vim's `Ctrl-A` / `Ctrl-X` (`delta` of `+1` / `-1`), which Zed and the
+    /// VS Code increment extensions all copy: bump the number under the
+    /// cursor. When the cursor is not inside a number, the next one to its
+    /// right on the same line is used, so the caret rarely needs positioning
+    /// precisely. Returns false when the line holds no number at or after
+    /// the cursor, leaving the buffer and the undo stack untouched.
+    ///
+    /// Formatting is preserved rather than normalised, because the point is
+    /// to edit a literal in place: zero padding keeps its width (`007` ->
+    /// `008`), and a hex or binary literal keeps its prefix and digit case
+    /// (`0xFF` -> `0x100`, `0Xff` -> `0X100`). Width only grows when the
+    /// value needs the room.
+    pub fn bump_number(&mut self, delta: i64) -> bool {
+        let row = self.cursor_row;
+        let Some(line) = self.lines.get(row) else {
+            return false;
+        };
+        let caret = self.byte_index(row, self.cursor_col);
+        let Some(tok) = number_token_at_or_after(line, caret) else {
+            return false;
+        };
+        let Some(replacement) = tok.bumped(line, delta) else {
+            return false;
+        };
+        // A clamped bump (`0x00` down) finds a number but changes nothing;
+        // recording it would dirty a clean buffer and leave an undo step
+        // that undoes nothing.
+        if replacement == line[tok.start..tok.end] {
+            return true;
+        }
+
+        // A real edit from here on: pin a preview tab, or the next preview
+        // open reuses it and the bump is lost with it.
+        self.pin_on_edit();
+        self.push_undo(EditKind::BumpNumber);
+        // Never coalesce: a run of bumps must undo one at a time, the way
+        // holding Ctrl-A in vim does.
+        self.last_edit_kind = None;
+        let line = &mut self.lines[row];
+        line.replace_range(tok.start..tok.end, &replacement);
+        // vim leaves the caret on the number's last digit, which is what
+        // makes a repeated bump keep working on the same literal even as it
+        // grows a digit.
+        let end_byte = tok.start + replacement.len();
+        let last = line[..end_byte]
+            .char_indices()
+            .next_back()
+            .map_or(end_byte, |(i, _)| i);
+        self.cursor_col = line[..last].chars().count();
+        self.selection = None;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// The Emmet dialect this buffer expands into, or `None` where the chord
+    /// is not offered.
+    fn emmet_profile(&self) -> Option<crate::emmet::Profile> {
+        emmet_profile_for(self.lang, self.path.as_deref())
+    }
+
+    /// Whether Emmet expansion is offered in this buffer at all, so the
+    /// caller can tell "wrong language" apart from "nothing to expand".
+    pub fn emmet_available(&self) -> bool {
+        self.emmet_profile().is_some()
+    }
+
+    /// VS Code "Emmet: Expand Abbreviation"
+    /// (`editor.emmet.action.expandAbbreviation`): replace the abbreviation
+    /// ending at the cursor with the markup it stands for, and leave the
+    /// caret in the first empty element.
+    ///
+    /// Only runs in markup buffers, and only when what sits left of the
+    /// cursor actually parses as an abbreviation — so the chord is inert in
+    /// prose and in code rather than mangling either. Returns whether
+    /// anything expanded, which the caller reports in the status bar.
+    pub fn expand_emmet_abbreviation(&mut self) -> bool {
+        let Some(profile) = self.emmet_profile() else {
+            return false;
+        };
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let line = match self.lines.get(row) {
+            Some(l) => l.clone(),
+            None => return false,
+        };
+        let (start_col, abbr) = match crate::emmet::abbreviation_before(&line, col) {
+            Some(v) => v,
+            None => return false,
+        };
+        let unit = self.indent_unit();
+        let (markup, caret) = match crate::emmet::expand(&abbr, &unit, profile) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // The abbreviation's own indentation prefixes every line of the
+        // expansion, so an abbreviation typed inside a nested block stays
+        // inside it.
+        let lead: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let lead = if start_col == lead.chars().count() {
+            lead
+        } else {
+            String::new()
+        };
+
+        self.pin_on_edit();
+        self.push_undo(EditKind::EmmetExpand);
+        self.last_edit_kind = None;
+
+        let chars: Vec<char> = line.chars().collect();
+        let before: String = chars[..start_col].iter().collect();
+        let after: String = chars[col.min(chars.len())..].iter().collect();
+
+        // `markup` always ends in a newline; the trailing line merges with
+        // whatever followed the abbreviation.
+        let body = markup.strip_suffix('\n').unwrap_or(&markup);
+        let mut out: Vec<String> = Vec::new();
+        let mut caret_row = row;
+        let mut caret_col = 0usize;
+        let mut consumed = 0usize;
+        for (i, seg) in body.split('\n').enumerate() {
+            let mut l = String::new();
+            if i == 0 {
+                l.push_str(&before);
+            } else {
+                l.push_str(&lead);
+            }
+            let text_start = l.chars().count();
+            l.push_str(seg);
+            // `caret` is a byte offset into `markup`; find the line holding
+            // it and convert to a char column on the rebuilt line.
+            let seg_end = consumed + seg.len();
+            if caret >= consumed && caret <= seg_end {
+                caret_row = row + i;
+                caret_col = text_start + seg[..caret - consumed].chars().count();
+            }
+            consumed = seg_end + 1; // the '\n' we split on
+            out.push(l);
+        }
+        if let Some(last) = out.last_mut() {
+            last.push_str(&after);
+        }
+
+        self.lines.splice(row..=row, out);
+        self.cursor_row = caret_row;
+        self.cursor_col = caret_col;
+        self.clear_selection();
+        self.mark_buffer_changed();
+        self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
     }
@@ -10330,10 +11078,418 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
     out
 }
 
+/// Perceived luminance (0..=255) of an sRGB triple, used to pick a legible
+/// black-or-white foreground for a color swatch's background tint.
+fn swatch_luma(r: u8, g: u8, b: u8) -> f32 {
+    0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+}
+
+fn swatch_fg_for_bg(r: u8, g: u8, b: u8) -> Color {
+    if swatch_luma(r, g, b) >= 140.0 {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a `#`-prefixed hex color (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`)
+/// starting at byte `i` in `line`. Returns the parsed RGB and the number of
+/// bytes consumed (including the `#`), or `None` if `i` isn't a `#` followed
+/// by 3/4/6/8 hex digits with no further hex digit (or word char) right
+/// after — so `#deadbeef123` (too long to be any CSS hex form) is left
+/// alone rather than truncated to a wrong prefix.
+///
+/// Two look-alikes are refused. A `#` glued to a word character or `&` is a
+/// URL fragment (`page#fade`) or an HTML entity (`&#123;`). A short run of
+/// decimal digits only (`#555`, `#1234`) is an issue or PR reference, which
+/// comments and Markdown are full of; it counts as a color only where
+/// `decimal_short` says the buffer is a stylesheet.
+fn parse_hex_color(bytes: &[u8], i: usize, decimal_short: bool) -> Option<((u8, u8, u8), usize)> {
+    if bytes.get(i) != Some(&b'#') {
+        return None;
+    }
+    if i > 0 && (matches!(bytes[i - 1], b'&' | b'_') || bytes[i - 1].is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut len = 0usize;
+    while bytes
+        .get(i + 1 + len)
+        .copied()
+        .is_some_and(|b| hex_digit(b).is_some())
+    {
+        len += 1;
+        if len > 8 {
+            break;
+        }
+    }
+    // The digit run must end exactly at 3, 4, 6, or 8 — a longer run (or one
+    // immediately followed by another word character) is not a CSS hex color.
+    if !matches!(len, 3 | 4 | 6 | 8) {
+        return None;
+    }
+    if bytes
+        .get(i + 1 + len)
+        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    if !decimal_short
+        && matches!(len, 3 | 4)
+        && bytes[i + 1..=i + len].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let d = |k: usize| hex_digit(bytes[i + 1 + k]).unwrap();
+    let rgb = match len {
+        3 | 4 => (d(0) * 17, d(1) * 17, d(2) * 17),
+        _ => (d(0) * 16 + d(1), d(2) * 16 + d(3), d(4) * 16 + d(5)),
+    };
+    Some((rgb, 1 + len))
+}
+
+/// Parse `rgb(`/`rgba(` (case-insensitive) starting at byte `i`, tolerating
+/// the CSS Color 4 comma-optional syntax and a trailing `/ alpha`. Returns
+/// the parsed RGB and the byte length of the whole `rgb(...)` call.
+fn parse_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    let rest = &line[i..];
+    let lower_prefix_len = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rgb("))
+    {
+        4
+    } else if rest
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rgba("))
+    {
+        5
+    } else {
+        return None;
+    };
+    let close = rest.find(')')?;
+    let inner = &rest[lower_prefix_len..close];
+    let mut nums = inner
+        .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+        .filter(|s| !s.is_empty());
+    let r: u8 = nums.next()?.parse().ok()?;
+    let g: u8 = nums.next()?.parse().ok()?;
+    let b: u8 = nums.next()?.parse().ok()?;
+    Some(((r, g, b), close + 1))
+}
+
+/// Convert HSL (h in degrees, s/l as 0..=100 percentages) to sRGB.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let s = s / 100.0;
+    let l = l / 100.0;
+    if s == 0.0 {
+        let v = (l * 255.0).round() as u8;
+        return (v, v, v);
+    }
+    let h = h.rem_euclid(360.0) / 360.0;
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hue_to_rgb = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    let to_u8 = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    (
+        to_u8(hue_to_rgb(h + 1.0 / 3.0)),
+        to_u8(hue_to_rgb(h)),
+        to_u8(hue_to_rgb(h - 1.0 / 3.0)),
+    )
+}
+
+/// Parse `hsl(`/`hsla(` (case-insensitive), same comma/space tolerance as
+/// [`parse_rgb_color`]. `s` and `l` may carry a trailing `%`, stripped
+/// before parsing.
+fn parse_hsl_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    let rest = &line[i..];
+    let prefix_len = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("hsl("))
+    {
+        4
+    } else if rest
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("hsla("))
+    {
+        5
+    } else {
+        return None;
+    };
+    let close = rest.find(')')?;
+    let inner = &rest[prefix_len..close];
+    let mut nums = inner
+        .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+        .filter(|s| !s.is_empty());
+    let h: f32 = nums.next()?.parse().ok()?;
+    let s: f32 = nums.next()?.trim_end_matches('%').parse().ok()?;
+    let l: f32 = nums.next()?.trim_end_matches('%').parse().ok()?;
+    Some((hsl_to_rgb(h, s, l), close + 1))
+}
+
+/// Buffers above this size skip the color-swatch scan, for the same reason
+/// [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a per-edit,
+/// per-line scan must not make typing in a huge file pay for it.
+const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
+
+/// Inline color-literal decoration scan (the `naumovs.color-highlight`
+/// convention): per line, the `(start char col, end char col, background,
+/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()`
+/// literal found anywhere in the text — comments, strings, and plain prose
+/// alike, since (unlike syntax highlighting) a color swatch has no notion of
+/// "this isn't code here." A byte-position match is converted to a char
+/// column range so the renderer's column math (shared with bracket
+/// colorization and indent guides) applies unchanged. `decimal_short` is
+/// passed through to [`parse_hex_color`]: true only for stylesheet buffers.
+fn scan_color_swatches(
+    lines: &[String],
+    decimal_short: bool,
+) -> Vec<Vec<(usize, usize, Color, Color)>> {
+    let mut out = vec![Vec::new(); lines.len()];
+    for (li, line) in lines.iter().enumerate() {
+        let bytes = line.as_bytes();
+        // The char column of byte `i`, advanced alongside it: this runs on
+        // every recompute over the whole buffer, so no per-line lookup table.
+        let mut col = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let hit = parse_hex_color(bytes, i, decimal_short)
+                .or_else(|| parse_rgb_color(line, i))
+                .or_else(|| parse_hsl_color(line, i));
+            match hit {
+                Some(((r, g, b), consumed)) => {
+                    // Every literal form is ASCII up to its closing `)`, but
+                    // `rgb(` may enclose anything, so count rather than assume.
+                    let width = line[i..i + consumed].chars().count();
+                    out[li].push((
+                        col,
+                        col + width,
+                        Color::Rgb(r, g, b),
+                        swatch_fg_for_bg(r, g, b),
+                    ));
+                    col += width;
+                    i += consumed;
+                }
+                None => {
+                    // Advance by one char (not one byte) to stay on a UTF-8
+                    // boundary for the next `line[i..]` slice a color parser
+                    // takes.
+                    let step = line[i..].chars().next().map_or(1, char::len_utf8);
+                    i += step;
+                    col += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
     match lang {
         Some(LangKind::Yaml) => "  ",
         _ => "    ",
+    }
+}
+
+/// The base a numeric literal is written in. Octal is deliberately absent:
+/// vim reads a bare leading zero as octal, which silently turns `019` into
+/// an error and `010` into `011` meaning nine, and every modern editor that
+/// copied Ctrl-A dropped that behaviour with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumberRadix {
+    Dec,
+    Hex,
+    Bin,
+}
+
+/// One numeric literal located on a line: the byte range it occupies and how
+/// to read it. `start` includes a `-` sign and a `0x` / `0b` prefix, so the
+/// range is exactly the text a bump replaces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NumberToken {
+    start: usize,
+    end: usize,
+    radix: NumberRadix,
+}
+
+impl NumberToken {
+    /// The literal rewritten with `delta` added, preserving how it was
+    /// written. `None` when the result cannot be represented — an overflow,
+    /// or a negative hex/binary value, which is clamped rather than wrapped
+    /// (vim turns `0x0` into `0xffffffffffffffff`, which is never what the
+    /// keystroke meant).
+    fn bumped(&self, line: &str, delta: i64) -> Option<String> {
+        let text = &line[self.start..self.end];
+        match self.radix {
+            NumberRadix::Dec => {
+                let value: i64 = text.parse().ok()?;
+                let next = value.checked_add(delta)?;
+                // Zero padding is a fact about the literal, not about its
+                // value: `007` is a version segment or a port, and widening
+                // it on every bump would be wrong.
+                let digits = text.strip_prefix('-').unwrap_or(text).len();
+                let body = next.unsigned_abs();
+                let sign = if next < 0 { "-" } else { "" };
+                Some(format!("{sign}{body:0digits$}"))
+            }
+            NumberRadix::Hex | NumberRadix::Bin => {
+                let (prefix, digits) = text.split_at(2);
+                let radix = if self.radix == NumberRadix::Hex {
+                    16
+                } else {
+                    2
+                };
+                let value = u64::from_str_radix(digits, radix).ok()?;
+                let next = match value.checked_add_signed(delta) {
+                    Some(v) => v,
+                    // Underflow clamps at zero rather than wrapping: vim
+                    // turns `0x0` into `0xffffffffffffffff`, which is never
+                    // what the keystroke meant.
+                    None if delta < 0 => 0,
+                    None => return None,
+                };
+                let width = digits.len();
+                let body = match self.radix {
+                    NumberRadix::Bin => format!("{next:0width$b}"),
+                    // Digit case follows the literal: a file that writes
+                    // `0xFF` keeps writing uppercase.
+                    _ if digits.chars().any(|c| c.is_ascii_uppercase()) => {
+                        format!("{next:0width$X}")
+                    }
+                    _ => format!("{next:0width$x}"),
+                };
+                Some(format!("{prefix}{body}"))
+            }
+        }
+    }
+}
+
+/// The literal the cursor sits inside, or failing that the next one to its
+/// right on the same line — vim's rule, and the reason Ctrl-A is usable
+/// without placing the caret exactly.
+fn number_token_at_or_after(line: &str, caret: usize) -> Option<NumberToken> {
+    // Tokens come out left to right and never overlap, so the first one
+    // ending at or after the caret is the one under it, or the next one
+    // along when the caret is between literals.
+    number_tokens(line).into_iter().find(|t| t.end >= caret)
+}
+
+/// Every numeric literal on the line, left to right and non-overlapping.
+fn number_tokens(line: &str) -> Vec<NumberToken> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        // A digit that continues an identifier (`utf8`, `sha256`) is still a
+        // number to vim, and bumping it is usually what was meant. What must
+        // NOT happen is reading the `8` of `utf8` as the start of a fresh
+        // token when we are already inside one, which the scan below avoids
+        // by consuming each token whole.
+        if let Some(tok) = radix_prefixed_token(b, i) {
+            i = tok.end;
+            out.push(tok);
+            continue;
+        }
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            // A `-` directly before the digits is the sign, as in vim, but
+            // only when it is not itself preceded by a digit or an
+            // identifier character: in `a-5` the `-` is a sign, in `x1-5`
+            // it is a subtraction and `5` is positive.
+            let signed = start > 0
+                && b[start - 1] == b'-'
+                && !line[..start - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_word_or_digit);
+            out.push(NumberToken {
+                start: if signed { start - 1 } else { start },
+                end: i,
+                radix: NumberRadix::Dec,
+            });
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `0x…` / `0b…` starting exactly at `i`, or None.
+fn radix_prefixed_token(b: &[u8], i: usize) -> Option<NumberToken> {
+    if b[i] != b'0' || i + 2 >= b.len() {
+        return None;
+    }
+    let (radix, valid): (NumberRadix, fn(u8) -> bool) = match b[i + 1] {
+        b'x' | b'X' => (NumberRadix::Hex, |c: u8| c.is_ascii_hexdigit()),
+        b'b' | b'B' => (NumberRadix::Bin, |c: u8| c == b'0' || c == b'1'),
+        _ => return None,
+    };
+    let mut j = i + 2;
+    while j < b.len() && valid(b[j]) {
+        j += 1;
+    }
+    if j == i + 2 {
+        return None;
+    }
+    Some(NumberToken {
+        start: i,
+        end: j,
+        radix,
+    })
+}
+
+/// Checked on the character, not the byte: before the `-` in `λ-5` sits a
+/// UTF-8 continuation byte, which no byte test reads as a letter.
+fn is_word_or_digit(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The Emmet dialect for a buffer, or `None` where expansion is not offered,
+/// matching VS Code's default `emmet.includeLanguages`. `.jsx` shares
+/// `LangKind::JavaScript` with plain `.js`, so the extension tells them
+/// apart: an abbreviation in ordinary JavaScript is code, not markup.
+fn emmet_profile_for(
+    lang: Option<LangKind>,
+    path: Option<&std::path::Path>,
+) -> Option<crate::emmet::Profile> {
+    use crate::emmet::Profile;
+    match lang {
+        Some(LangKind::Html) => Some(Profile::Html),
+        Some(LangKind::Xml) => Some(Profile::Xml),
+        Some(LangKind::Tsx) => Some(Profile::Jsx),
+        Some(LangKind::JavaScript)
+            if path
+                .and_then(|p| p.extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsx")) =>
+        {
+            Some(Profile::Jsx)
+        }
+        _ => None,
     }
 }
 
@@ -10584,6 +11740,93 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     segs
 }
 
+/// Map 1-based bookmark `marks` across a buffer change from `old` to `new`.
+///
+/// The common prefix and suffix are trimmed first (cheap, and usually the
+/// whole answer for a keystroke), then the changed middle is line-diffed, so
+/// an edit that touched several places at once (multi-cursor line delete,
+/// LSP formatting, Replace All with newlines, or the undo of any of them)
+/// moves each mark by what changed above IT, not by one span's delta.
+///
+/// Per diff op: an unchanged line carries its mark to its new row; within a
+/// replaced run a mark keeps its offset while that row still exists and
+/// otherwise collapses onto the run's last new line (the join line a
+/// backspace or a partial-line selection delete leaves behind); a mark on a
+/// line deleted outright is dropped.
+fn shift_bookmark_lines(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    use similar::DiffOp;
+    let common = old.len().min(new.len());
+    let prefix = old
+        .iter()
+        .zip(new)
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(common);
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(common - prefix);
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    // A deadline bounds a pathological middle; past it the diff is coarser
+    // but still a valid diff, so marks still land on real rows.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let ops = similar::capture_diff_slices_deadline(
+        similar::Algorithm::Myers,
+        &old[prefix..old_end],
+        &new[prefix..new_end],
+        Some(deadline),
+    );
+    let map_middle = |row: usize| -> Option<usize> {
+        let r = row - prefix;
+        for op in &ops {
+            match *op {
+                DiffOp::Equal {
+                    old_index,
+                    new_index,
+                    len,
+                } if (old_index..old_index + len).contains(&r) => {
+                    return Some(prefix + new_index + (r - old_index));
+                }
+                DiffOp::Delete {
+                    old_index, old_len, ..
+                } if (old_index..old_index + old_len).contains(&r) => return None,
+                DiffOp::Replace {
+                    old_index,
+                    old_len,
+                    new_index,
+                    new_len,
+                } if (old_index..old_index + old_len).contains(&r) => {
+                    return Some(prefix + new_index + (r - old_index).min(new_len - 1));
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    marks
+        .iter()
+        .filter_map(|&line| {
+            let row = line.checked_sub(1)?;
+            let mapped = if row < prefix {
+                row
+            } else if row >= old_end {
+                row - old_end + new_end
+            } else {
+                map_middle(row)?
+            };
+            Some(mapped + 1)
+        })
+        .collect()
+}
+
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
 /// entirely before the cut and clamping spans straddling the cut.
 /// Split file text into buffer lines the way the LSP spec / VS Code / Zed do:
@@ -10670,7 +11913,45 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
             });
         }
     }
-    out.extend_from_slice(over);
+    // The overlay normally wins outright, except over a comment tag (`TODO`,
+    // `FIXME`, ...), which the tag pass deliberately marked so it stands out.
+    // A server that reports the whole comment as one `comment` token would
+    // otherwise repaint the tag in ordinary comment grey, so tag highlighting
+    // would silently stop the moment an LSP attached. Carve those ranges out
+    // of each overlay span instead. Keywords are BOLD as well, so the tag
+    // test is the tag hue, not BOLD alone.
+    let keep: Vec<&HiSpan> = base
+        .iter()
+        .filter(|b| crate::highlight::is_comment_tag_style(b.style))
+        .collect();
+    for o in over {
+        let mut cur = o.start;
+        for k in keep.iter().filter(|k| k.end > o.start && k.start < o.end) {
+            if k.start > cur {
+                out.push(HiSpan {
+                    start: cur,
+                    end: k.start,
+                    style: o.style,
+                });
+            }
+            out.push(HiSpan {
+                start: k.start.max(o.start),
+                end: k.end.min(o.end),
+                style: k.style,
+            });
+            cur = cur.max(k.end);
+            if cur >= o.end {
+                break;
+            }
+        }
+        if cur < o.end {
+            out.push(HiSpan {
+                start: cur,
+                end: o.end,
+                style: o.style,
+            });
+        }
+    }
     out.sort_by_key(|s| s.start);
     out
 }
@@ -11214,6 +12495,19 @@ impl Widget for &mut Editor {
                 sign_taken = true;
             }
 
+            // Bookmark flag: a reader's own mark, ranked below every debugger
+            // glyph and the AI-stream square (those report machine state and
+            // must never be hidden) but above the test play bead.
+            if (!wrap || row_start == 0) && !sign_taken && self.is_bookmarked(line_idx) {
+                buf.set_string(
+                    sign_x,
+                    y,
+                    "\u{2691}", // ⚑, a plain-Unicode flag: no Nerd Font needed
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x4f, 0xc1, 0xff))),
+                );
+                sign_taken = true;
+            }
+
             // Testing gutter glyph: the play button beside a test fn's
             // definition (VS Code's run bead, in its testing green), sharing
             // the sign cell with the debugger — whose stop arrow and
@@ -11403,6 +12697,34 @@ impl Widget for &mut Editor {
                     let cell = &mut buf[(text_x + col, y)];
                     let style = cell.style().fg(fg);
                     cell.set_style(style);
+                }
+            }
+
+            // Inline color-literal decorations (VS Code's
+            // `naumovs.color-highlight`, filling the "no colour-swatch
+            // decorations" gap): tint each recognized `#hex` / `rgb()` /
+            // `hsl()` literal's own cells with its parsed color, choosing a
+            // black or white foreground for legibility. Painted after
+            // bracket colorization so a color literal's own brackets (e.g.
+            // `rgb(...)`) still read against the tint, and before the
+            // overlays below (selection, search) so those still win over it.
+            if self.show_color_swatches
+                && let Some(hits) = self.color_swatches.get(line_idx)
+            {
+                for &(start_c, end_c, bg, fg) in hits {
+                    if end_c <= row_start {
+                        continue;
+                    }
+                    let from = start_c.max(row_start);
+                    for c in from..end_c {
+                        let col = (c + ex(c) - row_start) as u16;
+                        if col >= row_width {
+                            break;
+                        }
+                        let cell = &mut buf[(text_x + col, y)];
+                        let style = cell.style().bg(bg).fg(fg);
+                        cell.set_style(style);
+                    }
                 }
             }
 
@@ -11902,6 +13224,16 @@ impl Widget for &mut Editor {
 
         if let Some(metrics) = scrollbar_metrics {
             scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            // Overview ruler: ticks for the whole file painted over the track
+            // the thumb rides on, so problems and search hits off screen are
+            // still visible. Computed first so `self` is free while painting.
+            if self.overview_ruler {
+                let ticks = self.overview_ruler_rows_wrapped(
+                    metrics.area.height,
+                    wrap.then_some(text_width as usize),
+                );
+                paint_overview_ruler(buf, metrics.area, &ticks, self.theme);
+            }
         }
         if let Some(metrics) = hbar_metrics {
             scrollbar::render_horizontal(buf, metrics, self.focused, self.theme);
@@ -12288,6 +13620,32 @@ fn search_highlight_styles(theme: crate::theme::Theme) -> (Style, Style) {
     (inactive, active)
 }
 
+/// Paint the overview ruler's ticks over an already-rendered scrollbar track.
+///
+/// The tick is a foreground glyph, not a background fill, so the thumb still
+/// shows through underneath it: the ruler must not cost you the ability to see
+/// where you are in the file, which is what the scrollbar is for.
+fn paint_overview_ruler(
+    buf: &mut Buffer,
+    area: Rect,
+    ticks: &[Option<OverviewMark>],
+    theme: crate::theme::Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    for (row, tick) in ticks.iter().enumerate() {
+        let Some(mark) = tick else { continue };
+        let y = area.y.saturating_add(row as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        let cell = &mut buf[(area.x, y)];
+        cell.set_symbol("\u{2501}"); // ━ heavy horizontal: a tick across the track
+        cell.set_fg(mark.color(theme));
+    }
+}
+
 // Render helper: each argument is an independent painting input (buffer,
 // geometry, text, styling); bundling them into a struct would add indirection
 // without improving clarity.
@@ -12482,6 +13840,166 @@ fn paint_bracket_match(
     }
     let cell = &mut buf[(text_x + col, y)];
     cell.set_style(cell.style().bg(theme.bracket_match_bg()));
+}
+
+/// HTML void elements: they never take a closing tag, so typing `>` after
+/// one must not produce `</br>` and friends.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Languages where `>` closes a tag. TypeScript (`.ts`) is deliberately
+/// absent — it has no JSX, so every `<` there is a comparison or a generic.
+fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(LangKind::Html | LangKind::Xml | LangKind::Tsx | LangKind::JavaScript)
+    )
+}
+
+/// The tag name a `>` typed at `byte` in `line` should close, or `None` when
+/// the text before the caret is not an unterminated opening tag.
+///
+/// Heuristic, not a parse: the editor decides this on one keystroke against
+/// one line, so every rule below errs toward NOT closing — a missed close
+/// costs one typed `</tag>`, a spurious one corrupts code. In particular the
+/// "`<` may not follow a word character" rule is what keeps generic calls
+/// (`foo<T>`, `Array<string>`) and comparisons (`a<b`) from sprouting closing
+/// tags. What one line cannot show (a string or block comment opened on an
+/// earlier line) is not seen.
+fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Option<&str> {
+    if !lang_auto_closes_tags(lang) {
+        return None;
+    }
+    let before = line.get(..byte)?;
+    let lt = before.rfind('<')?;
+    let inner = &before[lt + 1..];
+    // A closing tag (`</p`), a comment or doctype (`<!`), or an XML
+    // processing instruction (`<?`) closes nothing.
+    if inner.starts_with(['/', '!', '?']) {
+        return None;
+    }
+    // The author is self-closing it themselves: `<br/`, `<Foo /`.
+    if inner.ends_with('/') {
+        return None;
+    }
+    // `<` directly after a word character is a comparison or a generic
+    // argument list, never markup: `a<b`, `foo<T`, `Array<string`.
+    if before[..lt]
+        .chars()
+        .next_back()
+        .is_some_and(|p| p.is_alphanumeric() || p == '_')
+    {
+        return None;
+    }
+    // In script, a `<` inside a string literal or a comment is text, not
+    // JSX: `"<div"`, `// renders <div`.
+    if matches!(lang, Some(LangKind::Tsx | LangKind::JavaScript))
+        && ends_in_script_string_or_comment(&before[..lt])
+    {
+        return None;
+    }
+    let name_len = inner
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
+        .unwrap_or(inner.len());
+    let name = &inner[..name_len];
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|f| f.is_alphabetic() || f == '_')
+    {
+        return None;
+    }
+    // Whatever follows the name must look like the inside of a tag: nothing
+    // at all, or attributes after whitespace. This rejects the standalone
+    // generic declaration `<T,>(x: T) => x`, whose `,` is not tag syntax.
+    let rest = &inner[name.len()..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // The generic arrow's other two forms, `<T extends U>` and `<T = U>`,
+    // also put whitespace after the name. No attribute list opens with `=`,
+    // and `extends` is TypeScript's constraint keyword, not a JSX attribute.
+    if matches!(lang, Some(LangKind::Tsx | LangKind::JavaScript)) {
+        let attrs = rest.trim_start();
+        let first = attrs
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .next()
+            .unwrap_or("");
+        if attrs.starts_with('=') || first == "extends" {
+            return None;
+        }
+    }
+    // A `>` typed inside a quoted attribute value (`title="1`) or a `{…}`
+    // expression (`onClick={() =`, the arrow) belongs to that value, not to
+    // the tag. Track quote and brace state across the attribute text and
+    // close only when the caret sits at the top level of the tag.
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    for c in rest.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() || depth > 0 {
+        return None;
+    }
+    // A `>` already inside means that `<` is closed and the caret is past
+    // the tag (or inside an attribute value holding a `>`); either way this
+    // keystroke is not closing THIS tag.
+    if rest.contains('>') {
+        return None;
+    }
+    if matches!(lang, Some(LangKind::Html))
+        && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Whether the end of `prefix`, one line of JavaScript/TSX, sits inside a
+/// string literal (`'`, `"` or a template literal), a `//` comment or an
+/// unclosed `/* */` comment. A backslash escapes the next character inside a
+/// string. JSX text containing an apostrophe (`<p>Don't <b`) reads as an open
+/// string, which only ever suppresses a close — the safe direction.
+fn ends_in_script_string_or_comment(prefix: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut block_comment = false;
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
+        if block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
+            }
+        } else if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '/' if chars.peek() == Some(&'/') => return true,
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    block_comment = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    quote.is_some() || block_comment
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -14799,6 +16317,400 @@ mod tests {
         );
     }
 
+    /// A bookmark editor over a real temp file: bookmarks are keyed by path,
+    /// so an unsaved scratch buffer cannot carry any.
+    fn bookmark_editor(lines: usize) -> (Editor, tempfile::NamedTempFile) {
+        let f = NamedTempFile::new().unwrap();
+        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(f.path(), &body).unwrap();
+        let mut e = Editor::new();
+        e.open(f.path()).unwrap();
+        (e, f)
+    }
+
+    #[test]
+    fn toggling_a_bookmark_adds_then_removes_the_cursor_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 3; // 0-based; the mark is stored 1-based
+        assert_eq!(e.toggle_bookmark(), Some(true), "first toggle sets it");
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+        assert_eq!(e.toggle_bookmark(), Some(false), "second toggle clears it");
+        assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn clearing_the_last_bookmark_drops_the_files_entry_entirely() {
+        let (mut e, f) = bookmark_editor(10);
+        e.cursor_row = 0;
+        e.toggle_bookmark();
+        e.toggle_bookmark();
+        assert!(
+            !e.bookmarks.contains_key(f.path()),
+            "an emptied set must be removed, not left as a hollow entry"
+        );
+    }
+
+    #[test]
+    fn a_scratch_buffer_with_no_path_cannot_be_bookmarked() {
+        let mut e = editor_with("a\nb\n");
+        assert_eq!(e.toggle_bookmark(), None);
+        assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn bookmarks_report_ascending_regardless_of_the_order_they_were_set() {
+        let (mut e, _f) = bookmark_editor(30);
+        for row in [20, 4, 11] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        assert_eq!(e.bookmarked_lines(), vec![5, 12, 21]);
+    }
+
+    #[test]
+    fn next_bookmark_walks_down_and_wraps_to_the_first() {
+        let (mut e, _f) = bookmark_editor(40);
+        for row in [4, 14, 29] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        e.cursor_row = 0;
+        assert_eq!(e.goto_next_bookmark(), Some(5));
+        assert_eq!(e.cursor_row, 4);
+        assert_eq!(e.goto_next_bookmark(), Some(15));
+        assert_eq!(e.goto_next_bookmark(), Some(30));
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(5),
+            "past the last mark it wraps to the top of the file"
+        );
+        assert_eq!(e.cursor_row, 4);
+    }
+
+    #[test]
+    fn previous_bookmark_walks_up_and_wraps_to_the_last() {
+        let (mut e, _f) = bookmark_editor(40);
+        for row in [4, 14, 29] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        e.cursor_row = 39;
+        assert_eq!(e.goto_prev_bookmark(), Some(30));
+        assert_eq!(e.goto_prev_bookmark(), Some(15));
+        assert_eq!(e.goto_prev_bookmark(), Some(5));
+        assert_eq!(
+            e.goto_prev_bookmark(),
+            Some(30),
+            "above the first mark it wraps to the bottom of the file"
+        );
+    }
+
+    #[test]
+    fn navigating_with_no_bookmarks_reports_none_and_leaves_the_cursor() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 6;
+        assert_eq!(e.goto_next_bookmark(), None);
+        assert_eq!(e.goto_prev_bookmark(), None);
+        assert_eq!(e.cursor_row, 6, "a failed jump must not move the cursor");
+    }
+
+    #[test]
+    fn a_lone_bookmark_on_the_cursors_own_line_still_reports_itself() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 5;
+        e.toggle_bookmark();
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(6),
+            "wrapping onto the only mark must report it, not look broken"
+        );
+        assert_eq!(e.goto_prev_bookmark(), Some(6));
+    }
+
+    #[test]
+    fn jumping_to_a_bookmark_drops_any_selection() {
+        let (mut e, _f) = bookmark_editor(20);
+        e.cursor_row = 15;
+        e.toggle_bookmark();
+        e.cursor_row = 0;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        e.goto_next_bookmark();
+        assert!(
+            e.selection.is_none(),
+            "a jump is a navigation, not an extend"
+        );
+    }
+
+    #[test]
+    fn clear_bookmarks_reports_how_many_it_removed() {
+        let (mut e, _f) = bookmark_editor(20);
+        for row in [1, 5, 9] {
+            e.cursor_row = row;
+            e.toggle_bookmark();
+        }
+        assert_eq!(e.clear_bookmarks(), 3);
+        assert!(e.bookmarked_lines().is_empty());
+        assert_eq!(e.clear_bookmarks(), 0, "clearing twice is a no-op");
+    }
+
+    #[test]
+    fn bookmarks_are_per_file_so_switching_tabs_keeps_each_files_marks() {
+        let (mut e, first) = bookmark_editor(10);
+        e.cursor_row = 2;
+        e.toggle_bookmark();
+        let second = NamedTempFile::new().unwrap();
+        std::fs::write(second.path(), "x\ny\nz\n").unwrap();
+        e.open(second.path()).unwrap();
+        assert!(
+            e.bookmarked_lines().is_empty(),
+            "the second file starts unmarked"
+        );
+        e.cursor_row = 0;
+        e.toggle_bookmark();
+        e.open(first.path()).unwrap();
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3],
+            "coming back restores the first file's marks"
+        );
+    }
+
+    /// Set a bookmark on each 0-based row through the real toggle path.
+    fn mark_rows(e: &mut Editor, rows: &[usize]) {
+        for &row in rows {
+            e.cursor_row = row;
+            e.cursor_col = 0;
+            e.toggle_bookmark();
+        }
+    }
+
+    /// Several edit paths change lines in more than one place and sync once
+    /// (multi-cursor line delete, LSP formatting, Replace All with newlines,
+    /// and their undo). A mark between two such regions must move by the
+    /// lines removed above it, not stay put because a single prefix/suffix
+    /// span swallowed it.
+    #[test]
+    fn bookmark_shift_follows_lines_through_a_multi_region_edit() {
+        let old: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        let new: Vec<String> = old
+            .iter()
+            .filter(|l| *l != "line 2" && *l != "line 7")
+            .cloned()
+            .collect();
+        let marks: std::collections::BTreeSet<usize> = [2, 5, 7, 9].into_iter().collect();
+        let moved: Vec<usize> = shift_bookmark_lines(&marks, &old, &new)
+            .into_iter()
+            .collect();
+        // `line 5` is now row 4 and `line 9` row 7; the marks on the two
+        // deleted lines go with them.
+        assert_eq!(moved, vec![4, 7]);
+        assert_eq!(new[3], "line 5");
+        assert_eq!(new[6], "line 9");
+    }
+
+    #[test]
+    fn bookmark_shift_a_newline_above_a_mark_pushes_it_down() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 5]); // lines 2 and 6
+        e.cursor_row = 2;
+        e.cursor_col = 0;
+        e.insert_newline();
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![2, 7],
+            "the mark above the edit stays, the one below follows its line"
+        );
+        assert!(e.is_bookmarked(6), "row 6 now holds `line 6`");
+        assert_eq!(e.lines[6], "line 6");
+    }
+
+    #[test]
+    fn bookmark_shift_a_multi_line_paste_moves_marks_by_the_pasted_count() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[5]); // `line 6`
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_str("a\nb\nc\n");
+        assert_eq!(e.lines[8], "line 6");
+        assert_eq!(e.bookmarked_lines(), vec![9]);
+    }
+
+    #[test]
+    fn bookmark_shift_deleting_lines_drops_marks_inside_and_pulls_up_the_rest() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[2, 4, 8]); // lines 3, 5, 9
+        e.cursor_row = 3;
+        e.delete_lines(3); // removes lines 4, 5, 6
+        assert_eq!(e.lines[5], "line 9");
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3, 6],
+            "line 5 went with its line; line 9 is now line 6"
+        );
+    }
+
+    #[test]
+    fn bookmark_shift_undo_and_redo_of_a_line_delete_move_marks_back_and_forth() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[8]); // `line 9`
+        e.cursor_row = 3;
+        e.delete_lines(3);
+        assert_eq!(e.bookmarked_lines(), vec![6]);
+        assert!(e.undo());
+        assert_eq!(e.lines[8], "line 9");
+        assert_eq!(e.bookmarked_lines(), vec![9], "undo restores the line");
+        assert!(e.redo());
+        assert_eq!(e.bookmarked_lines(), vec![6], "redo deletes it again");
+    }
+
+    #[test]
+    fn bookmark_shift_a_selection_delete_collapses_inner_marks_onto_the_join_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[3, 7]); // lines 4 and 8
+        e.selection = Some(EditorSelection {
+            anchor: (2, 2),
+            head: (5, 1),
+        });
+        e.cursor_row = 5;
+        e.cursor_col = 1;
+        assert!(e.delete_selection());
+        assert_eq!(e.lines[4], "line 8");
+        assert_eq!(
+            e.bookmarked_lines(),
+            vec![3, 5],
+            "line 4 folded into the join line 3; line 8 moved up by 3"
+        );
+    }
+
+    #[test]
+    fn bookmark_shift_backspace_joining_lines_keeps_the_mark_on_the_join_line() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[4, 6]); // lines 5 and 7
+        e.cursor_row = 4;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines[3], "line 4line 5");
+        assert_eq!(e.bookmarked_lines(), vec![4, 6]);
+    }
+
+    #[test]
+    fn bookmark_shift_an_external_reload_that_shrinks_the_file_clamps_marks() {
+        let (mut e, f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 9]); // lines 2 and 10
+        std::fs::write(f.path(), "line 1\nline 2\nline 3\n").unwrap();
+        assert!(matches!(e.reload_if_clean(), Some(Ok(()))));
+        assert_eq!(e.lines.len(), 3);
+        let marks = e.bookmarked_lines();
+        assert!(
+            marks.iter().all(|&l| l <= e.lines.len()),
+            "no mark may outlive the buffer; was {marks:?}"
+        );
+        assert!(marks.contains(&2), "the untouched line keeps its mark");
+        assert!(
+            e.bookmarks.values().flatten().all(|&l| l <= 3),
+            "the stored set is clamped too, not only the view"
+        );
+    }
+
+    #[test]
+    fn bookmark_nav_next_wraps_after_a_delete_pulled_the_last_mark_up() {
+        let (mut e, _f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1, 9]); // lines 2 and 10
+        e.cursor_row = 3;
+        e.delete_lines(3);
+        e.cursor_row = e.lines.len() - 1; // `line 10`, now line 7
+        assert_eq!(
+            e.goto_next_bookmark(),
+            Some(2),
+            "from the last mark, next wraps to the first"
+        );
+        assert_eq!(e.cursor_row, 1);
+    }
+
+    #[test]
+    fn bookmark_nav_ignores_a_mark_past_the_end_of_the_buffer() {
+        // Defence in depth for navigation itself: a stale mark beyond the
+        // last line (however it got there) must not become a target the
+        // jump clamps back onto the cursor's own row, which froze the ring.
+        let (mut e, f) = bookmark_editor(10);
+        mark_rows(&mut e, &[1]);
+        e.bookmarks
+            .get_mut(f.path())
+            .expect("marked above")
+            .insert(50);
+        e.cursor_row = 9;
+        assert_eq!(e.goto_next_bookmark(), Some(2), "wraps past the stale mark");
+        e.cursor_row = 0;
+        assert_eq!(
+            e.goto_prev_bookmark(),
+            Some(2),
+            "prev wraps to the last in-range mark, not line 50"
+        );
+        assert_eq!(e.bookmarked_lines(), vec![2]);
+    }
+
+    #[test]
+    fn is_bookmarked_is_zero_based_to_match_the_render_loop() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 4; // stored as line 5
+        e.toggle_bookmark();
+        assert!(e.is_bookmarked(4), "0-based row 4 is the bookmarked line");
+        assert!(
+            !e.is_bookmarked(5),
+            "off-by-one would light up the wrong row"
+        );
+    }
+
+    #[test]
+    fn the_bookmark_flag_is_painted_in_the_left_glyph_margin() {
+        let (mut e, _f) = bookmark_editor(5);
+        e.cursor_row = 1; // line 2
+        e.toggle_bookmark();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let row = e.last_inner.y + 1; // line 2 is the 2nd content row
+        assert_eq!(
+            buf[(e.last_inner.x, row)].symbol(),
+            "\u{2691}",
+            "the flag belongs in the sign margin at inner.x"
+        );
+        let unmarked = e.last_inner.y + 2; // line 3 carries no mark
+        assert_ne!(buf[(e.last_inner.x, unmarked)].symbol(), "\u{2691}");
+    }
+
+    #[test]
+    fn a_breakpoint_outranks_a_bookmark_in_the_shared_sign_cell() {
+        let (mut e, f) = bookmark_editor(5);
+        e.cursor_row = 1;
+        e.toggle_bookmark();
+        e.breakpoints
+            .entry(f.path().to_path_buf())
+            .or_default()
+            .insert(2); // same line
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        assert_eq!(
+            buf[(e.last_inner.x, e.last_inner.y + 1)].symbol(),
+            "\u{25cf}",
+            "debugger state must never be hidden behind a reader's own mark"
+        );
+    }
+
     #[test]
     fn breakpoint_glyph_sits_in_left_margin_not_over_the_line_number() {
         let f = NamedTempFile::new().unwrap();
@@ -15945,6 +17857,328 @@ mod tests {
             severity,
             message: String::from("test diagnostic"),
         }
+    }
+
+    // --- Overview ruler ---------------------------------------------------
+
+    /// A 100-line buffer with a path, so git marks and diagnostics can attach.
+    fn ruler_editor() -> Editor {
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let mut e = editor_with(&body);
+        e.path = Some(std::path::PathBuf::from("/tmp/ruler.rs"));
+        e
+    }
+
+    #[test]
+    fn an_unmarked_file_produces_an_empty_ruler() {
+        let mut e = ruler_editor();
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(rows.len(), 20, "one slot per track row");
+        assert!(rows.iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn a_zero_height_track_asks_for_no_slots() {
+        let mut e = ruler_editor();
+        assert!(e.overview_ruler_rows(0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_buffer_does_not_divide_by_its_line_count() {
+        let mut e = Editor::new();
+        e.lines.clear();
+        assert_eq!(e.overview_ruler_rows(10).len(), 10);
+    }
+
+    #[test]
+    fn a_diagnostic_lands_on_the_track_row_its_line_maps_to() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Line 51 (0-based 50) of 100 lines on a 20-row track => row 10.
+        e.apply_diagnostics(p, vec![diag(50, 0, 50, 4, DiagnosticSeverity::Error)]);
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(rows[10], Some(OverviewMark::Error));
+        assert_eq!(
+            rows.iter().filter(|r| r.is_some()).count(),
+            1,
+            "one diagnostic must not smear across the track"
+        );
+    }
+
+    #[test]
+    fn the_last_line_maps_inside_the_track_rather_than_one_past_it() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(99, 0, 99, 1, DiagnosticSeverity::Error)]);
+        let rows = e.overview_ruler_rows(20);
+        assert_eq!(
+            rows[19],
+            Some(OverviewMark::Error),
+            "the final line belongs on the final track row, not out of bounds"
+        );
+    }
+
+    #[test]
+    fn an_error_outranks_a_warning_sharing_a_track_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Lines 0 and 1 both compress onto track row 0 (100 lines / 10 rows).
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(0, 0, 0, 1, DiagnosticSeverity::Warning),
+                diag(1, 0, 1, 1, DiagnosticSeverity::Error),
+            ],
+        );
+        assert_eq!(
+            e.overview_ruler_rows(10)[0],
+            Some(OverviewMark::Error),
+            "a broken build must not be hidden behind a warning on the next line"
+        );
+    }
+
+    #[test]
+    fn hints_and_information_stay_off_the_ruler() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(10, 0, 10, 1, DiagnosticSeverity::Hint),
+                diag(30, 0, 30, 1, DiagnosticSeverity::Information),
+            ],
+        );
+        assert!(
+            e.overview_ruler_rows(20).iter().all(|r| r.is_none()),
+            "advisory diagnostics would crowd the one column real problems use"
+        );
+    }
+
+    #[test]
+    fn search_matches_are_ticked_only_where_the_highlighter_agrees() {
+        let mut e = ruler_editor();
+        e.lines[20] = String::from("needle here");
+        e.lines[60] = String::from("NEEDLE shouting");
+        e.search_highlight = Some(String::from("needle"));
+        // Case-insensitive by default: both lines match.
+        let rows = e.overview_ruler_rows(10);
+        assert_eq!(rows[2], Some(OverviewMark::SearchMatch));
+        assert_eq!(rows[6], Some(OverviewMark::SearchMatch));
+
+        e.search_highlight_opts.case_sensitive = true;
+        let rows = e.overview_ruler_rows(10);
+        assert_eq!(rows[2], Some(OverviewMark::SearchMatch));
+        assert_eq!(
+            rows[6], None,
+            "the ruler must agree with the yellow runs in the text, not guess"
+        );
+    }
+
+    #[test]
+    fn an_empty_needle_ticks_nothing() {
+        let mut e = ruler_editor();
+        e.search_highlight = Some(String::new());
+        assert!(e.overview_ruler_rows(10).iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn a_diagnostic_outranks_a_search_hit_on_the_same_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.lines[5] = String::from("needle");
+        e.search_highlight = Some(String::from("needle"));
+        e.apply_diagnostics(p, vec![diag(5, 0, 5, 1, DiagnosticSeverity::Warning)]);
+        assert_eq!(e.overview_ruler_rows(10)[0], Some(OverviewMark::Warning));
+    }
+
+    #[test]
+    fn the_mark_priority_order_is_the_declared_one() {
+        // The render relies on `Ord`, so pin it rather than the comparison
+        // silently inverting when a variant is inserted in the middle.
+        assert!(OverviewMark::Error > OverviewMark::Warning);
+        assert!(OverviewMark::Warning > OverviewMark::SearchMatch);
+        assert!(OverviewMark::SearchMatch > OverviewMark::GitDeleted);
+        assert!(OverviewMark::GitDeleted > OverviewMark::GitModified);
+        assert!(OverviewMark::GitModified > OverviewMark::GitAdded);
+    }
+
+    #[test]
+    fn git_marks_reach_the_ruler_in_their_own_three_colours() {
+        let mut e = ruler_editor();
+        // A HEAD baseline that differs from the buffer on known lines.
+        let mut head: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        head[10] = String::from("line 11 as committed");
+        e.git_head_lines = Some(head);
+        e.git_baseline_for = e.path.clone();
+        let rows = e.overview_ruler_rows(100);
+        assert_eq!(
+            rows[10],
+            Some(OverviewMark::GitModified),
+            "an edited line must show as modified on the ruler; rows were {:?}",
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.is_some())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Render `e` into a 40x12 buffer and return it with the track-relative
+    /// rows that carry a ruler tick.
+    fn rendered_ruler_ticks(e: &mut Editor) -> (ratatui::buffer::Buffer, Vec<u16>) {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut *e, area, &mut buf);
+        let bar = e.last_scrollbar;
+        let ticks = (0..bar.height)
+            .filter(|&r| buf[(bar.x, bar.y + r)].symbol() == "\u{2501}")
+            .collect();
+        (buf, ticks)
+    }
+
+    #[test]
+    fn the_ticks_paint_over_the_track_without_erasing_the_thumb() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        // Scrolled to the top, line 0's tick sits on the thumb and line 99's
+        // on the bare track: each must keep the background it was painted on.
+        e.apply_diagnostics(
+            p,
+            vec![
+                diag(0, 0, 0, 1, DiagnosticSeverity::Error),
+                diag(99, 0, 99, 1, DiagnosticSeverity::Error),
+            ],
+        );
+        let (buf, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(ticks, vec![0, bar.height - 1], "one tick per error");
+        let thumb = if e.focused {
+            e.theme.scrollbar_thumb_focused()
+        } else {
+            e.theme.scrollbar_thumb()
+        };
+        assert_eq!(
+            buf[(bar.x, bar.y)].style().bg,
+            Some(thumb),
+            "a tick on the thumb must not erase it"
+        );
+        assert_eq!(
+            buf[(bar.x, bar.y + bar.height - 1)].style().bg,
+            Some(e.theme.scrollbar_track()),
+            "a tick on the track keeps the track colour"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_file_places_ticks_where_the_thumb_would_reveal_them() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        e.wrap_override = Some(true);
+        // The first half wraps to many rows each, so line 50 starts near the
+        // bottom of the content the thumb travels over — not at its middle.
+        for l in 0..50 {
+            e.lines[l] = "x".repeat(400);
+        }
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(50, 0, 50, 1, DiagnosticSeverity::Error)]);
+        let (_, ticks) = rendered_ruler_ticks(&mut e);
+        let bar = e.last_scrollbar;
+        assert_eq!(
+            ticks,
+            vec![bar.height - 1],
+            "line 50 starts past 90% of the visual rows, so on the last track row; \
+             a line-count mapping puts it halfway, at {}",
+            bar.height / 2
+        );
+    }
+
+    #[test]
+    fn a_zero_width_regex_match_ticks_nothing() {
+        let mut e = ruler_editor();
+        e.search_highlight_opts.use_regex = true;
+        // Each matches every line at zero width; the text highlighter paints
+        // no cell for any of them, so the ruler must not either.
+        for needle in ["^", "\\b", "q*", "needle|"] {
+            e.search_highlight = Some(String::from(needle));
+            assert!(
+                e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+                "{needle} highlights no text"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_after_a_search_moves_the_search_ticks() {
+        let mut e = ruler_editor();
+        e.search_highlight = Some(String::from("needle"));
+        assert!(e.overview_ruler_rows(10).iter().all(|r| r.is_none()));
+        // Through the real insert path, so a result cached per frame must
+        // notice the buffer changed under it.
+        e.cursor_row = 30;
+        e.cursor_col = 0;
+        for c in "needle ".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+    }
+
+    /// The search ticks are cached per `(edit, needle, options)`, so a new
+    /// needle or a flipped option must be a miss, not a stale answer.
+    #[test]
+    fn a_new_needle_or_option_recomputes_the_cached_search_ticks() {
+        let mut e = ruler_editor();
+        e.lines[30] = String::from("Needle");
+        e.search_highlight = Some(String::from("needle"));
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+        e.search_highlight_opts.case_sensitive = true;
+        assert!(
+            e.overview_ruler_rows(10).iter().all(|r| r.is_none()),
+            "case-sensitive `needle` does not match `Needle`"
+        );
+        e.search_highlight = Some(String::from("Needle"));
+        assert_eq!(
+            e.overview_ruler_rows(10)[3],
+            Some(OverviewMark::SearchMatch)
+        );
+    }
+
+    #[test]
+    fn toggling_the_ruler_off_leaves_a_plain_scrollbar() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = ruler_editor();
+        let p = e.path.clone().unwrap();
+        e.apply_diagnostics(p, vec![diag(99, 0, 99, 1, DiagnosticSeverity::Error)]);
+        e.overview_ruler = false;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 12,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let bar_x = e.last_scrollbar.x;
+        assert!(
+            (e.last_scrollbar.y..e.last_scrollbar.y + e.last_scrollbar.height)
+                .all(|y| buf[(bar_x, y)].symbol() != "\u{2501}"),
+            "the toggle must actually stop the paint, not just dim it"
+        );
     }
 
     #[test]
@@ -19685,6 +21919,84 @@ mod tests {
         let spans = build_line_spans("abcde", &hi);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
+    }
+
+    /// A semantic `comment` token covering a tag must not erase the tag's
+    /// colour. `merge_overlay` gives the overlay precedence, so a server that
+    /// reports the whole comment as one token would repaint TODO in ordinary
+    /// comment grey - the tag highlighting would silently stop working the
+    /// moment an LSP attached.
+    #[test]
+    fn a_semantic_comment_token_does_not_erase_a_tag_colour() {
+        use ratatui::style::Color;
+        let comment = Style::default().fg(Color::Rgb(0x65, 0x73, 0x7e));
+        // BOLD is what the tag pass adds (src/highlight.rs, the
+        // `base_style.fg(color).add_modifier(Modifier::BOLD)` push), and it
+        // is the marker merge_overlay keys on. A fixture without it would
+        // not exercise the real path.
+        let tag = Style::default()
+            .fg(Color::Rgb(0x4F, 0xC1, 0xFF))
+            .add_modifier(Modifier::BOLD);
+        // What the tree-sitter pass produces for `// TODO x`: grey, then the
+        // tag in its own colour, then grey.
+        let base = vec![
+            HiSpan {
+                start: 0,
+                end: 3,
+                style: comment,
+            },
+            HiSpan {
+                start: 3,
+                end: 7,
+                style: tag,
+            },
+            HiSpan {
+                start: 7,
+                end: 9,
+                style: comment,
+            },
+        ];
+        // What a server reports: one `comment` token over the whole line.
+        let over = vec![HiSpan {
+            start: 0,
+            end: 9,
+            style: comment,
+        }];
+        let merged = merge_overlay(&base, &over);
+        assert!(
+            merged
+                .iter()
+                .any(|sp| sp.style.fg == Some(Color::Rgb(0x4F, 0xC1, 0xFF))),
+            "the TODO span must survive the semantic overlay: {merged:?}"
+        );
+    }
+
+    /// Keywords are BOLD too (`palette_style_for_name`, "keyword"), so the tag
+    /// carve-out must not key on BOLD alone: a semantic token over a keyword
+    /// (rust-analyzer's inactive-code dimming, `selfKeyword`) still wins.
+    #[test]
+    fn a_semantic_token_still_repaints_a_bold_keyword() {
+        use ratatui::style::Color;
+        let keyword = Style::default()
+            .fg(Color::Rgb(0xc6, 0x78, 0xdd))
+            .add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::Rgb(0x5c, 0x63, 0x70));
+        let base = vec![HiSpan {
+            start: 0,
+            end: 2,
+            style: keyword,
+        }];
+        let over = vec![HiSpan {
+            start: 0,
+            end: 9,
+            style: inactive,
+        }];
+        let merged = merge_overlay(&base, &over);
+        assert_eq!(
+            merged.iter().map(|sp| sp.style).collect::<Vec<_>>(),
+            vec![inactive],
+            "the overlay must repaint the keyword: {merged:?}"
+        );
     }
 
     #[test]
@@ -23760,6 +26072,107 @@ mod tests {
     }
 
     #[test]
+    fn scan_color_swatches_recognizes_hex_forms() {
+        let lines = vec![String::from("bg: #f00; border: #00ff0080; a: #abcabcabc")];
+        let out = scan_color_swatches(&lines, false);
+        // #f00 -> (255,0,0); #00ff0080 -> (0,255,0); the trailing 9-digit
+        // run is not any valid CSS hex length and must not match at all.
+        assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
+        assert_eq!(out[0][1].2, Color::Rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn scan_color_swatches_recognizes_rgb_and_hsl() {
+        let lines = vec![String::from(
+            "color: rgb(255, 0, 0); fill: hsl(0, 100%, 50%);",
+        )];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
+        // hsl(0, 100%, 50%) is pure red too.
+        assert_eq!(out[0][1].2, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn scan_color_swatches_ignores_hex_like_identifiers() {
+        // A hex digit run of invalid CSS length (12 digits, immediately
+        // followed by another hex digit) must not match as any color form.
+        let lines = vec![String::from("let x = #abcdefabcdefg;")];
+        let out = scan_color_swatches(&lines, false);
+        assert!(out[0].is_empty(), "found: {:?}", out[0]);
+    }
+
+    #[test]
+    fn scan_color_swatches_skips_issue_refs_fragments_and_entities() {
+        let lines = vec![String::from(
+            "fixes #555 and #1234; see page#fade; &#123; but #fade and #000000",
+        )];
+        let out = scan_color_swatches(&lines, false);
+        let found: Vec<_> = out[0].iter().map(|h| h.0).collect();
+        // Only the free-standing `#fade` (col 48) and `#000000` (col 58).
+        assert_eq!(found, vec![48, 58], "found: {:?}", out[0]);
+
+        // In a stylesheet `#555` is a color.
+        let css = scan_color_swatches(&[String::from("color: #555;")], true);
+        assert_eq!(css[0].len(), 1);
+        assert_eq!(css[0][0].2, Color::Rgb(0x55, 0x55, 0x55));
+    }
+
+    #[test]
+    fn scan_color_swatches_counts_columns_past_multibyte_text() {
+        let lines = vec![String::from("é → #ff0000")];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!((out[0][0].0, out[0][0].1), (4, 11));
+    }
+
+    #[test]
+    fn scan_color_swatches_picks_a_legible_foreground() {
+        let lines = vec![String::from("#ffffff #000000")];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!(out[0][0].3, Color::Black, "white bg needs black text");
+        assert_eq!(out[0][1].3, Color::White, "black bg needs white text");
+    }
+
+    #[test]
+    fn color_swatch_scan_runs_in_any_language_including_comments() {
+        // Unlike syntax highlighting, a color swatch has no notion of
+        // "inside a comment" — the whole point is spotting color literals
+        // wherever a human left one, e.g. a Rust doc comment.
+        let mut e = editor_with("// legacy brand color: #336699\nfn f() {}");
+        e.set_language(Some(LangKind::Rust));
+        assert_eq!(e.color_swatches[0].len(), 1);
+        assert_eq!(e.color_swatches[0][0].2, Color::Rgb(0x33, 0x66, 0x99));
+    }
+
+    #[test]
+    fn render_paints_a_color_swatch_background_over_the_literal() {
+        let mut e = editor_with("bg: #ff0000;");
+        e.recompute_highlights();
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        // "#ff0000" starts at column 4 ("bg: " is 4 chars).
+        assert_eq!(buf[(text_x + 4, y0)].bg, Color::Rgb(255, 0, 0));
+        assert_eq!(buf[(text_x + 4, y0)].fg, Color::White);
+        // The text before the literal is untouched.
+        assert_ne!(buf[(text_x, y0)].bg, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn plain_text_color_swatch_scan_is_gated_by_buffer_size() {
+        let big_line = "x".repeat(64 * 1024);
+        let mut e = editor_with("");
+        e.lines = vec![big_line; (COLOR_SWATCH_SCAN_MAX_BYTES / (64 * 1024)) + 2];
+        e.lines.push(String::from("#ff0000"));
+        e.recompute_highlights();
+        assert!(
+            e.color_swatches.iter().all(Vec::is_empty),
+            "an oversized buffer opts out of the color-swatch scan"
+        );
+    }
+
+    #[test]
     fn render_colors_brackets_by_nesting_depth() {
         let mut e = editor_with("a(b[c{d}e]f)g");
         e.recompute_highlights();
@@ -24060,6 +26473,423 @@ mod tests {
         assert_eq!((e.cursor_row, e.cursor_col), (0, 3));
     }
 
+    // ---- Increment / Decrement Number (vim Ctrl-A / Ctrl-X) ----
+
+    fn num_editor(text: &str, col: usize) -> Editor {
+        let mut e = editor_with(text);
+        e.cursor_row = 0;
+        e.cursor_col = col;
+        e
+    }
+
+    // ---- Emmet: Expand Abbreviation ----
+
+    fn html_editor(text: &str, col: usize) -> Editor {
+        let mut e = editor_with(text);
+        e.lang = Some(LangKind::Html);
+        e.cursor_row = e.lines.len() - 1;
+        e.cursor_col = col;
+        e
+    }
+
+    #[test]
+    fn increment_bumps_the_number_the_cursor_sits_in() {
+        let mut e = num_editor("port = 8080", 8); // on the '0' of 8080
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["port = 8081"]);
+    }
+
+    /// A bump is an edit like any other: it pins a preview tab, or the next
+    /// preview open reuses the tab and the edit is lost with it.
+    #[test]
+    fn a_bump_pins_a_preview_tab() {
+        let mut e = num_editor("port = 8080", 8);
+        e.preview = true;
+        assert!(e.bump_number(1));
+        assert!(!e.preview);
+        // A bump that finds no number edits nothing, so it pins nothing.
+        let mut e = num_editor("no digits", 0);
+        e.preview = true;
+        assert!(!e.bump_number(1));
+        assert!(e.preview);
+    }
+
+    #[test]
+    fn decrement_bumps_the_number_down() {
+        let mut e = num_editor("retries = 3", 10);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["retries = 2"]);
+    }
+
+    /// vim's rule, and the reason the chord is usable without aiming: a
+    /// caret before the number still finds it.
+    #[test]
+    fn a_caret_left_of_the_number_still_finds_it() {
+        let mut e = num_editor("port = 8080", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["port = 8081"]);
+    }
+
+    #[test]
+    fn the_nearest_number_to_the_right_wins_over_a_later_one() {
+        let mut e = num_editor("a 1 b 2", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["a 2 b 2"]);
+    }
+
+    /// The caret lands on the last digit, so holding the chord keeps
+    /// bumping the same literal even as it grows.
+    #[test]
+    fn repeated_bumps_stay_on_the_same_number_across_a_width_change() {
+        let mut e = num_editor("x = 9", 4);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 10"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 11"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 12"]);
+    }
+
+    #[test]
+    fn zero_padding_keeps_its_width() {
+        let mut e = num_editor("v1.0.007", 6);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["v1.0.008"]);
+    }
+
+    #[test]
+    fn zero_padding_widens_only_when_the_value_needs_the_room() {
+        let mut e = num_editor("099", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["100"]);
+    }
+
+    #[test]
+    fn hex_literals_keep_their_prefix_and_digit_case() {
+        let mut lower = num_editor("mask = 0xff", 9);
+        assert!(lower.bump_number(1));
+        assert_eq!(lower.lines, vec!["mask = 0x100"]);
+
+        let mut upper = num_editor("mask = 0xFF", 9);
+        assert!(upper.bump_number(1));
+        assert_eq!(upper.lines, vec!["mask = 0x100"]);
+
+        let mut wide = num_editor("mask = 0X00FF", 9);
+        assert!(wide.bump_number(1));
+        assert_eq!(wide.lines, vec!["mask = 0X0100"], "prefix case is kept");
+    }
+
+    #[test]
+    fn binary_literals_bump_in_base_two() {
+        let mut e = num_editor("flags = 0b0111", 10);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["flags = 0b1000"]);
+    }
+
+    /// vim wraps `0x0` round to `0xffffffffffffffff`, which is never what
+    /// the keystroke meant.
+    #[test]
+    fn a_hex_literal_clamps_at_zero_rather_than_wrapping() {
+        let mut e = num_editor("0x00", 3);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["0x00"]);
+    }
+
+    /// A clamped bump changes nothing, so it must not dirty a clean buffer
+    /// or leave an undo step that undoes nothing. It still reports true: a
+    /// number was found, and "no number here" would be the wrong message.
+    #[test]
+    fn a_clamped_bump_neither_dirties_the_buffer_nor_records_an_undo_step() {
+        let mut e = num_editor("mask = 0x00", 0);
+        assert!(!e.dirty);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["mask = 0x00"]);
+        assert!(!e.dirty, "an unchanged literal must not dirty the buffer");
+        assert!(e.undo_stack.is_empty(), "no undo step for a no-op");
+        // A bump that does change the literal still records both, so the
+        // two assertions above cannot pass vacuously.
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["mask = 0x01"]);
+        assert!(e.dirty);
+        assert_eq!(e.undo_stack.len(), 1);
+    }
+
+    /// vim ignores a leading `-` on hex and binary literals ("ignore leading
+    /// '-' for hex and octal and bin numbers" in `do_addsub`), treating them
+    /// as unsigned bit patterns: `-0x10` bumps to `-0x11`.
+    #[test]
+    fn a_minus_before_a_hex_literal_is_not_a_sign() {
+        let mut e = num_editor("x = -0x10", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = -0x11"]);
+    }
+
+    #[test]
+    fn a_decimal_can_cross_zero_into_negative() {
+        let mut e = num_editor("delta = 0", 8);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["delta = -1"]);
+        assert!(e.bump_number(-1));
+        assert_eq!(e.lines, vec!["delta = -2"]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["delta = -1"]);
+    }
+
+    /// A `-` that follows a digit or an identifier is a subtraction, not a
+    /// sign. Dates are the case that makes this matter: bumping the month
+    /// of `2026-09-21` must not turn it into `2026-08-21`.
+    #[test]
+    fn a_minus_after_a_digit_is_subtraction_not_a_sign() {
+        let mut e = num_editor("2026-09-21", 5);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["2026-10-21"]);
+    }
+
+    /// The identifier rule holds for non-ASCII identifiers too: the byte
+    /// before the `-` in `λ-5` is a UTF-8 continuation byte, not a letter,
+    /// so the check has to look at the character.
+    #[test]
+    fn a_minus_after_a_non_ascii_identifier_is_subtraction_not_a_sign() {
+        let mut e = num_editor("λ-5", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["λ-6"]);
+
+        let mut cjk = num_editor("变量-5", 0);
+        assert!(cjk.bump_number(1));
+        assert_eq!(cjk.lines, vec!["变量-6"]);
+
+        // Non-ASCII punctuation is not an identifier, so the sign stands.
+        let mut dash = num_editor("x—-5", 0);
+        assert!(dash.bump_number(1));
+        assert_eq!(dash.lines, vec!["x—-4"]);
+    }
+
+    #[test]
+    fn a_minus_after_a_space_is_a_sign() {
+        let mut e = num_editor("offset = -5", 10);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["offset = -4"]);
+    }
+
+    #[test]
+    fn a_line_with_no_number_is_left_alone_and_reports_it() {
+        let mut e = num_editor("let value = name;", 4);
+        assert!(!e.bump_number(1));
+        assert_eq!(e.lines, vec!["let value = name;"]);
+    }
+
+    /// A number entirely to the LEFT of the caret is not picked up: vim
+    /// searches forward, and grabbing backwards would edit a literal the
+    /// user has already moved past.
+    #[test]
+    fn a_number_behind_the_caret_is_not_picked_up() {
+        let mut e = num_editor("x = 5; y = name", 10);
+        assert!(!e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 5; y = name"]);
+    }
+
+    #[test]
+    fn each_bump_is_its_own_undo_step() {
+        let mut e = num_editor("x = 1", 4);
+        assert!(e.bump_number(1));
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 3"]);
+        e.undo();
+        assert_eq!(e.lines, vec!["x = 2"], "one bump undone, not both");
+        e.undo();
+        assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    #[test]
+    fn a_digit_inside_an_identifier_is_still_a_number() {
+        let mut e = num_editor("let sha256 = 1;", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["let sha257 = 1;"]);
+    }
+
+    /// Byte offsets and char columns are not the same thing once the line
+    /// holds multibyte text, and the caret is tracked in columns.
+    #[test]
+    fn a_multibyte_line_bumps_at_the_right_place() {
+        let mut e = num_editor("héllo — count 41", 0);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["héllo — count 42"]);
+    }
+
+    #[test]
+    fn emmet_replaces_the_abbreviation_with_markup() {
+        let mut e = html_editor("ul>li*2", 7);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
+        );
+    }
+
+    /// The caret has to end up somewhere useful, or the user just has to go
+    /// looking for the hole they meant to type into.
+    #[test]
+    fn emmet_leaves_the_caret_in_the_first_empty_element() {
+        let mut e = html_editor("div>span", 8);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.cursor_row, 1);
+        let line = &e.lines[1];
+        let byte = byte_index_of_char(line, e.cursor_col);
+        assert_eq!(&line[byte..], "</span>");
+    }
+
+    #[test]
+    fn emmet_uses_the_buffers_indent_style() {
+        let mut e = html_editor("div>p", 5);
+        e.set_indent_style(IndentStyle {
+            width: 2,
+            use_spaces: true,
+        });
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines[1], "  <p></p>");
+    }
+
+    /// An abbreviation typed inside a nested block must stay inside it, so
+    /// the expansion is prefixed with the line's own indentation.
+    #[test]
+    fn emmet_keeps_the_lines_existing_indentation() {
+        let mut e = html_editor("        ul>li", 13);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(
+            e.lines,
+            vec!["        <ul>", "            <li></li>", "        </ul>"]
+        );
+    }
+
+    #[test]
+    fn emmet_keeps_text_that_followed_the_cursor() {
+        let mut e = html_editor("br</div>", 2);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<br></div>"]);
+    }
+
+    #[test]
+    fn emmet_keeps_text_that_preceded_the_abbreviation() {
+        let mut e = html_editor("<p>strong", 9);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<p><strong></strong>"]);
+    }
+
+    /// One undo step, and it restores the abbreviation rather than peeling
+    /// the markup off a character at a time.
+    #[test]
+    fn emmet_expansion_undoes_in_one_step() {
+        let mut e = html_editor("ul>li*3", 7);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines.len(), 5);
+        e.undo();
+        assert_eq!(e.lines, vec!["ul>li*3"]);
+    }
+
+    /// With no empty element the caret goes to the end of the expansion,
+    /// not back to the start of the line.
+    #[test]
+    fn emmet_leaves_the_caret_after_the_expansion_when_nothing_is_empty() {
+        let mut e = html_editor("p{Hello}</div>", 8);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<p>Hello</p></div>"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 12));
+    }
+
+    /// An expansion is an edit like any other: it pins a preview tab so
+    /// the next preview open does not reuse the tab and discard it.
+    #[test]
+    fn emmet_expansion_pins_a_preview_tab() {
+        let mut e = html_editor("div", 3);
+        e.preview = true;
+        assert!(e.expand_emmet_abbreviation());
+        assert!(!e.preview);
+    }
+
+    /// `.jsx` shares `LangKind::JavaScript` with plain `.js`, so the file
+    /// extension decides: JSX expands, ordinary JavaScript does not.
+    #[test]
+    fn emmet_runs_in_jsx_files_but_not_plain_javascript() {
+        let mut e = html_editor("img", 3);
+        e.lang = Some(LangKind::JavaScript);
+        e.path = Some(PathBuf::from("App.jsx"));
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<img />"]);
+
+        let mut e = html_editor("img", 3);
+        e.lang = Some(LangKind::JavaScript);
+        e.path = Some(PathBuf::from("app.js"));
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["img"]);
+    }
+
+    #[test]
+    fn emmet_self_closes_void_elements_in_tsx() {
+        let mut e = html_editor("br", 2);
+        e.lang = Some(LangKind::Tsx);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["<br />"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_outside_markup_buffers() {
+        let mut e = html_editor("ul>li*2", 7);
+        e.lang = Some(LangKind::Rust);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["ul>li*2"]);
+    }
+
+    #[test]
+    fn emmet_runs_in_xml_and_jsx_too() {
+        for lang in [LangKind::Xml, LangKind::Tsx] {
+            let mut e = html_editor("div", 3);
+            e.lang = Some(lang);
+            assert!(e.expand_emmet_abbreviation(), "{lang:?}");
+            assert_eq!(e.lines, vec!["<div></div>"], "{lang:?}");
+        }
+    }
+
+    /// Prose in an HTML buffer must not turn into tags.
+    #[test]
+    fn emmet_is_inert_on_prose() {
+        let mut e = html_editor("the quick brown fox", 19);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["the quick brown fox"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_on_an_unparseable_abbreviation() {
+        let mut e = html_editor("div>(span", 9);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["div>(span"]);
+    }
+
+    #[test]
+    fn emmet_is_inert_at_the_start_of_a_line() {
+        let mut e = html_editor("div", 0);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["div"]);
+    }
+
+    #[test]
+    fn emmet_marks_the_buffer_dirty() {
+        let mut e = html_editor("div", 3);
+        e.dirty = false;
+        assert!(e.expand_emmet_abbreviation());
+        assert!(e.dirty, "an expansion is an edit");
+    }
+
+    #[test]
+    fn emmet_drops_any_active_selection() {
+        let mut e = html_editor("div", 3);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        assert!(e.expand_emmet_abbreviation());
+        assert!(e.selection.is_none());
+    }
+
     // ---- Convert Indentation to Spaces / Tabs ----
 
     #[test]
@@ -24136,6 +26966,253 @@ mod tests {
             use_spaces: true,
         });
         assert_eq!(o.indent_style().width, 8, "override beats detection");
+    }
+
+    /// `.editorconfig` outranks content detection: a project that STATES its
+    /// style beats a guess at it, including on a file whose current content
+    /// disagrees — which is the case the property exists to correct.
+    #[test]
+    fn editorconfig_indent_beats_detection_but_not_the_manual_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 2\n",
+        )
+        .unwrap();
+        // Content is unambiguously 4-space, so detection and the config
+        // genuinely disagree and the winner is observable.
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        assert_eq!(
+            e.indent_style(),
+            IndentStyle {
+                width: 2,
+                use_spaces: true
+            },
+            ".editorconfig must beat the 4-space content detection"
+        );
+        assert_eq!(e.indent_style().unit(), "  ");
+
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: true,
+        });
+        assert_eq!(
+            e.indent_style().width,
+            8,
+            "the manual status-bar override still beats .editorconfig"
+        );
+    }
+
+    /// A section naming only one of the two indent properties leaves the
+    /// other one to detection, rather than resetting it to a default.
+    #[test]
+    fn editorconfig_resolves_indent_style_and_width_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = tab\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn main() {\n  let a = 1;\n  let b = 2;\n}\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        let s = e.indent_style();
+        assert!(!s.use_spaces, "indent_style = tab must apply");
+        assert_eq!(s.width, 2, "the unnamed width stays with detection");
+    }
+
+    /// A per-glob section beats the `[*]` catch-all, and files the section
+    /// does not match are unaffected.
+    #[test]
+    fn editorconfig_per_language_section_applies_to_matching_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 2\n\n[*.py]\nindent_size = 8\n",
+        )
+        .unwrap();
+        let rs = tmp.path().join("a.rs");
+        std::fs::write(&rs, "fn main() {}\n").unwrap();
+        let py = tmp.path().join("a.py");
+        std::fs::write(&py, "def f():\n    pass\n").unwrap();
+
+        let mut r = Editor::new();
+        r.open(&rs).unwrap();
+        assert_eq!(r.indent_style().label(), "Spaces: 2");
+
+        let mut p = Editor::new();
+        p.open(&py).unwrap();
+        assert_eq!(p.indent_style().label(), "Spaces: 8");
+    }
+
+    /// `end_of_line` overrides the CRLF sniff, so a file that currently
+    /// disagrees with the project is rewritten to match it on save.
+    #[test]
+    fn editorconfig_end_of_line_overrides_the_sniffed_eol() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nend_of_line = crlf\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        assert_eq!(e.eol, LineEnding::Crlf, "the config must beat the sniff");
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        let on_disk = std::fs::read_to_string(&f).unwrap();
+        assert!(on_disk.contains("\r\n"), "saved as CRLF: {on_disk:?}");
+    }
+
+    /// The two save-time properties both fire from the single write choke
+    /// point, and the whole normalisation is undoable.
+    #[test]
+    fn editorconfig_trims_whitespace_and_adds_a_final_newline_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one   \ntwo\t\nthree").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        // The caret's own line is spared (see the test below), so it sits on
+        // the one line with nothing to trim.
+        e.cursor_row = 2;
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "one\ntwo\nthree\n",
+            "trailing whitespace trimmed and a final newline added"
+        );
+    }
+
+    /// Auto-save fires a second after typing stops, so trimming the line
+    /// under a caret would turn `foo ` into `foo` mid-word and the next key
+    /// would produce `foobar`. Caret lines keep their trailing whitespace
+    /// (primary and extra carets alike); every other line is trimmed, and a
+    /// later save with the caret elsewhere normalises the rest.
+    #[test]
+    fn editorconfig_trim_on_save_spares_the_lines_under_a_caret() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo \nbar  \nbaz\t").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.carets.push(EditorSelection::new(2, 4));
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "foo \nbar\nbaz\t",
+            "only the line without a caret is trimmed"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 4), "the caret stays put");
+    }
+
+    /// Neither save-time property fires unless a `.editorconfig` asked for
+    /// it: rewriting whitespace on an unconfigured project is a surprise.
+    #[test]
+    fn editorconfig_save_normalisation_is_off_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `root = true` with no properties, so no ancestor config can leak
+        // in and make this pass for the wrong reason.
+        std::fs::write(tmp.path().join(".editorconfig"), "root = true\n").unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one   \ntwo").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "!one   \ntwo",
+            "untouched whitespace and no newline appended"
+        );
+    }
+
+    /// An empty buffer has no last line to terminate, so
+    /// `insert_final_newline` must not turn a zero-byte file into a
+    /// one-byte one on every save.
+    #[test]
+    fn editorconfig_final_newline_leaves_an_empty_buffer_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
+    }
+
+    /// The save-time final newline is its own undo step: it must not
+    /// coalesce into the typing burst before the save, or one Cmd+Z would
+    /// take the user's keystrokes along with the newline.
+    #[test]
+    fn editorconfig_final_newline_is_its_own_undo_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_char('!');
+        e.save_to_disk().unwrap();
+        assert_eq!(e.lines, vec!["!one", ""]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["!one"], "undo removes only the newline");
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["one"], "the next undo removes the typing");
+    }
+
+    /// A file already ending in a newline must not collect another one on
+    /// each save.
+    #[test]
+    fn editorconfig_final_newline_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "one\n").unwrap();
+
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\n");
     }
 
     /// The pure detector: majority rules between tabs and spaces, and the
@@ -24719,6 +27796,182 @@ mod tests {
         assert_eq!(e.lines[0], "()");
         e.backspace();
         assert_eq!(e.lines[0], "", "the empty pair dies together");
+    }
+
+    fn tag_editor(text: &str, lang: LangKind) -> Editor {
+        let mut e = editor_with(text);
+        e.lang = Some(lang);
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e
+    }
+
+    #[test]
+    fn typing_the_closing_angle_of_an_html_tag_inserts_the_closing_tag() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+        assert_eq!(e.cursor_col, 5, "the caret sits between the two tags");
+    }
+
+    #[test]
+    fn tag_auto_close_carries_attributes_but_closes_on_the_name_only() {
+        let mut e = tag_editor("<a href=\"/x\" class=\"link\"", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<a href=\"/x\" class=\"link\"></a>");
+    }
+
+    #[test]
+    fn tag_auto_close_is_one_undo_step() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+        e.undo();
+        assert_eq!(e.lines[0], "<div", "undo restores the pre-keystroke text");
+    }
+
+    #[test]
+    fn void_elements_never_get_a_closing_tag() {
+        for void in ["<br", "<img src=\"a.png\"", "<input", "<hr", "<meta"] {
+            let mut e = tag_editor(void, LangKind::Html);
+            e.insert_char('>');
+            assert_eq!(
+                e.lines[0],
+                format!("{void}>"),
+                "a void element takes no closing tag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closing_tag_does_not_close_again() {
+        let mut e = tag_editor("<div></div", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div></div>");
+    }
+
+    #[test]
+    fn a_self_closed_tag_is_left_alone() {
+        let mut e = tag_editor("<Foo /", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<Foo />");
+    }
+
+    #[test]
+    fn jsx_components_and_namespaced_tags_close_with_their_full_name() {
+        let mut e = tag_editor("<Foo.Bar", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<Foo.Bar></Foo.Bar>");
+        // A void element name is HTML's rule, not JSX's: `<Input>` is an
+        // ordinary component there and does take a closing tag.
+        let mut e = tag_editor("<input", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<input></input>");
+    }
+
+    #[test]
+    fn generics_and_comparisons_never_sprout_a_closing_tag() {
+        // A `<` right after a word character is a generic or a comparison,
+        // which is what these all are — none may auto-close.
+        for src in ["const a = b<c", "let x: Array<string", "foo<Bar"] {
+            let mut e = tag_editor(src, LangKind::Tsx);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // A standalone generic declaration: the `,` is not tag syntax.
+        let mut e = tag_editor("const f = <T,", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "const f = <T,>");
+        // The other two generic arrow forms: a constraint and a default.
+        for src in ["const f = <T extends unknown", "const f = <T = unknown"] {
+            let mut e = tag_editor(src, LangKind::Tsx);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // A `>` typed inside a `{…}` expression or a quoted attribute value is
+        // part of that value (an arrow, a comparison, text), not the tag's end.
+        for (src, lang) in [
+            ("return <Foo onClick={() =", LangKind::Tsx),
+            ("<div hidden={a ", LangKind::Tsx),
+            ("<a title=\"1", LangKind::Html),
+            ("<a title='x", LangKind::Html),
+            ("return <Foo label={`a", LangKind::Tsx),
+        ] {
+            let mut e = tag_editor(src, lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // Once the value or expression is closed, the tag closes as usual.
+        let mut e = tag_editor("<a title=\"1\"", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<a title=\"1\"></a>");
+        // An ordinary attribute after the name still closes, so the two
+        // assertions above cannot pass by closing nothing at all.
+        let mut e = tag_editor("return <Foo bar={1}", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "return <Foo bar={1}></Foo>");
+    }
+
+    #[test]
+    fn a_tag_inside_a_script_string_or_comment_never_auto_closes() {
+        // The caret sits before the partner quote auto-pairing inserted.
+        for (src, lang) in [
+            ("const s = \"<div\"", LangKind::JavaScript),
+            ("const s = '<div'", LangKind::Tsx),
+            ("const s = `<div`", LangKind::Tsx),
+            ("const s = \"a\\\"<div\"", LangKind::Tsx),
+        ] {
+            let mut e = tag_editor(src, lang);
+            e.cursor_col -= 1;
+            e.insert_char('>');
+            let want = format!("{}>{}", &src[..src.len() - 1], &src[src.len() - 1..]);
+            assert_eq!(e.lines[0], want, "{src} is a string, not markup");
+        }
+        let mut e = tag_editor("// render <div", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "// render <div>", "a comment is not markup");
+        // Control: balanced strings earlier on the line do not suppress it.
+        let mut e = tag_editor("f(\"x\", 'y', <div", LangKind::Tsx);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "f(\"x\", 'y', <div></div>");
+    }
+
+    #[test]
+    fn tag_auto_close_only_runs_in_markup_languages() {
+        // The same text in Rust or TypeScript is a comparison or a generic.
+        for lang in [LangKind::Rust, LangKind::TypeScript, LangKind::Python] {
+            let mut e = tag_editor("<div", lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], "<div>", "{lang:?} must not auto-close tags");
+        }
+    }
+
+    #[test]
+    fn tag_auto_close_can_be_switched_off() {
+        let mut e = tag_editor("<div", LangKind::Html);
+        e.auto_close_tags = false;
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div>");
+    }
+
+    #[test]
+    fn comments_doctypes_and_processing_instructions_are_left_alone() {
+        for src in ["<!-- note --", "<!DOCTYPE html", "<?xml version=\"1.0\"?"] {
+            let mut e = tag_editor(src, LangKind::Xml);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+    }
+
+    #[test]
+    fn typing_the_angle_with_a_selection_replaces_it_without_closing() {
+        let mut e = tag_editor("<div>old</div>", LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 5),
+            head: (0, 8),
+        }); // "old"
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<div>></div>");
     }
 
     #[test]
