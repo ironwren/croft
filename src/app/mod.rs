@@ -1482,6 +1482,8 @@ enum PendingLaunchStep {
 struct CompoundLaunch {
     members: Vec<crate::dap::configs::DebugConfig>,
     compound: String,
+    /// The compound's `stopAll`, carried to the moment the set is replaced.
+    stop_all: bool,
 }
 
 /// What became of one compound member (#310).
@@ -3268,6 +3270,16 @@ pub struct App {
         PathBuf,
         std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
     >,
+    /// Markdown-lint's own edit-seq cursor, mirroring `lsp_last_seen` but
+    /// independent of the LSP: `.md` files get linted whether or not any
+    /// language server is running (there is none for Markdown), so this
+    /// cannot share the LSP's cursor map. Keyed by path; a path's entry is
+    /// removed when its tab closes so a later re-open re-lints instead of
+    /// trusting a stale seq (a different file could reuse a `PathBuf` after
+    /// a rename-in-place on disk). Each entry holds the lines that were
+    /// linted as well as their seq, because two split panes count edits
+    /// separately and can share a seq while holding different text.
+    markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -3696,6 +3708,18 @@ pub struct App {
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
+    /// Name of the compound F5 starts, when the last picker launch was a
+    /// compound. Exclusive with `selected_debug_config`: a compound and a
+    /// configuration may share a name, so one string cannot say which (#567).
+    selected_debug_compound: Option<String>,
+    /// The launched compound asked for `stopAll: true` (#567): the first
+    /// member to end stops the rest. Set on every compound launch, so a
+    /// single-config launch (one session, no siblings) never reads a stale
+    /// value in a way that matters.
+    debug_stop_all: bool,
+    /// The running compound's name, kept past launch so the report rebuilt
+    /// when one member ends can still say which compound is live (#567).
+    debug_compound: Option<String>,
     /// A config launch parked behind its `preLaunchTask`: the task runs in
     /// its pane, and the FinishedCommand sweep launches (exit 0) or aborts
     /// (non-zero) when the matching command completes. Replaced by a newer
@@ -4837,6 +4861,7 @@ impl App {
             semantic_generation_seen: std::collections::HashMap::new(),
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
+            markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -4942,6 +4967,9 @@ impl App {
             debug_configs: Vec::new(),
             debug_compounds: Vec::new(),
             selected_debug_config: None,
+            selected_debug_compound: None,
+            debug_stop_all: false,
+            debug_compound: None,
             pending_debug_launch: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -7061,6 +7089,111 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Lints every open `.md` tab and folds the results into the same
+    /// diagnostics store a real language server writes to (`lsp_diagnostics`,
+    /// keyed by path then by "producer"), under the synthetic server name
+    /// `"Markdown Lint"`. There is no bundled Markdown language server (see
+    /// `src/vscode_extensions.rs`), so this runs independently of `self.lsp`
+    /// and `sync_lsp`'s extension gate, which only covers languages that
+    /// map to a real server. Gated by its own edit-seq cursor
+    /// (`markdown_lint_last_seen`) so an unchanged buffer isn't re-linted
+    /// every tick. Returns whether any editor's overlay or the PROBLEMS
+    /// panel changed, for the caller's redraw decision.
+    pub fn sync_markdown_lint(&mut self) -> bool {
+        let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
+        // Both collections: `self.editor` is the ACTIVE group's tabs, and a
+        // split's other panes live in `editor_layout`. Walking only the
+        // active one left a `.md` open in an inactive pane unlinted, and the
+        // `closed` sweep below then dropped its diagnostics as though the tab
+        // had gone - squiggles vanishing from a pane in plain sight.
+        let inactive_tabs: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        for tab in self.editor.iter_tabs().chain(inactive_tabs) {
+            if tab.has_non_text_view() {
+                continue;
+            }
+            let Some(path) = tab.path.as_ref() else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // The same file can be open in several panes, each its own
+            // buffer with its own `edit_seq`. Only the FIRST tab seen for a
+            // path (the active group comes first) is compared: judging each
+            // pane against one shared cursor made two panes with different
+            // seqs take turns, re-linting and redrawing on every tick.
+            if !current.insert(path.clone()) {
+                continue;
+            }
+            // The seq alone cannot tell two panes apart: each counts its own
+            // edits, so they can agree while holding different text. The
+            // lines last linted are kept too and compared when the seqs
+            // match (one comparison, no allocation), so switching to the
+            // other pane re-lints exactly when its text differs.
+            let seq = tab.edit_seq;
+            let seen = self
+                .markdown_lint_last_seen
+                .get(path)
+                .is_some_and(|(s, lines)| *s == seq && *lines == tab.lines);
+            if !seen {
+                to_lint.push((path.clone(), tab.lines.clone(), seq));
+            }
+        }
+        let mut changed = false;
+        for (path, lines, seq) in to_lint {
+            let diags = crate::markdown_lint::lint(&lines.join("\n"));
+            let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
+            if diags.is_empty() {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&path);
+                }
+            } else if by_server.get("Markdown Lint") != Some(&diags) {
+                // Only a different set is a change: storing the same
+                // diagnostics again must not ask for a redraw.
+                by_server.insert("Markdown Lint".to_string(), diags);
+                changed = true;
+            }
+            self.markdown_lint_last_seen
+                .insert(path.clone(), (seq, lines));
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                }
+            }
+        }
+        let closed: Vec<PathBuf> = self
+            .markdown_lint_last_seen
+            .keys()
+            .filter(|p| !current.contains(*p))
+            .cloned()
+            .collect();
+        for p in closed {
+            self.markdown_lint_last_seen.remove(&p);
+            if let Some(by_server) = self.lsp_diagnostics.get_mut(&p) {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&p);
+                }
+            }
+        }
+        if changed {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
+        changed
     }
 
     /// The repository toplevel owning the workspace, from the git worker's
@@ -20179,7 +20312,10 @@ impl App {
                 .iter()
                 .filter(|c| !c.hidden())
                 .count();
-        self.run_debug.selected_config = self.selected_debug_config.clone();
+        self.run_debug.selected_config = self
+            .selected_debug_compound
+            .clone()
+            .or_else(|| self.selected_debug_config.clone());
     }
 
     /// Resolve how to run `file`: which command line to feed the PTY and
@@ -20285,10 +20421,25 @@ impl App {
             }
         }
         // Highest index first, so removing one does not move the next.
+        let mut ended_names = Vec::new();
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
                 gone.session.disconnect();
+                ended_names.push(gone.name);
             }
+        }
+        // `stopAll: true` (#567): a background member ending takes the set
+        // down with it, the same as the focused one ending does below.
+        if self.debug_stop_all && !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.debug_stop();
+            self.status = format!(
+                "{} ended — stopAll stopped the rest of the compound",
+                ended_names.join(", ")
+            );
+            return true;
+        }
+        if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+            self.report_member_ended(&ended_names.join(", "));
         }
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
@@ -20411,13 +20562,17 @@ impl App {
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
                     gone.session.disconnect();
                 }
+                // `stopAll: true` (#567): the siblings go too, and the rest
+                // of this arm reports the ended run as for a lone session.
+                if self.debug_stop_all && !self.debug_sessions.is_empty() {
+                    self.debug_stop();
+                    self.status =
+                        format!("{ended_name} ended — stopAll stopped the rest of the compound");
+                }
                 if !self.debug_sessions.is_empty() {
                     // Siblings are still running, so the debugger is not torn
                     // down: the view moves to one of them.
-                    self.status = format!(
-                        "{ended_name} ended — {} session(s) still running · Shift+F5 stops all",
-                        self.debug_sessions.len()
-                    );
+                    self.report_member_ended(&ended_name);
                     return true;
                 }
                 // The watchdog reparents to init the moment the server dies;
@@ -20806,6 +20961,25 @@ impl App {
     /// Configs are re-read here so an edited launch.json applies on the next
     /// F5 without reopening the picker.
     fn start_selected_debug(&mut self) {
+        if let Some(name) = self.selected_debug_compound.clone() {
+            let root = self.active_workspace_root();
+            self.debug_compounds = crate::dap::configs::discover_compounds(&root);
+            if let Some(compound) = self
+                .debug_compounds
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
+                self.launch_compound(&compound);
+                return;
+            }
+            self.selected_debug_compound = None;
+            self.run_debug.selected_config = None;
+            self.status =
+                format!("Debug compound \"{name}\" no longer exists — debugging the active file");
+            self.start_debug_session();
+            return;
+        }
         if let Some(name) = self.selected_debug_config.clone() {
             let root = self.active_workspace_root();
             self.debug_configs = crate::dap::configs::discover_configs(&root);
@@ -20822,6 +20996,138 @@ impl App {
             );
         }
         self.start_debug_session();
+    }
+
+    /// Launch a launch.json compound: resolve its members against the
+    /// un-deduped config list, refuse what croft cannot honour, then start
+    /// one or several sessions. Shared by the picker and by F5/restart once
+    /// the compound is the selected target (#567).
+    fn launch_compound(&mut self, compound: &crate::dap::configs::Compound) {
+        // Resolve first: a compound naming a configuration no
+        // launch.json declares is a config error worth
+        // reporting now, separately from the unbuilt feature.
+        // The un-deduped list: `debug_configs` is the picker's
+        // display list and drops a lower-precedence duplicate by
+        // name, which is the very entry a `.vscode` compound
+        // naming that name has to bind.
+        let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
+        // #310 defers compounds that need SEVERAL sessions at
+        // once. A compound naming ONE configuration needs one,
+        // which croft has run since #250 — so the arity has to
+        // be READ here rather than assumed. Reporting the
+        // multi-session limit for a one-member compound cites
+        // a limitation that does not apply and tells the user
+        // something false about their own launch.json.
+        match crate::dap::configs::resolve_compound(compound, &all) {
+            Err(e) => self.debug_error(e),
+            // A one-member compound carrying keys croft does
+            // not honour is REFUSED rather than launched.
+            // Since #318 completed, only VALUES croft cannot
+            // READ remain: a `presentation` that is not an
+            // object, or a `hidden`/`group`/`order` that is
+            // not a bool/string/number. Every key that says
+            // something croft can act on is honoured -
+            // `preLaunchTask` by the branch below, `hidden`,
+            // `group` and `order` by the picker's sort.
+            // Launching while ignoring what the compound asked
+            // for is the "silently debug something other than
+            // what was asked for" outcome every guard here
+            // exists to prevent.
+            // Asked of BOTH arities (#310). It sat on the
+            // one-member arm because the other refused anyway;
+            // now that both launch, a malformed key would be
+            // refused at one member and ignored at two - the
+            // "silently debug something other than what was
+            // asked for" outcome this guard exists to prevent.
+            Ok(members) if !compound.unsupported_keys.is_empty() => {
+                // #318, NOT #310: this compound needs ONE
+                // session, which croft runs. What it cannot do
+                // is honour the key. Citing the multi-session
+                // limit here would be the same false claim the
+                // launching branch below exists to stop making.
+                //
+                // The remedy names both ways out: fix the
+                // value, or run the member directly. Running
+                // it directly DOES skip the compound's own
+                // preLaunchTask, which the message leaves
+                // unsaid on purpose - a test pins that the
+                // status never mentions preLaunchTask, since
+                // naming it here would read as advice to
+                // accept the skip.
+                // Up to three keys can be listed now, so
+                // "a and b and c" would read as one run-on;
+                // the last pair keeps the "and".
+                let keys = match compound.unsupported_keys.split_last() {
+                    Some((last, [])) => (*last).to_string(),
+                    Some((last, rest)) => {
+                        format!("{} and {last}", rest.join(", "))
+                    }
+                    None => String::new(),
+                };
+                let plural = if compound.unsupported_keys.len() > 1 {
+                    "those keys"
+                } else {
+                    "that key"
+                };
+                // Name EVERY member, not `members[0]`. The
+                // guard now covers both arities, and telling
+                // the user of a three-member compound to run
+                // the first one directly is advice to launch
+                // a SUBSET - the precise outcome this arm
+                // refuses to produce itself.
+                let all = members
+                    .iter()
+                    .map(|m| format!("\"{}\"", m.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let run_them = if members.len() > 1 {
+                    format!("or run {all} directly, in that order")
+                } else {
+                    format!("or run {all} directly")
+                };
+                self.debug_error(format!(
+                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch {} through the compound, {}",
+                    compound.name, keys, plural, all, run_them
+                ));
+            }
+            Ok(members) if members.len() == 1 => {
+                let cfg = members[0].clone();
+                // One member has no siblings to stop, so its `stopAll` is set
+                // false rather than inherited from whatever ran before.
+                self.debug_stop_all = false;
+                match compound.pre_launch_task.clone() {
+                    // #318: the compound's own task runs
+                    // first, and the member starts only if it
+                    // exits 0 - the same contract a config's
+                    // own task already gets. Chained rather
+                    // than merged: the member may declare a
+                    // task too, and VS Code runs both.
+                    Some(task) => self.launch_after_compound_task(&task, cfg),
+                    None => self.launch_debug_config(&cfg),
+                }
+            }
+            Ok(members) => {
+                // Several sessions at once: what #310 built
+                // the set for. Members start in DECLARATION
+                // order, which is the order the file asked
+                // for and the order a client-then-server
+                // compound depends on.
+                let label = compound.name.clone();
+                // `resolve_compound` borrows from the config
+                // list; the launch outlives that borrow, so
+                // the members are owned from here on.
+                let members: Vec<_> = members.into_iter().cloned().collect();
+                match compound.pre_launch_task.clone() {
+                    Some(task) => self.launch_after_compound_task_all(
+                        &task,
+                        members,
+                        label,
+                        compound.stop_all,
+                    ),
+                    None => self.launch_compound_members(members, label, compound.stop_all),
+                }
+            }
+        }
     }
 
     /// Debug: Select and Start Debugging — the launch.json configurations
@@ -20945,6 +21251,7 @@ impl App {
         task_label: &str,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
         self.pending_debug_launch = None;
@@ -20964,7 +21271,11 @@ impl App {
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members(Box::new(CompoundLaunch { members, compound })),
+            step: PendingLaunchStep::Members(Box::new(CompoundLaunch {
+                members,
+                compound,
+                stop_all,
+            })),
             started: std::time::Instant::now(),
         });
         self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
@@ -20990,8 +21301,18 @@ impl App {
         &mut self,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
+        // Set only here, once the old set is gone: a compound refused before
+        // this point leaves the running set untouched, and must leave its
+        // `stopAll` out of it too (#567).
+        self.debug_stop_all = stop_all;
+        // A launch supersedes any older one still parked behind its task:
+        // left in place, that task's exit would launch its config and stop
+        // this set (#567). The task-gated path reaches here via `take()`, so
+        // this only ever drops a STALE parking.
+        self.pending_debug_launch = None;
         let total = members.len();
         let mut started = 0usize;
         let mut unrun: Vec<String> = Vec::new();
@@ -21021,6 +21342,7 @@ impl App {
         // written server-first, and landing the user on whichever happened to
         // start last would put them in the wrong one.
         self.debug_sessions.focus(0);
+        self.debug_compound = Some(compound.clone());
         // Reveal FIRST, then write the feedback: `reveal_debug_view` runs
         // `refresh_run_debug`, which clears `feedback` unconditionally, so
         // doing it afterwards wiped every line built below - including the
@@ -21088,7 +21410,7 @@ impl App {
             // member - parking is one-at-a-time and a set of parked members
             // would interleave.
             PendingLaunchStep::Members(launch) => {
-                self.launch_compound_members(launch.members, launch.compound)
+                self.launch_compound_members(launch.members, launch.compound, launch.stop_all)
             }
         }
     }
@@ -21446,6 +21768,9 @@ impl App {
     /// languages route to lldb-dap.
     fn start_debug_session(&mut self) {
         use crate::dap::session::AdapterKind;
+        // Same as every other launch path: a parked older launch must not
+        // fire later and replace this one (#567).
+        self.pending_debug_launch = None;
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;
@@ -21942,6 +22267,27 @@ impl App {
         self.watch_baseline_pending = false;
     }
 
+    /// A compound member ended and siblings survive (#567): rebuild the
+    /// status and the panel line from the live set, naming what ended, which
+    /// session the view now shows, and every one still running. Without this
+    /// both kept naming the ended session.
+    fn report_member_ended(&mut self, ended: &str) {
+        let running = self.debug_sessions.names().join(", ");
+        let focused = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let what = self
+            .debug_compound
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" compound {c}"));
+        self.run_debug.feedback = Some(format!("Debugging{what}: {running} ({ended} ended)"));
+        self.run_debug.feedback_is_error = false;
+        self.status =
+            format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
     /// Shift+F5: stop debugging and tear the session down.
     pub fn debug_stop(&mut self) {
         // EVERY session, not the focused one (#310). A compound launches
@@ -21952,6 +22298,7 @@ impl App {
             session.disconnect();
         }
         self.debug_sessions.clear();
+        self.debug_compound = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
@@ -24627,133 +24974,15 @@ impl App {
                         .parse::<usize>()
                         .ok()
                         .and_then(|i| self.debug_compounds.get(i));
-                    if let Some(compound) = found {
-                        // Resolve first: a compound naming a configuration no
-                        // launch.json declares is a config error worth
-                        // reporting now, separately from the unbuilt feature.
-                        // The un-deduped list: `debug_configs` is the picker's
-                        // display list and drops a lower-precedence duplicate by
-                        // name, which is the very entry a `.vscode` compound
-                        // naming that name has to bind.
-                        let all = crate::dap::configs::discover_configs_all(
-                            &self.active_workspace_root(),
-                        );
-                        // #310 defers compounds that need SEVERAL sessions at
-                        // once. A compound naming ONE configuration needs one,
-                        // which croft has run since #250 — so the arity has to
-                        // be READ here rather than assumed. Reporting the
-                        // multi-session limit for a one-member compound cites
-                        // a limitation that does not apply and tells the user
-                        // something false about their own launch.json.
-                        match crate::dap::configs::resolve_compound(compound, &all) {
-                            Err(e) => self.debug_error(e),
-                            // A one-member compound carrying keys croft does
-                            // not honour is REFUSED rather than launched.
-                            // Since #318 completed, only VALUES croft cannot
-                            // READ remain: a `presentation` that is not an
-                            // object, or a `hidden`/`group`/`order` that is
-                            // not a bool/string/number. Every key that says
-                            // something croft can act on is honoured -
-                            // `preLaunchTask` by the branch below, `hidden`,
-                            // `group` and `order` by the picker's sort.
-                            // Launching while ignoring what the compound asked
-                            // for is the "silently debug something other than
-                            // what was asked for" outcome every guard here
-                            // exists to prevent.
-                            // Asked of BOTH arities (#310). It sat on the
-                            // one-member arm because the other refused anyway;
-                            // now that both launch, a malformed key would be
-                            // refused at one member and ignored at two - the
-                            // "silently debug something other than what was
-                            // asked for" outcome this guard exists to prevent.
-                            Ok(members) if !compound.unsupported_keys.is_empty() => {
-                                // #318, NOT #310: this compound needs ONE
-                                // session, which croft runs. What it cannot do
-                                // is honour the key. Citing the multi-session
-                                // limit here would be the same false claim the
-                                // launching branch below exists to stop making.
-                                //
-                                // The remedy names both ways out: fix the
-                                // value, or run the member directly. Running
-                                // it directly DOES skip the compound's own
-                                // preLaunchTask, which the message leaves
-                                // unsaid on purpose - a test pins that the
-                                // status never mentions preLaunchTask, since
-                                // naming it here would read as advice to
-                                // accept the skip.
-                                // Up to three keys can be listed now, so
-                                // "a and b and c" would read as one run-on;
-                                // the last pair keeps the "and".
-                                let keys = match compound.unsupported_keys.split_last() {
-                                    Some((last, [])) => (*last).to_string(),
-                                    Some((last, rest)) => {
-                                        format!("{} and {last}", rest.join(", "))
-                                    }
-                                    None => String::new(),
-                                };
-                                let plural = if compound.unsupported_keys.len() > 1 {
-                                    "those keys"
-                                } else {
-                                    "that key"
-                                };
-                                // Name EVERY member, not `members[0]`. The
-                                // guard now covers both arities, and telling
-                                // the user of a three-member compound to run
-                                // the first one directly is advice to launch
-                                // a SUBSET - the precise outcome this arm
-                                // refuses to produce itself.
-                                let all = members
-                                    .iter()
-                                    .map(|m| format!("\"{}\"", m.name))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let run_them = if members.len() > 1 {
-                                    format!("or run {all} directly, in that order")
-                                } else {
-                                    format!("or run {all} directly")
-                                };
-                                self.debug_error(format!(
-                                    "compound \"{}\" sets {}, which croft cannot read — fix {} to launch {} through the compound, {}",
-                                    compound.name, keys, plural, all, run_them
-                                ));
-                            }
-                            Ok(members) if members.len() == 1 => {
-                                let cfg = members[0].clone();
-                                self.selected_debug_config = Some(cfg.name.clone());
-                                self.run_debug.selected_config = Some(cfg.name.clone());
-                                match compound.pre_launch_task.clone() {
-                                    // #318: the compound's own task runs
-                                    // first, and the member starts only if it
-                                    // exits 0 - the same contract a config's
-                                    // own task already gets. Chained rather
-                                    // than merged: the member may declare a
-                                    // task too, and VS Code runs both.
-                                    Some(task) => self.launch_after_compound_task(&task, cfg),
-                                    None => self.launch_debug_config(&cfg),
-                                }
-                            }
-                            Ok(members) => {
-                                // Several sessions at once: what #310 built
-                                // the set for. Members start in DECLARATION
-                                // order, which is the order the file asked
-                                // for and the order a client-then-server
-                                // compound depends on.
-                                let label = compound.name.clone();
-                                // `resolve_compound` borrows from the config
-                                // list; the launch outlives that borrow, so
-                                // the members are owned from here on.
-                                let members: Vec<_> = members.into_iter().cloned().collect();
-                                match compound.pre_launch_task.clone() {
-                                    Some(task) => {
-                                        self.launch_after_compound_task_all(&task, members, label)
-                                    }
-                                    None => self.launch_compound_members(members, label),
-                                }
-                            }
-                        }
+                    if let Some(compound) = found.cloned() {
+                        self.selected_debug_config = None;
+                        self.selected_debug_compound = Some(compound.name.clone());
+                        self.run_debug.selected_config = Some(compound.name.clone());
+                        self.launch_compound(&compound);
                     }
                 } else if row.id == "active" {
                     self.selected_debug_config = None;
+                    self.selected_debug_compound = None;
                     self.run_debug.selected_config = None;
                     self.start_selected_debug();
                 } else if let Some(cfg) = row
@@ -24764,6 +24993,7 @@ impl App {
                     .cloned()
                 {
                     self.selected_debug_config = Some(cfg.name.clone());
+                    self.selected_debug_compound = None;
                     self.run_debug.selected_config = Some(cfg.name.clone());
                     self.launch_debug_config(&cfg);
                 }
@@ -27869,6 +28099,82 @@ impl App {
         }
     }
 
+    /// Toggle a bookmark on the cursor's line and report the new state in the
+    /// status bar. A buffer with no path on disk cannot hold marks, and says so
+    /// rather than silently doing nothing.
+    fn toggle_bookmark(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.toggle_bookmark() {
+            Some(true) => format!("Bookmark set on line {line}"),
+            Some(false) => format!("Bookmark cleared on line {line}"),
+            None => String::from("Save the file before bookmarking a line"),
+        };
+    }
+
+    /// Jump to the next (`forward`) or previous bookmark in the open file,
+    /// wrapping at the ends. Explains an empty set instead of doing nothing.
+    fn goto_bookmark(&mut self, forward: bool) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let jumped = if forward {
+            self.editor.goto_next_bookmark()
+        } else {
+            self.editor.goto_prev_bookmark()
+        };
+        self.status = match jumped {
+            Some(line) => {
+                // Position among the marks, 1-based, then the line itself:
+                // "Bookmark 2 of 3 (line 42)", never a line number over a count.
+                let marks = self.editor.bookmarked_lines();
+                let total = marks.len();
+                let idx = marks.iter().position(|&l| l == line).map_or(0, |i| i + 1);
+                format!("Bookmark {idx} of {total} (line {line})")
+            }
+            None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
+        };
+    }
+
+    /// Clear every bookmark in the open file, reporting how many went.
+    fn clear_bookmarks(&mut self) {
+        // Every path in (chord and palette) goes through here, so the guard
+        // lives here: a preview or non-text view must not clear marks it does
+        // not show.
+        if !self.editor_is_text() {
+            return;
+        }
+        let gone = self.editor.clear_bookmarks();
+        self.status = if gone == 0 {
+            String::from("No bookmarks in this file")
+        } else if gone == 1 {
+            String::from("Cleared 1 bookmark")
+        } else {
+            format!("Cleared {gone} bookmarks")
+        };
+    }
+
+    /// Emmet: Expand Abbreviation. Says why nothing happened rather than
+    /// failing silently — the two reasons (wrong language, unparseable
+    /// abbreviation) need different fixes from the user.
+    fn expand_emmet_abbreviation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.status = if !self.editor.emmet_available() {
+            format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            )
+        } else if self.editor.expand_emmet_abbreviation() {
+            String::from("Emmet: expanded abbreviation")
+        } else {
+            String::from("Emmet: no abbreviation at the cursor")
+        };
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -28177,6 +28483,24 @@ impl App {
             }
             return;
         }
+        // Bookmarks: toggle on the cursor's line, then walk them with
+        // Cmd+Opt+. / Cmd+Opt+, (VS Code's Bookmarks extension, nvim marks).
+        if is_toggle_bookmark_key(key) {
+            self.toggle_bookmark();
+            return;
+        }
+        if is_next_bookmark_key(key) {
+            self.goto_bookmark(true);
+            return;
+        }
+        if is_prev_bookmark_key(key) {
+            self.goto_bookmark(false);
+            return;
+        }
+        if is_clear_bookmarks_key(key) {
+            self.clear_bookmarks();
+            return;
+        }
         // Formerly palette-only editor commands, now each on a chord so none
         // ships without an accelerator (croft tenet: everything has a shortcut).
         if is_join_lines_key(key) {
@@ -28223,6 +28547,10 @@ impl App {
         }
         if is_decrement_number_key(key) {
             self.bump_number_under_cursor(-1);
+            return;
+        }
+        if is_emmet_expand_key(key) {
+            self.expand_emmet_abbreviation();
             return;
         }
         // VS Code "Format Document" (Cmd+Opt+Shift+F): reformat the whole buffer
@@ -34977,6 +35305,7 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
@@ -35263,6 +35592,18 @@ impl App {
                     self.status = String::from("Trimmed final newlines");
                 }
             }
+            Cmd::ToggleOverviewRuler => {
+                self.editor.overview_ruler = !self.editor.overview_ruler;
+                self.status = if self.editor.overview_ruler {
+                    String::from("Overview ruler on")
+                } else {
+                    String::from("Overview ruler off")
+                };
+            }
+            Cmd::ToggleBookmark => self.toggle_bookmark(),
+            Cmd::NextBookmark => self.goto_bookmark(true),
+            Cmd::PreviousBookmark => self.goto_bookmark(false),
+            Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
@@ -46723,6 +47064,38 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
 }
 
+/// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
+/// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
+fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'k')
+}
+
+/// `Cmd+Opt+Shift+B`: clear every bookmark in the open file. `Cmd+Shift+B`
+/// (Run Build Task) and `Cmd+Opt+B` (secondary side bar) each exclude the
+/// other modifier, so the three chords on `b` never collide.
+fn is_clear_bookmarks_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'b')
+}
+
+/// `Cmd+Opt+.`: jump to the next bookmark below the cursor, wrapping to the
+/// top of the file. `Cmd+.` alone is Quick Fix, which excludes Alt, so the
+/// two never collide.
+fn is_next_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('.') | KeyCode::Char('>'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Opt+,`: mirror of [`is_next_bookmark_key`] walking upwards. The
+/// shifted glyph `<` is accepted for terminals that pre-apply the shift.
+fn is_prev_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(',') | KeyCode::Char('<'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// `Cmd+Opt+Shift+J`: Join Lines (`editor.action.joinLines`).
 fn is_join_lines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'j')
@@ -46795,6 +47168,15 @@ fn is_cmd_alt_char(key: KeyEvent, chars: &[char]) -> bool {
 /// `Shift+Alt+F`). Reformats the whole buffer through the language server.
 fn is_format_document_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'f')
+}
+
+/// `Cmd+Opt+Shift+E`: Emmet Expand Abbreviation
+/// (`editor.emmet.action.expandAbbreviation`). VS Code binds this to Tab,
+/// which croft cannot reuse — Tab is indentation here, and an abbreviation
+/// that only sometimes expands on Tab is worse than one that always expands
+/// on its own chord.
+fn is_emmet_expand_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'e')
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
@@ -50079,6 +50461,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        let markdown_lint_changed = app.sync_markdown_lint();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
@@ -50235,7 +50618,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || explorer_panels_changed
             || install_status_changed
             || blame_changed
-            || dap_changed;
+            || dap_changed
+            || markdown_lint_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);
