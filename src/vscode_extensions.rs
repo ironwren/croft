@@ -445,6 +445,12 @@ pub const TABLE: &[Mapping] = &[
         note: "run through tasks.json or the terminal; runnable Markdown fences are tracked in #353",
     },
     Mapping {
+        vscode: "vscode.emmet",
+        croft: "emmet",
+        status: Status::Builtin,
+        note: "Emmet abbreviations expand with Cmd+Opt+Shift+E in HTML, XML and JSX buffers",
+    },
+    Mapping {
         vscode: "formulahendry.auto-rename-tag",
         croft: "lsp-html",
         status: Status::Builtin,
@@ -452,9 +458,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "formulahendry.auto-close-tag",
-        croft: "",
-        status: Status::None,
-        note: "no tag auto-close; brackets and quotes auto-close (disable_auto_close_pairs)",
+        croft: "tag auto-close",
+        status: Status::Builtin,
+        note: "typing `>` after an HTML/XML/JSX opening tag inserts the matching closing tag",
     },
     Mapping {
         vscode: "streetsidesoftware.code-spell-checker",
@@ -470,9 +476,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "aaron-bond.better-comments",
-        croft: "",
-        status: Status::None,
-        note: "no comment-keyword highlighting",
+        croft: "comment tag highlighting",
+        status: Status::Builtin,
+        note: "TODO/FIXME/XXX/BUG/HACK/NOTE/WARNING recoloured in comments",
     },
     Mapping {
         vscode: "coenraads.bracket-pair-colorizer-2",
@@ -518,9 +524,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "davidanson.vscode-markdownlint",
-        croft: "",
-        status: Status::None,
-        note: "no Markdown linter",
+        croft: "Markdown lint diagnostics",
+        status: Status::Builtin,
+        note: "MD025/MD018/MD009/MD012 checks run on open .md tabs, surfacing as squiggles and PROBLEMS entries",
     },
     Mapping {
         vscode: "bierner.markdown-mermaid",
