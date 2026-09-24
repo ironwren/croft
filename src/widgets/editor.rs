@@ -13614,6 +13614,27 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
             return None;
         }
     }
+    // A `>` typed inside a quoted attribute value (`title="1`) or a `{…}`
+    // expression (`onClick={() =`, the arrow) belongs to that value, not to
+    // the tag. Track quote and brace state across the attribute text and
+    // close only when the caret sits at the top level of the tag.
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    for c in rest.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() || depth > 0 {
+        return None;
+    }
     // A `>` already inside means that `<` is closed and the caret is past
     // the tag (or inside an attribute value holding a `>`); either way this
     // keystroke is not closing THIS tag.
@@ -27070,6 +27091,23 @@ mod tests {
             e.insert_char('>');
             assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
         }
+        // A `>` typed inside a `{…}` expression or a quoted attribute value is
+        // part of that value (an arrow, a comparison, text), not the tag's end.
+        for (src, lang) in [
+            ("return <Foo onClick={() =", LangKind::Tsx),
+            ("<div hidden={a ", LangKind::Tsx),
+            ("<a title=\"1", LangKind::Html),
+            ("<a title='x", LangKind::Html),
+            ("return <Foo label={`a", LangKind::Tsx),
+        ] {
+            let mut e = tag_editor(src, lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], format!("{src}>"), "{src} must not auto-close");
+        }
+        // Once the value or expression is closed, the tag closes as usual.
+        let mut e = tag_editor("<a title=\"1\"", LangKind::Html);
+        e.insert_char('>');
+        assert_eq!(e.lines[0], "<a title=\"1\"></a>");
         // An ordinary attribute after the name still closes, so the two
         // assertions above cannot pass by closing nothing at all.
         let mut e = tag_editor("return <Foo bar={1}", LangKind::Tsx);
