@@ -3274,8 +3274,10 @@ pub struct App {
     /// cannot share the LSP's cursor map. Keyed by path; a path's entry is
     /// removed when its tab closes so a later re-open re-lints instead of
     /// trusting a stale seq (a different file could reuse a `PathBuf` after
-    /// a rename-in-place on disk).
-    markdown_lint_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// a rename-in-place on disk). Each entry holds the lines that were
+    /// linted as well as their seq, because two split panes count edits
+    /// separately and can share a seq while holding different text.
+    markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -7084,7 +7086,7 @@ impl App {
     /// panel changed, for the caller's redraw decision.
     pub fn sync_markdown_lint(&mut self) -> bool {
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut to_lint: Vec<(PathBuf, String, u64)> = Vec::new();
+        let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
         // Both collections: `self.editor` is the ACTIVE group's tabs, and a
         // split's other panes live in `editor_layout`. Walking only the
         // active one left a `.md` open in an inactive pane unlinted, and the
@@ -7114,14 +7116,23 @@ impl App {
             if !current.insert(path.clone()) {
                 continue;
             }
+            // The seq alone cannot tell two panes apart: each counts its own
+            // edits, so they can agree while holding different text. The
+            // lines last linted are kept too and compared when the seqs
+            // match (one comparison, no allocation), so switching to the
+            // other pane re-lints exactly when its text differs.
             let seq = tab.edit_seq;
-            if self.markdown_lint_last_seen.get(path).copied() != Some(seq) {
-                to_lint.push((path.clone(), tab.lines.join("\n"), seq));
+            let seen = self
+                .markdown_lint_last_seen
+                .get(path)
+                .is_some_and(|(s, lines)| *s == seq && *lines == tab.lines);
+            if !seen {
+                to_lint.push((path.clone(), tab.lines.clone(), seq));
             }
         }
         let mut changed = false;
-        for (path, text, seq) in to_lint {
-            let diags = crate::markdown_lint::lint(&text);
+        for (path, lines, seq) in to_lint {
+            let diags = crate::markdown_lint::lint(&lines.join("\n"));
             let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
             if diags.is_empty() {
                 changed |= by_server.remove("Markdown Lint").is_some();
@@ -7134,7 +7145,8 @@ impl App {
                 by_server.insert("Markdown Lint".to_string(), diags);
                 changed = true;
             }
-            self.markdown_lint_last_seen.insert(path.clone(), seq);
+            self.markdown_lint_last_seen
+                .insert(path.clone(), (seq, lines));
             let merged = self.merged_diagnostics(&path);
             if self.editor.path.as_deref() == Some(path.as_path()) {
                 self.editor.apply_diagnostics(path.clone(), merged.clone());

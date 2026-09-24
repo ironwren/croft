@@ -23372,6 +23372,54 @@ fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
     assert!(!app.sync_markdown_lint(), "and it stays settled");
 }
 
+/// Two panes can reach the same `edit_seq` with different text (one edit in
+/// each). Switching which pane is linted must still lint it: the cursor has
+/// to recognise a different buffer, not just a different sequence number.
+#[test]
+fn sync_markdown_lint_relints_a_pane_with_the_same_seq_but_other_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("doc.md");
+    std::fs::write(&file, "# Title\n\nplain\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor();
+    // One edit per pane: the focused pane gains an MD018 heading
+    // (`#Bad`), the other a harmless character, so both seqs match.
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    for c in "#Bad".chars() {
+        app.editor.insert_char(c);
+    }
+    let seq_bad = app.editor.edit_seq;
+    // The split put the new, focused pane on the right; move to the left one.
+    app.focus_editor_group(true);
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 5;
+    // A split does not copy `edit_seq`, so type harmless text until this
+    // pane's count meets the other's.
+    while app.editor.edit_seq < seq_bad {
+        app.editor.insert_char('!');
+    }
+    assert_eq!(app.editor.edit_seq, seq_bad, "same seq, different text");
+    assert!(!app.editor.lines.iter().any(|l| l.starts_with("#B")));
+    let md018 = |app: &App| {
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD018"))
+    };
+    // Lint with the `#Bad` pane focused (it is walked first) ...
+    app.focus_editor_group(false);
+    app.sync_markdown_lint();
+    assert!(md018(&app), "the focused pane has `#Bad`");
+    // ... then with the clean pane focused: same seq, other text.
+    app.focus_editor_group(true);
+    app.sync_markdown_lint();
+    assert!(
+        !md018(&app),
+        "the other pane has no MD018, so it must be re-linted"
+    );
+}
+
 /// A `.md` held by an INACTIVE split group must still be linted. The gather
 /// loop used to walk only `self.editor`, so such a tab was never linted and
 /// the cleanup below then dropped its stored diagnostics while it was still
