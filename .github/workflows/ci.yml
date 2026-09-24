@@ -309,12 +309,22 @@ jobs:
       # Byte-for-byte the command src/remote.rs runs for a remote install.
       - name: cargo zigbuild --profile remote-fast
         run: cargo zigbuild --profile remote-fast --locked --bin croft --target ${{ matrix.target }}
-      - name: The shipped artifact must exist and be a Linux ELF
+      - name: The shipped artifact must exist and be a Linux ELF for its target
+        # The architecture, not only the container format: `ELF 64-bit LSB`
+        # is true of both musl legs, so an aarch64 build that fell back to the
+        # host would pass as x86-64 (#556). Same recipe as release.yml's check.
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/remote-fast/croft"
-          test -x "$bin"
+          test -x "$bin" || { echo "::error::no artifact at $bin"; exit 1; }
           file "$bin"
-          file "$bin" | grep -q 'ELF 64-bit LSB'
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)  file "$bin" | grep -qE 'ELF 64-bit LSB.*x86-64' ;;
+            aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
+            # A `case` with no match exits 0; a new matrix target must add
+            # its own assertion rather than pass unchecked.
+            *) echo "::error::no artifact-kind assertion for ${{ matrix.target }}"; exit 1 ;;
+          esac
 
   android:
     name: Android build (aarch64-linux-android)
