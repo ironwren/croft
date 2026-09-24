@@ -9550,6 +9550,9 @@ impl Editor {
             return true;
         }
 
+        // A real edit from here on: pin a preview tab, or the next preview
+        // open reuses it and the bump is lost with it.
+        self.pin_on_edit();
         self.push_undo(EditKind::BumpNumber);
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
@@ -26487,6 +26490,21 @@ mod tests {
         let mut e = num_editor("port = 8080", 8); // on the '0' of 8080
         assert!(e.bump_number(1));
         assert_eq!(e.lines, vec!["port = 8081"]);
+    }
+
+    /// A bump is an edit like any other: it pins a preview tab, or the next
+    /// preview open reuses the tab and the edit is lost with it.
+    #[test]
+    fn a_bump_pins_a_preview_tab() {
+        let mut e = num_editor("port = 8080", 8);
+        e.preview = true;
+        assert!(e.bump_number(1));
+        assert!(!e.preview);
+        // A bump that finds no number edits nothing, so it pins nothing.
+        let mut e = num_editor("no digits", 0);
+        e.preview = true;
+        assert!(!e.bump_number(1));
+        assert!(e.preview);
     }
 
     #[test]
