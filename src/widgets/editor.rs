@@ -2736,6 +2736,17 @@ pub struct Editor {
     /// never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Inline color-literal decorations (the "no colour-swatch decorations"
+    /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
+    /// per line, the `(start char col, end char col, background, foreground)`
+    /// of every recognized `#hex` / `rgb()` / `hsl()` color literal, painted
+    /// as a background tint over the literal's own text. Language-agnostic
+    /// (a plain scan, not gated on any grammar) so it also lights up color
+    /// constants in Rust/Python/JSON/Markdown, unlike the LSP-driven
+    /// document-color `■` swatch (#254), which only fires where a language
+    /// server resolves one. Rebuilt in `recompute_highlights`, on by default.
+    show_color_swatches: bool,
+    color_swatches: Vec<Vec<(usize, usize, Color, Color)>>,
     /// Whether the overview ruler paints its whole-file ticks over the
     /// vertical scrollbar track. On by default, like VS Code's; the palette's
     /// `View: Toggle Overview Ruler` turns it off for a plain bar.
@@ -3023,6 +3034,8 @@ impl Editor {
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            show_color_swatches: true,
+            color_swatches: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
@@ -5631,6 +5644,15 @@ impl Editor {
                 };
             }
         }
+        let total_bytes: usize = self.lines.iter().map(String::len).sum();
+        self.color_swatches = if total_bytes > COLOR_SWATCH_SCAN_MAX_BYTES {
+            Vec::new()
+        } else {
+            scan_color_swatches(
+                &self.lines,
+                matches!(self.lang, Some(LangKind::Css | LangKind::Html)),
+            )
+        };
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
@@ -10852,6 +10874,234 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
     out
 }
 
+/// Perceived luminance (0..=255) of an sRGB triple, used to pick a legible
+/// black-or-white foreground for a color swatch's background tint.
+fn swatch_luma(r: u8, g: u8, b: u8) -> f32 {
+    0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+}
+
+fn swatch_fg_for_bg(r: u8, g: u8, b: u8) -> Color {
+    if swatch_luma(r, g, b) >= 140.0 {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a `#`-prefixed hex color (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`)
+/// starting at byte `i` in `line`. Returns the parsed RGB and the number of
+/// bytes consumed (including the `#`), or `None` if `i` isn't a `#` followed
+/// by 3/4/6/8 hex digits with no further hex digit (or word char) right
+/// after — so `#deadbeef123` (too long to be any CSS hex form) is left
+/// alone rather than truncated to a wrong prefix.
+///
+/// Two look-alikes are refused. A `#` glued to a word character or `&` is a
+/// URL fragment (`page#fade`) or an HTML entity (`&#123;`). A short run of
+/// decimal digits only (`#555`, `#1234`) is an issue or PR reference, which
+/// comments and Markdown are full of; it counts as a color only where
+/// `decimal_short` says the buffer is a stylesheet.
+fn parse_hex_color(bytes: &[u8], i: usize, decimal_short: bool) -> Option<((u8, u8, u8), usize)> {
+    if bytes.get(i) != Some(&b'#') {
+        return None;
+    }
+    if i > 0 && (matches!(bytes[i - 1], b'&' | b'_') || bytes[i - 1].is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut len = 0usize;
+    while bytes
+        .get(i + 1 + len)
+        .copied()
+        .is_some_and(|b| hex_digit(b).is_some())
+    {
+        len += 1;
+        if len > 8 {
+            break;
+        }
+    }
+    // The digit run must end exactly at 3, 4, 6, or 8 — a longer run (or one
+    // immediately followed by another word character) is not a CSS hex color.
+    if !matches!(len, 3 | 4 | 6 | 8) {
+        return None;
+    }
+    if bytes
+        .get(i + 1 + len)
+        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    if !decimal_short
+        && matches!(len, 3 | 4)
+        && bytes[i + 1..=i + len].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let d = |k: usize| hex_digit(bytes[i + 1 + k]).unwrap();
+    let rgb = match len {
+        3 | 4 => (d(0) * 17, d(1) * 17, d(2) * 17),
+        _ => (d(0) * 16 + d(1), d(2) * 16 + d(3), d(4) * 16 + d(5)),
+    };
+    Some((rgb, 1 + len))
+}
+
+/// Parse `rgb(`/`rgba(` (case-insensitive) starting at byte `i`, tolerating
+/// the CSS Color 4 comma-optional syntax and a trailing `/ alpha`. Returns
+/// the parsed RGB and the byte length of the whole `rgb(...)` call.
+fn parse_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    let rest = &line[i..];
+    let lower_prefix_len = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rgb("))
+    {
+        4
+    } else if rest
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rgba("))
+    {
+        5
+    } else {
+        return None;
+    };
+    let close = rest.find(')')?;
+    let inner = &rest[lower_prefix_len..close];
+    let mut nums = inner
+        .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+        .filter(|s| !s.is_empty());
+    let r: u8 = nums.next()?.parse().ok()?;
+    let g: u8 = nums.next()?.parse().ok()?;
+    let b: u8 = nums.next()?.parse().ok()?;
+    Some(((r, g, b), close + 1))
+}
+
+/// Convert HSL (h in degrees, s/l as 0..=100 percentages) to sRGB.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let s = s / 100.0;
+    let l = l / 100.0;
+    if s == 0.0 {
+        let v = (l * 255.0).round() as u8;
+        return (v, v, v);
+    }
+    let h = h.rem_euclid(360.0) / 360.0;
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hue_to_rgb = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    let to_u8 = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    (
+        to_u8(hue_to_rgb(h + 1.0 / 3.0)),
+        to_u8(hue_to_rgb(h)),
+        to_u8(hue_to_rgb(h - 1.0 / 3.0)),
+    )
+}
+
+/// Parse `hsl(`/`hsla(` (case-insensitive), same comma/space tolerance as
+/// [`parse_rgb_color`]. `s` and `l` may carry a trailing `%`, stripped
+/// before parsing.
+fn parse_hsl_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    let rest = &line[i..];
+    let prefix_len = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("hsl("))
+    {
+        4
+    } else if rest
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("hsla("))
+    {
+        5
+    } else {
+        return None;
+    };
+    let close = rest.find(')')?;
+    let inner = &rest[prefix_len..close];
+    let mut nums = inner
+        .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+        .filter(|s| !s.is_empty());
+    let h: f32 = nums.next()?.parse().ok()?;
+    let s: f32 = nums.next()?.trim_end_matches('%').parse().ok()?;
+    let l: f32 = nums.next()?.trim_end_matches('%').parse().ok()?;
+    Some((hsl_to_rgb(h, s, l), close + 1))
+}
+
+/// Buffers above this size skip the color-swatch scan, for the same reason
+/// [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a per-edit,
+/// per-line scan must not make typing in a huge file pay for it.
+const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
+
+/// Inline color-literal decoration scan (the `naumovs.color-highlight`
+/// convention): per line, the `(start char col, end char col, background,
+/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()`
+/// literal found anywhere in the text — comments, strings, and plain prose
+/// alike, since (unlike syntax highlighting) a color swatch has no notion of
+/// "this isn't code here." A byte-position match is converted to a char
+/// column range so the renderer's column math (shared with bracket
+/// colorization and indent guides) applies unchanged. `decimal_short` is
+/// passed through to [`parse_hex_color`]: true only for stylesheet buffers.
+fn scan_color_swatches(
+    lines: &[String],
+    decimal_short: bool,
+) -> Vec<Vec<(usize, usize, Color, Color)>> {
+    let mut out = vec![Vec::new(); lines.len()];
+    for (li, line) in lines.iter().enumerate() {
+        let bytes = line.as_bytes();
+        // The char column of byte `i`, advanced alongside it: this runs on
+        // every recompute over the whole buffer, so no per-line lookup table.
+        let mut col = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let hit = parse_hex_color(bytes, i, decimal_short)
+                .or_else(|| parse_rgb_color(line, i))
+                .or_else(|| parse_hsl_color(line, i));
+            match hit {
+                Some(((r, g, b), consumed)) => {
+                    // Every literal form is ASCII up to its closing `)`, but
+                    // `rgb(` may enclose anything, so count rather than assume.
+                    let width = line[i..i + consumed].chars().count();
+                    out[li].push((
+                        col,
+                        col + width,
+                        Color::Rgb(r, g, b),
+                        swatch_fg_for_bg(r, g, b),
+                    ));
+                    col += width;
+                    i += consumed;
+                }
+                None => {
+                    // Advance by one char (not one byte) to stay on a UTF-8
+                    // boundary for the next `line[i..]` slice a color parser
+                    // takes.
+                    let step = line[i..].chars().next().map_or(1, char::len_utf8);
+                    i += step;
+                    col += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn indent_unit_for(lang: Option<LangKind>) -> &'static str {
     match lang {
         Some(LangKind::Yaml) => "  ",
@@ -12044,6 +12294,34 @@ impl Widget for &mut Editor {
                     let cell = &mut buf[(text_x + col, y)];
                     let style = cell.style().fg(fg);
                     cell.set_style(style);
+                }
+            }
+
+            // Inline color-literal decorations (VS Code's
+            // `naumovs.color-highlight`, filling the "no colour-swatch
+            // decorations" gap): tint each recognized `#hex` / `rgb()` /
+            // `hsl()` literal's own cells with its parsed color, choosing a
+            // black or white foreground for legibility. Painted after
+            // bracket colorization so a color literal's own brackets (e.g.
+            // `rgb(...)`) still read against the tint, and before the
+            // overlays below (selection, search) so those still win over it.
+            if self.show_color_swatches
+                && let Some(hits) = self.color_swatches.get(line_idx)
+            {
+                for &(start_c, end_c, bg, fg) in hits {
+                    if end_c <= row_start {
+                        continue;
+                    }
+                    let from = start_c.max(row_start);
+                    for c in from..end_c {
+                        let col = (c + ex(c) - row_start) as u16;
+                        if col >= row_width {
+                            break;
+                        }
+                        let cell = &mut buf[(text_x + col, y)];
+                        let style = cell.style().bg(bg).fg(fg);
+                        cell.set_style(style);
+                    }
                 }
             }
 
@@ -25150,6 +25428,107 @@ mod tests {
         let mut small = editor_with("f()");
         small.recompute_highlights();
         assert_eq!(small.bracket_colors[0], vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn scan_color_swatches_recognizes_hex_forms() {
+        let lines = vec![String::from("bg: #f00; border: #00ff0080; a: #abcabcabc")];
+        let out = scan_color_swatches(&lines, false);
+        // #f00 -> (255,0,0); #00ff0080 -> (0,255,0); the trailing 9-digit
+        // run is not any valid CSS hex length and must not match at all.
+        assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
+        assert_eq!(out[0][1].2, Color::Rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn scan_color_swatches_recognizes_rgb_and_hsl() {
+        let lines = vec![String::from(
+            "color: rgb(255, 0, 0); fill: hsl(0, 100%, 50%);",
+        )];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!(out[0].len(), 2, "found: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
+        // hsl(0, 100%, 50%) is pure red too.
+        assert_eq!(out[0][1].2, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn scan_color_swatches_ignores_hex_like_identifiers() {
+        // A hex digit run of invalid CSS length (12 digits, immediately
+        // followed by another hex digit) must not match as any color form.
+        let lines = vec![String::from("let x = #abcdefabcdefg;")];
+        let out = scan_color_swatches(&lines, false);
+        assert!(out[0].is_empty(), "found: {:?}", out[0]);
+    }
+
+    #[test]
+    fn scan_color_swatches_skips_issue_refs_fragments_and_entities() {
+        let lines = vec![String::from(
+            "fixes #555 and #1234; see page#fade; &#123; but #fade and #000000",
+        )];
+        let out = scan_color_swatches(&lines, false);
+        let found: Vec<_> = out[0].iter().map(|h| h.0).collect();
+        // Only the free-standing `#fade` (col 48) and `#000000` (col 58).
+        assert_eq!(found, vec![48, 58], "found: {:?}", out[0]);
+
+        // In a stylesheet `#555` is a color.
+        let css = scan_color_swatches(&[String::from("color: #555;")], true);
+        assert_eq!(css[0].len(), 1);
+        assert_eq!(css[0][0].2, Color::Rgb(0x55, 0x55, 0x55));
+    }
+
+    #[test]
+    fn scan_color_swatches_counts_columns_past_multibyte_text() {
+        let lines = vec![String::from("é → #ff0000")];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!((out[0][0].0, out[0][0].1), (4, 11));
+    }
+
+    #[test]
+    fn scan_color_swatches_picks_a_legible_foreground() {
+        let lines = vec![String::from("#ffffff #000000")];
+        let out = scan_color_swatches(&lines, false);
+        assert_eq!(out[0][0].3, Color::Black, "white bg needs black text");
+        assert_eq!(out[0][1].3, Color::White, "black bg needs white text");
+    }
+
+    #[test]
+    fn color_swatch_scan_runs_in_any_language_including_comments() {
+        // Unlike syntax highlighting, a color swatch has no notion of
+        // "inside a comment" — the whole point is spotting color literals
+        // wherever a human left one, e.g. a Rust doc comment.
+        let mut e = editor_with("// legacy brand color: #336699\nfn f() {}");
+        e.set_language(Some(LangKind::Rust));
+        assert_eq!(e.color_swatches[0].len(), 1);
+        assert_eq!(e.color_swatches[0][0].2, Color::Rgb(0x33, 0x66, 0x99));
+    }
+
+    #[test]
+    fn render_paints_a_color_swatch_background_over_the_literal() {
+        let mut e = editor_with("bg: #ff0000;");
+        e.recompute_highlights();
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        // "#ff0000" starts at column 4 ("bg: " is 4 chars).
+        assert_eq!(buf[(text_x + 4, y0)].bg, Color::Rgb(255, 0, 0));
+        assert_eq!(buf[(text_x + 4, y0)].fg, Color::White);
+        // The text before the literal is untouched.
+        assert_ne!(buf[(text_x, y0)].bg, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn plain_text_color_swatch_scan_is_gated_by_buffer_size() {
+        let big_line = "x".repeat(64 * 1024);
+        let mut e = editor_with("");
+        e.lines = vec![big_line; (COLOR_SWATCH_SCAN_MAX_BYTES / (64 * 1024)) + 2];
+        e.lines.push(String::from("#ff0000"));
+        e.recompute_highlights();
+        assert!(
+            e.color_swatches.iter().all(Vec::is_empty),
+            "an oversized buffer opts out of the color-swatch scan"
+        );
     }
 
     #[test]
