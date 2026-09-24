@@ -9238,6 +9238,34 @@ impl Editor {
         true
     }
 
+    /// `trim_trailing_whitespace` for a save: every line except the ones a
+    /// caret sits on (primary and extra carets). Auto-save runs a second
+    /// after typing stops, so trimming the caret's own line would eat the
+    /// space just typed and glue the next word onto the previous one. The
+    /// caret lines are normalised by a later save once the caret has moved;
+    /// the explicit Trim Trailing Whitespace command still trims them all.
+    fn trim_trailing_whitespace_off_caret_lines(&mut self) -> bool {
+        let spared: std::collections::HashSet<usize> = std::iter::once(self.cursor_row)
+            .chain(self.carets.iter().map(|c| c.head.0))
+            .collect();
+        let dirty = |(i, l): (usize, &String)| {
+            !spared.contains(&i) && l.trim_end_matches([' ', '\t']).len() != l.len()
+        };
+        if !self.lines.iter().enumerate().any(dirty) {
+            return false;
+        }
+        self.push_undo(EditKind::TrimWhitespace);
+        for (i, line) in self.lines.iter_mut().enumerate() {
+            if !spared.contains(&i) {
+                let trimmed_len = line.trim_end_matches([' ', '\t']).len();
+                line.truncate(trimmed_len);
+            }
+        }
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
+    }
+
     /// Apply the `.editorconfig` properties that act at save time, from the
     /// single write choke point so every save path (explicit, force, auto,
     /// format-on-save) gets them.
@@ -9248,7 +9276,7 @@ impl Editor {
     fn apply_editorconfig_on_save(&mut self) -> bool {
         let mut changed = false;
         if self.editorconfig.trim_trailing_whitespace == Some(true) {
-            changed |= self.trim_trailing_whitespace();
+            changed |= self.trim_trailing_whitespace_off_caret_lines();
         }
         if self.editorconfig.insert_final_newline == Some(true) {
             // `lines` joins with the EOL on write, so a trailing empty
@@ -26605,12 +26633,44 @@ mod tests {
 
         let mut e = Editor::new();
         e.open(&f).unwrap();
+        // The caret's own line is spared (see the test below), so it sits on
+        // the one line with nothing to trim.
+        e.cursor_row = 2;
         e.save_to_disk().unwrap();
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "one\ntwo\nthree\n",
             "trailing whitespace trimmed and a final newline added"
         );
+    }
+
+    /// Auto-save fires a second after typing stops, so trimming the line
+    /// under a caret would turn `foo ` into `foo` mid-word and the next key
+    /// would produce `foobar`. Caret lines keep their trailing whitespace
+    /// (primary and extra carets alike); every other line is trimmed, and a
+    /// later save with the caret elsewhere normalises the rest.
+    #[test]
+    fn editorconfig_trim_on_save_spares_the_lines_under_a_caret() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo \nbar  \nbaz\t").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.carets.push(EditorSelection::new(2, 4));
+        e.save_to_disk().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "foo \nbar\nbaz\t",
+            "only the line without a caret is trimmed"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 4), "the caret stays put");
     }
 
     /// Neither save-time property fires unless a `.editorconfig` asked for

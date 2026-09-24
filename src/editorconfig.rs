@@ -268,7 +268,11 @@ fn section_matches(glob: &str, rel: &str) -> bool {
     } else {
         format!("**/{glob}")
     };
-    expand_braces(&anchored).iter().any(|p| {
+    // An expansion past the cap matches nothing rather than allocating it.
+    let Some(patterns) = expand_braces(&anchored) else {
+        return false;
+    };
+    patterns.iter().any(|p| {
         glob_match(
             &p.chars().collect::<Vec<_>>(),
             &rel.chars().collect::<Vec<_>>(),
@@ -276,12 +280,19 @@ fn section_matches(glob: &str, rel: &str) -> bool {
     })
 }
 
+/// The most concrete patterns one section glob may expand to. Brace groups
+/// multiply (`{a,b}` thirty times is over a billion), and the file comes from
+/// whatever repository was opened, so the product is capped before it is
+/// built rather than after.
+const MAX_BRACE_EXPANSION: usize = 1024;
+
 /// Expand `{a,b}` alternatives into concrete patterns. Nested braces expand
-/// too, since the recursion re-runs over each produced alternative.
-fn expand_braces(pattern: &str) -> Vec<String> {
+/// too, since the recursion re-runs over each produced alternative. `None`
+/// once the expansion would pass [`MAX_BRACE_EXPANSION`].
+fn expand_braces(pattern: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = pattern.chars().collect();
     let Some(open) = chars.iter().position(|&c| c == '{') else {
-        return vec![pattern.to_string()];
+        return Some(vec![pattern.to_string()]);
     };
     // The matching close brace, skipping any nested pairs.
     let mut depth = 0usize;
@@ -300,7 +311,7 @@ fn expand_braces(pattern: &str) -> Vec<String> {
         }
     }
     let Some(close) = close else {
-        return vec![pattern.to_string()];
+        return Some(vec![pattern.to_string()]);
     };
     let prefix: String = chars[..open].iter().collect();
     let suffix: String = chars[close + 1..].iter().collect();
@@ -326,9 +337,12 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     parts.push(cur);
     let mut out = Vec::new();
     for p in parts {
-        out.extend(expand_braces(&format!("{prefix}{p}{suffix}")));
+        out.extend(expand_braces(&format!("{prefix}{p}{suffix}"))?);
+        if out.len() > MAX_BRACE_EXPANSION {
+            return None;
+        }
     }
-    out
+    Some(out)
 }
 
 /// A glob matcher with EditorConfig's semantics: `*` stops at `/`, `**`
@@ -672,6 +686,24 @@ mod tests {
         assert!(section_matches("*.{js,ts,tsx}", "src/a.ts"));
         assert!(section_matches("*.{js,ts,tsx}", "a.tsx"));
         assert!(!section_matches("*.{js,ts,tsx}", "a.rs"));
+    }
+
+    /// Brace groups multiply: `{a,b}` thirty times is over a billion
+    /// patterns, built before any matching starts, from a file any cloned
+    /// repository can ship. Past a fixed cap the section matches nothing.
+    #[test]
+    fn a_brace_expansion_past_the_cap_matches_nothing() {
+        // 12 groups = 4096 alternatives, over the cap; the name would match.
+        let glob = format!("{}x", "{a,b}".repeat(12));
+        let name = format!("{}x", "a".repeat(12));
+        assert!(
+            !section_matches(&glob, &name),
+            "an oversized expansion is refused"
+        );
+        // Under the cap it still matches, so the refusal is the cap and not
+        // a pattern that never matched.
+        let small = format!("{}x", "{a,b}".repeat(4));
+        assert!(section_matches(&small, "aaaax"));
     }
 
     #[test]
