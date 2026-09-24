@@ -3268,6 +3268,16 @@ pub struct App {
         PathBuf,
         std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
     >,
+    /// Markdown-lint's own edit-seq cursor, mirroring `lsp_last_seen` but
+    /// independent of the LSP: `.md` files get linted whether or not any
+    /// language server is running (there is none for Markdown), so this
+    /// cannot share the LSP's cursor map. Keyed by path; a path's entry is
+    /// removed when its tab closes so a later re-open re-lints instead of
+    /// trusting a stale seq (a different file could reuse a `PathBuf` after
+    /// a rename-in-place on disk). Each entry holds the lines that were
+    /// linted as well as their seq, because two split panes count edits
+    /// separately and can share a seq while holding different text.
+    markdown_lint_last_seen: std::collections::HashMap<PathBuf, (u64, Vec<String>)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -4849,6 +4859,7 @@ impl App {
             semantic_generation_seen: std::collections::HashMap::new(),
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
+            markdown_lint_last_seen: std::collections::HashMap::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -7076,6 +7087,111 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Lints every open `.md` tab and folds the results into the same
+    /// diagnostics store a real language server writes to (`lsp_diagnostics`,
+    /// keyed by path then by "producer"), under the synthetic server name
+    /// `"Markdown Lint"`. There is no bundled Markdown language server (see
+    /// `src/vscode_extensions.rs`), so this runs independently of `self.lsp`
+    /// and `sync_lsp`'s extension gate, which only covers languages that
+    /// map to a real server. Gated by its own edit-seq cursor
+    /// (`markdown_lint_last_seen`) so an unchanged buffer isn't re-linted
+    /// every tick. Returns whether any editor's overlay or the PROBLEMS
+    /// panel changed, for the caller's redraw decision.
+    pub fn sync_markdown_lint(&mut self) -> bool {
+        let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
+        // Both collections: `self.editor` is the ACTIVE group's tabs, and a
+        // split's other panes live in `editor_layout`. Walking only the
+        // active one left a `.md` open in an inactive pane unlinted, and the
+        // `closed` sweep below then dropped its diagnostics as though the tab
+        // had gone - squiggles vanishing from a pane in plain sight.
+        let inactive_tabs: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        for tab in self.editor.iter_tabs().chain(inactive_tabs) {
+            if tab.has_non_text_view() {
+                continue;
+            }
+            let Some(path) = tab.path.as_ref() else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // The same file can be open in several panes, each its own
+            // buffer with its own `edit_seq`. Only the FIRST tab seen for a
+            // path (the active group comes first) is compared: judging each
+            // pane against one shared cursor made two panes with different
+            // seqs take turns, re-linting and redrawing on every tick.
+            if !current.insert(path.clone()) {
+                continue;
+            }
+            // The seq alone cannot tell two panes apart: each counts its own
+            // edits, so they can agree while holding different text. The
+            // lines last linted are kept too and compared when the seqs
+            // match (one comparison, no allocation), so switching to the
+            // other pane re-lints exactly when its text differs.
+            let seq = tab.edit_seq;
+            let seen = self
+                .markdown_lint_last_seen
+                .get(path)
+                .is_some_and(|(s, lines)| *s == seq && *lines == tab.lines);
+            if !seen {
+                to_lint.push((path.clone(), tab.lines.clone(), seq));
+            }
+        }
+        let mut changed = false;
+        for (path, lines, seq) in to_lint {
+            let diags = crate::markdown_lint::lint(&lines.join("\n"));
+            let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
+            if diags.is_empty() {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&path);
+                }
+            } else if by_server.get("Markdown Lint") != Some(&diags) {
+                // Only a different set is a change: storing the same
+                // diagnostics again must not ask for a redraw.
+                by_server.insert("Markdown Lint".to_string(), diags);
+                changed = true;
+            }
+            self.markdown_lint_last_seen
+                .insert(path.clone(), (seq, lines));
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                }
+            }
+        }
+        let closed: Vec<PathBuf> = self
+            .markdown_lint_last_seen
+            .keys()
+            .filter(|p| !current.contains(*p))
+            .cloned()
+            .collect();
+        for p in closed {
+            self.markdown_lint_last_seen.remove(&p);
+            if let Some(by_server) = self.lsp_diagnostics.get_mut(&p) {
+                changed |= by_server.remove("Markdown Lint").is_some();
+                if by_server.is_empty() {
+                    self.lsp_diagnostics.remove(&p);
+                }
+            }
+        }
+        if changed {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
+        changed
     }
 
     /// The repository toplevel owning the workspace, from the git worker's
@@ -27952,6 +28068,82 @@ impl App {
         !self.editor.has_non_text_view() && self.editor.markdown_preview.is_none()
     }
 
+    /// Toggle a bookmark on the cursor's line and report the new state in the
+    /// status bar. A buffer with no path on disk cannot hold marks, and says so
+    /// rather than silently doing nothing.
+    fn toggle_bookmark(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.toggle_bookmark() {
+            Some(true) => format!("Bookmark set on line {line}"),
+            Some(false) => format!("Bookmark cleared on line {line}"),
+            None => String::from("Save the file before bookmarking a line"),
+        };
+    }
+
+    /// Jump to the next (`forward`) or previous bookmark in the open file,
+    /// wrapping at the ends. Explains an empty set instead of doing nothing.
+    fn goto_bookmark(&mut self, forward: bool) {
+        if !self.editor_is_text() {
+            return;
+        }
+        let jumped = if forward {
+            self.editor.goto_next_bookmark()
+        } else {
+            self.editor.goto_prev_bookmark()
+        };
+        self.status = match jumped {
+            Some(line) => {
+                // Position among the marks, 1-based, then the line itself:
+                // "Bookmark 2 of 3 (line 42)", never a line number over a count.
+                let marks = self.editor.bookmarked_lines();
+                let total = marks.len();
+                let idx = marks.iter().position(|&l| l == line).map_or(0, |i| i + 1);
+                format!("Bookmark {idx} of {total} (line {line})")
+            }
+            None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
+        };
+    }
+
+    /// Clear every bookmark in the open file, reporting how many went.
+    fn clear_bookmarks(&mut self) {
+        // Every path in (chord and palette) goes through here, so the guard
+        // lives here: a preview or non-text view must not clear marks it does
+        // not show.
+        if !self.editor_is_text() {
+            return;
+        }
+        let gone = self.editor.clear_bookmarks();
+        self.status = if gone == 0 {
+            String::from("No bookmarks in this file")
+        } else if gone == 1 {
+            String::from("Cleared 1 bookmark")
+        } else {
+            format!("Cleared {gone} bookmarks")
+        };
+    }
+
+    /// Emmet: Expand Abbreviation. Says why nothing happened rather than
+    /// failing silently — the two reasons (wrong language, unparseable
+    /// abbreviation) need different fixes from the user.
+    fn expand_emmet_abbreviation(&mut self) {
+        if !self.editor_is_text() {
+            return;
+        }
+        self.status = if !self.editor.emmet_available() {
+            format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            )
+        } else if self.editor.expand_emmet_abbreviation() {
+            String::from("Emmet: expanded abbreviation")
+        } else {
+            String::from("Emmet: no abbreviation at the cursor")
+        };
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -28260,6 +28452,24 @@ impl App {
             }
             return;
         }
+        // Bookmarks: toggle on the cursor's line, then walk them with
+        // Cmd+Opt+. / Cmd+Opt+, (VS Code's Bookmarks extension, nvim marks).
+        if is_toggle_bookmark_key(key) {
+            self.toggle_bookmark();
+            return;
+        }
+        if is_next_bookmark_key(key) {
+            self.goto_bookmark(true);
+            return;
+        }
+        if is_prev_bookmark_key(key) {
+            self.goto_bookmark(false);
+            return;
+        }
+        if is_clear_bookmarks_key(key) {
+            self.clear_bookmarks();
+            return;
+        }
         // Formerly palette-only editor commands, now each on a chord so none
         // ships without an accelerator (croft tenet: everything has a shortcut).
         if is_join_lines_key(key) {
@@ -28298,6 +28508,10 @@ impl App {
             if self.editor_is_text() && self.editor.trim_trailing_whitespace() {
                 self.status = String::from("Trimmed trailing whitespace");
             }
+            return;
+        }
+        if is_emmet_expand_key(key) {
+            self.expand_emmet_abbreviation();
             return;
         }
         // VS Code "Format Document" (Cmd+Opt+Shift+F): reformat the whole buffer
@@ -35050,6 +35264,7 @@ impl App {
                     self.status = String::from("Trimmed trailing whitespace");
                 }
             }
+            Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::ToggleWordWrap => {
@@ -35336,6 +35551,18 @@ impl App {
                     self.status = String::from("Trimmed final newlines");
                 }
             }
+            Cmd::ToggleOverviewRuler => {
+                self.editor.overview_ruler = !self.editor.overview_ruler;
+                self.status = if self.editor.overview_ruler {
+                    String::from("Overview ruler on")
+                } else {
+                    String::from("Overview ruler off")
+                };
+            }
+            Cmd::ToggleBookmark => self.toggle_bookmark(),
+            Cmd::NextBookmark => self.goto_bookmark(true),
+            Cmd::PreviousBookmark => self.goto_bookmark(false),
+            Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
@@ -46796,6 +47023,38 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
 }
 
+/// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
+/// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
+fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'k')
+}
+
+/// `Cmd+Opt+Shift+B`: clear every bookmark in the open file. `Cmd+Shift+B`
+/// (Run Build Task) and `Cmd+Opt+B` (secondary side bar) each exclude the
+/// other modifier, so the three chords on `b` never collide.
+fn is_clear_bookmarks_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'b')
+}
+
+/// `Cmd+Opt+.`: jump to the next bookmark below the cursor, wrapping to the
+/// top of the file. `Cmd+.` alone is Quick Fix, which excludes Alt, so the
+/// two never collide.
+fn is_next_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('.') | KeyCode::Char('>'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// `Cmd+Opt+,`: mirror of [`is_next_bookmark_key`] walking upwards. The
+/// shifted glyph `<` is accepted for terminals that pre-apply the shift.
+fn is_prev_bookmark_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(',') | KeyCode::Char('<'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// `Cmd+Opt+Shift+J`: Join Lines (`editor.action.joinLines`).
 fn is_join_lines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'j')
@@ -46839,6 +47098,15 @@ fn is_trim_trailing_whitespace_key(key: KeyEvent) -> bool {
 /// `Shift+Alt+F`). Reformats the whole buffer through the language server.
 fn is_format_document_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'f')
+}
+
+/// `Cmd+Opt+Shift+E`: Emmet Expand Abbreviation
+/// (`editor.emmet.action.expandAbbreviation`). VS Code binds this to Tab,
+/// which croft cannot reuse — Tab is indentation here, and an abbreviation
+/// that only sometimes expands on Tab is worse than one that always expands
+/// on its own chord.
+fn is_emmet_expand_key(key: KeyEvent) -> bool {
+    is_cmd_alt_shift_letter(key, 'e')
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
@@ -50123,6 +50391,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        let markdown_lint_changed = app.sync_markdown_lint();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
@@ -50279,7 +50548,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || explorer_panels_changed
             || install_status_changed
             || blame_changed
-            || dap_changed;
+            || dap_changed
+            || markdown_lint_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);
