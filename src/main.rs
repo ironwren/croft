@@ -15,6 +15,7 @@ mod config_layers;
 mod config_sync;
 mod dap;
 mod docx;
+mod editorconfig;
 mod emmet;
 mod file_ref;
 mod fleet;
