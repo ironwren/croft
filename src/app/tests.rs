@@ -49426,6 +49426,44 @@ fn stop_all_false_leaves_the_siblings_running() {
     app.debug_stop();
 }
 
+/// A compound that is REFUSED (here, it names a configuration no
+/// launch.json declares) leaves the running set alone, so it must not leave
+/// its `stopAll` behind either: that set never asked for it.
+#[test]
+fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{"version":"0.2.0","configurations":[],
+            "compounds":[{"name":"Bad","configurations":["Missing"],"stopAll":true}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(1);
+    let compound = crate::dap::configs::discover_compounds(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Bad")
+        .expect("the compound parses");
+    assert!(compound.stop_all);
+    app.launch_compound(&compound);
+    assert_eq!(
+        app.debug_sessions.len(),
+        2,
+        "the refusal leaves the set running"
+    );
+
+    poll_until_shrinks(&mut app, 2);
+    assert_eq!(
+        app.debug_sessions.names(),
+        vec!["B"],
+        "A ending must not take B: the running set never asked for stopAll"
+    );
+    app.debug_stop();
+}
+
 #[test]
 fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
     // #567 items 2 and 3: the status and panel line kept naming the ended

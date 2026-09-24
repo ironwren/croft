@@ -1482,6 +1482,8 @@ enum PendingLaunchStep {
 struct CompoundLaunch {
     members: Vec<crate::dap::configs::DebugConfig>,
     compound: String,
+    /// The compound's `stopAll`, carried to the moment the set is replaced.
+    stop_all: bool,
 }
 
 /// What became of one compound member (#310).
@@ -21001,7 +21003,6 @@ impl App {
     /// one or several sessions. Shared by the picker and by F5/restart once
     /// the compound is the selected target (#567).
     fn launch_compound(&mut self, compound: &crate::dap::configs::Compound) {
-        self.debug_stop_all = compound.stop_all;
         // Resolve first: a compound naming a configuration no
         // launch.json declares is a config error worth
         // reporting now, separately from the unbuilt feature.
@@ -21091,6 +21092,9 @@ impl App {
             }
             Ok(members) if members.len() == 1 => {
                 let cfg = members[0].clone();
+                // One member has no siblings to stop, so its `stopAll` is set
+                // false rather than inherited from whatever ran before.
+                self.debug_stop_all = false;
                 match compound.pre_launch_task.clone() {
                     // #318: the compound's own task runs
                     // first, and the member starts only if it
@@ -21114,8 +21118,13 @@ impl App {
                 // the members are owned from here on.
                 let members: Vec<_> = members.into_iter().cloned().collect();
                 match compound.pre_launch_task.clone() {
-                    Some(task) => self.launch_after_compound_task_all(&task, members, label),
-                    None => self.launch_compound_members(members, label),
+                    Some(task) => self.launch_after_compound_task_all(
+                        &task,
+                        members,
+                        label,
+                        compound.stop_all,
+                    ),
+                    None => self.launch_compound_members(members, label, compound.stop_all),
                 }
             }
         }
@@ -21242,6 +21251,7 @@ impl App {
         task_label: &str,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
         self.pending_debug_launch = None;
@@ -21261,7 +21271,11 @@ impl App {
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members(Box::new(CompoundLaunch { members, compound })),
+            step: PendingLaunchStep::Members(Box::new(CompoundLaunch {
+                members,
+                compound,
+                stop_all,
+            })),
             started: std::time::Instant::now(),
         });
         self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
@@ -21287,8 +21301,13 @@ impl App {
         &mut self,
         members: Vec<crate::dap::configs::DebugConfig>,
         compound: String,
+        stop_all: bool,
     ) {
         self.debug_stop();
+        // Set only here, once the old set is gone: a compound refused before
+        // this point leaves the running set untouched, and must leave its
+        // `stopAll` out of it too (#567).
+        self.debug_stop_all = stop_all;
         // A launch supersedes any older one still parked behind its task:
         // left in place, that task's exit would launch its config and stop
         // this set (#567). The task-gated path reaches here via `take()`, so
@@ -21391,7 +21410,7 @@ impl App {
             // member - parking is one-at-a-time and a set of parked members
             // would interleave.
             PendingLaunchStep::Members(launch) => {
-                self.launch_compound_members(launch.members, launch.compound)
+                self.launch_compound_members(launch.members, launch.compound, launch.stop_all)
             }
         }
     }
