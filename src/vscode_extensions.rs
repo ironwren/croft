@@ -458,9 +458,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "formulahendry.auto-close-tag",
-        croft: "",
-        status: Status::None,
-        note: "no tag auto-close; brackets and quotes auto-close (disable_auto_close_pairs)",
+        croft: "tag auto-close",
+        status: Status::Builtin,
+        note: "typing `>` after an HTML/XML/JSX opening tag inserts the matching closing tag",
     },
     Mapping {
         vscode: "streetsidesoftware.code-spell-checker",
