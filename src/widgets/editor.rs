@@ -9566,6 +9566,10 @@ impl Editor {
             .map_or(end_byte, |(i, _)| i);
         self.cursor_col = line[..last].chars().count();
         self.selection = None;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
     }
 
     /// The Emmet dialect this buffer expands into, or `None` where the chord
