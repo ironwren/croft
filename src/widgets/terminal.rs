@@ -1932,6 +1932,16 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
+        // Shutdown pipe + master fd for the reader's poll gate: the reader
+        // must be wakeable without depending on the pty ever reaching EOF.
+        let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
+        let pty_fd = pair
+            .master
+            .as_raw_fd()
+            .context("pty master has no raw fd")?;
+        // Taken BEFORE the rewind registration below, which has no `?` after
+        // it: an early return past a registered buffer would leave every
+        // other pane trimmed to a share nobody is using.
         // One budget shared by every pane (#694), re-read per spawn like the
         // scrollback so a settings edit applies without a relaunch. Setting
         // it re-splits the budget over the panes already open; registering
@@ -1939,7 +1949,7 @@ impl PtyTerminal {
         let rewind_budget = crate::rewind::budget();
         rewind_budget.set_total(crate::rewind::configured_budget_bytes(
             crate::prefs::Prefs::load_or_default().terminal_rewind_mb,
-            crate::rewind::running_over_ssh(),
+            crate::remote::running_over_ssh(),
         ));
         let rewind = rewind_budget.register();
         let rewind_for_thread = rewind.clone();
@@ -1986,13 +1996,6 @@ impl PtyTerminal {
             Vec<crate::build_matchers::BuildDiag>,
         )>();
 
-        // Shutdown pipe + master fd for the reader's poll gate: the reader
-        // must be wakeable without depending on the pty ever reaching EOF.
-        let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
-        let pty_fd = pair
-            .master
-            .as_raw_fd()
-            .context("pty master has no raw fd")?;
         let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();

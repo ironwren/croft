@@ -33,9 +33,10 @@
 //! silently discarding it would leave the replay showing a gap it cannot
 //! explain.
 //!
-//! Keyframes count against the same cap (#694). They are whole screens, one
-//! per [`KEYFRAME_INTERVAL_BYTES`] of output, and a budget that covered only
-//! frames let hundreds of them sit on top of it.
+//! Everything held counts against the cap (#694): each frame's slot as well
+//! as its payload, and keyframes as well as frames. Nothing stores keyframes
+//! yet (the reader drops the request until the replay overlay lands), so
+//! charging them is a guard for that caller, not a saving today.
 //!
 //! # The cap is shared, not per pane
 //!
@@ -78,14 +79,6 @@ pub const REMOTE_DEFAULT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// must not hand the rewind buffer the machine.
 pub const MAX_BUDGET_MB: usize = 4096;
 
-/// True when croft runs inside an SSH login, which is how a remote croft is
-/// launched (`croft remote` execs it over ssh).
-pub fn running_over_ssh() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some()
-        || std::env::var_os("SSH_CLIENT").is_some()
-}
-
 /// The shared budget in bytes for a `terminal_rewind_mb` setting.
 ///
 /// Unset picks the default for where croft runs; `0` turns rewind off; any
@@ -94,7 +87,9 @@ pub fn configured_budget_bytes(setting_mb: Option<usize>, remote: bool) -> usize
     match setting_mb {
         None if remote => REMOTE_DEFAULT_BUDGET_BYTES,
         None => DEFAULT_BUDGET_BYTES,
-        Some(mb) => mb.min(MAX_BUDGET_MB) * 1024 * 1024,
+        // Saturating: 4096 MiB is exactly 2^32, which wraps to 0 on a 32-bit
+        // host and would turn rewind off instead of maximising it.
+        Some(mb) => mb.min(MAX_BUDGET_MB).saturating_mul(1024 * 1024),
     }
 }
 
@@ -146,8 +141,9 @@ pub struct Keyframe {
 /// `String` header that holds it.
 ///
 /// Counted because a keyframe is a whole screen, and one is asked for every
-/// [`KEYFRAME_INTERVAL_BYTES`] of output. Leaving them out of the cap (as the
-/// first version did) let ~256 of them ride on top of a full frame budget.
+/// [`KEYFRAME_INTERVAL_BYTES`] of output. Nothing stores one yet; left out of
+/// the cap, the replay overlay that will would let ~256 of them ride on top
+/// of a full frame budget.
 fn keyframe_cost(screen: &[String]) -> usize {
     screen
         .iter()
@@ -155,13 +151,26 @@ fn keyframe_cost(screen: &[String]) -> usize {
         .sum()
 }
 
+/// What one frame costs beyond its payload: its slot in the deque. The
+/// payload's own allocation header is left out, as allocator detail.
+const FRAME_OVERHEAD: usize = std::mem::size_of::<Frame>();
+
+/// A frame's charge against the byte budget: its payload plus its slot.
+///
+/// Payload alone undercounts badly where it matters most (#694 review): the
+/// reader records one frame per `read()`, and output that trickles in a byte
+/// at a time costs some 40 real bytes per byte counted.
+fn frame_cost(payload: usize) -> usize {
+    payload + FRAME_OVERHEAD
+}
+
 /// The session's recent output, bounded by total bytes held.
 #[derive(Debug)]
 pub struct RewindBuffer {
     frames: VecDeque<Frame>,
     keyframes: VecDeque<Keyframe>,
-    /// Summed `data.len()` of every frame held plus the [`keyframe_cost`] of
-    /// every keyframe — the quantity actually capped.
+    /// [`frame_cost`] of every frame held plus the [`keyframe_cost`] of every
+    /// keyframe — the quantity actually capped.
     bytes: usize,
     capacity: usize,
     /// Bytes seen since the last keyframe, driving the next snapshot.
@@ -199,15 +208,19 @@ impl RewindBuffer {
         if data.is_empty() {
             return false;
         }
+        // A cap too small to hold even one frame's bookkeeping holds nothing.
+        let Some(room) = self.capacity.checked_sub(FRAME_OVERHEAD).filter(|&r| r > 0) else {
+            return false;
+        };
         // One frame bigger than the whole budget is truncated to the budget
         // rather than dropped: the replay then shows a shortened write, which
         // is explicable, instead of a hole that looks like lost output.
-        let data = if data.len() > self.capacity {
-            &data[data.len() - self.capacity..]
+        let data = if data.len() > room {
+            &data[data.len() - room..]
         } else {
             data
         };
-        self.bytes += data.len();
+        self.bytes += frame_cost(data.len());
         let seq = self.take_seq();
         self.frames.push_back(Frame {
             at_ms,
@@ -261,13 +274,20 @@ impl RewindBuffer {
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity;
         if capacity == 0 {
-            self.frames.clear();
-            self.keyframes.clear();
+            // New deques, not `clear`: clearing keeps the slot arrays, and a
+            // pane that once held a million frames would keep 40 MB of empty
+            // slots after rewind was turned off.
+            self.frames = VecDeque::new();
+            self.keyframes = VecDeque::new();
             self.bytes = 0;
             self.since_keyframe = 0;
             return;
         }
         self.evict();
+        // A smaller share leaves the slot array sized for the old one; give
+        // back what is well past what the new share holds.
+        self.frames.shrink_to(self.frames.len() * 2);
+        self.keyframes.shrink_to(self.keyframes.len() * 2);
     }
 
     /// The cap currently in force.
@@ -292,13 +312,13 @@ impl RewindBuffer {
         while self.bytes > self.capacity {
             if self.frames.len() > 1 {
                 if let Some(f) = self.frames.pop_front() {
-                    self.bytes -= f.data.len();
+                    self.bytes -= frame_cost(f.data.len());
                 }
                 self.drop_orphan_keyframes();
             } else if self.pop_keyframe_front() {
                 // Loop again: the remaining keyframes may still not fit.
             } else if let Some(f) = self.frames.pop_front() {
-                self.bytes -= f.data.len();
+                self.bytes -= frame_cost(f.data.len());
             } else {
                 // Unreachable while `bytes` is the sum of what is held, but
                 // a `while` on a counter that a future change could desync
@@ -580,13 +600,18 @@ mod tests {
     /// interpret.
     #[test]
     fn a_write_larger_than_the_budget_keeps_its_tail() {
-        let mut b = RewindBuffer::new(16);
+        // Room for one frame of 16 payload bytes.
+        let mut b = RewindBuffer::new(frame_cost(16));
         // DISTINGUISHABLE payload: every byte differs, so the assertion can
         // tell the tail from the head. A uniform `[b'x'; 100]` would pass
         // just as happily against a slice taken from the wrong end.
         let big: Vec<u8> = (0u8..100).collect();
         b.push(1, &big);
-        assert_eq!(b.bytes(), 16, "a huge write must be clamped to the budget");
+        assert_eq!(
+            b.bytes(),
+            frame_cost(16),
+            "a huge write must be clamped to the budget"
+        );
         assert!(!b.is_empty(), "it must not vanish entirely");
 
         let (_, frames) = b.replay_from(u64::MAX);
@@ -605,7 +630,8 @@ mod tests {
     /// would be exactly backwards: the whole point is the last few minutes.
     #[test]
     fn eviction_drops_the_oldest_output_first() {
-        let mut b = RewindBuffer::new(10);
+        // Room for two 5-byte frames.
+        let mut b = RewindBuffer::new(2 * frame_cost(5));
         b.push(1, b"aaaaa");
         b.push(2, b"bbbbb");
         b.push(3, b"ccccc");
@@ -725,7 +751,7 @@ mod tests {
             .iter()
             .map(|s| keyframe_cost(&[String::from(*s)]))
             .sum::<usize>();
-        let mut b = RewindBuffer::new(kf_bytes + 10);
+        let mut b = RewindBuffer::new(kf_bytes + 2 * frame_cost(5));
         b.push_keyframe(1, vec![String::from("ancient")]);
         b.push(2, b"aaaaa");
         b.push_keyframe(3, vec![String::from("old")]);
@@ -758,7 +784,8 @@ mod tests {
     /// picks the newest keyframe and never sees the gap.
     #[test]
     fn replay_never_starts_from_a_keyframe_with_evicted_frames_after_it() {
-        let mut b = RewindBuffer::new(10);
+        // Room for the keyframe and two 5-byte frames.
+        let mut b = RewindBuffer::new(keyframe_cost(&[String::from("t=1")]) + 2 * frame_cost(5));
         b.push_keyframe(1, vec![String::from("t=1")]);
         b.push(2, b"aaaaa");
         b.push(3, b"bbbbb");
@@ -801,7 +828,10 @@ mod tests {
     /// contrived one.
     #[test]
     fn eviction_within_one_millisecond_still_invalidates_the_keyframe() {
-        let mut b = RewindBuffer::new(15);
+        // Room for the keyframe and three 5-byte frames.
+        let mut b = RewindBuffer::new(
+            keyframe_cost(&[String::from("before any output")]) + 3 * frame_cost(5),
+        );
         b.push_keyframe(5, vec![String::from("before any output")]);
         b.push(5, b"aaaaa");
         b.push(5, b"bbbbb");
@@ -892,8 +922,10 @@ mod tests {
     /// before the next frame lands.
     #[test]
     fn a_run_of_stale_keyframes_is_swept_not_just_the_newest() {
-        // 16 bytes of budget: each 8-byte frame evicts what came before it.
-        let mut b = RewindBuffer::new(16);
+        // Room for the three keyframes and two 8-byte frames, so the third
+        // frame evicts the first.
+        let kf_bytes = 3 * keyframe_cost(&[String::from("s1")]);
+        let mut b = RewindBuffer::new(kf_bytes + 2 * frame_cost(8));
         b.push(10, b"aaaaaaaa");
         // Three keyframes back to back, all describing screens that only the
         // first frame can reach.
@@ -1079,7 +1111,10 @@ mod tests {
     /// What the buffer holds, summed from the records themselves, to check
     /// the running `bytes` counter against.
     fn recount(b: &RewindBuffer) -> usize {
-        b.frames.iter().map(|f| f.data.len()).sum::<usize>()
+        b.frames
+            .iter()
+            .map(|f| frame_cost(f.data.len()))
+            .sum::<usize>()
             + b.keyframes.iter().map(|k| k.cost).sum::<usize>()
     }
 
@@ -1126,7 +1161,7 @@ mod tests {
     #[test]
     fn a_keyframe_evicts_old_output_to_make_room() {
         let kf = screen(2, 10);
-        let cap = 30 + keyframe_cost(&kf);
+        let cap = 3 * frame_cost(10) + keyframe_cost(&kf);
         let mut b = RewindBuffer::new(cap);
         b.push(1, &[b'a'; 10]);
         b.push(2, &[b'b'; 10]);
@@ -1287,5 +1322,41 @@ mod tests {
             MAX_BUDGET_MB << 20,
             "an absurd value must clamp, not overflow"
         );
+    }
+
+    /// #694 review: output that trickles in a byte at a time must not cost
+    /// forty times what the cap says.
+    ///
+    /// Charging payload alone let 4 Mi one-byte frames sit in a 1 MiB buffer
+    /// while their slots alone took ~160 MiB. The bound is asserted on the
+    /// slots actually held, not on `bytes()`, which is what was wrong.
+    #[test]
+    fn one_byte_frames_are_charged_their_slot() {
+        let cap = 1 << 20;
+        let mut b = RewindBuffer::new(cap);
+        for i in 0..(4u64 << 20) {
+            b.push(i, b".");
+        }
+        let slots = b.frames.len() * std::mem::size_of::<Frame>();
+        let payload: usize = b.frames.iter().map(|f| f.data.len()).sum();
+        assert!(
+            slots + payload <= cap,
+            "{} frames hold {} bytes of slots and payload against a {cap} cap",
+            b.frames.len(),
+            slots + payload
+        );
+        assert_eq!(b.bytes(), recount(&b));
+        // PRESENCE: the buffer still keeps the recent past.
+        assert!(b.frames.len() > 1000, "only {} frames kept", b.frames.len());
+    }
+
+    /// A cap smaller than one frame's bookkeeping records nothing, rather
+    /// than a frame whose payload is truncated to nothing.
+    #[test]
+    fn a_cap_below_one_frame_records_nothing() {
+        let mut b = RewindBuffer::new(FRAME_OVERHEAD);
+        assert!(!b.push(1, b"x"));
+        assert!(b.is_empty());
+        assert_eq!(b.bytes(), 0);
     }
 }
