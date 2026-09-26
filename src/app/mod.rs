@@ -46611,16 +46611,28 @@ impl App {
         // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
         // against the new servers; the stale diagnostics / progress from the
         // old root are dropped with it.
-        self.lsp = match crate::lsp::LspManager::new(new_root.clone()) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                // Not stderr: the TUI owns the screen here, and text written
-                // around ratatui stays on it (#537's class of leak).
-                let msg = format!("Language servers could not restart: {e}");
-                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
-                self.status = msg;
-                None
-            }
+        //
+        // Not while a source build of croft has the servers stopped (#694):
+        // starting them now would put rust-analyzer back beside the compile.
+        // The manager drops either way, and the end of the build starts one
+        // at the new root, since the resume reads `workspace_root()`.
+        self.lsp = match self.lsp_paused_for_build {
+            true => None,
+            false => match crate::lsp::LspManager::new(new_root.clone()) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    // Not stderr: the TUI owns the screen here, and text written
+                    // around ratatui stays on it (#537's class of leak).
+                    let msg = format!("Language servers could not restart: {e}");
+                    crate::output::push(
+                        "Language Servers",
+                        crate::output::OutputLevel::Error,
+                        &msg,
+                    );
+                    self.status = msg;
+                    None
+                }
+            },
         };
         self.lsp_last_seen.clear();
         self.lsp_diagnostics.clear();

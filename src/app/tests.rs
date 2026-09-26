@@ -52985,3 +52985,32 @@ fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
     assert!(!app.apply_source_build_state(false));
     assert!(app.lsp.is_none());
 }
+
+/// #694: re-rooting while a build has the language servers stopped must not
+/// start them beside the compile; the build's end starts them at the new
+/// root instead.
+#[test]
+fn a_reroot_during_a_source_build_leaves_the_servers_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none());
+
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(
+        app.lsp.is_none(),
+        "a re-root started the servers while the build still runs"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    let lsp = app
+        .lsp
+        .as_ref()
+        .expect("the build's end restarts the servers");
+    assert_eq!(
+        lsp.workspace_root(),
+        app.workspace_root(),
+        "the restarted servers must serve the NEW root"
+    );
+}

@@ -3009,8 +3009,11 @@ CROFT_AVAIL_KB=$(awk '/^MemAvailable:/ {{ print $2 }}' /proc/meminfo 2>/dev/null
 if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
   CROFT_JOBS=1
 fi
+# Little memory free right now counts too, whatever the total: a big host
+# can still be mostly spoken for by the time the update runs.
 if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
-  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job under a memory cap" >&2
+  CROFT_JOBS=1
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job" >&2
 fi
 # And cap the build's memory outright where systemd can: the compile runs
 # in its own scope limited to 60% of RAM with no swap, so if it outgrows
@@ -4339,6 +4342,14 @@ Host !blocked *.internal
         assert!(
             command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
             "the memory cap must wrap the compile itself"
+        );
+        // Little memory FREE drops to one job too, not just a small total:
+        // a warning that promised one job without setting it was the bug.
+        let avail = command.find("-lt 2097152").unwrap();
+        let avail_branch = &command[avail..command[avail..].find("fi\n").unwrap() + avail];
+        assert!(
+            avail_branch.contains("CROFT_JOBS=1"),
+            "low available memory must drop to one job: {avail_branch}"
         );
         // The marker goes as soon as the compile does, so language servers
         // are not held back through the rest of the install.
