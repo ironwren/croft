@@ -594,11 +594,6 @@ mod tests {
         assert_eq!(read_pair_record(&path).as_ref(), Some(&record));
     }
 
-    /// A workspace's collab relay socket (`<hash>.collab.sock`) shares the
-    /// sessions directory and hash keying with the real session socket, and
-    /// is a live listener whenever `croft pair` seated a navigator. It is not
-    /// a session: `croft ls` used to print it as a phantom `(unknown)` row
-    /// whose 8-char id collided with the real session's.
     /// #343: `croft ls` says which sessions `croft web` exposes, and where.
     #[test]
     fn ls_shows_where_a_session_is_served_on_the_web() {
@@ -627,6 +622,11 @@ mod tests {
         assert_eq!(rows[0].web.as_deref(), Some("wss://127.0.0.1:7681/"));
     }
 
+    /// A workspace's collab relay socket (`<hash>.collab.sock`) shares the
+    /// sessions directory and hash keying with the real session socket, and
+    /// is a live listener whenever `croft pair` seated a navigator. It is not
+    /// a session: `croft ls` used to print it as a phantom `(unknown)` row
+    /// whose 8-char id collided with the real session's.
     #[test]
     fn ls_does_not_report_the_collab_relay_as_a_session() {
         let dir = tempfile::tempdir().unwrap();
