@@ -1,8 +1,8 @@
 # croft web: a browser client for the session host
 
-Design RFC, now being built. The WebSocket transport (#341) and its token,
-TLS and listener lifecycle (#343) have shipped; the page (#342) has not. What
-has shipped is described under [The transport](#the-transport) and
+Design RFC, now built. The WebSocket transport (#341), its token, TLS and
+listener lifecycle (#343), and the page (#342) have shipped. What shipped is
+described under [The transport](#the-transport), [The page](#the-page) and
 [Threat model](#threat-model), at the end.
 
 The session host already fans one inner croft out to N clients, enforces write
@@ -304,6 +304,55 @@ machine is to leave `croft web` on loopback and put something in front of it:
 - Caddy as a reverse proxy: `reverse_proxy 127.0.0.1:7681` in a site block.
 - A certificate from `mkcert` for `--tls`, when the browser is on the same
   machine or you install mkcert's root on the other.
+
+## The page
+
+`croft web` prints `http://127.0.0.1:7681/#token=...`. Opening it loads a page
+the listener serves from the binary: `/`, `/term.js`, `/app.js` and
+`/icons.woff2`, about 65 KB together, with a Content-Security-Policy that
+allows the page's own scripts, `data:` images and a WebSocket back to the
+host it came from, and nothing else. The token sits in the fragment, which
+the browser never sends; the page moves it into memory and clears it from
+the address bar before connecting.
+
+**Rendering.** `term.js` is a terminal model written for what croft emits,
+not a general emulator: cursor addressing, SGR colour (16, 256, truecolor,
+and the colon forms) and attributes, erase and insert/delete, scroll
+regions, the alternate screen, the private modes croft sets, kitty keyboard
+flags (push, pop and the SET form croft re-asserts on every resize), and
+wide and combining characters. `app.js` paints its grid on a canvas.
+
+- **Icons.** `icons.woff2` holds the Nerd Font glyphs croft's source uses and
+  nothing else (150 glyphs, 21 KB). `scripts/web_icon_font.py` rebuilds it
+  from the Meslo Nerd Font; `scripts/tests/test_web_page.py` fails while an
+  icon in `src/` is missing from it.
+- **Images.** Kitty (`APC G`, chunked PNG, placements replaced by id, `a=d`
+  deletes) and iTerm2 (`OSC 1337;File=`) images become `<img>` elements over
+  the cells they cover, removed when those cells are written or the screen is
+  cleared. Sixel is not decoded.
+- **Queries.** DA1, cursor position, kitty flags, window and cell size, and
+  default colours are answered, so croft's probes get a reply. Only the
+  write-control holder's replies reach croft, as for any client.
+
+**Input.**
+
+- Keys: with kitty flags on, a key with Ctrl, Alt or Cmd is sent as
+  `CSI code;mods u`, so `Cmd+K` reaches croft as `CSI 107;9u` exactly as
+  from iTerm2 or Ghostty. Without them, the legacy encodings. Plain text goes
+  through a hidden textarea, so IME composition, dead keys and phone
+  keyboards send what they show. The chords a browser keeps for itself are
+  the ones listed under [Input](#input); `Cmd+K` and the palette reach
+  everything they would.
+- Mouse: SGR reports for the modes croft enables, including drags (pane
+  seams resize) and the wheel. Touch scrolling becomes wheel reports.
+- Paste: bracketed when croft asked for it.
+- Clipboard: croft's OSC 52 copies go to the system clipboard in a secure
+  context (HTTPS, or `localhost`); elsewhere the page says the copy was not
+  made.
+
+**Size.** The page sizes the grid to the window and sends `resize`; the
+host's smallest-window rule applies, so a small browser window shrinks the
+session for everyone attached, as a small terminal would.
 
 ## Threat model
 

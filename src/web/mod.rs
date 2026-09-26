@@ -112,10 +112,11 @@ pub fn run(workspace: &Path, opts: Options) -> Result<()> {
             addr: Some(local),
         },
     )?;
-    println!("croft web: serving {} at {url}", root.display());
-    println!("  token {token}");
+    let page_scheme = if tls.is_some() { "https" } else { "http" };
+    println!("croft web: serving {}", root.display());
+    println!("  open {page_scheme}://{local}/#token={token}");
     println!(
-        "  a client offers the WebSocket subprotocols `{PROTOCOL}` and `{TOKEN_PROTOCOL_PREFIX}<token>`"
+        "  or connect to {url} offering the WebSocket subprotocols `{PROTOCOL}` and `{TOKEN_PROTOCOL_PREFIX}{token}`"
     );
     {
         let (socket, record) = (socket.clone(), record.clone());
@@ -376,9 +377,14 @@ fn handle<C: Conn>(mut conn: C, server: &Server, scheme: &str) -> std::io::Resul
     let request = ws::read_request(&mut conn)?;
     conn.read_timeout(None)?;
     let Some(key) = request.websocket_key().map(str::to_string) else {
-        return conn.write_all(
-            ws::refusal("426 Upgrade Required", "croft web speaks WebSocket\n").as_bytes(),
-        );
+        // The page is static and holds no secret, so it is served to anyone
+        // who can reach the port; the session behind it needs the token.
+        return match page(&request.target) {
+            Some((content_type, body)) => {
+                conn.write_all(&page_response(content_type, body, request.header("host")))
+            }
+            None => conn.write_all(ws::refusal("404 Not Found", "not found\n").as_bytes()),
+        };
     };
     let offered = offered_token(request.header("sec-websocket-protocol"));
     if !token_matches(offered, &server.token) {
@@ -402,6 +408,50 @@ fn handle<C: Conn>(mut conn: C, server: &Server, scheme: &str) -> std::io::Resul
     };
     conn.write_all(ws::upgrade_response(&key, Some(PROTOCOL)).as_bytes())?;
     bridge(conn, unix)
+}
+
+/// The page (#342): markup, the terminal model and the glue, embedded so
+/// `croft web` needs nothing beside the binary.
+const INDEX_HTML: &str = include_str!("page/index.html");
+const TERM_JS: &str = include_str!("page/term.js");
+const APP_JS: &str = include_str!("page/app.js");
+/// The Nerd Font glyphs croft's icons use, subset by
+/// scripts/web_icon_font.py so a browser needs no font installed.
+const ICONS_WOFF2: &[u8] = include_bytes!("page/icons.woff2");
+
+/// What the page serves at `target`, as (content type, body).
+fn page(target: &str) -> Option<(&'static str, &'static [u8])> {
+    let path = target.split(['?', '#']).next().unwrap_or_default();
+    match path {
+        "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX_HTML.as_bytes())),
+        "/term.js" => Some(("text/javascript; charset=utf-8", TERM_JS.as_bytes())),
+        "/app.js" => Some(("text/javascript; charset=utf-8", APP_JS.as_bytes())),
+        "/icons.woff2" => Some(("font/woff2", ICONS_WOFF2)),
+        _ => None,
+    }
+}
+
+/// A page response. The Content-Security-Policy allows only the page's own
+/// scripts, inline images decoded from the session, and a WebSocket back to
+/// the host it was loaded from; no other network request can be made.
+fn page_response(content_type: &str, body: &[u8], host: Option<&str>) -> Vec<u8> {
+    // Only a plain host[:port] goes into the policy, so a crafted Host
+    // header cannot add directives to it.
+    let host = host.filter(|h| {
+        !h.is_empty()
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+    });
+    let sockets = host
+        .map(|h| format!(" ws://{h} wss://{h}"))
+        .unwrap_or_default();
+    let mut out = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:; font-src 'self'; connect-src 'self'{sockets}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
 }
 
 /// Relay between one WebSocket and one session-host connection until either
@@ -776,7 +826,15 @@ mod tests {
             });
         }
 
-        // Refusals first: no upgrade, a wrong token, a foreign page.
+        // A plain GET is the page, with no token needed.
+        let mut plain = TcpStream::connect(addr).unwrap();
+        write!(plain, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").unwrap();
+        let mut got = String::new();
+        plain.read_to_string(&mut got).unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 OK"), "{got}");
+        assert!(got.contains("<canvas id=\"grid\">"), "{got}");
+
+        // Refusals: a wrong token, no `croft`, a foreign page.
         let (_t, head) = Client::connect(addr, "croft, croft.token.nope", None);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         let (_t, head) = Client::connect(addr, "croft.token.secret", None);
@@ -859,6 +917,54 @@ mod tests {
                 Instant::now() < end,
                 "the browser stayed on the roster: {term_roster}"
             );
+        }
+    }
+
+    #[test]
+    fn the_page_is_served_with_a_policy_that_allows_nothing_else() {
+        let (ty, _) = page("/").unwrap();
+        assert!(ty.starts_with("text/html"));
+        assert!(INDEX_HTML.contains("term.js") && INDEX_HTML.contains("app.js"));
+        assert!(INDEX_HTML.contains("icons.woff2"));
+        assert_eq!(page("/?x=1").map(|p| p.1), Some(INDEX_HTML.as_bytes()));
+        assert_eq!(page("/term.js").map(|p| p.1), Some(TERM_JS.as_bytes()));
+        assert_eq!(page("/app.js").map(|p| p.1), Some(APP_JS.as_bytes()));
+        assert_eq!(page("/icons.woff2"), Some(("font/woff2", ICONS_WOFF2)));
+        assert!(ICONS_WOFF2.starts_with(b"wOF2"));
+        assert_eq!(page("/../etc/passwd"), None);
+        assert_eq!(page("/favicon.ico"), None);
+
+        let reply =
+            String::from_utf8(page_response("text/html", b"hi", Some("127.0.0.1:7681"))).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(reply.contains("Content-Length: 2\r\n"), "{reply}");
+        assert!(reply.contains("default-src 'none'"), "{reply}");
+        assert!(
+            reply.contains("connect-src 'self' ws://127.0.0.1:7681 wss://127.0.0.1:7681;"),
+            "{reply}"
+        );
+        assert!(reply.ends_with("\r\n\r\nhi"));
+        // A Host header cannot write into the policy.
+        let reply =
+            String::from_utf8(page_response("text/html", b"", Some("x; script-src *"))).unwrap();
+        assert!(!reply.contains("script-src *"), "{reply}");
+        assert!(reply.contains("connect-src 'self'; base-uri"), "{reply}");
+    }
+
+    /// #342's budget: the whole page, icon font included, under 300 KB, with
+    /// no external request anywhere in it.
+    #[test]
+    fn the_page_stays_small_and_self_contained() {
+        let total = INDEX_HTML.len() + TERM_JS.len() + APP_JS.len() + ICONS_WOFF2.len();
+        assert!(total < 300 * 1024, "the page is {total} bytes");
+        for (name, text) in [
+            ("index.html", INDEX_HTML),
+            ("term.js", TERM_JS),
+            ("app.js", APP_JS),
+        ] {
+            for scheme in ["http://", "https://", "//cdn", "@import"] {
+                assert!(!text.contains(scheme), "{name} references {scheme}");
+            }
         }
     }
 
