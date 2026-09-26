@@ -74,7 +74,11 @@ impl Task {
             let literal_space =
                 raw.is_empty() || literal_parts(raw).any(|l| l.contains(char::is_whitespace));
             line.push(' ');
-            line.push_str(&expand_task_text(raw, ctx, literal_space)?);
+            // An argument that expands to nothing (an unset `${env:X}`) is
+            // still an argument: left out, the next one took its place
+            // (`--name  f` passed `f` as the name).
+            let arg = expand_task_text(raw, ctx, literal_space)?;
+            line.push_str(if arg.is_empty() { "''" } else { &arg });
         }
         let mut setup = Vec::new();
         if let Some(cwd) = &v.cwd {
@@ -97,9 +101,10 @@ impl Task {
 /// a variable filled in is data whatever it holds, so it is quoted when it
 /// needs to be: a workspace `it's` or a file `a;touch x.rs` from a cloned
 /// repo must not reach the shell as syntax, in `python3 ${file}` as much as
-/// in an argument. A variable croft does not expand (`${HOME}`,
-/// `${input:...}`) is left bare for the shell, as it always was, rather
-/// than refusing the task; an unset `${env:X}` is empty, as in VS Code.
+/// in an argument. A variable croft does not know (`${HOME}`) is left bare
+/// for the shell to expand rather than refusing the task; an unset
+/// `${env:X}` is empty, as in VS Code; `${input:...}` / `${command:...}`,
+/// which VS Code prompts for, refuse the task.
 /// With `quote_literals`, the literal text is quoted too, so the whole
 /// result is one shell word.
 fn expand_task_text(
@@ -128,6 +133,11 @@ fn expand_task_text(
             }
             Ok(value) => out.push_str(&value),
             Err(e) if e.contains("no active file") => return Err(e),
+            // VS Code prompts for these; croft cannot, and bash would read
+            // `${input:x}` as a substring expansion and pass nothing.
+            Err(_) if var.starts_with("input:") || var.starts_with("command:") => {
+                return Err(format!("${{{var}}}: croft cannot prompt for task inputs"));
+            }
             Err(_) if var.starts_with("env:") => {}
             Err(_) => {
                 out.push_str("${");
@@ -604,7 +614,9 @@ mod tests {
                  "args": ["-m", "fix bug", "${file}"],
                  "options": {"cwd": "${workspaceFolder}/web", "env": {"MODE": "it's"}}},
                 {"label": "line", "command": "python3 ${file} ${env:CROFT_TEST_UNSET_VAR} ${HOME}"},
-                {"label": "plain", "command": "npm run lint"}
+                {"label": "plain", "command": "npm run lint"},
+                {"label": "empty", "command": "prog", "args": ["--name", "${env:CROFT_TEST_UNSET_VAR}", "f"]},
+                {"label": "input", "command": "prog ${input:target}"}
             ]}"#,
         )
         .unwrap();
@@ -643,6 +655,16 @@ mod tests {
         );
         assert!(!std::path::Path::new("pwned.rs").exists());
         assert_eq!(task("plain").command_line(&ctx).unwrap(), "npm run lint");
+        assert_eq!(
+            task("empty").command_line(&ctx).unwrap(),
+            "prog --name '' f"
+        );
+        assert!(
+            task("input")
+                .command_line(&ctx)
+                .unwrap_err()
+                .contains("cannot prompt")
+        );
         let no_file = crate::dap::configs::SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,

@@ -23799,6 +23799,9 @@ impl App {
     }
 
     pub fn stage_selected_source_control_entries(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
         let indices: Vec<usize> = if self.source_control.multi_selection.is_empty() {
             self.source_control
                 .selected_change
@@ -23998,6 +24001,9 @@ impl App {
     /// Unstage a single entry by index (the inline "−" icon on a staged
     /// row). Mirror of `stage_source_control_entry`.
     pub fn unstage_source_control_entry(&mut self, entry_idx: usize) {
+        if self.repo_git_busy() {
+            return;
+        }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
@@ -24105,6 +24111,20 @@ impl App {
                 self.git_view_job = None;
                 false
             }
+        }
+    }
+
+    /// Whether a network operation on THIS repository is still running,
+    /// saying so: what a commit, stage or branch switch must not overlap
+    /// (they fight over `index.lock`, and a pull would land on the switched
+    /// branch). A clone writes into another directory and blocks nothing here.
+    fn repo_git_busy(&mut self) -> bool {
+        match &self.git_net_job {
+            Some((running, _)) if running != "clone" => {
+                self.status = format!("Git: {running} is still running");
+                true
+            }
+            _ => false,
         }
     }
 
@@ -24365,7 +24385,7 @@ impl App {
         // Nothing else touches the repository while a push, pull or fetch
         // runs in the background: a commit or branch switch under it fights
         // over `index.lock`, and a pull would land on the switched branch.
-        if !matches!(action, ScmAction::ShowGitOutput) && self.git_net_busy() {
+        if !matches!(action, ScmAction::ShowGitOutput) && self.repo_git_busy() {
             return;
         }
         match action {
@@ -27434,7 +27454,7 @@ impl App {
 
     /// Resolve the branch-picker selection per its open purpose.
     fn apply_branch_picker_selection(&mut self) {
-        if self.git_net_busy() {
+        if self.repo_git_busy() {
             return;
         }
         let Some(picker) = self.branch_picker.as_ref() else {
@@ -27647,6 +27667,9 @@ impl App {
     }
 
     pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        if self.repo_git_busy() {
+            return;
+        }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
@@ -28123,6 +28146,9 @@ impl App {
     }
 
     fn commit_source_control(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
             self.source_control.commit_feedback = Some(String::from("Empty commit message"));

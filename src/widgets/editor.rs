@@ -4509,9 +4509,13 @@ impl Editor {
         // process writes to it, freezing the UI thread indefinitely; none of
         // them is a document. (Directories and missing paths go on to the
         // handling they always had.)
+        // Process substitution (`croft <(git show HEAD:f)`) hands over a
+        // `/dev/fd/N` pipe whose writer is already running, so it reads.
+        let substituted = path.starts_with("/dev/fd") || path.starts_with("/proc/self/fd");
         if let Ok(meta) = std::fs::metadata(path)
             && !meta.is_file()
             && !meta.is_dir()
+            && !substituted
         {
             anyhow::bail!("{} is not a regular file", path.display());
         }

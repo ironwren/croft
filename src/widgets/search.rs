@@ -759,9 +759,26 @@ fn replace_in_line(
         let adjacent_empty = start == end && prev_end == Some(start);
         if !adjacent_empty {
             out.push_str(&line[last..start]);
-            match full.and_then(|re| re.captures(&line[start..end])) {
+            // Captures from the whole line at the match, so assertions like
+            // `\b` see the text around it (on the bare substring `\b(\.rs)`
+            // no longer matched and `$1` came out literally); the substring
+            // alone only as a fallback.
+            let caps = full.and_then(|re| {
+                re.captures_at(line, start)
+                    .filter(|c| {
+                        c.get(0)
+                            .is_some_and(|m| (m.start(), m.end()) == (start, end))
+                    })
+                    .or_else(|| {
+                        re.captures(&line[start..end])
+                            .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
+                    })
+            });
+            match caps {
                 Some(caps) if opts.use_regex => {
-                    caps.expand(&brace_group_refs(replacement), &mut out);
+                    let mut expanded = String::new();
+                    caps.expand(&brace_group_refs(replacement), &mut expanded);
+                    out.push_str(&expanded);
                 }
                 _ => out.push_str(replacement),
             }
@@ -828,10 +845,11 @@ pub fn replace_in_text(
 ) -> Option<(String, usize)> {
     let q = query.trim();
     let matcher = build_matcher(q, opts)?;
-    // The pattern anchored to a whole match, for `$1` expansion only.
+    // The pattern itself, for `$1` expansion only. Not wrapped in anything:
+    // a `(?x)` query's trailing `# comment` swallowed a closing `)$`.
     let full = if opts.use_regex {
         let case = if opts.case_sensitive { "" } else { "(?i)" };
-        Some(regex::Regex::new(&format!("{case}^(?:{q})$")).ok()?)
+        Some(regex::Regex::new(&format!("{case}{q}")).ok()?)
     } else {
         None
     };
@@ -3735,6 +3753,18 @@ mod tests {
         assert_eq!(
             replace_in_text("let a1 = b2;", "([a-z])(\\d)", "$2$1", re).map(|r| r.0),
             Some(String::from("let 1a = 2b;"))
+        );
+    }
+
+    #[test]
+    fn captures_keep_the_context_around_the_match() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            replace_in_text("foo.rs", r"\b(\.rs)", "${1}x", re).map(|r| r.0),
+            Some(String::from("foo.rsx"))
         );
     }
 
