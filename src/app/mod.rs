@@ -3673,6 +3673,10 @@ pub struct App {
     review_export_pr: Option<(PathBuf, String)>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
+    /// The branch checked out when `review_pr` was recorded: the number is
+    /// reused only while it is still the branch, or a `gh pr checkout` of
+    /// another PR sent comments to the old one.
+    review_pr_branch: Option<String>,
     review_nodes: std::collections::HashMap<u64, String>,
     review_verdict: Option<crate::review_threads::ReviewEvent>,
     review_gh: String,
@@ -5398,6 +5402,7 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| String::from(crate::review_threads::DEFAULT_AI_PREFIX)),
             review_pr: None,
+            review_pr_branch: None,
             review_nodes: std::collections::HashMap::new(),
             review_verdict: None,
             review_gh: String::from("gh"),
@@ -17813,6 +17818,9 @@ impl App {
         // selection. Croft Dark keeps the legacy bright-blue accent so the
         // menu stays coherent with that theme's blue focus border.
         let border_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        // Clipped to the frame (a submenu flipped at a narrow edge can still
+        // reach past it).
+        let rect = rect.intersection(frame.area());
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(border_blue))
@@ -28841,14 +28849,23 @@ impl App {
         Some((root, path, rel))
     }
 
+    /// Remember the PR under review, with the branch it belongs to.
+    fn set_review_pr(&mut self, root: PathBuf, number: String) {
+        self.review_pr_branch = self.git_worker_for_root(&root).status().branch.clone();
+        self.review_pr = Some((root, number));
+    }
+
     /// The PR number for `root`'s branch, remembered for the write side, or
     /// `None` with the reason in the status bar.
     fn review_pr_number(&mut self, root: &Path) -> Option<String> {
         // The PR already loaded for this root, when there is one: this runs
         // on the UI thread for every comment and submit, and asking GitHub
         // each time froze croft on a slow network or a gh auth prompt.
+        let branch = self.git_worker_for_root(root).status().branch.clone();
         if let Some((r, number)) = &self.review_pr
             && r == root
+            && branch.is_some()
+            && branch == self.review_pr_branch
         {
             return Some(number.clone());
         }
@@ -28867,7 +28884,7 @@ impl App {
                 return None;
             }
         };
-        self.review_pr = Some((root.to_path_buf(), number.clone()));
+        self.set_review_pr(root.to_path_buf(), number.clone());
         Some(number)
     }
 
@@ -28939,7 +28956,7 @@ impl App {
         notes: Vec<u64>,
         inline: usize,
     ) {
-        self.review_pr = Some((root.clone(), number.clone()));
+        self.set_review_pr(root.clone(), number.clone());
         self.review_export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
@@ -29052,7 +29069,7 @@ impl App {
         mut threads: Vec<crate::review_threads::Thread>,
         states: std::collections::HashMap<u64, (String, bool)>,
     ) {
-        self.review_pr = Some((root, number));
+        self.set_review_pr(root, number);
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
@@ -46408,9 +46425,12 @@ impl App {
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
         let widest = menu.items.iter().map(menu_entry_width).max().unwrap_or(0);
-        let width = (widest + 4).max(18) as u16;
-        let height = (menu.items.len() + 2) as u16;
         let area = self.last_frame_area;
+        // Never past the frame: a long menu on a short terminal (or any menu
+        // under 18 columns) built a rect outside the buffer, which panics.
+        let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
+        let width = fit((widest + 4).max(18) as u16, area.width);
+        let height = fit((menu.items.len() + 2) as u16, area.height);
         // Clamp identically to `render_context_menu` so hit-testing maps
         // clicks to the same row the user actually sees. Without this, a
         // menu that has to shift up to fit (right-click low on screen)
@@ -46444,9 +46464,10 @@ impl App {
         };
         let main = self.menu_rect()?;
         let widest = items.iter().map(menu_entry_width).max().unwrap_or(0);
-        let width = (widest + 4).max(18) as u16;
-        let height = (items.len() + 2) as u16;
         let area = self.last_frame_area;
+        let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
+        let width = fit((widest + 4).max(18) as u16, area.width);
+        let height = fit((items.len() + 2) as u16, area.height);
         // Float right of the main panel; flip left if it would overflow.
         let mut x = main.x + main.width;
         if area.width > 0 && x + width > area.width {
@@ -51091,6 +51112,12 @@ fn fence_command(interpreter: &str, code: &str) -> String {
             .replace('\n', "\\n")
             .replace('\t', "\\t")
             .replace('\'', "'\\''");
+        // A shell block runs IN the pane's shell, as a typed one does (a
+        // `cd` or `export` persists, bash-isms still work): `eval` of the
+        // decoded text. Other interpreters read it on stdin.
+        if interpreter == "sh" {
+            return format!("eval \"$(printf '%b' '{escaped}')\"\r");
+        }
         return format!("printf '%b' '{escaped}' | {interpreter}\r");
     }
     match interpreter {

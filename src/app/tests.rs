@@ -515,6 +515,25 @@ fn terminal_warning_renders_inside_a_narrow_frame_without_panicking() {
     term.draw(|f| app.render(f)).unwrap();
 }
 
+/// A context menu longer than the terminal is tall, or on a terminal under
+/// 18 columns, renders clipped instead of panicking.
+#[test]
+fn a_context_menu_bigger_than_the_terminal_renders_without_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let items: Vec<(String, MenuAction)> = (0..30)
+        .map(|i| (format!("item {i}"), MenuAction::Create(CreateKind::File)))
+        .collect();
+    app.context_menu = Some(ContextMenu::flat((2, 2), items, tmp.path().to_path_buf()));
+    for (w, h) in [(80, 12), (12, 30), (8, 3)] {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let r = app.menu_rect().unwrap();
+        assert!(r.width <= w && r.height <= h, "{r:?} in {w}x{h}");
+    }
+}
+
 /// Overlays on a terminal smaller than their minimum size: `clamp(40, w)`
 /// panics when the width is under 40, and a confirm dialog's 50-column
 /// floor built a rect outside the buffer. A phone in portrait or a small
@@ -24796,8 +24815,16 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap(), code);
-    // `sh` blocks get the same treatment, piped to sh.
-    assert!(super::fence_command("sh", "echo hi!\n").ends_with("| sh\r"));
+    // `sh` blocks run in the pane's own shell through eval: a `cd` in the
+    // block persists after it.
+    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n");
+    assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
+    let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
+    let out = std::process::Command::new("sh")
+        .args(["-c", &probe])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hi!\n/\n");
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
