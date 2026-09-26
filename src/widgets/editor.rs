@@ -6558,6 +6558,38 @@ impl Editor {
         true
     }
 
+    /// [`Self::apply_span_edits`] for text another seat wrote (#349): the line
+    /// provenance map is spliced edit by edit, bottom-up like the edits, so
+    /// rows below a multi-line insertion keep their own seats, and the rows
+    /// each edit wrote are credited to `seat`. One undo step.
+    pub fn apply_span_edits_as(
+        &mut self,
+        edits: &[TextSpanEdit],
+        seat: crate::provenance::Seat,
+    ) -> usize {
+        if edits.is_empty() {
+            return 0;
+        }
+        self.pin_on_edit();
+        self.push_undo(EditKind::Paste);
+        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        if n > 0 {
+            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+            order.sort_by(|a, b| b.start.cmp(&a.start));
+            for e in order {
+                let removed = e.end.0.saturating_sub(e.start.0) + 1;
+                let added = e.new_text.matches('\n').count() + 1;
+                self.provenance.splice(e.start.0, removed, added);
+                self.provenance
+                    .record(e.start.0..e.start.0 + added, seat.clone());
+            }
+            self.provenance.truncate(self.lines.len());
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        n
+    }
+
     /// Apply LSP rename edits to this buffer in-memory as a single undo step,
     /// marking the tab dirty (the user saves to persist). Returns the number
     /// of edits applied.

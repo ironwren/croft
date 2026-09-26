@@ -12493,6 +12493,66 @@ fn bounded_output_gives_up_on_a_command_that_hangs() {
     assert_eq!(out, b"42");
 }
 
+/// The accept shifts the server's ranges by what was typed or deleted since
+/// the request, applies the auto-import in the request's coordinates, is one
+/// undo step, and credits the text to the server (#349).
+#[test]
+fn a_completion_accept_tracks_the_caret_and_is_one_generated_undo_step() {
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Requested at `abc|)`, then one Backspace: `ab|)`.
+    app.editor.lines = vec![String::from("ab)")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.completion_origin = Some((0, 3));
+    let item = crate::lsp::CompletionItem {
+        label: String::from("abcdef"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 0),
+            end: (0, 3),
+            new_text: String::from("abcdef"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(app.editor.lines, vec![String::from("abcdef)")]);
+    assert_eq!(app.editor.cursor_col, 6);
+    // A same-row additional edit lands where the server meant it, and the
+    // whole accept is one undo step credited to the server.
+    app.editor.lines = vec![String::from("x = fo; y"), String::from("z")];
+    app.editor.provenance = crate::provenance::Provenance::new();
+    app.editor.cursor_col = 6;
+    app.completion_origin = Some((0, 6));
+    let before = app.editor.lines.clone();
+    let item = crate::lsp::CompletionItem {
+        label: String::from("foobar"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 4),
+            end: (0, 6),
+            new_text: String::from("foobar"),
+            utf16: true,
+        }),
+        additional_edits: vec![TextSpanEdit {
+            start: (0, 9),
+            end: (0, 9),
+            new_text: String::from("Z"),
+            utf16: true,
+        }],
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(app.editor.lines[0], "x = foobar; yZ");
+    assert_eq!(app.editor.cursor_col, 10);
+    assert_eq!(
+        app.editor.provenance.seat(0),
+        Some(&crate::provenance::Seat::Generated)
+    );
+    app.editor.undo();
+    assert_eq!(app.editor.lines, before, "one accept is one undo step");
+}
+
 /// A completion is accepted by the server's own edit: TypeScript's `?.foo`
 /// replaces the `.` before the word (croft produced `a.?.foo`), letters
 /// typed since the request go too, and an auto-import lands with it.

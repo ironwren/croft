@@ -3507,6 +3507,10 @@ pub struct App {
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
+    /// Where the caret was (row, char column) when the pending completion was
+    /// requested: the server's edit ranges describe the line then, and the
+    /// accept shifts them by what was typed or deleted since.
+    completion_origin: Option<(usize, usize)>,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -5361,6 +5365,7 @@ impl App {
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
             completion_request_id: None,
+            completion_origin: None,
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -7943,6 +7948,7 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
+        self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -12844,12 +12850,12 @@ impl App {
         self.status = String::from("Resolving quick fix");
     }
 
-    /// Accept a completion by the server's own edit: its range, from where
-    /// it starts to its end or the caret, whichever is further (so letters
-    /// typed since the request go too),
-    /// becomes its text, then its additional edits (auto-imports) apply.
-    /// False when the item has no usable edit, for the prefix fallback.
+    /// Accept a completion by the server's own edit and its additional edits
+    /// (auto-imports), shifted by what was typed or deleted at the caret since
+    /// the request, as one generated edit and one undo step. False when the
+    /// item has no usable edit, for the prefix fallback.
     fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
+        use crate::widgets::editor::TextSpanEdit;
         let Some(te) = &item.text_edit else {
             return false;
         };
@@ -12860,42 +12866,84 @@ impl App {
         let Some(line) = self.editor.lines.get(row) else {
             return false;
         };
-        let col = |c: usize| {
-            if te.utf16 {
+        let to_char = |e: &TextSpanEdit, c: usize| {
+            if e.utf16 {
                 crate::widgets::editor::utf16_to_char_col(line, c as u32)
             } else {
                 c
             }
         };
-        let (start, end) = (col(te.start.1), col(te.end.1));
         let caret = self.editor.cursor_col;
+        // The server's ranges describe the line when the completion was asked
+        // for; the caret has moved since by what was typed (or deleted) at it.
+        // Everything on this row from the request point on shifts with it,
+        // both ways: a Backspace after the request made the server's end
+        // reach past the word and swallow the `)` after it.
+        let shift: isize = match self.completion_origin {
+            Some((r, c)) if r == row => caret as isize - c as isize,
+            _ => 0,
+        };
+        let origin_col = self.completion_origin.map_or(caret, |(_, c)| c);
+        let moved = |c: usize| -> usize {
+            if c >= origin_col {
+                (c as isize + shift).max(0) as usize
+            } else {
+                c
+            }
+        };
+        let line_len = line.chars().count();
+        let start = to_char(te, te.start.1);
+        let end = moved(to_char(te, te.end.1)).max(caret).min(line_len);
         if start > caret {
             return false;
         }
-        // To the server's end, or the caret when letters typed since the
-        // request run past it: a range covering a suffix after the caret
-        // (`fooBar` completed from `foo|`) replaces the suffix too.
-        self.editor
-            .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
-                start: (row, start),
-                end: (row, end.max(caret)),
-                new_text: te.new_text.clone(),
-                utf16: false,
-            }]);
-        self.editor.cursor_col = start + te.new_text.chars().count();
-        if !item.additional_edits.is_empty() {
-            // Imports land before the caret: it moves down by the rows the
-            // edits ending before the completed word add (their positions
-            // are the document's before any edit, per the spec).
-            let rows_added: isize = item
-                .additional_edits
-                .iter()
-                .filter(|e| e.end <= (row, te.start.1))
-                .map(|e| e.new_text.matches('\n').count() as isize - (e.end.0 - e.start.0) as isize)
-                .sum();
-            self.editor.apply_span_edits(&item.additional_edits);
-            self.editor.cursor_row = (row as isize + rows_added).max(0) as usize;
+        // The main edit and its additional edits (auto-imports) go in as ONE
+        // edit against the same text, as the spec defines them: applied one
+        // after the other, an import on this row landed in the edited line,
+        // and one accept took two undos.
+        let mut edits = vec![TextSpanEdit {
+            start: (row, start),
+            end: (row, end),
+            new_text: te.new_text.clone(),
+            utf16: false,
+        }];
+        for e in &item.additional_edits {
+            let mut e = e.clone();
+            if e.start.0 == row {
+                e.start.1 = moved(to_char(&e, e.start.1));
+                e.end.1 = if e.end.0 == row {
+                    moved(to_char(&e, e.end.1))
+                } else {
+                    e.end.1
+                };
+                e.utf16 = false;
+            }
+            edits.push(e);
         }
+        // The caret lands after the inserted text, moved by what the
+        // additional edits before it added or removed.
+        let mut caret_row = row as isize;
+        let mut caret_col = (start + te.new_text.chars().count()) as isize;
+        for e in &edits[1..] {
+            if e.end > (row, start) {
+                continue;
+            }
+            let added_rows = e.new_text.matches('\n').count() as isize;
+            caret_row += added_rows - (e.end.0 - e.start.0) as isize;
+            if e.end.0 == row {
+                let tail = e.new_text.rsplit('\n').next().unwrap_or("").chars().count() as isize;
+                caret_col += if added_rows == 0 && e.start.0 == row {
+                    tail - (e.end.1 - e.start.1) as isize
+                } else {
+                    tail + e.start.1 as isize - e.end.1 as isize
+                };
+            }
+        }
+        // An accepted completion is the server's text, not the user's (#349).
+        self.editor
+            .apply_span_edits_as(&edits, crate::provenance::Seat::Generated);
+        self.editor.cursor_row = caret_row.max(0) as usize;
+        self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
         true
     }
