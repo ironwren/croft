@@ -6579,7 +6579,7 @@ impl Editor {
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
             let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-            order.sort_by(|a, b| b.start.cmp(&a.start));
+            order.sort_by_key(|e| std::cmp::Reverse(e.start));
             for e in order {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
