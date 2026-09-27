@@ -383,15 +383,16 @@ impl HistoryEntry {
             .unwrap_or_default()
     }
 
-    /// Whether this run was on the database at `path` named `name`: by
-    /// canonical path when the entry recorded one, else by name.
-    pub fn refers_to(&self, path: &Path, name: &str) -> bool {
+    /// Whether this run was on the database at `path` that goes, or went,
+    /// by one of `names`: by canonical path when the entry recorded one,
+    /// else by name.
+    pub fn refers_to(&self, path: &Path, names: &[&str]) -> bool {
         match &self.database_path {
             Some(p) => {
                 let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
                 canon(p) == canon(path)
             }
-            None => self.database == name,
+            None => names.contains(&self.database.as_str()),
         }
     }
 
@@ -652,11 +653,15 @@ mod tests {
         std::fs::create_dir_all(&db).unwrap();
         std::fs::create_dir_all(tmp.path().join("x")).unwrap();
         let mut e = entry(RunStatus::Succeeded);
-        assert!(e.refers_to(&db, "app"), "an old entry goes by name");
-        assert!(!e.refers_to(&db, "renamed"));
+        assert!(e.refers_to(&db, &["app"]), "an old entry goes by name");
+        assert!(!e.refers_to(&db, &["renamed"]));
+        assert!(
+            e.refers_to(&db, &["renamed", "app"]),
+            "or by a name the database had before a rename"
+        );
         e.database_path = Some(tmp.path().join("x/../app"));
-        assert!(e.refers_to(&db, "renamed"), "a path survives a rename");
-        assert!(!e.refers_to(&tmp.path().join("other"), "app"));
+        assert!(e.refers_to(&db, &["renamed"]), "a path survives a rename");
+        assert!(!e.refers_to(&tmp.path().join("other"), &["app"]));
     }
 
     /// #578: runs that only named their database get its path before a

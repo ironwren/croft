@@ -207,6 +207,18 @@ pub struct DbEntry {
     /// existed read as 0, so they sort as the oldest.
     #[serde(default)]
     pub added: u64,
+    /// Names it had before being renamed. History saved before runs
+    /// recorded their database's path names the database it ran on, so
+    /// these keep such a run tied to it after a rename (#578).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
+}
+
+impl DbEntry {
+    /// Whether it goes by `name`, now or before a rename.
+    pub fn has_had_name(&self, name: &str) -> bool {
+        self.name == name || self.former_names.iter().any(|n| n == name)
+    }
 }
 
 /// The orders VS Code's Databases view sorts by.
@@ -287,6 +299,7 @@ impl DatabaseStore {
             path: dir.to_path_buf(),
             language: database_language(dir),
             added: now_secs(),
+            former_names: Vec::new(),
         });
         self.current = Some(self.databases.len() - 1);
         // A new database takes its place in the chosen order.
@@ -306,6 +319,10 @@ impl DatabaseStore {
             .databases
             .get_mut(index)
             .ok_or_else(|| String::from("No such database"))?;
+        if db.name != name && !db.former_names.contains(&db.name) {
+            let old = std::mem::take(&mut db.name);
+            db.former_names.push(old);
+        }
         db.name = name.to_string();
         Ok(())
     }
@@ -425,6 +442,7 @@ mod tests {
             path: PathBuf::from("/dbs").join(name),
             language: lang.map(Into::into),
             added,
+            former_names: Vec::new(),
         }
     }
 
@@ -439,6 +457,12 @@ mod tests {
         assert!(s.rename(0, "   ").is_err());
         assert_eq!(s.databases[0].name, "flask main", "unchanged");
         assert!(s.rename(3, "x").is_err());
+        // It remembers what it was called, once each, for older history.
+        s.rename(0, "flask").unwrap();
+        s.rename(0, "flask").unwrap();
+        assert_eq!(s.databases[0].former_names, ["a", "flask main"]);
+        assert!(s.databases[0].has_had_name("a") && s.databases[0].has_had_name("flask"));
+        assert!(!s.databases[0].has_had_name("b"));
     }
 
     #[test]

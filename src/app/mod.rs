@@ -22751,11 +22751,16 @@ impl App {
             return;
         }
         // History from before runs recorded their database's path names it
-        // only by its old name. Pin those runs to its path first, or Delete
-        // Unused would take it for unused. With another database of the
-        // same name the runs could be either's, so they are left to match
-        // by name.
-        let same_name = store.databases.iter().filter(|d| d.name == old).count();
+        // only by its old name. The rename keeps that name among its former
+        // names, so such runs still count for it; with no other database
+        // ever called that, they are also pinned to its path. Otherwise the
+        // runs could be either's, and both stay protected by name.
+        let same_name = store
+            .databases
+            .iter()
+            .enumerate()
+            .filter(|&(j, d)| j != i && d.has_had_name(&old))
+            .count();
         if same_name == 0 {
             let history_path = Self::codeql_history_path();
             let mut history = crate::codeql_query::History::load(&history_path);
@@ -22951,10 +22956,9 @@ impl App {
             .filter(|&(i, d)| store.current != Some(i) && Some(&d.path) != upgrading)
             .filter(|(_, d)| Self::codeql_cached_copy(&d.path).is_some())
             .filter(|(_, d)| {
-                !history
-                    .entries
-                    .iter()
-                    .any(|e| e.refers_to(&d.path, &d.name))
+                let mut names = vec![d.name.as_str()];
+                names.extend(d.former_names.iter().map(String::as_str));
+                !history.entries.iter().any(|e| e.refers_to(&d.path, &names))
             })
             .map(|(_, d)| d.path.clone())
             .collect()

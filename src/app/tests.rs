@@ -55290,6 +55290,7 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
             path: db,
             language: Some(String::from("rust")),
             added: 0,
+            former_names: Vec::new(),
         }],
         current: Some(0),
         sort_by: None,
@@ -55964,6 +55965,53 @@ fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
             Command::from_id("codeql_delete_unused_databases"),
             Some(Command::CodeqlDeleteUnusedDatabases)
         );
+    });
+}
+
+#[test]
+fn renaming_one_of_two_same_named_databases_keeps_both_protected() {
+    // #578: an old run that names "dup" could have been on either of two
+    // databases called that. After one is renamed, Delete Unused must
+    // still leave both alone: the renamed one remembers its former name.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = App::codeql_db_cache_dir();
+        let first = make_codeql_db(&cache.join("one"), "dup", "go");
+        let second = make_codeql_db(&cache.join("two"), "dup", "go");
+        let current = make_codeql_db(&cache.join("cur"), "current", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&first, &second, &current] {
+            store.add(db).unwrap();
+        }
+        store.current = Some(2);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let mut history = crate::codeql_query::History::default();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.path().join("q.ql"),
+            database: String::from("dup"),
+            database_path: None,
+            started: 1,
+            seconds: 1,
+            status: crate::codeql_query::RunStatus::Succeeded,
+            output: tmp.path().join("r.csv"),
+            name: None,
+        });
+        history.save(&App::codeql_history_path()).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_rename_codeql_database(&first, "renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(
+            history.entries[0].database_path, None,
+            "ambiguous: not pinned to either"
+        );
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        assert!(app.input_prompt.is_none());
+        assert_eq!(app.status, "There are no unused CodeQL databases to delete");
+        assert!(first.exists() && second.exists());
     });
 }
 
