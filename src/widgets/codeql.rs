@@ -66,6 +66,8 @@ pub enum Action {
     SelectDatabase(usize),
     /// Step the Databases list to its next sort order.
     SortDatabases,
+    /// Step the Query History list to its next sort order.
+    SortHistory,
     /// Open the results of the query history entry at this index.
     OpenHistory(usize),
     /// Fold or unfold the query pack at this index of `queries`.
@@ -135,8 +137,10 @@ pub struct CodeqlPanel {
     pub current_db: Option<usize>,
     /// The order the store keeps the databases in, shown on the sort row.
     pub db_sort: Option<crate::codeql_db::DbSort>,
-    /// Query history labels, newest first (#578).
+    /// Query history labels, in the store's order (#578).
     pub history: Vec<String>,
+    /// The order the store keeps the history in, shown on the sort row.
+    pub history_sort: crate::codeql_query::HistSort,
     /// The workspace's queries by pack, from the last discovery.
     pub queries: Vec<crate::codeql_query::QueryPack>,
     /// Folded packs, by folder, so a fold survives rediscovery.
@@ -191,6 +195,25 @@ impl CodeqlPanel {
         }
     }
 
+    /// The store index of the query history entry whose row is selected.
+    pub fn selected_history(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::OpenHistory(i))) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on history entry `index`'s row, when it shows.
+    pub fn select_history(&mut self, index: usize) {
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::OpenHistory(i), _) if *i == index))
+        {
+            self.selected = n;
+        }
+    }
+
     /// Fold or unfold a query pack, keeping the selection on its line.
     pub fn toggle_pack(&mut self, pack: usize) {
         let Some(dir) = self.queries.get(pack).map(|p| p.dir.clone()) else {
@@ -205,6 +228,15 @@ impl CodeqlPanel {
             .position(|l| matches!(l, Line::Action(Action::TogglePack(p), _) if *p == pack))
         {
             self.selected = n;
+        }
+    }
+
+    /// The index into `queries` of the pack whose line, or one of whose
+    /// query rows, is selected.
+    pub fn selected_pack(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::TogglePack(p) | Action::RunQuery(p, _))) => Some(p),
+            _ => None,
         }
     }
 
@@ -321,6 +353,10 @@ impl CodeqlPanel {
                     ));
                 }
                 Section::QueryHistory if !self.history.is_empty() => {
+                    out.push(Line::Action(
+                        Action::SortHistory,
+                        format!("Sort by: {}", self.history_sort.label()),
+                    ));
                     for (i, label) in self.history.iter().enumerate() {
                         out.push(Line::Action(Action::OpenHistory(i), label.clone()));
                     }
@@ -653,6 +689,17 @@ mod tests {
             Action::OpenHistory(1),
             "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
         )));
+        assert!(
+            lines.contains(&Line::Action(Action::SortHistory, "Sort by: date".into())),
+            "the list offers its order"
+        );
+        p.history_sort = crate::codeql_query::HistSort::Name;
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::SortHistory, "Sort by: name".into()))
+        );
+        p.select_history(1);
+        assert_eq!(p.selected_history(), Some(1));
     }
 
     fn pack(
@@ -728,7 +775,11 @@ mod tests {
                 .any(|l| matches!(l, Line::Action(Action::RunQuery(..), _)))
         );
         p.toggle_pack(0);
+        assert_eq!(p.selected_pack(), Some(0));
         p.move_selection(true);
         assert_eq!(p.selected_hit(), Some(Hit::Action(Action::RunQuery(0, 0))));
+        assert_eq!(p.selected_pack(), Some(0), "a query row is in its pack");
+        p.toggle(Section::Queries);
+        assert_eq!(p.selected_pack(), None);
     }
 }

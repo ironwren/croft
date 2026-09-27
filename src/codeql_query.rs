@@ -7,6 +7,9 @@
 //! produces alerts, so it runs through `database analyze` into SARIF and
 //! opens in the SARIF viewer. Any other query produces a table, which runs
 //! through `query run` and is decoded to CSV.
+//!
+//! "CodeQL: Create Query" starts a new query from [`query_template`],
+//! with a pack file beside it when it has none.
 
 use std::path::{Path, PathBuf};
 
@@ -221,6 +224,118 @@ pub fn discover(root: &Path) -> Vec<QueryPack> {
     out
 }
 
+/// The CodeQL library for a language id, which is also what `import` names
+/// and what `codeql/<id>-all` depends on. The ids a database or a pack file
+/// may use for a language the library covers (`typescript`, `kotlin`, `c`)
+/// map to it; anything else is `None`.
+pub fn language_module(lang: &str) -> Option<&'static str> {
+    Some(match lang.trim().to_ascii_lowercase().as_str() {
+        "cpp" | "c" | "c++" => "cpp",
+        "csharp" | "c#" => "csharp",
+        "go" => "go",
+        "java" | "kotlin" => "java",
+        "javascript" | "typescript" => "javascript",
+        "python" => "python",
+        "ruby" => "ruby",
+        "rust" => "rust",
+        "swift" => "swift",
+        "actions" => "actions",
+        _ => return None,
+    })
+}
+
+/// `name` in lower-case words joined by hyphens, as a query `@id` or a pack
+/// name wants it: "Find SQL_injection" is `find-sql-injection`.
+fn kebab(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A starter query called `name`, as VS Code's "Create Query" writes one: a
+/// problem query reporting every file, which runs as soon as it is saved.
+/// With no known language there is no library to import, so it is a plain
+/// `select` of a string and says no `@kind`.
+pub fn query_template(lang: Option<&str>, name: &str) -> String {
+    let id = match kebab(name) {
+        k if k.is_empty() => String::from("query"),
+        k => k,
+    };
+    match lang.and_then(language_module) {
+        Some(module) => format!(
+            "/**\n * @name {name}\n * @description Describe what this query finds.\n * @kind problem\n * @problem.severity warning\n * @id {module}/{id}\n */\n\nimport {module}\n\nfrom File f\nselect f, \"Hello, world!\"\n"
+        ),
+        None => format!(
+            "/**\n * @name {name}\n * @description Describe what this query finds.\n * @id {id}\n */\n\nselect \"Hello, world!\"\n"
+        ),
+    }
+}
+
+/// The file name a typed query name becomes: trimmed, with a `.ql` the
+/// user typed dropped and put back. Empty names, names with a path in them
+/// and names that are only dots are refused.
+pub fn query_file_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let stem = name.strip_suffix(".ql").unwrap_or(name).trim_end();
+    if stem.is_empty() {
+        return Err(String::from("A query name cannot be empty"));
+    }
+    if stem.contains(['/', '\\', '\0']) || stem.chars().all(|c| c == '.') {
+        return Err(format!("'{name}' is not a file name"));
+    }
+    Ok(format!("{stem}.ql"))
+}
+
+/// Write a starter query called `name` into `dir` (#578) and return its
+/// path. An existing file is never overwritten. When `lang` is known and
+/// neither `dir` nor a folder above it (up to `root`) holds a pack file, a
+/// minimal `qlpack.yml` depending on that language's library goes beside
+/// it, so the query compiles.
+pub fn scaffold_query(
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    lang: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    let file = query_file_name(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(&file);
+    let stem = file.strip_suffix(".ql").unwrap_or(&file);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| match e.kind() {
+            ErrorKind::AlreadyExists => {
+                Error::new(ErrorKind::AlreadyExists, format!("{file} already exists"))
+            }
+            _ => e,
+        })?;
+    out.write_all(query_template(lang, stem).as_bytes())?;
+    let module = lang.and_then(language_module);
+    let in_pack = dir
+        .ancestors()
+        .take_while(|d| d.starts_with(root) || *d == dir)
+        .any(|d| d.join("qlpack.yml").is_file() || d.join("codeql-pack.yml").is_file());
+    if let (Some(module), false) = (module, in_pack) {
+        let scope = dir
+            .file_name()
+            .map(|n| kebab(&n.to_string_lossy()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| String::from("local"));
+        std::fs::write(
+            dir.join("qlpack.yml"),
+            format!(
+                "name: {scope}/queries\nversion: 0.0.1\ndependencies:\n  codeql/{module}-all: \"*\"\n"
+            ),
+        )?;
+    }
+    Ok(path)
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunStatus {
@@ -239,19 +354,43 @@ pub struct HistoryEntry {
     pub started: u64,
     pub seconds: u64,
     pub status: RunStatus,
-    /// The SARIF or CSV the run wrote.
+    /// The SARIF or CSV the run wrote. Each run writes into its own
+    /// folder, so this also identifies the entry.
     pub output: PathBuf,
+    /// The label the user gave it, shown in place of the default one.
+    /// History saved before renaming existed reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl HistoryEntry {
-    /// A history line: "✓ query.ql · db · 12s", "✗ … · failed: why",
-    /// "… running".
-    pub fn label(&self) -> String {
-        let name = self
-            .query
+    /// The query's file name.
+    pub fn query_name(&self) -> String {
+        self.query
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// What the entry is called: the user's label, else the query's file
+    /// name. The name sort orders by this.
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.query_name())
+    }
+
+    /// A history line: "✓ query.ql · db · 12s", "✗ … · failed: why",
+    /// "… running". A renamed entry keeps only the status mark before the
+    /// user's label.
+    pub fn label(&self) -> String {
+        if let Some(custom) = &self.name {
+            let mark = match self.status {
+                RunStatus::Succeeded => '\u{2713}',
+                RunStatus::Failed(_) => '\u{2717}',
+                RunStatus::Running => '\u{2026}',
+            };
+            return format!("{mark} {custom}");
+        }
+        let name = self.query_name();
         match &self.status {
             RunStatus::Succeeded => format!(
                 "\u{2713} {name} \u{b7} {} \u{b7} {}s",
@@ -268,11 +407,46 @@ impl HistoryEntry {
     }
 }
 
-/// The query history, newest first, capped at [`History::CAP`] entries.
+/// The orders the Query History section sorts by. VS Code also sorts by
+/// result count; croft's history does not record counts, so the third
+/// order groups runs by how they ended instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HistSort {
+    /// Newest first.
+    #[default]
+    Date,
+    Name,
+    /// Succeeded, then failed, then running; newest first within each.
+    Status,
+}
+
+impl HistSort {
+    /// The next order in the cycle the side bar's sort row steps through.
+    pub fn next(self) -> HistSort {
+        match self {
+            HistSort::Date => HistSort::Name,
+            HistSort::Name => HistSort::Status,
+            HistSort::Status => HistSort::Date,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HistSort::Date => "date",
+            HistSort::Name => "name",
+            HistSort::Status => "status",
+        }
+    }
+}
+
+/// The query history in the order the user chose (newest first unless
+/// they sorted it otherwise), capped at [`History::CAP`] entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct History {
     #[serde(default)]
     pub entries: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub sort_by: HistSort,
 }
 
 impl History {
@@ -293,10 +467,80 @@ impl History {
         std::fs::write(path, text)
     }
 
-    /// Record a new run at the top, dropping the oldest past the cap.
+    /// Record a new run, dropping the oldest past the cap. It goes at the
+    /// top, then takes its place in the chosen order.
     pub fn push(&mut self, entry: HistoryEntry) {
         self.entries.insert(0, entry);
-        self.entries.truncate(Self::CAP);
+        if self.entries.len() > Self::CAP {
+            // The oldest run, wherever the order put it; among equals the
+            // one furthest down goes, never the new entry at the top.
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .min_by_key(|(_, e)| e.started)
+                .map_or(0, |(i, _)| i);
+            self.entries.remove(oldest);
+        }
+        if self.sort_by != HistSort::Date {
+            self.sort(self.sort_by);
+        }
+    }
+
+    /// Forget entry `index` (its results are the caller's business).
+    pub fn remove(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+
+    /// Give entry `index` a label of its own. A blank label is refused.
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(String::from("A query history label cannot be empty"));
+        }
+        let entry = self
+            .entries
+            .get_mut(index)
+            .ok_or_else(|| String::from("No such query history entry"))?;
+        entry.name = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Reorder the entries and remember the order.
+    pub fn sort(&mut self, by: HistSort) {
+        use std::cmp::Reverse;
+        match by {
+            HistSort::Date => self.entries.sort_by_key(|e| Reverse(e.started)),
+            HistSort::Name => self
+                .entries
+                .sort_by_key(|e| (e.display_name().to_lowercase(), Reverse(e.started))),
+            HistSort::Status => self.entries.sort_by_key(|e| {
+                let rank = match e.status {
+                    RunStatus::Succeeded => 0,
+                    RunStatus::Failed(_) => 1,
+                    RunStatus::Running => 2,
+                };
+                (rank, Reverse(e.started))
+            }),
+        }
+        self.sort_by = by;
+    }
+
+    /// The index of the entry whose run wrote `output`.
+    pub fn position(&self, output: &Path) -> Option<usize> {
+        self.entries.iter().position(|e| e.output == output)
+    }
+
+    /// The index of the most recent run, whatever the order.
+    pub fn newest(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
     }
 }
 
@@ -445,6 +689,7 @@ mod tests {
             seconds: 12,
             status,
             output: PathBuf::from("/out/r.sarif"),
+            name: None,
         }
     }
 
@@ -482,5 +727,207 @@ mod tests {
             History::load(&dir.path().join("missing.json")),
             History::default()
         );
+    }
+
+    fn run(query: &str, started: u64, status: RunStatus) -> HistoryEntry {
+        HistoryEntry {
+            query: PathBuf::from("/w").join(query),
+            started,
+            status,
+            output: PathBuf::from(format!("/out/{started}/r.sarif")),
+            ..entry(RunStatus::Succeeded)
+        }
+    }
+
+    fn started(h: &History) -> Vec<u64> {
+        h.entries.iter().map(|e| e.started).collect()
+    }
+
+    #[test]
+    fn a_history_entry_is_removed_by_index() {
+        let mut h = History::default();
+        for i in 1..=3 {
+            h.push(run("q.ql", i, RunStatus::Succeeded));
+        }
+        h.remove(1);
+        assert_eq!(started(&h), [3, 1]);
+        h.remove(7);
+        assert_eq!(started(&h), [3, 1], "out of range is a no-op");
+        assert_eq!(h.position(Path::new("/out/1/r.sarif")), Some(1));
+        assert_eq!(h.position(Path::new("/out/2/r.sarif")), None);
+    }
+
+    #[test]
+    fn a_renamed_entry_shows_its_label_but_never_a_blank_one() {
+        let mut h = History::default();
+        h.push(entry(RunStatus::Succeeded));
+        assert_eq!(h.rename(0, "  sqli on main  "), Ok(()));
+        assert_eq!(h.entries[0].label(), "\u{2713} sqli on main");
+        assert_eq!(h.entries[0].display_name(), "sqli on main");
+        assert!(h.rename(0, "  ").is_err());
+        assert_eq!(h.entries[0].name.as_deref(), Some("sqli on main"));
+        assert!(h.rename(4, "x").is_err());
+        h.entries[0].status = RunStatus::Failed(String::from("x"));
+        assert_eq!(h.entries[0].label(), "\u{2717} sqli on main");
+    }
+
+    #[test]
+    fn history_saved_before_labels_and_sorting_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"query":"/w/sql.ql","database":"app","started":1,"seconds":12,"status":"Succeeded","output":"/out/r.sarif"}]}"#,
+        )
+        .unwrap();
+        let h = History::load(&path);
+        assert_eq!(h.entries, vec![entry(RunStatus::Succeeded)]);
+        assert_eq!(h.sort_by, HistSort::Date);
+        // An unrenamed entry saves without the field.
+        h.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"name\""));
+    }
+
+    #[test]
+    fn history_sorts_by_date_name_or_status_and_keeps_the_order() {
+        let mut h = History::default();
+        h.push(run("b.ql", 1, RunStatus::Failed(String::from("x"))));
+        h.push(run("A.ql", 2, RunStatus::Succeeded));
+        h.push(run("c.ql", 3, RunStatus::Running));
+        h.push(run("b.ql", 4, RunStatus::Succeeded));
+        assert_eq!(started(&h), [4, 3, 2, 1], "newest first by default");
+        h.sort(HistSort::Name);
+        assert_eq!(started(&h), [2, 4, 1, 3], "case-insensitive, newest first");
+        h.rename(3, "0 first").unwrap();
+        h.sort(HistSort::Name);
+        assert_eq!(started(&h), [3, 2, 4, 1], "a label sorts as its name");
+        h.sort(HistSort::Status);
+        assert_eq!(started(&h), [4, 2, 1, 3]);
+        assert_eq!(h.newest(), Some(0));
+        // A new run takes its place in the chosen order.
+        h.push(run("z.ql", 5, RunStatus::Failed(String::from("y"))));
+        assert_eq!(started(&h), [4, 2, 5, 1, 3]);
+        assert_eq!(h.newest(), Some(2));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        h.save(&path).unwrap();
+        assert_eq!(History::load(&path).sort_by, HistSort::Status, "saved");
+        h.sort(HistSort::Date);
+        assert_eq!(started(&h), [5, 4, 3, 2, 1]);
+        assert_eq!(HistSort::Status.next(), HistSort::Date);
+    }
+
+    #[test]
+    fn the_cap_drops_the_oldest_run_in_any_order() {
+        let mut h = History::default();
+        for i in 0..History::CAP as u64 {
+            h.push(run("q.ql", i + 1, RunStatus::Succeeded));
+        }
+        h.sort(HistSort::Name);
+        h.push(run("q.ql", 1000, RunStatus::Succeeded));
+        assert_eq!(h.entries.len(), History::CAP);
+        assert!(h.entries.iter().all(|e| e.started != 1), "the oldest went");
+        assert_eq!(h.entries[0].started, 1000);
+    }
+
+    #[test]
+    fn a_template_imports_each_languages_library() {
+        for (lang, module) in [
+            ("python", "python"),
+            ("cpp", "cpp"),
+            ("java", "java"),
+            ("kotlin", "java"),
+            ("javascript", "javascript"),
+            ("typescript", "javascript"),
+            ("csharp", "csharp"),
+            ("go", "go"),
+            ("ruby", "ruby"),
+            ("rust", "rust"),
+            ("swift", "swift"),
+            ("actions", "actions"),
+        ] {
+            let q = query_template(Some(lang), "Find SQL_injection");
+            assert!(q.starts_with("/**\n * @name Find SQL_injection\n"), "{q}");
+            assert!(q.contains(&format!("\nimport {module}\n")), "{lang}: {q}");
+            assert!(
+                q.contains(&format!(" * @id {module}/find-sql-injection\n")),
+                "{q}"
+            );
+            assert!(q.contains(" * @problem.severity warning\n"), "{q}");
+            assert!(q.contains("\nfrom File f\nselect f, "), "{q}");
+            assert_eq!(query_kind(&q).as_deref(), Some("problem"));
+            assert_eq!(output_for(&q), Output::Sarif);
+        }
+    }
+
+    #[test]
+    fn a_template_in_no_known_language_imports_nothing() {
+        for lang in [None, Some("cobol")] {
+            let q = query_template(lang, "hello");
+            assert!(!q.contains("import"), "{q}");
+            assert!(q.contains(" * @id hello\n"), "{q}");
+            assert!(q.ends_with("select \"Hello, world!\"\n"), "{q}");
+            assert_eq!(query_kind(&q), None);
+        }
+    }
+
+    #[test]
+    fn query_names_become_file_names_or_are_refused() {
+        assert_eq!(query_file_name(" sqli ").as_deref(), Ok("sqli.ql"));
+        assert_eq!(query_file_name("sqli.ql").as_deref(), Ok("sqli.ql"));
+        assert_eq!(query_file_name("a.b").as_deref(), Ok("a.b.ql"));
+        for bad in ["", "  ", ".ql", "a/b", "..\\x", "..", "."] {
+            assert!(query_file_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn scaffolding_writes_the_query_and_never_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "pack/qlpack.yml",
+            "name: acme/py\nextractor: python\n",
+        );
+        let dir = root.join("pack/sub");
+        let path = scaffold_query(root, &dir, "sqli.ql", Some("python")).unwrap();
+        assert_eq!(path, dir.join("sqli.ql"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, query_template(Some("python"), "sqli"));
+        assert!(
+            !dir.join("qlpack.yml").exists(),
+            "the pack above already covers it"
+        );
+        std::fs::write(&path, "mine").unwrap();
+        let e = scaffold_query(root, &dir, "sqli", Some("python")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        let e = scaffold_query(root, &dir, "a/b", Some("python")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(scaffold_query(root, &dir, " ", None).is_err());
+    }
+
+    #[test]
+    fn scaffolding_adds_a_pack_file_only_when_one_is_needed_and_possible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("My App");
+        scaffold_query(&root, &root, "loose", None).unwrap();
+        assert!(!root.join("qlpack.yml").exists(), "no language, no pack");
+        let path = scaffold_query(&root, &root, "hello", Some("go")).unwrap();
+        let pack = std::fs::read_to_string(root.join("qlpack.yml")).unwrap();
+        assert_eq!(
+            pack,
+            "name: my-app/queries\nversion: 0.0.1\ndependencies:\n  codeql/go-all: \"*\"\n"
+        );
+        assert_eq!(pack_language(&pack).as_deref(), Some("go"));
+        let packs = discover(&root);
+        assert_eq!(packs[0].name, "my-app/queries");
+        assert!(packs[0].queries.contains(&path));
+        // A pack file above the workspace root does not count.
+        write(tmp.path(), "outer/codeql-pack.yml", "name: x/y\n");
+        let inner = tmp.path().join("outer/ws");
+        scaffold_query(&inner, &inner, "q", Some("ruby")).unwrap();
+        assert!(inner.join("qlpack.yml").is_file());
     }
 }

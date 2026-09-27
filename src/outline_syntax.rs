@@ -169,6 +169,7 @@ fn lang_and_query(kind: LangKind) -> Option<(Language, &'static str)> {
         LangKind::Tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY),
         LangKind::Go => (tree_sitter_go::LANGUAGE.into(), GO_QUERY),
         LangKind::Lua => (tree_sitter_lua::LANGUAGE.into(), LUA_QUERY),
+        LangKind::Ql => (tree_sitter_ql::LANGUAGE.into(), QL_QUERY),
         // Other languages either lack a useful symbol structure (json/toml/
         // yaml/css/html/bash) or are not yet covered; they fall through to the
         // LSP outline. Add a query + arm here to light one up.
@@ -259,6 +260,19 @@ const LUA_QUERY: &str = r#"
     value: (function_definition))) @item
 "#;
 
+// The definition patterns of tree-sitter-ql's own `tags.scm`, recaptured in
+// this file's `@item` / `@name.<kind>` shape. A `newtype` and its branches
+// read as an enum and its members; member predicates nest under their class
+// by byte containment.
+const QL_QUERY: &str = r#"
+(classlessPredicate name: (predicateName) @name.function) @item
+(memberPredicate name: (predicateName) @name.method) @item
+(module name: (moduleName) @name.module) @item
+(dataclass name: (className) @name.class) @item
+(datatype name: (className) @name.enum) @item
+(datatypeBranch name: (className) @name.enum_member) @item
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +349,17 @@ mod tests {
         assert!(got.contains(&("move".into(), OutlineKind::Method, 0)));
         assert!(got.contains(&("jump".into(), OutlineKind::Function, 0)));
         assert!(got.contains(&("attack".into(), OutlineKind::Function, 0)));
+    }
+
+    #[test]
+    fn codeql_predicates_classes_and_modules_are_extracted() {
+        let src = b"module Util {\n  predicate isSmall(int i) { i < 10 }\n}\n\nclass Small extends int {\n  Small() { this = 1 }\n  int twice() { result = this * 2 }\n}\n";
+        let syms = symbols_for(LangKind::Ql, src);
+        let got = names_kinds_depths(&syms);
+        assert!(got.contains(&("Util".into(), OutlineKind::Module, 0)));
+        assert!(got.contains(&("isSmall".into(), OutlineKind::Function, 1)));
+        assert!(got.contains(&("Small".into(), OutlineKind::Class, 0)));
+        assert!(got.contains(&("twice".into(), OutlineKind::Method, 1)));
     }
 
     #[test]
