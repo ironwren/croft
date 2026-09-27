@@ -38780,17 +38780,6 @@ impl App {
             .map(|s| s.millis)
     }
 
-    /// Diff one agent-lane row against the snapshot that was its baseline
-    /// when the user last marked it reviewed (#345), rather than against
-    /// HEAD.
-    ///
-    /// Refuses rather than falling back to a different baseline. A row with
-    /// no recorded snapshot (never reviewed, or reviewed before the store
-    /// had one) and a row whose snapshot has since been PRUNED — the store
-    /// keeps 50 per file against a 1s autosave, so this is a live case, not
-    /// only a legacy one — both say so. A diff against a baseline other than
-    /// the one claimed is worse than no diff, because the user cannot see
-    /// which one they got.
     /// Agents: Review a Changed File (#345): every lane's files in a picker,
     /// labelled as the AGENT LANE section labels them; Enter opens the
     /// chosen file's diff since review, as a click on its row does.
@@ -38831,6 +38820,17 @@ impl App {
         ));
     }
 
+    /// Diff one agent-lane row against the snapshot that was its baseline
+    /// when the user last marked it reviewed (#345), rather than against
+    /// HEAD.
+    ///
+    /// Refuses rather than falling back to a different baseline. A row with
+    /// no recorded snapshot (never reviewed, or reviewed before the store
+    /// had one) and a row whose snapshot has since been PRUNED — the store
+    /// keeps 50 per file against a 1s autosave, so this is a live case, not
+    /// only a legacy one — both say so. A diff against a baseline other than
+    /// the one claimed is worse than no diff, because the user cannot see
+    /// which one they got.
     pub(crate) fn diff_agent_lane_row(&mut self, agent: &str, path: &Path) {
         // "Restore Snapshot" writes to the path recorded here, and only
         // `open_timeline_diff` cleared it. Browsing a.txt's timeline and then
@@ -50268,17 +50268,6 @@ impl App {
         }
     }
 
-    /// Re-root the workspace at `new_root`. Resets the file tree, updates
-    /// `workspace_root`, refreshes git status and the source-control
-    /// panel, and respawns the FS watcher off-thread (a recursive stat
-    /// walk on a multi-GB monorepo is the dominant cost - blocking the
-    /// UI thread for it is what froze the app on "Make root"). The
-    /// polling fallback in `drain_fs_events` keeps the tree fresh until
-    /// the watcher comes online via `try_install_pending_init`. Open
-    /// editor tabs are NOT closed - a path that escapes the new root
-    /// still resolves on disk and the user may want to keep it open.
-    /// Compare anchor / clipboard / marks are reset because they point
-    /// into the old workspace.
     /// `root`'s saved agent review queue (#345), less files deleted while
     /// croft was closed; an empty one when nothing is saved or there is no
     /// store.
@@ -50332,6 +50321,17 @@ impl App {
         self.agent_ledger_saved = (generation, std::time::Instant::now());
     }
 
+    /// Re-root the workspace at `new_root`. Resets the file tree, updates
+    /// `workspace_root`, refreshes git status and the source-control
+    /// panel, and respawns the FS watcher off-thread (a recursive stat
+    /// walk on a multi-GB monorepo is the dominant cost - blocking the
+    /// UI thread for it is what froze the app on "Make root"). The
+    /// polling fallback in `drain_fs_events` keeps the tree fresh until
+    /// the watcher comes online via `try_install_pending_init`. Open
+    /// editor tabs are NOT closed - a path that escapes the new root
+    /// still resolves on disk and the user may want to keep it open.
+    /// Compare anchor / clipboard / marks are reset because they point
+    /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
         // The review queue being left is saved under its own root first.
         self.persist_agent_ledger(true);
