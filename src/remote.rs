@@ -2467,9 +2467,12 @@ impl ConfigRepush {
                     &mut state,
                     &dir,
                     std::time::Instant::now(),
-                    &mut || {
-                        let (hosts, files) = exclusions.current();
-                        (!crate::config_sync::host_excluded(&host, &hosts)).then_some(files)
+                    &mut || match exclusions.current() {
+                        None => RepushGate::Unknown,
+                        Some((hosts, _)) if crate::config_sync::host_excluded(&host, &hosts) => {
+                            RepushGate::HostExcluded
+                        }
+                        Some((_, files)) => RepushGate::Push(files),
                     },
                     &mut |files| push_over_bulk_lane(&host, &socket, files),
                     &mut log,
@@ -2505,40 +2508,52 @@ impl Drop for ConfigRepush {
 /// The user's config-sync exclusions (#603) as a live re-push reads them.
 ///
 /// Read again whenever a file changes, so an edited exclusion applies
-/// without a reconnect, but a read that skipped a layer (a config file
-/// half-written or invalid at that moment) keeps the last clean read:
-/// falling back to the defaults would send a file to a host the user had
-/// excluded.
+/// without a reconnect. Only a clean read counts: one that skipped a layer
+/// (a config file half-written or invalid at that moment) would report the
+/// default, empty lists, and pushing on those would send a file to a host
+/// the user had excluded. So a bad read keeps the last clean one, and until
+/// there has been a clean read at all the exclusions are unknown and
+/// nothing is pushed.
 struct SyncExclusions {
-    hosts: Vec<String>,
-    files: Vec<String>,
+    /// `(config_sync_excluded_hosts, config_sync_excluded_files)` from the
+    /// last clean read; `None` before the first.
+    known: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl SyncExclusions {
-    /// The exclusions as of the session start, the same read the
-    /// connect-time push makes.
+    /// The exclusions as of the session start, if they read cleanly.
     fn load() -> Self {
-        let prefs = crate::config_layers::load_merged(None).prefs;
-        SyncExclusions {
-            hosts: prefs.config_sync_excluded_hosts,
-            files: prefs.config_sync_excluded_files,
-        }
+        let mut ex = SyncExclusions { known: None };
+        ex.update(crate::config_layers::load_merged(None));
+        ex
     }
 
-    /// Re-read the exclusions, keeping the previous ones when this read
-    /// reported a problem with a layer. User layers only, as at connect: a
-    /// workspace must not decide what leaves the laptop.
-    fn current(&mut self) -> (Vec<String>, Vec<String>) {
+    /// Re-read the exclusions: the latest clean read, or `None` while no
+    /// read has been clean. User layers only, as at connect: a workspace
+    /// must not decide what leaves the laptop.
+    fn current(&mut self) -> Option<(Vec<String>, Vec<String>)> {
         self.update(crate::config_layers::load_merged(None));
-        (self.hosts.clone(), self.files.clone())
+        self.known.clone()
     }
 
     fn update(&mut self, merged: crate::config_layers::MergedConfig) {
         if merged.warnings.is_empty() {
-            self.hosts = merged.prefs.config_sync_excluded_hosts;
-            self.files = merged.prefs.config_sync_excluded_files;
+            self.known = Some((
+                merged.prefs.config_sync_excluded_hosts,
+                merged.prefs.config_sync_excluded_files,
+            ));
         }
     }
+}
+
+/// What the exclusions say about a pending re-push.
+enum RepushGate {
+    /// Push, leaving out these files (`config_sync_excluded_files`).
+    Push(Vec<String>),
+    /// The host is in `config_sync_excluded_hosts`: push nothing, now or later.
+    HostExcluded,
+    /// The exclusions have not read cleanly: hold the files and try again.
+    Unknown,
 }
 
 /// How long a failed re-push waits before it is tried again: long enough
@@ -2576,7 +2591,7 @@ fn repush_tick(
     state: &mut RepushState,
     dir: &Path,
     now: std::time::Instant,
-    exclusions: &mut dyn FnMut() -> Option<Vec<String>>,
+    exclusions: &mut dyn FnMut() -> RepushGate,
     push: &mut dyn FnMut(&Pushes) -> Vec<&'static str>,
     log: &mut dyn FnMut(String),
 ) {
@@ -2595,11 +2610,22 @@ fn repush_tick(
         return;
     }
     // The same rules as the push at connect (#603), read when a file
-    // changes so an edited exclusion applies without a reconnect: `None`
-    // is a host config sync never pushes to.
-    let Some(excluded) = exclusions() else {
-        state.pending.clear();
-        return;
+    // changes so an edited exclusion applies without a reconnect.
+    let excluded = match exclusions() {
+        RepushGate::Push(excluded) => excluded,
+        RepushGate::HostExcluded => {
+            state.pending.clear();
+            return;
+        }
+        RepushGate::Unknown => {
+            // Nothing leaves until the exclusions can be read; the files
+            // stay pending and are tried again.
+            state.retry_at = Some(now + REPUSH_RETRY);
+            log(String::from(
+                "Config sync: holding changes until the config-sync exclusions read cleanly",
+            ));
+            return;
+        }
     };
     let (files, _) = crate::config_sync::apply_exclusions(files, &excluded);
     if files.is_empty() {
@@ -2638,6 +2664,14 @@ fn push_over_bulk_lane(
     socket: &Path,
     files: &[(crate::config_sync::Syncable, PathBuf)],
 ) -> Vec<&'static str> {
+    // The connect-time push creates this only when it had files to send, so
+    // a host that had none has no ~/.config/croft for the first file made
+    // mid-session to land in.
+    let mut mk = ssh_socket_command(socket, true);
+    mk.arg(host).arg("mkdir -p ~/.config/croft");
+    if !matches!(mk.status(), Ok(st) if st.success()) {
+        return files.iter().map(|(s, _)| s.name).collect();
+    }
     let bulk = crate::remote_bulk::establish(host, socket, |_| {});
     files
         .iter()
@@ -4824,28 +4858,37 @@ Host !blocked *.internal
     /// would push to a host the user excluded.
     #[test]
     fn a_broken_config_read_keeps_the_last_good_sync_exclusions() {
-        let mut ex = SyncExclusions {
-            hosts: vec![String::from("shared-box")],
-            files: vec![String::from("macros.json")],
-        };
+        let mut ex = SyncExclusions { known: None };
         let broken = crate::config_layers::MergedConfig {
             prefs: crate::prefs::Prefs::default(),
             provenance: Default::default(),
             chain: Vec::new(),
             warnings: vec![String::from("config.json: expected value at line 1")],
         };
-        ex.update(broken);
-        assert_eq!(ex.hosts, vec![String::from("shared-box")]);
-        assert_eq!(ex.files, vec![String::from("macros.json")]);
-        // A clean read applies, including an emptied list.
+        // No clean read yet: the exclusions are unknown, not empty.
+        ex.update(broken.clone());
+        assert_eq!(ex.known, None);
+        // A clean read applies.
+        let prefs = crate::prefs::Prefs {
+            config_sync_excluded_hosts: vec![String::from("shared-box")],
+            config_sync_excluded_files: vec![String::from("macros.json")],
+            ..Default::default()
+        };
         let clean = crate::config_layers::MergedConfig {
-            prefs: crate::prefs::Prefs::default(),
+            prefs,
             provenance: Default::default(),
             chain: Vec::new(),
             warnings: Vec::new(),
         };
         ex.update(clean);
-        assert!(ex.hosts.is_empty() && ex.files.is_empty());
+        let good = Some((
+            vec![String::from("shared-box")],
+            vec![String::from("macros.json")],
+        ));
+        assert_eq!(ex.known, good);
+        // A later broken read keeps it rather than falling back to none.
+        ex.update(broken);
+        assert_eq!(ex.known, good);
     }
 
     /// #262: a config file edited during the session is pushed once, on the
@@ -4879,7 +4922,10 @@ Host !blocked *.internal
                 state,
                 dir.path(),
                 now,
-                &mut || excluded.clone(),
+                &mut || match excluded.clone() {
+                    Some(files) => RepushGate::Push(files),
+                    None => RepushGate::HostExcluded,
+                },
                 &mut |files| {
                     sent.push(files.iter().map(|(s, _)| s.name).collect());
                     fail.to_vec()
@@ -4950,6 +4996,50 @@ Host !blocked *.internal
         let later = failed_at + REPUSH_RETRY + step;
         tick(&mut state, later, None, &[], &mut sent, &mut lines);
         assert_eq!(sent.len(), 2, "an excluded host is never pushed to");
+        assert!(state.pending.is_empty());
+    }
+
+    /// #262 review: while the exclusions have not read cleanly, a changed
+    /// file is held, not pushed, and goes once they do.
+    #[test]
+    fn a_live_repush_holds_changes_until_the_exclusions_read_cleanly() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut state = RepushState::new(ConfigWatch::new(vec![keys.clone()]));
+        let t0 = std::time::Instant::now();
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        let mut sent = 0;
+        let mut lines = Vec::new();
+        let first = t0 + ConfigWatch::INTERVAL * 2;
+        repush_tick(
+            &mut state,
+            dir.path(),
+            first,
+            &mut || RepushGate::Unknown,
+            &mut |_| {
+                sent += 1;
+                Vec::new()
+            },
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(sent, 0, "nothing leaves while the exclusions are unknown");
+        assert_eq!(state.pending.len(), 1, "the edit is held");
+        assert!(lines[0].contains("holding changes"), "{lines:?}");
+        repush_tick(
+            &mut state,
+            dir.path(),
+            first + REPUSH_RETRY,
+            &mut || RepushGate::Push(Vec::new()),
+            &mut |_| {
+                sent += 1;
+                Vec::new()
+            },
+            &mut |l| lines.push(l),
+        );
+        assert_eq!(sent, 1, "it goes once they read cleanly");
+        assert!(state.pending.is_empty());
     }
 
     /// #694: the build, and every rustc under it, is the kernel's first
