@@ -136,6 +136,56 @@ fn flush(tls: &mut ServerConnection, mut net: &TcpStream) -> std::io::Result<()>
 mod tests {
     use super::*;
 
+    /// A write far larger than one TLS record (a big paste, a burst of
+    /// screen output) arrives whole in both directions.
+    #[test]
+    fn a_large_write_passes_through_whole() {
+        use rustls::pki_types::pem::PemObject;
+        let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/testdata");
+        let config = load(&here.join("cert.pem"), &here.join("key.pem")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            terminate(tcp, config).unwrap()
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(here.join("cert.pem")).unwrap() {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap())
+            .unwrap();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+        let big: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        tls.write_all(&big).unwrap();
+        tls.flush().unwrap();
+        let mut plain = server.join().unwrap();
+        plain
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut got = vec![0u8; big.len()];
+        plain.read_exact(&mut got).unwrap();
+        assert!(got == big, "the client's bytes arrived changed");
+
+        // And back: the plaintext side's write reaches the client.
+        plain.write_all(&big).unwrap();
+        let mut back = vec![0u8; big.len()];
+        tls.read_exact(&mut back).unwrap();
+        assert!(back == big, "the server's bytes arrived changed");
+    }
+
     #[test]
     fn a_missing_certificate_is_named_in_the_error() {
         let dir = tempfile::tempdir().unwrap();
