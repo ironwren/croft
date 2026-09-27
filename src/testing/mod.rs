@@ -10,6 +10,7 @@
 
 pub mod coverage;
 pub mod failure_site;
+pub mod gotest;
 pub mod locate;
 pub mod model;
 pub mod parse;
