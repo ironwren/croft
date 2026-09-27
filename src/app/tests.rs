@@ -54549,7 +54549,7 @@ fn the_demo_tour_runs_in_a_scratch_project_and_esc_cleans_up() {
             }
         }
         assert!(
-            screen.contains("1/9"),
+            screen.contains("1/8"),
             "the caption chip shows progress:\n{screen}"
         );
         // Enter advances the tour instead of typing into the file.
@@ -54588,7 +54588,7 @@ fn walking_the_whole_tour_ends_it_and_cleans_up() {
             steps += 1;
         }
         assert!(app.tour.is_none(), "the tour ends");
-        assert_eq!(steps, 9, "one advance per step");
+        assert_eq!(steps, 8, "one advance per step");
         assert_eq!(app.workspace_root(), tmp.path());
         assert!(!scratch.exists());
     });
@@ -59629,4 +59629,108 @@ fn a_masked_row_is_recorded_plain_and_its_neighbours_in_colour() {
         frame.contains("\u{1b}[34mQQBLUE\u{1b}[0m"),
         "the next row keeps its colour: {frame:?}"
     );
+}
+
+/// #377, as a user takes it: `croft demo`, then Enter and nothing else.
+/// Every popup a step opens takes its own Enter, and that Enter must do the
+/// harmless thing the caption says (open app.py, open the theme picker,
+/// keep the theme), never whatever sorts first (the marker file, or Move
+/// Line Up into the sample). The tour then ends with the sample's files as
+/// they were created, and no tab left naming a deleted file.
+#[test]
+fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        let mut opened = Vec::new();
+        let mut presses = 0;
+        let mut saw_theme_picker = false;
+        while app.tour.is_some() && presses < 30 {
+            if let Some(step) = app.tour.as_ref().and_then(|r| r.tour.current()) {
+                // The sample, as created, at every step: nothing typed into it.
+                for (rel, text) in crate::tour::sample_files() {
+                    if let Ok(on_disk) = std::fs::read_to_string(scratch.join(rel)) {
+                        assert_eq!(on_disk, text, "{rel} at {:?}", step.action);
+                    }
+                }
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            presses += 1;
+            saw_theme_picker |= app.context_menu.is_some();
+            if let Some(path) = app.editor.path.clone()
+                && !opened.contains(&path)
+            {
+                opened.push(path);
+            }
+            let dirty: Vec<_> = std::iter::once(&app.editor)
+                .chain(app.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter())
+                .filter(|e| e.dirty)
+                .filter_map(|e| e.path.clone())
+                .collect();
+            assert!(dirty.is_empty(), "Enter #{presses} edited {dirty:?}");
+        }
+        assert!(app.tour.is_none(), "Enter alone finishes the tour");
+        assert!(presses <= 12, "{presses} presses for an 8-step tour");
+        assert!(
+            app.context_menu.is_none() && app.command_palette.is_none(),
+            "no picker the tour opened outlives it"
+        );
+        assert!(
+            saw_theme_picker,
+            "the palette's Enter opened the theme picker, and Enter closed it"
+        );
+        assert!(
+            opened.contains(&scratch.join("app.py")),
+            "Quick Open's Enter opened app.py: {opened:?}"
+        );
+        assert!(
+            !opened.contains(&scratch.join(crate::tour::SCRATCH_MARKER)),
+            "never the marker file: {opened:?}"
+        );
+        assert!(!scratch.exists(), "the sample project is gone");
+        assert_eq!(app.workspace_root(), tmp.path());
+        let left: Vec<_> = std::iter::once(&app.editor)
+            .chain(app.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter_map(|e| e.path.clone())
+            .filter(|p| p.starts_with(&scratch))
+            .collect();
+        assert!(left.is_empty(), "tabs naming the deleted sample: {left:?}");
+    });
+}
+
+/// #377: Esc mid-tour closes the sample's tabs too, an edited one
+/// included, so no save can write a scratch file back.
+#[test]
+fn leaving_the_tour_closes_the_samples_tabs_even_edited_ones() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        app.focus_pane(Pane::Editor);
+        app.editor.insert_char('x');
+        assert!(app.editor.dirty);
+        app.split_editor();
+        app.close_all_modals_for_test();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tour.is_none());
+        assert!(!scratch.exists());
+        let left: Vec<_> = std::iter::once(&app.editor)
+            .chain(app.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter_map(|e| e.path.clone())
+            .filter(|p| p.starts_with(&scratch))
+            .collect();
+        assert!(left.is_empty(), "tabs naming the deleted sample: {left:?}");
+    });
 }

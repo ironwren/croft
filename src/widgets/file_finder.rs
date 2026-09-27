@@ -83,7 +83,6 @@ impl FileFinder {
         me
     }
 
-    #[cfg(test)]
     pub fn set_query(&mut self, q: &str) {
         if q == self.query {
             return;

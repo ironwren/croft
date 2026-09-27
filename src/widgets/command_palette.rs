@@ -1550,7 +1550,6 @@ impl CommandPalette {
             .unwrap_or(self.query.len())
     }
 
-    #[cfg(test)]
     pub fn set_query(&mut self, q: &str) {
         self.query = q.to_string();
         self.cursor = self.query.chars().count();
