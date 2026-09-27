@@ -23,6 +23,9 @@ pub enum TourAction {
     /// Open a file, relative to the sample project.
     Open(String),
     QuickOpen,
+    /// Quick Open with this query already typed, so Enter alone opens its
+    /// match: an empty finder's first row is whatever sorts first.
+    FindFile(String),
     SplitEditor,
     Terminal,
     /// Type a command into the terminal and run it.
@@ -30,6 +33,10 @@ pub enum TourAction {
     /// Open the first error the terminal shows.
     JumpToError,
     CommandPalette,
+    /// The command palette with this query already typed, so Enter alone
+    /// runs the command it names rather than whichever sorts first (an edit
+    /// such as Move Line Up, into the sample).
+    Palette(String),
     ThemePicker,
     Done,
 }
@@ -208,12 +215,13 @@ mod tests {
         let actions: Vec<&TourAction> = tour.steps.iter().map(|s| &s.action).collect();
         assert_eq!(actions[0], &TourAction::Open("src/main.rs".into()));
         for want in [
-            TourAction::QuickOpen,
+            TourAction::FindFile("app".into()),
             TourAction::SplitEditor,
             TourAction::Terminal,
             TourAction::JumpToError,
-            TourAction::CommandPalette,
-            TourAction::ThemePicker,
+            // The palette leads into the theme picker, the issue's last two
+            // stops, through the command typed into it.
+            TourAction::Palette("color theme".into()),
         ] {
             assert!(actions.contains(&&want), "{want:?} in the tour");
         }
