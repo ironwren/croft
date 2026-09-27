@@ -99,6 +99,8 @@ pub enum CliCommand {
         /// The pull request number (`579`, `#579`, or its URL).
         number: String,
     },
+    /// Take the guided tour (#377) in a throwaway sample project.
+    Demo,
     /// Set macOS Terminal.app's default profile font to a Nerd Font.
     SetupTerminal {
         /// PostScript name of the font (read from the .ttf with `fontTools` or `fc-scan`)
@@ -611,6 +613,8 @@ impl Cli {
                     std::process::exit(2);
                 };
                 crate::pr_review::set_startup_pr(n);
+            Some(CliCommand::Demo) => {
+                crate::tour::request_startup_demo();
                 let cwd = std::env::current_dir()?;
                 crate::app::run(cwd, None, None, false, Vec::new())
             }
@@ -1898,6 +1902,9 @@ mod tests {
             Cli::try_parse_from(["croft", "pr"]).is_err(),
             "the number is required"
         );
+    fn demo_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["croft", "demo"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Demo)));
     }
 
     /// #375: `--build-info` says when a package manager owns the binary, so a
