@@ -55033,6 +55033,221 @@ fn codeql_database_palette_commands_act_on_the_current_database() {
     });
 }
 
+/// Save a query history of `(query, started, status, output)` runs, with
+/// each output file written, for the history management tests.
+fn seed_codeql_history(
+    tmp: &std::path::Path,
+    runs: &[(&str, u64, crate::codeql_query::RunStatus, PathBuf)],
+) {
+    let mut history = crate::codeql_query::History::default();
+    for (query, started, status, output) in runs {
+        std::fs::write(tmp.join(query), "select 1").unwrap();
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, "col0\n1\n").unwrap();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.join(query),
+            database: String::from("app"),
+            started: *started,
+            seconds: 3,
+            status: status.clone(),
+            output: output.clone(),
+            name: None,
+        });
+    }
+    history.save(&App::codeql_history_path()).unwrap();
+}
+
+#[test]
+fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Query History view renames, sorts, views the query
+    // of, opens the results directory of and removes a run; removing
+    // deletes only results in croft's own cache.
+    use crate::codeql_query::RunStatus;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = App::codeql_results_dir().join("200-a");
+        let elsewhere = tmp.path().join("elsewhere");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                (
+                    "c.ql",
+                    50,
+                    RunStatus::Running,
+                    App::codeql_results_dir().join("50-c/results.csv"),
+                ),
+                (
+                    "b.ql",
+                    100,
+                    RunStatus::Succeeded,
+                    elsewhere.join("results.csv"),
+                ),
+                (
+                    "a.ql",
+                    200,
+                    RunStatus::Succeeded,
+                    cached.join("results.csv"),
+                ),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        assert_eq!(app.codeql.history.len(), 3);
+        assert!(app.codeql.history[0].contains("a.ql"), "newest first");
+
+        // F2 renames, starting from the query's name.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "a.ql");
+        for _ in 0.."a.ql".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "zeta".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history[0], "\u{2713} zeta", "{}", app.status);
+
+        // `s` on a history row sorts the history, not the databases.
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        assert_eq!(app.codeql.db_sort, None, "databases untouched");
+        assert!(app.codeql.history[0].contains("b.ql"));
+        assert_eq!(app.codeql.selected_history(), Some(2), "still on zeta");
+        assert_eq!(
+            crate::codeql_query::History::load(&App::codeql_history_path()).sort_by,
+            crate::codeql_query::HistSort::Name,
+            "the order is saved"
+        );
+
+        // `v` opens the query; `o` the results in their cache folder.
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a.ql").as_path())
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(cached.join("results.csv").as_path())
+        );
+        assert!(app.status.contains("Results directory"), "{}", app.status);
+
+        // A run in flight is not removed.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(app.input_prompt.is_none());
+        assert!(app.status.contains("still running"), "{}", app.status);
+
+        // Delete asks first; Esc keeps it; results outside the cache stay.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("stay on disk"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.codeql.history.len(), 3, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 2, "{}", app.status);
+        assert!(
+            elsewhere.join("results.csv").is_file(),
+            "not croft's to delete"
+        );
+        assert_eq!(app.codeql.selected_history(), Some(0), "stays in the list");
+
+        // Croft's own results folder goes with its entry.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("results are deleted"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 1, "{}", app.status);
+        assert!(!cached.exists(), "the run's folder is gone");
+        assert!(
+            App::codeql_results_dir().join("50-c").is_dir(),
+            "only that run's folder"
+        );
+    });
+}
+
+#[test]
+fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlRemoveHistory);
+        assert!(
+            app.status.contains("no CodeQL query history"),
+            "{}",
+            app.status
+        );
+        assert!(app.input_prompt.is_none());
+        let out = |n: &str| App::codeql_results_dir().join(n).join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("a-old.ql", 1, RunStatus::Succeeded, out("1-old")),
+                ("b-new.ql", 2, RunStatus::Succeeded, out("2-new")),
+            ],
+        );
+        // Sorted by name, the newest run is no longer on top; it is still
+        // the one the commands pick.
+        app.run_command(Command::CodeqlSortHistory);
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        app.run_command(Command::CodeqlRenameHistory);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&InputPurpose::CodeqlRenameHistory {
+                output: out("2-new")
+            })
+        );
+        app.close_input_prompt();
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("b-new.ql").as_path())
+        );
+        // A selected row wins over the newest.
+        app.open_codeql_view();
+        app.codeql.select_history(0);
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a-old.ql").as_path())
+        );
+        assert_eq!(
+            Command::from_id("codeql_remove_history"),
+            Some(Command::CodeqlRemoveHistory)
+        );
+        assert_eq!(Command::CodeqlViewQuery.title(), "CodeQL: View Query");
+    });
+}
+
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
 /// `--output=` names, and exits with `code` (printing `err` on stderr).
 #[cfg(unix)]

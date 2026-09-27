@@ -59,6 +59,16 @@ pub enum InputPurpose {
     CodeqlRenameDatabase {
         path: PathBuf,
     },
+    /// Confirm removing the query history entry whose run wrote `output`
+    /// (#578). Submitting (Enter) removes it; Esc keeps it. The value is a
+    /// sentinel.
+    CodeqlRemoveHistory {
+        output: PathBuf,
+    },
+    /// A label for the query history entry whose run wrote `output` (#578).
+    CodeqlRenameHistory {
+        output: PathBuf,
+    },
     /// Where a SARIF result's file lives on this machine (#577): the value
     /// is a path; `uri` is the location the log named.
     SarifLocate {

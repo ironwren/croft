@@ -11764,7 +11764,8 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Tsx)
         | Some(LangKind::Go)
         | Some(LangKind::C)
-        | Some(LangKind::Cpp) => Some("//"),
+        | Some(LangKind::Cpp)
+        | Some(LangKind::Ql) => Some("//"),
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
@@ -11787,7 +11788,8 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Go)
         | Some(LangKind::C)
         | Some(LangKind::Cpp)
-        | Some(LangKind::Css) => Some(("/*", "*/")),
+        | Some(LangKind::Css)
+        | Some(LangKind::Ql) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         // Python has no true block comment; VS Code's language config maps
@@ -12392,6 +12394,7 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "C",
         Some(LangKind::Cpp) => "C++",
         Some(LangKind::Lua) => "Lua",
+        Some(LangKind::Ql) => "CodeQL",
     }
 }
 
@@ -12418,6 +12421,7 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "c",
         Some(LangKind::Cpp) => "cpp",
         Some(LangKind::Lua) => "lua",
+        Some(LangKind::Ql) => "ql",
     }
 }
 
@@ -12440,6 +12444,7 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::C,
     LangKind::Cpp,
     LangKind::Lua,
+    LangKind::Ql,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -12477,7 +12482,8 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Json)
         | Some(LangKind::Go)
         | Some(LangKind::Css)
-        | Some(LangKind::Lua) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Lua)
+        | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
 }
@@ -12494,6 +12500,7 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Go)
             | Some(LangKind::Css)
             | Some(LangKind::Lua)
+            | Some(LangKind::Ql)
     );
     if !bracket_aware {
         return false;
@@ -26486,6 +26493,16 @@ mod tests {
         e.cursor_row = 0;
         assert!(e.toggle_line_comment());
         assert_eq!(e.lines, vec!["# x = 1"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_codeql_uses_slashes() {
+        let mut e = editor_with("select 1");
+        e.lang = crate::highlight::lang_for_extension("ql");
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// select 1"]);
+        assert_eq!(language_label(e.lang), "CodeQL");
     }
 
     #[test]
