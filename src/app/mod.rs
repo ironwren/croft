@@ -28,6 +28,7 @@ mod editor_layout;
 mod fs_watch;
 mod git_worker;
 mod hover;
+mod memory_report;
 mod nav;
 mod overlay;
 mod perf_hud;
@@ -21863,6 +21864,75 @@ impl App {
         }
     }
 
+    /// Developer: Show Memory Usage (#694): what each subsystem holds, as a
+    /// tab. Running it again refreshes the same tab.
+    fn show_memory_usage(&mut self) {
+        use memory_report::{BufferMem, ChannelMem, MemoryReport, ServerMem, TerminalMem};
+        let live = self.terminals.iter().map(|t| (t, false));
+        let closed = self.closed_terminals.iter().map(|c| (&c.term, true));
+        let terminals = live
+            .chain(closed)
+            .map(|(t, closed)| {
+                let (scrollback_lines, screen_lines, columns) = t.grid_extent();
+                let rewind_bytes = t.rewind().lock().map(|r| r.bytes()).unwrap_or(0);
+                TerminalMem {
+                    name: t.label().to_string(),
+                    closed,
+                    rewind_bytes,
+                    scrollback_lines,
+                    screen_lines,
+                    columns,
+                }
+            })
+            .collect();
+        let root = self.roots.primary().to_path_buf();
+        let buffers = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .map(|e| {
+                let (steps, bytes) = e.undo_history_size();
+                let name = e.path.as_deref().map_or_else(
+                    || String::from("untitled"),
+                    |p| p.strip_prefix(&root).unwrap_or(p).display().to_string(),
+                );
+                BufferMem { name, steps, bytes }
+            })
+            .collect();
+        let channels = crate::output::channel_sizes()
+            .into_iter()
+            .map(|(name, lines, bytes)| ChannelMem { name, lines, bytes })
+            .collect();
+        let mut servers: std::collections::BTreeMap<&str, ServerMem> = Default::default();
+        for by_server in self.lsp_diagnostics.values() {
+            for (server, diags) in by_server {
+                let entry = servers.entry(server).or_insert_with(|| ServerMem {
+                    name: server.clone(),
+                    files: 0,
+                    diagnostics: 0,
+                });
+                entry.files += 1;
+                entry.diagnostics += diags.len();
+            }
+        }
+        let report = MemoryReport {
+            rss_kb: perf_hud::read_rss_kb(),
+            rewind_budget: crate::rewind::budget().total(),
+            cell_bytes: std::mem::size_of::<alacritty_terminal::term::cell::Cell>(),
+            terminals,
+            buffers,
+            channels,
+            servers: servers.into_values().collect(),
+        }
+        .format();
+        match self
+            .editor
+            .open_text_buffer(Path::new("Memory Usage"), &report)
+        {
+            Ok(()) => self.focus_pane(Pane::Editor),
+            Err(e) => self.status = format!("Could not open the report: {e}"),
+        }
+    }
+
     /// Install the runner's coverage tool in a terminal pane, where its
     /// output and any prompt are visible.
     fn install_coverage_tool(&mut self) {
@@ -22165,6 +22235,9 @@ impl App {
                 // lib test and an integration test can share a bare fn name.
                 let source = self.editor.path.clone();
                 self.start_test_binary_build(root, name, source);
+            }
+            Some(crate::testing::worker::Runner::Go) => {
+                self.start_delve_test_session(&root, &name, breakpoints);
             }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
                 // No session will start, so the armed breakpoint has nothing
@@ -24609,6 +24682,58 @@ impl App {
             Err(e) => {
                 self.debug_error(format!("Failed to start debugger: {e}"));
             }
+        }
+    }
+
+    /// Debug one Go test under delve's `test` mode (#264), scoped to it
+    /// with `-test.run`. `name` is a tree id (`./pkg::TestName`), or a bare
+    /// function name from the caret, whose package is the open file's.
+    fn start_delve_test_session(
+        &mut self,
+        root: &Path,
+        name: &str,
+        breakpoints: std::collections::BTreeMap<
+            PathBuf,
+            Vec<crate::dap::session::SourceBreakpoint>,
+        >,
+    ) {
+        let dir = match name.split_once("::") {
+            Some((pkg, _)) => crate::testing::gotest::package_dir(root, pkg),
+            None => self
+                .editor
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        let Some(dir) = dir else {
+            self.disarm_failure_breakpoint();
+            self.status = format!("Debug Test: no package directory for {name}");
+            return;
+        };
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.disarm_failure_breakpoint();
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let request = crate::dap::session::delve_test_request(
+            &dir,
+            &crate::testing::gotest::test_binary_args(name),
+        );
+        match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
+            Ok(session) => {
+                self.debug_sessions.replace_with(name.to_string(), session);
+                self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                ));
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
         }
     }
 
@@ -41351,6 +41476,7 @@ impl App {
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
             Cmd::TestingShowCoverageReport => self.show_coverage_report(),
+            Cmd::DeveloperShowMemoryUsage => self.show_memory_usage(),
             Cmd::RunTestAtCursorWithCoverage => self.run_test_at_cursor_with_coverage(),
             Cmd::TestingToggleWatchAll => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)

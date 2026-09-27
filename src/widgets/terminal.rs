@@ -3364,6 +3364,17 @@ impl PtyTerminal {
         p.advance(&mut *term, &bytes);
     }
 
+    /// Scrollback rows held, the live screen's rows, and the grid's width,
+    /// for the memory report (#694).
+    pub fn grid_extent(&self) -> (usize, usize, usize) {
+        let term = self.term.lock();
+        (
+            term.grid().history_size(),
+            term.screen_lines(),
+            term.columns(),
+        )
+    }
+
     /// The pane's rewind buffer (#357), for the scrubber to replay from.
     ///
     /// Handed out as the shared handle rather than a copy: the buffer is

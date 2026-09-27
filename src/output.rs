@@ -153,6 +153,23 @@ pub fn channel_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Each channel's name, line count and bytes of line text, for the memory
+/// report (#694). Counts under the lock rather than cloning the lines.
+pub fn channel_sizes() -> Vec<(String, usize, usize)> {
+    registry()
+        .lock()
+        .map(|r| {
+            r.channels
+                .iter()
+                .map(|(name, buf)| {
+                    let bytes = buf.iter().map(|l| l.text.len()).sum();
+                    (name.clone(), buf.len(), bytes)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Clone a channel's lines for rendering. `None` if the channel doesn't exist.
 pub fn snapshot(channel: &str) -> Option<Vec<OutputLine>> {
     let reg = registry().lock().ok()?;
@@ -187,6 +204,18 @@ mod tests {
         assert_eq!(lines[1].text, "second");
         assert_eq!(lines[1].level, OutputLevel::Error);
         assert!(channel_names().iter().any(|c| c == ch));
+    }
+
+    /// #694: the memory report reads each channel's line count and text
+    /// bytes.
+    #[test]
+    fn channel_sizes_count_lines_and_text_bytes() {
+        let ch = "test-channel-sizes";
+        push(ch, OutputLevel::Info, "abc");
+        push(ch, OutputLevel::Info, "de");
+        let sizes = channel_sizes();
+        let (_, lines, bytes) = sizes.iter().find(|(n, _, _)| n == ch).unwrap();
+        assert_eq!((*lines, *bytes), (2, 5));
     }
 
     /// #694: a multi-megabyte traced JSON-RPC body is held as one capped
