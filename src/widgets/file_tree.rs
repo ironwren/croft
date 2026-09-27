@@ -48,7 +48,10 @@ pub struct FileTree {
     /// Membership is EXACT, unlike `ignored`, which covers a directory's
     /// descendants. A directory is not something an agent wrote and not
     /// something "mark reviewed" can clear, so a dot on one would be a mark
-    /// no gesture removes. Fed from `AgentLedger` on the app's sync.
+    /// no gesture removes. A collapsed folder's dimmer rollup dot is derived
+    /// from this set at paint time instead (see
+    /// [`Self::hides_agent_touched`]). Fed from `AgentLedger` on the app's
+    /// sync.
     pub agent_touched: Arc<HashSet<PathBuf>>,
     /// Text painted after a ROOT row's name (#348): a worktree lane's
     /// branch and the badge of the agent seated in its pane, keyed by the
@@ -278,6 +281,21 @@ impl FileTree {
     /// Exact membership, deliberately: see [`Self::agent_touched`].
     pub fn is_agent_touched(&self, path: &Path) -> bool {
         !self.agent_touched.is_empty() && self.agent_touched.contains(path)
+    }
+
+    /// Whether a collapsed folder at `dir` hides a file an agent changed and
+    /// the user has not reviewed (#345), for its dimmer rollup dot.
+    ///
+    /// Derived at paint time from [`Self::agent_touched`], never stored: the
+    /// dot clears by itself when the last file under it is reviewed, which
+    /// is what keeps it from being the mark no gesture removes that the
+    /// field's exact membership guards against.
+    pub fn hides_agent_touched(&self, dir: &Path) -> bool {
+        !self.agent_touched.is_empty()
+            && self
+                .agent_touched
+                .iter()
+                .any(|p| p != dir && p.starts_with(dir))
     }
 
     /// Map a screen y coordinate to a node index, if any. Screen rows map
@@ -1593,6 +1611,16 @@ impl Widget for &mut FileTree {
                 ));
                 let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
                 push_name_spans(&mut spans, &name, &query, base, self.theme);
+                // A collapsed folder hiding an unreviewed agent write shows a
+                // dimmer copy of the file dot (#345), so the lane's changes
+                // stay findable without expanding every folder. Only while
+                // collapsed: expanded, the file's own dot is on screen.
+                if !node.expanded && self.hides_agent_touched(&node.path) {
+                    spans.push(Span::styled(
+                        format!(" {AGENT_DOT}"),
+                        Style::default().fg(self.theme.ui(Color::Gray)),
+                    ));
+                }
                 // A lane root wears its branch and its agent after the name
                 // (#348), dim so the folder name stays the thing the eye
                 // lands on; trailing for the same reason as the agent dot.
@@ -2458,6 +2486,53 @@ mod tests {
         // An empty set is the common case and must be cheap and quiet.
         tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
         assert!(!tree.is_agent_touched(&root.join("src/main.rs")));
+    }
+
+    /// #345: a collapsed folder with an unreviewed agent write anywhere
+    /// under it takes the dimmer rollup dot; expanded it does not (the
+    /// file's own dot shows), and it clears once the write is reviewed.
+    #[test]
+    fn a_collapsed_folder_rolls_up_an_unreviewed_agent_write() {
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        let src = root.join("src");
+        let row = |tree: &mut FileTree, name: &str| -> String {
+            let area = Rect::new(0, 0, 40, 12);
+            let mut buf = Buffer::empty(area);
+            tree.render(area, &mut buf);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+        };
+        tree.agent_touched =
+            std::sync::Arc::new(std::collections::HashSet::from([src.join("lib.rs")]));
+        assert!(tree.hides_agent_touched(&src));
+        assert!(tree.hides_agent_touched(&root), "any depth rolls up");
+        assert!(
+            !tree.hides_agent_touched(&src.join("lib.rs")),
+            "not the file itself"
+        );
+        let dir_idx = tree.nodes.iter().position(|n| n.path == src).unwrap();
+        assert!(!tree.nodes[dir_idx].expanded);
+        assert!(
+            row(&mut tree, "src").contains(AGENT_DOT),
+            "{:?}",
+            row(&mut tree, "src")
+        );
+        // Expanded: the folder drops its dot; the file shows its own.
+        tree.selected = dir_idx;
+        tree.expand_selected();
+        let expanded = row(&mut tree, "src");
+        assert!(!expanded.contains(AGENT_DOT), "{expanded:?}");
+        assert!(row(&mut tree, "lib.rs").contains(AGENT_DOT));
+        // Reviewed: nothing left to roll up.
+        tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
+        assert!(!tree.hides_agent_touched(&src));
     }
 
     #[test]
