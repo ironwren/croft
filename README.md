@@ -131,6 +131,7 @@ croft attach                     # open the current folder as a persistent sessi
 croft attach ~/projects          # ...for a specific folder
 croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
 croft ls                         # list running persistent sessions
+croft sync-config devbox         # push your keybindings, snippets, triggers to a host now (never over its own edits)
 croft demo                       # a guided tour in a throwaway sample project (--tour my.json runs your own steps)
 croft view report.pdf            # from any pane: open a file in the croft you are sitting in
 cat data.csv | croft view -      # ...or pipe it in (staged to ~/.cache/croft, 0600, swept at the next launch once a day old)
