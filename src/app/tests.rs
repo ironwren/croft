@@ -56098,7 +56098,14 @@ fn show_coverage_report_opens_the_last_run_as_a_tab() {
         &root,
     ));
     app.run_command(Command::TestingShowCoverageReport);
-    assert_eq!(app.editor.path.as_deref(), Some(Path::new("Coverage Report")));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(Path::new("Coverage Report"))
+    );
     assert_eq!(app.editor.lines[0], "Coverage: 50.0% of 2 lines");
-    assert!(app.editor.lines[2].ends_with(" a.rs"), "{:?}", app.editor.lines);
+    assert!(
+        app.editor.lines[2].ends_with(" a.rs"),
+        "{:?}",
+        app.editor.lines
+    );
 }
