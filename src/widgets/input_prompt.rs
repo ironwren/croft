@@ -48,6 +48,23 @@ pub enum InputPurpose {
     CodeqlDatabase {
         source: CodeqlDbSource,
     },
+    /// Where a SARIF result's file lives on this machine (#577): the value
+    /// is a path; `uri` is the location the log named.
+    SarifLocate {
+        uri: String,
+    },
+    /// Another SARIF log to merge into the open viewer (#577).
+    SarifAddLog,
+    /// A baseline SARIF log to compare the open viewer against (#577).
+    SarifBaseline,
+    /// Where to write the SARIF viewer's visible results as CSV (#577).
+    SarifExport,
+    /// The optional comment for dismissing code scanning alert `number`
+    /// with reason `reason` (an index into `DismissReason::ALL`).
+    DismissAlertComment {
+        number: u64,
+        reason: usize,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first
