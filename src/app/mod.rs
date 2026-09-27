@@ -1587,6 +1587,28 @@ type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
 /// How often an open review tab with running checks re-reads them (#365).
 const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where GitHub's viewed state for a review tab arrives (#365): the PR's
+/// node id and each file's state, or why it could not be read.
+type PrViewedRx = std::sync::mpsc::Receiver<
+    Result<
+        (
+            String,
+            std::collections::BTreeMap<String, crate::pr_review::ViewedState>,
+        ),
+        String,
+    >,
+>;
+
+/// One viewed mark waiting to reach GitHub (#365).
+struct PrViewedWrite {
+    /// The review tab's `owner/repo#n`, so a later tab's failure is not
+    /// reported against this one.
+    key: String,
+    pr_id: String,
+    path: String,
+    viewed: bool,
+}
+
 /// Where a pull request checkout's worktree path and commit, or git's
 /// refusal, arrive (#365).
 type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, crate::git::PrWorktree), String>>;
@@ -3863,6 +3885,14 @@ pub struct App {
     pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// When the open review tab's checks were last re-read (#365).
     pr_checks_polled: Option<std::time::Instant>,
+    /// GitHub's viewed state being read for the review tab keyed by the
+    /// first half (#365).
+    pr_viewed_fetch: Option<(String, PrViewedRx)>,
+    /// Viewed marks waiting to reach GitHub, sent one at a time so two
+    /// quick toggles of one file arrive in order (#365).
+    pr_viewed_queue: std::collections::VecDeque<PrViewedWrite>,
+    /// The viewed mutation in flight: its tab's key, and gh's answer.
+    pr_viewed_write: Option<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// The pull request head review mode checked out (#365), removed again
     /// when review is left with nothing in it worth keeping.
     pr_checkout: Option<PrCheckout>,
@@ -5690,6 +5720,9 @@ impl App {
             review_gh: String::from("gh"),
             pr_gh: None,
             pr_checks_polled: None,
+            pr_viewed_fetch: None,
+            pr_viewed_queue: std::collections::VecDeque::new(),
+            pr_viewed_write: None,
             pr_checkout: None,
             pr_checkout_rx: None,
             review_tx,
@@ -53851,6 +53884,142 @@ impl App {
         self.pr_gh = Some((job, rx));
     }
 
+    /// Read GitHub's viewed state for the open review tab on a worker
+    /// (#365). A PR whose key names no GitHub repository reads nothing, and
+    /// its marks stay local.
+    fn start_pr_viewed_fetch(&mut self) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        let key = view.key.clone();
+        let number = view.pr.number;
+        let slug = key.split('#').next().unwrap_or_default().to_string();
+        if crate::pr_review::viewed_query_args(&slug, number, None).is_none() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gh = self.review_gh.clone();
+        let root = self.workspace_root().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::pr_review::fetch_viewed(
+                &gh,
+                &slug,
+                number,
+                &root,
+                crate::pr_review::GH_TIMEOUT,
+            ));
+        });
+        self.pr_viewed_fetch = Some((key, rx));
+    }
+
+    /// Apply GitHub's viewed state when it arrives, report a failed viewed
+    /// mutation once per tab, and send the next queued one (#365). Returns
+    /// true when it changed what is on screen.
+    fn poll_pr_viewed(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        if let Some((key, rx)) = self.pr_viewed_fetch.as_ref() {
+            let got = rx.try_recv();
+            if !matches!(got, Err(TryRecvError::Empty)) {
+                let key = key.clone();
+                self.pr_viewed_fetch = None;
+                // gh missing, signed out or refused: the marks stay local,
+                // exactly as before, and nothing is said about it.
+                if let Ok(Ok((pr_id, states))) = got {
+                    changed |= self.apply_github_viewed(&key, pr_id, states);
+                }
+            }
+        }
+        if let Some((key, rx)) = self.pr_viewed_write.as_ref() {
+            let got = rx.try_recv();
+            if !matches!(got, Err(TryRecvError::Empty)) {
+                let key = key.clone();
+                self.pr_viewed_write = None;
+                let why = match got {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(why)) => Some(why),
+                    Err(_) => Some(String::from("gh stopped without answering")),
+                };
+                if let Some(why) = why {
+                    let warned = self
+                        .editor
+                        .pr_review
+                        .as_mut()
+                        .filter(|v| v.key == key)
+                        .is_some_and(|v| std::mem::replace(&mut v.sync_warned, true));
+                    if !warned {
+                        self.status = format!(
+                            "Viewed state saved locally; GitHub could not be updated: {why}"
+                        );
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if self.pr_viewed_write.is_none()
+            && let Some(write) = self.pr_viewed_queue.pop_front()
+        {
+            let args = crate::pr_review::mark_viewed_args(&write.pr_id, &write.path, write.viewed);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let gh = self.review_gh.clone();
+            let root = self.workspace_root().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::pr_review::run_gh(
+                    &gh,
+                    &args,
+                    &root,
+                    crate::pr_review::GH_TIMEOUT,
+                ));
+            });
+            self.pr_viewed_write = Some((write.key, rx));
+        }
+        changed
+    }
+
+    /// GitHub's viewed state for the tab keyed `key` becomes the truth
+    /// (#365): the checkboxes and the local store follow it, except for a
+    /// file toggled while the answer was on its way, whose newer mark is
+    /// sent to GitHub instead. Files GitHub did not list keep their local
+    /// mark.
+    fn apply_github_viewed(
+        &mut self,
+        key: &str,
+        pr_id: String,
+        states: std::collections::BTreeMap<String, crate::pr_review::ViewedState>,
+    ) -> bool {
+        let Some(view) = self.editor.pr_review.as_mut().filter(|v| v.key == key) else {
+            return false;
+        };
+        let store_path = Self::pr_viewed_path();
+        let mut store = crate::pr_review::ViewedStore::load(&store_path);
+        let unsynced = std::mem::take(&mut view.unsynced);
+        for (path, state) in states {
+            let local = view.viewed.contains(&path);
+            if unsynced.contains(&path) {
+                if local != state.is_viewed() {
+                    self.pr_viewed_queue.push_back(PrViewedWrite {
+                        key: key.to_string(),
+                        pr_id: pr_id.clone(),
+                        path,
+                        viewed: local,
+                    });
+                }
+                continue;
+            }
+            store.set(key, &path, state.is_viewed());
+            if state.is_viewed() {
+                view.viewed.insert(path);
+            } else {
+                view.viewed.remove(&path);
+            }
+        }
+        view.github_id = Some(pr_id);
+        // GitHub holds the marks now; a cache that cannot be written only
+        // costs the offline copy.
+        let _ = store.save(&store_path);
+        true
+    }
+
     /// While the open review tab has checks still running, re-read the PR
     /// every [`PR_CHECKS_POLL`] so they turn green or red on their own
     /// (#365). Never while another review call is in flight, which it would
@@ -53884,19 +54053,20 @@ impl App {
     /// Apply a finished review `gh` call. Returns true when it changed what
     /// is on screen.
     fn poll_pr_gh(&mut self) -> bool {
+        let synced = self.poll_pr_viewed();
         self.refresh_pending_pr_checks();
         let Some((_, rx)) = self.pr_gh.as_ref() else {
-            return false;
+            return synced;
         };
         let result = match rx.try_recv() {
             Ok(r) => r,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return synced,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(String::from("gh stopped without answering"))
             }
         };
         let Some((job, _)) = self.pr_gh.take() else {
-            return false;
+            return synced;
         };
         match job {
             PrGhJob::View { selector } => {
@@ -53904,6 +54074,7 @@ impl App {
                     Ok(pr) => {
                         let key = crate::pr_review::review_key(&pr);
                         self.open_pr_review(pr, key);
+                        self.start_pr_viewed_fetch();
                     }
                     Err(why) => self.status = format!("Could not load PR {selector}: {why}"),
                 }
@@ -54006,6 +54177,24 @@ impl App {
                 let now = store.toggle(&view.key, &path);
                 if let Err(e) = store.save(&store_path) {
                     self.status = format!("Could not save the viewed mark: {e}");
+                }
+                // The mark flips at once; GitHub hears about it off the UI
+                // thread, or once its viewed state has loaded.
+                match view.github_id.clone() {
+                    Some(pr_id) => self.pr_viewed_queue.push_back(PrViewedWrite {
+                        key: view.key.clone(),
+                        pr_id,
+                        path: path.clone(),
+                        viewed: now,
+                    }),
+                    None if self
+                        .pr_viewed_fetch
+                        .as_ref()
+                        .is_some_and(|(k, _)| *k == view.key) =>
+                    {
+                        view.unsynced.insert(path.clone());
+                    }
+                    None => {}
                 }
                 if now {
                     view.viewed.insert(path);

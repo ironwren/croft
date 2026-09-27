@@ -23,6 +23,14 @@ pub struct PrReviewView {
     /// `owner/repo#number`, the viewed-store key.
     pub key: String,
     pub viewed: BTreeSet<String>,
+    /// The PR's GraphQL node id, known once GitHub's viewed state has
+    /// loaded; until then (or when it never does) viewed marks stay local.
+    pub github_id: Option<String>,
+    /// Files toggled before GitHub's viewed state arrived: the person's
+    /// click wins over the older answer, and is sent once the id is known.
+    pub unsynced: BTreeSet<String>,
+    /// A viewed mutation failed and said so; later failures stay quiet.
+    pub sync_warned: bool,
     pub selected: usize,
     pub scroll: usize,
     /// The whole PR's patch from `gh pr diff`, split per file on first use.
@@ -38,6 +46,9 @@ impl PrReviewView {
             pr,
             key,
             viewed,
+            github_id: None,
+            unsynced: BTreeSet::new(),
+            sync_warned: false,
             selected: 0,
             scroll: 0,
             diff: None,

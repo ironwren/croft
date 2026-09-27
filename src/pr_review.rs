@@ -562,6 +562,184 @@ impl ViewedStore {
     pub fn viewed(&self, pr: &str) -> BTreeSet<String> {
         self.prs.get(pr).cloned().unwrap_or_default()
     }
+
+    /// Set a file's viewed mark outright, as GitHub reported it.
+    pub fn set(&mut self, pr: &str, file: &str, viewed: bool) {
+        if viewed {
+            self.prs
+                .entry(pr.to_string())
+                .or_default()
+                .insert(file.to_string());
+        } else if let Some(set) = self.prs.get_mut(pr) {
+            set.remove(file);
+            if set.is_empty() {
+                self.prs.remove(pr);
+            }
+        }
+    }
+}
+
+/// A file's `viewerViewedState` on GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewedState {
+    Viewed,
+    Unviewed,
+    /// Viewed once, then changed by a later push: GitHub unticks it, and
+    /// so does croft.
+    Dismissed,
+}
+
+impl ViewedState {
+    pub fn is_viewed(self) -> bool {
+        self == ViewedState::Viewed
+    }
+}
+
+/// One page of a pull request's files with their viewed state, as
+/// [`viewed_query_args`] asks for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewedPage {
+    /// The pull request's node id, which the viewed mutations take.
+    pub pr_id: String,
+    pub states: BTreeMap<String, ViewedState>,
+    /// The cursor of the next page, when there is one.
+    pub next: Option<String>,
+}
+
+/// One line, so a stub `gh` that logs its argv logs one line per call.
+const VIEWED_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { id files(first: 100, after: $after) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }";
+
+/// The `gh api graphql` arguments that read one page of the viewed state
+/// of pull request `number` in `slug` (`owner/repo`), after `after`. None
+/// when `slug` does not name a GitHub repository.
+pub fn viewed_query_args(slug: &str, number: u64, after: Option<&str>) -> Option<Vec<String>> {
+    let (owner, name) = slug.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let mut args: Vec<String> = [
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={VIEWED_QUERY}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-F",
+        &format!("number={number}"),
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if let Some(cursor) = after {
+        args.push(String::from("-f"));
+        args.push(format!("after={cursor}"));
+    }
+    Some(args)
+}
+
+/// Parse one [`viewed_query_args`] answer. GraphQL reports most failures
+/// in an `errors` list beside partial data, so any error fails the page.
+pub fn parse_viewed_page(json: &str) -> Result<ViewedPage, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    if let Some(msg) = v
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+    {
+        let text = msg.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(format!("GitHub refused the query: {text}"));
+    }
+    let pr = v
+        .pointer("/data/repository/pullRequest")
+        .filter(|p| !p.is_null())
+        .ok_or("GitHub did not return the pull request")?;
+    let pr_id = pr
+        .get("id")
+        .and_then(|i| i.as_str())
+        .filter(|i| !i.is_empty())
+        .ok_or("GitHub did not return the pull request's id")?
+        .to_string();
+    let states = pr
+        .pointer("/files/nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    let path = n.get("path")?.as_str()?.to_string();
+                    let state = match n.get("viewerViewedState")?.as_str()? {
+                        "VIEWED" => ViewedState::Viewed,
+                        "DISMISSED" => ViewedState::Dismissed,
+                        _ => ViewedState::Unviewed,
+                    };
+                    Some((path, state))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = pr
+        .pointer("/files/pageInfo")
+        .filter(|p| p.get("hasNextPage").and_then(|h| h.as_bool()) == Some(true))
+        .and_then(|p| p.get("endCursor"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    Ok(ViewedPage {
+        pr_id,
+        states,
+        next,
+    })
+}
+
+/// GitHub caps a pull request's file list at 3000 files: 30 pages of 100.
+const VIEWED_MAX_PAGES: usize = 30;
+
+/// Read every page of pull request `number`'s viewed state in `slug`:
+/// its node id and each file's state. Blocking: the app calls it on a
+/// worker thread.
+pub fn fetch_viewed(
+    program: &str,
+    slug: &str,
+    number: u64,
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> Result<(String, BTreeMap<String, ViewedState>), String> {
+    let mut states = BTreeMap::new();
+    let mut after: Option<String> = None;
+    for _ in 0..VIEWED_MAX_PAGES {
+        let args = viewed_query_args(slug, number, after.as_deref())
+            .ok_or_else(|| format!("{slug:?} is not a GitHub repository"))?;
+        let page = parse_viewed_page(&run_gh(program, &args, cwd, timeout)?)?;
+        states.extend(page.states);
+        if page.next.is_none() {
+            return Ok((page.pr_id, states));
+        }
+        after = page.next;
+    }
+    Err(String::from("too many pages of changed files"))
+}
+
+/// The `gh api graphql` arguments that mark (or, with `viewed` false,
+/// unmark) `path` viewed in the pull request whose node id is `pr_id`.
+pub fn mark_viewed_args(pr_id: &str, path: &str, viewed: bool) -> Vec<String> {
+    let mutation = if viewed {
+        "markFileAsViewed"
+    } else {
+        "unmarkFileAsViewed"
+    };
+    vec![
+        String::from("api"),
+        String::from("graphql"),
+        String::from("-f"),
+        format!(
+            "query=mutation($id: ID!, $path: String!) {{ {mutation}(input: {{pullRequestId: $id, path: $path}}) {{ clientMutationId }} }}"
+        ),
+        String::from("-f"),
+        format!("id={pr_id}"),
+        String::from("-f"),
+        format!("path={path}"),
+    ]
 }
 
 #[cfg(test)]
@@ -786,6 +964,84 @@ mod tests {
         let mut back = back;
         assert!(!back.toggle("o/r#579", "a.rs"), "second toggle clears it");
         assert!(!back.viewed("o/r#579").contains("a.rs"));
+    }
+
+    #[test]
+    fn setting_a_mark_outright_adds_or_clears_it() {
+        let mut store = ViewedStore::default();
+        store.set("o/r#1", "a.rs", true);
+        store.set("o/r#1", "a.rs", true);
+        assert!(store.viewed("o/r#1").contains("a.rs"));
+        store.set("o/r#1", "a.rs", false);
+        assert_eq!(store, ViewedStore::default(), "an emptied PR is dropped");
+        store.set("o/r#1", "b.rs", false);
+        assert_eq!(store, ViewedStore::default());
+    }
+
+    // ── GitHub's viewed state (#365) ────────────────────────────────────
+
+    #[test]
+    fn the_viewed_query_names_the_repository_the_pr_and_the_page() {
+        let args = viewed_query_args("o/r", 579, None).unwrap();
+        assert_eq!(&args[..3], ["api", "graphql", "-f"]);
+        assert!(args[3].starts_with("query=query("), "{}", args[3]);
+        assert!(args[3].contains("viewerViewedState") && args[3].contains("endCursor"));
+        assert!(!args[3].contains('\n'), "one line per call in a log");
+        assert_eq!(
+            &args[4..],
+            ["-f", "owner=o", "-f", "name=r", "-F", "number=579"]
+        );
+        let next = viewed_query_args("o/r", 579, Some("Y3Vy")).unwrap();
+        assert_eq!(&next[next.len() - 2..], ["-f", "after=Y3Vy"]);
+        assert_eq!(viewed_query_args("", 1, None), None, "not on GitHub");
+        assert_eq!(viewed_query_args("o/", 1, None), None);
+        assert_eq!(viewed_query_args("a/b/c", 1, None), None);
+    }
+
+    #[test]
+    fn a_viewed_page_parses_to_states_and_the_next_cursor() {
+        let page = parse_viewed_page(
+            r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","files":{
+                "nodes":[{"path":"a.rs","viewerViewedState":"VIEWED"},
+                         {"path":"b.rs","viewerViewedState":"DISMISSED"},
+                         {"path":"c.rs","viewerViewedState":"UNVIEWED"}],
+                "pageInfo":{"hasNextPage":true,"endCursor":"Y3Vy"}}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(page.pr_id, "PR_1");
+        assert_eq!(page.states["a.rs"], ViewedState::Viewed);
+        assert_eq!(page.states["b.rs"], ViewedState::Dismissed);
+        assert_eq!(page.states["c.rs"], ViewedState::Unviewed);
+        assert!(!ViewedState::Dismissed.is_viewed(), "changed since viewed");
+        assert_eq!(page.next.as_deref(), Some("Y3Vy"));
+        let last = parse_viewed_page(
+            r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","files":{"nodes":[],
+                "pageInfo":{"hasNextPage":false,"endCursor":"Zm9v"}}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(last.next, None, "no next page past the last");
+    }
+
+    #[test]
+    fn a_refused_or_empty_viewed_answer_is_an_error() {
+        let refused = parse_viewed_page(
+            r#"{"data":{"repository":null},"errors":[{"message":"Could not resolve to a Repository"}]}"#,
+        );
+        assert!(refused.unwrap_err().contains("Could not resolve"));
+        assert!(parse_viewed_page(r#"{"data":{"repository":{"pullRequest":null}}}"#).is_err());
+        assert!(parse_viewed_page("{}").is_err());
+        assert!(parse_viewed_page("").is_err());
+    }
+
+    #[test]
+    fn marking_viewed_sends_the_matching_mutation() {
+        let mark = mark_viewed_args("PR_1", "src/a b.rs", true);
+        assert_eq!(&mark[..3], ["api", "graphql", "-f"]);
+        assert!(mark[3].contains("markFileAsViewed(input: {pullRequestId: $id, path: $path})"));
+        assert!(!mark[3].contains("unmark"));
+        assert_eq!(&mark[4..], ["-f", "id=PR_1", "-f", "path=src/a b.rs"]);
+        let unmark = mark_viewed_args("PR_1", "a.rs", false);
+        assert!(unmark[3].contains("unmarkFileAsViewed("), "{}", unmark[3]);
     }
 
     // ── review payloads (#366, #368) ────────────────────────────────────
