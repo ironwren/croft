@@ -56272,3 +56272,59 @@ fn a_real_scoped_coverage_run_covers_only_the_test_at_the_cursor() {
         "only test_sub reaches `return a - b`"
     );
 }
+
+/// #371: the scrubber's slider sits on the editor's bottom row; a click at
+/// its left end shows the oldest commit, and dragging to its right end
+/// returns to the working tree.
+#[test]
+fn the_scrubber_slider_seeks_on_click_and_drag() {
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let track = app.scrub_slider;
+    assert!(track.width > 10, "the slider lays out: {track:?}");
+    let row: String = (0..120)
+        .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
+        .collect();
+    assert!(row.contains("working tree"), "{row}");
+    let mouse = |app: &mut App, kind, column| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row: track.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        track.x,
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1"],
+        "the oldest commit"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    let row: String = (0..120)
+        .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
+        .collect();
+    assert!(row.contains(" 1/3 "), "{row}");
+    // The drag keeps seeking off the row too.
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Drag(MouseButton::Left),
+        track.x + track.width + 5,
+    );
+    assert!(app.scrub_view.is_none(), "back at the working tree");
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Up(MouseButton::Left),
+        0,
+    );
+    assert!(!app.scrub_dragging);
+    assert!(app.scrubber.is_some(), "the scrubber stays open");
+}

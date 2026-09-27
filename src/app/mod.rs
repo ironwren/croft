@@ -3835,6 +3835,10 @@ pub struct App {
     /// rebuilds the view for the new file rather than showing the old one's
     /// history over it.
     scrub_for: Option<PathBuf>,
+    /// The scrubber slider's track, from the last frame, and whether a
+    /// drag that started on it is under way (#371).
+    scrub_slider: Rect,
+    scrub_dragging: bool,
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
     scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
@@ -5599,6 +5603,8 @@ impl App {
             scrubber: None,
             scrub_view: None,
             scrub_for: None,
+            scrub_slider: Rect::default(),
+            scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             tour: None,
             tour_done: loaded_prefs.tour_done,
@@ -17285,6 +17291,7 @@ impl App {
                 );
                 frame.render_widget(view, body);
             }
+            self.render_scrub_slider(frame);
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
@@ -31637,6 +31644,93 @@ impl App {
         self.status = format!("{rel}: {} → working tree", commit.short_hash);
     }
 
+    /// Seek the scrubber to the stop under screen column `col` on the
+    /// slider, and show that commit.
+    fn scrub_seek_column(&mut self, col: u16) {
+        let track = self.scrub_slider;
+        if track.width == 0 {
+            return;
+        }
+        let Some(scrub) = self.scrubber.as_mut() else {
+            return;
+        };
+        let span = track.width.saturating_sub(1).max(1) as f32;
+        let f = (col.saturating_sub(track.x) as f32 / span).clamp(0.0, 1.0);
+        let before = scrub.position();
+        scrub.seek_fraction(f);
+        if scrub.position() == before {
+            return;
+        }
+        self.status = match self.scrubber.as_ref().and_then(|s| s.commit()) {
+            Some(c) => format!("At {} — {}", c.short_hash, c.summary),
+            None => String::from("At your working tree"),
+        };
+        self.rebuild_scrub_view();
+    }
+
+    /// The history scrubber's slider (#371), on the editor body's last row
+    /// while scrubbing: where the cursor is (a commit's short hash and its
+    /// place in the history, or the working tree), then a track from the
+    /// oldest loaded commit on the left to the working tree on the right,
+    /// with the handle where the view is.
+    fn render_scrub_slider(&mut self, frame: &mut ratatui::Frame) {
+        self.scrub_slider = Rect::default();
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return;
+        };
+        let body = self.editor.last_body;
+        if body.width < 20 || body.height < 2 {
+            return;
+        }
+        let row = Rect {
+            x: body.x,
+            y: body.y + body.height - 1,
+            width: body.width,
+            height: 1,
+        };
+        let label = match (scrub.position(), scrub.commit()) {
+            (crate::scrubber::Position::At(i), Some(c)) => {
+                format!(" {} {}/{} ", c.short_hash, scrub.len() - i, scrub.len())
+            }
+            _ => String::from(" working tree "),
+        };
+        let label_w = (label.chars().count() as u16).min(row.width / 2);
+        let track = Rect {
+            x: row.x + label_w + 1,
+            y: row.y,
+            width: row.width.saturating_sub(label_w + 2),
+            height: 1,
+        };
+        let bar_bg = self.theme.ui(Color::Rgb(0x1c, 0x21, 0x2b));
+        let buf = frame.buffer_mut();
+        buf.set_style(row, Style::default().bg(bar_bg));
+        buf.set_stringn(
+            row.x,
+            row.y,
+            &label,
+            label_w as usize,
+            Style::default()
+                .fg(self.theme.accent())
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        let handle = (scrub.fraction() * track.width.saturating_sub(1) as f32).round() as u16;
+        for dx in 0..track.width {
+            let (sym, fg) = if dx == handle {
+                ("\u{25cf}", self.theme.accent())
+            } else {
+                ("\u{2500}", self.theme.ui(Color::Rgb(0x5a, 0x63, 0x73)))
+            };
+            buf.set_string(
+                track.x + dx,
+                track.y,
+                sym,
+                Style::default().fg(fg).bg(bar_bg),
+            );
+        }
+        self.scrub_slider = track;
+    }
+
     /// Build the read-only view of the active file at the scrubber's commit
     /// (#371), or drop it at the working tree. File text is cached per
     /// (commit, path), so stepping back and forth after the first visit
@@ -43273,6 +43367,28 @@ impl App {
         // The approval popup takes no clicks, and none reach what it covers.
         if self.approval_ui.is_some() {
             return;
+        }
+        // The history scrubber's slider (#371): a press on the track seeks
+        // there, and a drag that started on it keeps seeking wherever the
+        // pointer goes, so the handle can be dragged off the row and back.
+        if self.scrubber.is_some() && !self.modal_overlay_open() {
+            let on_track = rect_contains(self.scrub_slider, m.column, m.row);
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) if on_track => {
+                    self.scrub_dragging = true;
+                    self.scrub_seek_column(m.column);
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.scrub_dragging => {
+                    self.scrub_seek_column(m.column);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) if self.scrub_dragging => {
+                    self.scrub_dragging = false;
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
