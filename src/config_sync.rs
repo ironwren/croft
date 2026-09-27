@@ -202,6 +202,28 @@ pub fn apply_exclusions(
     (keep, skipped)
 }
 
+/// Every syncable file's local path, present or not: what a live re-push
+/// watches, so a file created mid-session is sent too.
+pub fn watched_local_paths() -> Vec<PathBuf> {
+    let dir = crate::prefs::config_dir();
+    SYNCABLE.iter().map(|s| dir.join(s.name)).collect()
+}
+
+/// The syncable files among `changed` that exist now, as pushes to make.
+/// A deleted file is not pushed: the remote keeps its copy, the same rule
+/// the push at connect time follows for a file the laptop does not have.
+pub fn repush_targets(changed: &[PathBuf], dir: &std::path::Path) -> Vec<(Syncable, PathBuf)> {
+    changed
+        .iter()
+        .filter(|p| p.parent() == Some(dir) && p.is_file())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let s = SYNCABLE.iter().find(|s| s.name == name)?;
+            Some((*s, p.clone()))
+        })
+        .collect()
+}
+
 /// The rsync destination for `name` on `host`, as an rsync remote spec.
 ///
 /// `.config/croft` rather than `$XDG_CONFIG_HOME`: rsync gets no shell on
@@ -466,6 +488,24 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// #262: a local edit mid-session pushes that file; a deleted file, a
+    /// file outside the config dir and one not on the allow-list do not.
+    #[test]
+    fn a_live_repush_sends_only_changed_syncable_files_that_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        let gone = dir.path().join("snippets.json");
+        let other = dir.path().join("config.json");
+        std::fs::write(&keys, "[]").unwrap();
+        std::fs::write(&other, "{}").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stray = elsewhere.path().join("keybindings.json");
+        std::fs::write(&stray, "[]").unwrap();
+        let got = repush_targets(&[keys.clone(), gone, other, stray], dir.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].0.name, &got[0].1), ("keybindings.json", &keys));
     }
 
     #[test]
