@@ -160,6 +160,11 @@ pub enum InputPurpose {
         range: (usize, usize),
         selection: String,
     },
+    /// One field of **Debug: Add Configuration…** (#250); the draft it
+    /// fills is the App's.
+    DebugConfigField {
+        field: crate::dap::configs::DraftField,
+    },
 }
 
 pub struct InputPrompt {
@@ -169,6 +174,9 @@ pub struct InputPrompt {
     pub value: String,
     pub cursor: usize,
     pub last_rect: Rect,
+    /// Whether Enter on an empty field submits (an optional field left
+    /// blank) rather than waiting for a value.
+    pub allow_blank: bool,
 }
 
 impl InputPrompt {
@@ -184,7 +192,14 @@ impl InputPrompt {
             value: String::new(),
             cursor: 0,
             last_rect: Rect::default(),
+            allow_blank: false,
         }
+    }
+
+    /// Let Enter submit an empty field, for a value that is optional.
+    pub fn allowing_blank(mut self) -> Self {
+        self.allow_blank = true;
+        self
     }
 
     /// Seed the field with an initial value (e.g. the current branch name
@@ -253,7 +268,7 @@ impl InputPrompt {
     /// field is a no-op the caller treats as "keep waiting").
     pub fn submit_value(&self) -> Option<String> {
         let v = self.value.trim();
-        (!v.is_empty()).then(|| v.to_string())
+        (self.allow_blank || !v.is_empty()).then(|| v.to_string())
     }
 }
 

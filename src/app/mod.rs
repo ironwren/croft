@@ -4197,6 +4197,9 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// The configuration **Debug: Add Configuration…** is building (#250),
+    /// between its steps.
+    debug_config_draft: Option<crate::dap::configs::ConfigDraft>,
     /// Compounds declared beside those configurations. Listed in the picker so
     /// a workspace's compounds are visible; launching one needs the
     /// multi-session model tracked in #310.
@@ -5577,6 +5580,7 @@ impl App {
             process_picker: None,
             debug_sessions: Default::default(),
             debug_configs: Vec::new(),
+            debug_config_draft: None,
             debug_compounds: Vec::new(),
             selected_debug_config: None,
             selected_debug_compound: None,
@@ -24529,6 +24533,94 @@ impl App {
         }
     }
 
+    /// Debug: Add Configuration… (#250): the native form for a launch.json
+    /// entry, one step at a time, written to `.croft/launch.json` at the end.
+    /// Starts with the adapter.
+    pub fn open_add_debug_config(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        self.debug_config_draft = None;
+        let rows = crate::dap::configs::DRAFT_TYPES
+            .iter()
+            .map(|(id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DebugConfigType,
+                "Add Configuration: Debugger",
+                rows,
+            ),
+            "",
+        );
+    }
+
+    /// Ask for `field` of the draft, seeded with `retry` (a value just
+    /// refused) or the field's default; `None` means the draft is complete,
+    /// so write it.
+    fn prompt_debug_config_field(
+        &mut self,
+        field: Option<crate::dap::configs::DraftField>,
+        retry: Option<&str>,
+    ) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(draft) = self.debug_config_draft.as_ref() else {
+            return;
+        };
+        let Some(field) = field else {
+            self.finish_debug_config_draft();
+            return;
+        };
+        let (title, hint, seed) = draft.prompt(field);
+        let mut prompt = InputPrompt::new(InputPurpose::DebugConfigField { field }, title, hint)
+            .with_value(retry.map_or(seed, str::to_string));
+        if crate::dap::configs::ConfigDraft::optional(field) {
+            prompt = prompt.allowing_blank();
+        }
+        self.open_input_prompt(prompt);
+    }
+
+    /// Take a field's value: on to the next field, or back to this one with
+    /// the reason when it does not fit.
+    fn submit_debug_config_field(&mut self, field: crate::dap::configs::DraftField, value: &str) {
+        let Some(draft) = self.debug_config_draft.as_mut() else {
+            return;
+        };
+        match draft.set(field, value) {
+            Ok(()) => {
+                let next = draft.next_field(Some(field));
+                self.prompt_debug_config_field(next, None);
+            }
+            Err(why) => {
+                self.status = why;
+                self.prompt_debug_config_field(Some(field), Some(value));
+            }
+        }
+    }
+
+    /// Write the finished draft to `.croft/launch.json` and pick up the file
+    /// again, so the new configuration is in the picker and F5 at once.
+    fn finish_debug_config_draft(&mut self) {
+        let Some(draft) = self.debug_config_draft.take() else {
+            return;
+        };
+        let root = self.active_workspace_root();
+        match crate::dap::configs::add_to_croft_launch_json(&root, &draft) {
+            Ok(_) => {
+                self.debug_configs = crate::dap::configs::discover_configs(&root);
+                self.selected_debug_config = Some(draft.name.clone());
+                self.selected_debug_compound = None;
+                self.run_debug.selected_config = Some(draft.name.clone());
+                self.status = format!(
+                    "Added \"{}\" to .croft/launch.json and selected it; F5 starts it",
+                    draft.name
+                );
+            }
+            Err(why) => self.status = why,
+        }
+    }
+
     /// Debug: Select and Start Debugging — the launch.json configurations
     /// plus the synthesized zero-config entry.
     pub fn open_debug_config_picker(&mut self) {
@@ -24588,6 +24680,10 @@ impl App {
                 .into_iter()
                 .map(|(row, _)| row),
         );
+        rows.push(ListRow {
+            id: String::from("add"),
+            label: String::from("Add Configuration…"),
+        });
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -27448,6 +27544,10 @@ impl App {
                 let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
                 self.run_scm_op("switch -c (from)", r, "Created branch");
             }
+            InputPurpose::DebugConfigField { field } => {
+                self.close_input_prompt();
+                self.submit_debug_config_field(field, &value);
+            }
             InputPurpose::AddRemoteName => {
                 // First step: capture the name, then re-prompt for the URL.
                 self.close_input_prompt();
@@ -29713,6 +29813,42 @@ impl App {
                     self.launch_resolved_in(rc, slot);
                 }
             }
+            ListPurpose::DebugConfigType => {
+                self.debug_config_draft = Some(crate::dap::configs::ConfigDraft::new(
+                    &row.id,
+                    crate::dap::configs::RequestKind::Launch,
+                ));
+                self.open_list_picker(
+                    crate::widgets::list_picker::ListPicker::new(
+                        ListPurpose::DebugConfigRequest,
+                        "Add Configuration: Launch or Attach",
+                        vec![
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("launch"),
+                                label: String::from(
+                                    "Launch — start the program under the debugger",
+                                ),
+                            },
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("attach"),
+                                label: String::from("Attach — to a program already running"),
+                            },
+                        ],
+                    ),
+                    "",
+                );
+            }
+            ListPurpose::DebugConfigRequest => {
+                if let Some(draft) = self.debug_config_draft.as_mut() {
+                    draft.request = if row.id == "attach" {
+                        crate::dap::configs::RequestKind::Attach
+                    } else {
+                        crate::dap::configs::RequestKind::Launch
+                    };
+                    let first = draft.next_field(None);
+                    self.prompt_debug_config_field(first, None);
+                }
+            }
             ListPurpose::DebugConfig => {
                 if let Some(idx) = row.id.strip_prefix("compound:") {
                     // Index the row straight through rather than round-tripping
@@ -29730,6 +29866,8 @@ impl App {
                         self.run_debug.selected_config = Some(compound.name.clone());
                         self.launch_compound(&compound);
                     }
+                } else if row.id == "add" {
+                    self.open_add_debug_config();
                 } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.selected_debug_compound = None;
@@ -42466,6 +42604,7 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
+            Cmd::AddDebugConfig => self.open_add_debug_config(),
             Cmd::StopDebugging => self.debug_stop_by_user(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::SwitchDebugSession => self.switch_debug_session(),

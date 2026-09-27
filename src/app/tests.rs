@@ -37038,8 +37038,8 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
     let picker = app.list_picker.as_ref().expect("picker open");
     assert_eq!(
         picker.rows.len(),
-        5,
-        "zero-config entry + two configurations + two compounds"
+        6,
+        "zero-config entry + two configurations + two compounds + Add Configuration"
     );
     let compound_row = picker
         .rows
@@ -37118,7 +37118,11 @@ fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("picker open");
-    assert_eq!(picker.rows.len(), 3, "zero-config entry + the two configs");
+    assert_eq!(
+        picker.rows.len(),
+        4,
+        "zero-config entry + the two configs + Add Configuration"
+    );
     assert!(picker.rows[0].label.contains("active file"));
     assert!(picker.rows[1].label.contains("API"));
 
@@ -46433,7 +46437,8 @@ fn the_config_row_does_not_count_a_hidden_compound() {
         "the visible configuration counts; the hidden compound does not"
     );
 
-    // And the picker agrees: nothing but the always-present active-file row.
+    // And the picker agrees: nothing but the always-present rows (the active
+    // file, and Add Configuration).
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("the picker opened");
     assert!(
@@ -46560,7 +46565,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
     let configs = crate::dap::configs::discover_configs(tmp.path());
     let ordered: Vec<&str> = rows
         .iter()
-        .filter(|(id, _)| id != "active")
+        .filter(|(id, _)| id != "active" && id != "add")
         .map(|(_, label)| label.split(' ').next().unwrap_or_default())
         .collect();
     assert_eq!(
@@ -46569,7 +46574,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
         "precondition: the presentation actually moved a row"
     );
     // The claim: every id still indexes the entry whose name the row shows.
-    for (id, label) in rows.iter().filter(|(id, _)| id != "active") {
+    for (id, label) in rows.iter().filter(|(id, _)| id != "active" && id != "add") {
         let idx: usize = id.parse().expect("a configuration row's id is its index");
         assert!(
             label.starts_with(&configs[idx].name),
@@ -51111,6 +51116,99 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
 }
 
 /// Open the debug picker and confirm the row whose label starts with `label`.
+/// Pick the row of the open list picker whose id is `id`.
+fn pick_row_id(app: &mut App, id: &str) {
+    let picker = app.list_picker.as_mut().expect("a picker is open");
+    picker.selected = picker
+        .rows
+        .iter()
+        .position(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no row {id}"));
+    app.confirm_list_picker();
+}
+
+/// Type `value` over whatever the open prompt holds and press Enter.
+fn answer_prompt(app: &mut App, value: &str) {
+    app.input_prompt.as_mut().expect("a prompt is open").value = value.to_string();
+    app.submit_input_prompt();
+}
+
+/// #250: Debug: Add Configuration… walks the fields a launch needs, refuses
+/// a value that does not fit without losing the rest, and writes the entry
+/// to `.croft/launch.json`, selected for F5 and listed in the picker.
+#[test]
+fn add_debug_configuration_writes_a_launch_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Reachable from the picker, not only the palette.
+    app.open_debug_config_picker();
+    pick_row_id(&mut app, "add");
+    pick_row_id(&mut app, "python");
+    pick_row_id(&mut app, "launch");
+    let prompt = app.input_prompt.as_ref().expect("the name is asked");
+    assert_eq!(prompt.value, "Launch Python", "seeded with a name");
+    answer_prompt(&mut app, "Serve");
+    assert_eq!(app.input_prompt.as_ref().unwrap().value, "${file}");
+    answer_prompt(&mut app, "${workspaceFolder}/api.py");
+    answer_prompt(&mut app, "--port \"80 00");
+    assert!(app.status.contains("quote"), "{}", app.status);
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "--port \"80 00",
+        "the refused value is offered back to fix"
+    );
+    answer_prompt(&mut app, "--port 8000");
+    // Optional fields take a blank Enter.
+    answer_prompt(&mut app, "");
+    answer_prompt(&mut app, "DEBUG=1");
+    answer_prompt(&mut app, "");
+    assert!(app.input_prompt.is_none(), "the draft is complete");
+    assert!(app.status.contains("Added \"Serve\""), "{}", app.status);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Serve"));
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].source, ".croft/launch.json");
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/launch.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &written["configurations"][0];
+    assert_eq!(entry["program"], "${workspaceFolder}/api.py");
+    assert_eq!(entry["args"], serde_json::json!(["--port", "8000"]));
+    assert_eq!(entry["env"]["DEBUG"], "1");
+    assert!(entry.get("cwd").is_none() && entry.get("preLaunchTask").is_none());
+    app.open_debug_config_picker();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.label.starts_with("Serve")),
+        "and the picker lists it"
+    );
+}
+
+/// #250: an attach asks only where to attach, and the palette starts it.
+#[test]
+fn add_debug_configuration_attaches_by_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::AddDebugConfig);
+    pick_row_id(&mut app, "node");
+    pick_row_id(&mut app, "attach");
+    answer_prompt(&mut app, "Web");
+    answer_prompt(&mut app, "nope");
+    assert!(app.status.contains("Not a port"), "{}", app.status);
+    answer_prompt(&mut app, "9229");
+    assert!(app.input_prompt.is_none());
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(
+        (cfgs.len(), cfgs[0].request),
+        (1, crate::dap::configs::RequestKind::Attach)
+    );
+}
+
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
     let idx = app
