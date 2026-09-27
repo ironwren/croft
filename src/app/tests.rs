@@ -37038,8 +37038,8 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
     let picker = app.list_picker.as_ref().expect("picker open");
     assert_eq!(
         picker.rows.len(),
-        5,
-        "zero-config entry + two configurations + two compounds"
+        6,
+        "zero-config entry + two configurations + two compounds + Add Configuration"
     );
     let compound_row = picker
         .rows
@@ -37118,7 +37118,11 @@ fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("picker open");
-    assert_eq!(picker.rows.len(), 3, "zero-config entry + the two configs");
+    assert_eq!(
+        picker.rows.len(),
+        4,
+        "zero-config entry + the two configs + Add Configuration"
+    );
     assert!(picker.rows[0].label.contains("active file"));
     assert!(picker.rows[1].label.contains("API"));
 
@@ -46433,7 +46437,8 @@ fn the_config_row_does_not_count_a_hidden_compound() {
         "the visible configuration counts; the hidden compound does not"
     );
 
-    // And the picker agrees: nothing but the always-present active-file row.
+    // And the picker agrees: nothing but the always-present rows (the active
+    // file, and Add Configuration).
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("the picker opened");
     assert!(
@@ -46560,7 +46565,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
     let configs = crate::dap::configs::discover_configs(tmp.path());
     let ordered: Vec<&str> = rows
         .iter()
-        .filter(|(id, _)| id != "active")
+        .filter(|(id, _)| id != "active" && id != "add")
         .map(|(_, label)| label.split(' ').next().unwrap_or_default())
         .collect();
     assert_eq!(
@@ -46569,7 +46574,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
         "precondition: the presentation actually moved a row"
     );
     // The claim: every id still indexes the entry whose name the row shows.
-    for (id, label) in rows.iter().filter(|(id, _)| id != "active") {
+    for (id, label) in rows.iter().filter(|(id, _)| id != "active" && id != "add") {
         let idx: usize = id.parse().expect("a configuration row's id is its index");
         assert!(
             label.starts_with(&configs[idx].name),
@@ -51110,6 +51115,99 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
     }
 }
 
+/// Pick the row of the open list picker whose id is `id`.
+fn pick_row_id(app: &mut App, id: &str) {
+    let picker = app.list_picker.as_mut().expect("a picker is open");
+    picker.selected = picker
+        .rows
+        .iter()
+        .position(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no row {id}"));
+    app.confirm_list_picker();
+}
+
+/// Type `value` over whatever the open prompt holds and press Enter.
+fn answer_prompt(app: &mut App, value: &str) {
+    app.input_prompt.as_mut().expect("a prompt is open").value = value.to_string();
+    app.submit_input_prompt();
+}
+
+/// #250: Debug: Add Configuration… walks the fields a launch needs, refuses
+/// a value that does not fit without losing the rest, and writes the entry
+/// to `.croft/launch.json`, selected for F5 and listed in the picker.
+#[test]
+fn add_debug_configuration_writes_a_launch_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Reachable from the picker, not only the palette.
+    app.open_debug_config_picker();
+    pick_row_id(&mut app, "add");
+    pick_row_id(&mut app, "python");
+    pick_row_id(&mut app, "launch");
+    let prompt = app.input_prompt.as_ref().expect("the name is asked");
+    assert_eq!(prompt.value, "Launch Python", "seeded with a name");
+    answer_prompt(&mut app, "Serve");
+    assert_eq!(app.input_prompt.as_ref().unwrap().value, "${file}");
+    answer_prompt(&mut app, "${workspaceFolder}/api.py");
+    answer_prompt(&mut app, "--port \"80 00");
+    assert!(app.status.contains("quote"), "{}", app.status);
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "--port \"80 00",
+        "the refused value is offered back to fix"
+    );
+    answer_prompt(&mut app, "--port 8000");
+    // Optional fields take a blank Enter.
+    answer_prompt(&mut app, "");
+    answer_prompt(&mut app, "DEBUG=1");
+    answer_prompt(&mut app, "");
+    assert!(app.input_prompt.is_none(), "the draft is complete");
+    assert!(app.status.contains("Added \"Serve\""), "{}", app.status);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Serve"));
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].source, ".croft/launch.json");
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/launch.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &written["configurations"][0];
+    assert_eq!(entry["program"], "${workspaceFolder}/api.py");
+    assert_eq!(entry["args"], serde_json::json!(["--port", "8000"]));
+    assert_eq!(entry["env"]["DEBUG"], "1");
+    assert!(entry.get("cwd").is_none() && entry.get("preLaunchTask").is_none());
+    app.open_debug_config_picker();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.label.starts_with("Serve")),
+        "and the picker lists it"
+    );
+}
+
+/// #250: an attach asks only where to attach, and the palette starts it.
+#[test]
+fn add_debug_configuration_attaches_by_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::AddDebugConfig);
+    pick_row_id(&mut app, "node");
+    pick_row_id(&mut app, "attach");
+    answer_prompt(&mut app, "Web");
+    answer_prompt(&mut app, "nope");
+    assert!(app.status.contains("Not a port"), "{}", app.status);
+    answer_prompt(&mut app, "9229");
+    assert!(app.input_prompt.is_none());
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(
+        (cfgs.len(), cfgs[0].request),
+        (1, crate::dap::configs::RequestKind::Attach)
+    );
+}
+
 /// Open the debug picker and confirm the row whose label starts with `label`.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
@@ -53786,6 +53884,71 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// Wait for the OUTLINE to show the scrubbed commit's own symbols (#371),
+/// which the builder parses on its own thread with the finished view.
+fn settle_scrub_outline(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.drain_scrub_views();
+        app.sync_outline();
+        let commit = app
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if commit.is_some() && app.outline_scrub_key.as_ref().map(|(_, c)| c.clone()) == commit {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubbed commit's outline was never built"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait for the history scrubber's finished view of where it stands to
+/// replace the plain stand-in (#371); the builder runs on its own thread.
+fn settle_scrub_view(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !matches!(app.scrub_view_key, Some((_, true))) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubber's view was never built"
+        );
+        app.drain_scrub_views();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stepping_back_to_a_finished_scrub_view_reuses_it() {
+    // #371: a step never waits on highlighting, and a commit whose view was
+    // already built shows it at once rather than building it again.
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Right), "back to HEAD");
+    assert!(
+        matches!(app.scrub_view_key, Some((_, true))),
+        "HEAD's finished view was kept"
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1", "v2", "v3"]
+    );
+    // Home drops the view; Esc drops the kept ones with the builder.
+    assert!(app.handle_scrubber_key(KeyCode::Home));
+    assert!(app.scrub_view.is_none() && app.scrub_view_key.is_none());
+    assert!(app.handle_scrubber_key(KeyCode::Esc));
+    assert!(app.scrub_views.is_empty() && app.scrub_builder.is_none());
+}
+
 #[test]
 fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     // #371: at each position the editor shows the file at that commit, and
@@ -53795,6 +53958,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     app.editor.open(&repo.path().join("a.txt")).unwrap();
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
     assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
     assert_eq!(
@@ -53803,6 +53967,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     );
     assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
     assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1", "v2"]);
     assert_eq!(
@@ -53810,6 +53975,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         Some(crate::widgets::editor::GitMark::Added)
     );
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1"]);
     assert_eq!(
@@ -58284,7 +58450,7 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "HEAD");
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
-    app.sync_outline();
+    settle_scrub_outline(&mut app);
     assert_eq!(names(&app), ["alpha"], "the commit's outline");
 
     // A jump to `alpha` lands in the historical view, where it is line 0,
@@ -58553,5 +58719,228 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
         app.editor.open_pinned(&other).unwrap();
         assert!(app.editor.dirty, "the other tab kept its unsaved work");
         assert_eq!(app.editor.lines[0], "fn b() { unsaved }");
+    });
+}
+
+/// #371's criterion, measured: after a warm-up pass, holding an arrow key
+/// back across up to 200 commits of this repository's own
+/// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
+/// frame it paints. Highlighting that file takes over half a second, so a
+/// step shows the plain text the builder already split and swaps the
+/// finished view in behind it. Needs this checkout's history, so it is
+/// ignored by default.
+#[test]
+#[ignore]
+fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/app/mod.rs")).unwrap();
+    app.scrub_history();
+    let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
+    assert!(steps > 20, "only {steps} commits to scrub");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // A held arrow key repeats about 30 times a second; between repeats the
+    // main loop takes in what the builder produced.
+    let repeat = std::time::Duration::from_millis(33);
+    // Warm-up, as the criterion allows: one pass reads every version.
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        app.handle_scrubber_key(KeyCode::Left);
+        app.sync_outline();
+    }
+    app.handle_scrubber_key(KeyCode::Home);
+    let mut times = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        let t = std::time::Instant::now();
+        app.handle_scrubber_key(KeyCode::Left);
+        // What the main loop runs between the key and the frame: the
+        // Outline follows the commit on screen.
+        app.sync_outline();
+        term.draw(|f| app.render(f)).unwrap();
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let p95 = times[times.len() * 95 / 100];
+    let max = *times.last().unwrap();
+    eprintln!("{steps} steps: p50 {p50:?} p95 {p95:?} max {max:?}");
+    assert!(p95 < std::time::Duration::from_millis(16), "p95 {p95:?}");
+}
+
+#[test]
+fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Variant Analysis Repositories view: a controller
+    // repository, then lists, repositories and owners to run against.
+    use crate::codeql_variant::{Item, Selection, VariantConfig};
+    use crate::widgets::codeql::{Action, Line};
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
+
+        // The welcome row asks for the controller and refuses a bad one.
+        app.codeql.select_action(Action::SetUpControllerRepository);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&crate::widgets::input_prompt::InputPurpose::CodeqlControllerRepository)
+        );
+        type_in(&mut app, "not a repo");
+        assert!(
+            app.status.contains("is not a GitHub repository"),
+            "{}",
+            app.status
+        );
+        assert!(!App::codeql_variant_path().exists(), "nothing saved");
+        press(&mut app, KeyCode::Enter);
+        type_in(&mut app, "https://github.com/me/ctl.git");
+        assert_eq!(saved().controller_repo.as_deref(), Some("me/ctl"));
+        assert!(app.codeql.lines().contains(&Line::Action(
+            Action::SetUpControllerRepository,
+            "Controller: me/ctl".into()
+        )));
+
+        // `l` adds a list, `a` a repository into the selected list.
+        press(&mut app, KeyCode::Char('l'));
+        type_in(&mut app, "top");
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().title,
+            "Add Repository to top"
+        );
+        type_in(&mut app, "github/codeql");
+        assert_eq!(saved().lists[0].repos, ["github/codeql"]);
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(Some(0), 0))
+        );
+        press(&mut app, KeyCode::Char('a'));
+        type_in(&mut app, "GitHub/CodeQL");
+        assert!(app.status.contains("already in list top"), "{}", app.status);
+
+        // `o` adds an owner; the palette adds a single repository.
+        press(&mut app, KeyCode::Char('o'));
+        type_in(&mut app, "octo-org");
+        assert_eq!(saved().owners, ["octo-org"]);
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::Owner(0)));
+        app.run_command(Command::CodeqlAddVariantRepo);
+        type_in(&mut app, "https://github.com/e/f/tree/main");
+        assert_eq!(saved().repos, ["e/f"]);
+
+        // Enter selects what a run targets, marked in the side bar.
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(None, 0))
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            saved().selected,
+            Some(Selection::Repo {
+                nwo: "e/f".into(),
+                list: None
+            })
+        );
+        assert!(
+            app.codeql
+                .lines()
+                .contains(&Line::Action(Action::VariantRepo(None, 0), "● e/f".into()))
+        );
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.status, "Open https://github.com/e/f");
+
+        // It persists for the next session.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.variant, saved());
+
+        // F2 renames a list; Space folds it.
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "top");
+        for _ in 0.."top".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_in(&mut app, "best");
+        assert_eq!(saved().lists[0].name, "best", "{}", app.status);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            !app.codeql
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::VariantRepo(Some(_), _), _)))
+        );
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+
+        // Delete removes an owner at once and asks before a list.
+        app.codeql.select_variant_item(Item::Owner(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(saved().owners.is_empty(), "{}", app.status);
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("and its 1 repository"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(saved().lists.len(), 1, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert!(saved().lists.is_empty(), "{}", app.status);
+        assert!(app.codeql.selected_hit().is_some(), "still on a row");
+
+        // Submission is still to come.
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(app.status.contains("not available yet"), "{}", app.status);
+
+        // The config file opens in a tab.
+        app.run_command(Command::CodeqlOpenVariantConfig);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(App::codeql_variant_path().as_path())
+        );
+
+        // A corrupt file is reported and never saved over.
+        std::fs::write(App::codeql_variant_path(), "{ broken").unwrap();
+        app.run_command(Command::CodeqlAddVariantList);
+        type_in(&mut app, "x");
+        assert!(app.status.contains("unchanged"), "{}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(App::codeql_variant_path()).unwrap(),
+            "{ broken"
+        );
+        app.open_codeql_view();
+        assert!(app.codeql.variant_error);
+        assert_eq!(
+            Command::from_id("codeql_set_up_controller_repository"),
+            Some(Command::CodeqlSetUpController)
+        );
     });
 }
