@@ -57162,6 +57162,51 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
         assert!(!checkout.exists(), "the worktree is gone");
         assert!(!app.roots.iter().any(|r| r == checkout));
         assert!(app.pr_checkout.is_none());
+
+        // Leaving before the fetch lands: nobody owns the result, so it is
+        // settled on arrival, never adopted.
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "PR checkout",
+            || {
+                app.poll_pr_checkout();
+                app.pr_checkout_rx.is_none()
+            },
+        );
+        assert!(
+            app.status
+                .contains("after its review closed; removed its checkout"),
+            "{}",
+            app.status
+        );
+        assert!(app.pr_checkout.is_none() && !checkout.exists());
+        assert!(!app.roots.iter().any(|r| r == checkout));
+
+        // An unsaved tab under the checkout keeps it.
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "PR checkout",
+            || {
+                app.poll_pr_checkout();
+                app.pr_checkout_rx.is_none()
+            },
+        );
+        let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
+        app.editor.open(&checkout.join("a.txt")).unwrap();
+        app.editor.dirty = true;
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.status.contains("a.txt has unsaved changes"),
+            "{}",
+            app.status
+        );
+        assert!(checkout.exists(), "kept");
     });
 }
 

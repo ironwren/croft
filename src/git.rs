@@ -1394,32 +1394,46 @@ fn is_worktree_of(repo: &Path, path: &Path) -> bool {
     })
 }
 
+/// A pull request head checked out by [`checkout_pr_worktree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrWorktree {
+    /// The commit checked out.
+    pub oid: String,
+    /// Whether this call created the worktree. One that was already there
+    /// is the user's as much as review mode's, and leaving never removes it.
+    pub created: bool,
+}
+
 /// Fetch pull request `number` from `remote` and check its head out,
-/// detached, in a worktree at `path` (#365). An existing checkout of the
-/// same repository is moved to the new head, so re-running after a push
-/// updates it. Anything else already at `path` is refused, never touched.
-/// Returns the commit checked out.
+/// detached, in a worktree at `path` (#365).
+///
+/// An existing worktree of the same repository is moved to the new head
+/// only when that loses nothing: it is clean, and its HEAD is the fetched
+/// head already or `previous`, the head review mode checked out there last.
+/// Any other HEAD holds commits that a detached checkout would leave to the
+/// reflog. Anything else already at `path` is refused, never touched.
 pub fn checkout_pr_worktree(
     repo: &Path,
     remote: &str,
     number: u64,
     path: &Path,
-) -> Result<String, String> {
+    previous: Option<&str>,
+) -> Result<PrWorktree, String> {
     let Some(path_s) = path.to_str() else {
         return Err(String::from("worktree path is not valid UTF-8"));
     };
     let Some(repo_s) = repo.to_str() else {
         return Err(String::from("repository path is not valid UTF-8"));
     };
-    // No prompt: this runs off the UI thread, where a credential prompt
-    // would wait forever on a terminal nobody sees.
-    let fetch = Command::new("git")
+    // No prompt: this runs off the UI thread, where a credential prompt,
+    // or ssh's own passphrase or host-key question on /dev/tty, would wait
+    // forever on a terminal nobody sees, or draw over the UI.
+    let mut fetch = Command::new("git");
+    fetch
         .args(["-C", repo_s, "fetch", "--quiet", remote])
-        .arg(format!("refs/pull/{number}/head"))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+        .arg(format!("refs/pull/{number}/head"));
+    never_prompt(&mut fetch);
+    let fetch = fetch.output().map_err(|e| e.to_string())?;
     if !fetch.status.success() {
         let err = String::from_utf8_lossy(&fetch.stderr);
         return Err(err
@@ -1439,16 +1453,26 @@ pub fn checkout_pr_worktree(
                 "{path_s} already exists and is not a worktree of this repository"
             ));
         }
-        if let Some(why) =
-            lane_removal_block(path).filter(|_| worktree_head(path).as_deref() != Some(&oid))
-        {
-            return Err(format!("the existing checkout has work in it: {why}"));
+        let head = worktree_head(path);
+        if head.as_deref() != Some(oid.as_str()) {
+            if let Some(why) = lane_removal_block(path) {
+                return Err(format!("the existing checkout has work in it: {why}"));
+            }
+            if previous.is_none() || head.as_deref() != previous {
+                return Err(format!(
+                    "{path_s} is at a commit review mode did not check out — put that work on a branch, or remove the worktree"
+                ));
+            }
         }
         run_git_mut(path, &["checkout", "--quiet", "--detach", &oid])?;
+        Ok(PrWorktree {
+            oid,
+            created: false,
+        })
     } else {
         run_git_mut(repo, &["worktree", "add", "--detach", path_s, &oid])?;
+        Ok(PrWorktree { oid, created: true })
     }
-    Ok(oid)
 }
 
 /// The commit a worktree's HEAD is on.
@@ -3297,17 +3321,26 @@ mod tests {
         let remote = remote_for_slug(&app, "o/r");
         assert_eq!(remote, "https://github.com/o/r.git", "no remote names o/r");
         assert_eq!(
-            checkout_pr_worktree(&app, "origin", 7, &path),
-            Ok(first.clone())
+            checkout_pr_worktree(&app, "origin", 7, &path, None),
+            Ok(PrWorktree {
+                oid: first.clone(),
+                created: true
+            })
         );
         assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "one");
         assert_eq!(pr_worktree_keep_reason(&path, &first), None);
 
-        // A new push moves the existing checkout.
+        // A new push moves the checkout review mode made, and only that:
+        // not knowing what it last checked out there, it refuses.
         let second = pr_commit("two");
+        let err = checkout_pr_worktree(&app, "origin", 7, &path, None).unwrap_err();
+        assert!(err.contains("did not check out"), "{err}");
         assert_eq!(
-            checkout_pr_worktree(&app, "origin", 7, &path),
-            Ok(second.clone())
+            checkout_pr_worktree(&app, "origin", 7, &path, Some(&first)),
+            Ok(PrWorktree {
+                oid: second.clone(),
+                created: false
+            })
         );
         assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "two");
 
@@ -3317,13 +3350,20 @@ mod tests {
         git(&path, &["commit", "-q", "-am", "mine"]);
         let why = pr_worktree_keep_reason(&path, &second).expect("a new commit keeps it");
         assert!(why.contains("commits"), "{why}");
+        // ...and a refresh will not detach away from that commit either.
+        let mine = git(&path, &["rev-parse", "HEAD"]);
+        let third = pr_commit("three");
+        let err = checkout_pr_worktree(&app, "origin", 7, &path, Some(&second)).unwrap_err();
+        assert!(err.contains("did not check out"), "{err}");
+        assert_eq!(worktree_head(&path).as_deref(), Some(mine.as_str()));
+        assert_ne!(mine, third);
 
         // Something else at the path is never touched.
         let stray = pr_worktree_path(&app, 8).unwrap();
         std::fs::create_dir(&stray).unwrap();
         let second_pr = git(&up, &["rev-parse", "HEAD"]);
         git(&up, &["update-ref", "refs/pull/8/head", &second_pr]);
-        let err = checkout_pr_worktree(&app, "origin", 8, &stray).unwrap_err();
+        let err = checkout_pr_worktree(&app, "origin", 8, &stray, None).unwrap_err();
         assert!(err.contains("not a worktree"), "{err}");
     }
 

@@ -1589,7 +1589,7 @@ const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a pull request checkout's worktree path and commit, or git's
 /// refusal, arrive (#365).
-type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, String), String>>;
+type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, crate::git::PrWorktree), String>>;
 
 /// A pull request head checked out into a sibling worktree (#365).
 struct PrCheckout {
@@ -1597,6 +1597,9 @@ struct PrCheckout {
     path: PathBuf,
     /// The commit checked out: a HEAD anywhere else means new commits.
     oid: String,
+    /// Whether review mode created the worktree; one that was already there
+    /// is never removed by leaving.
+    created: bool,
 }
 
 /// What a pull request review tab's `gh` call is fetching (#365).
@@ -52529,6 +52532,13 @@ impl App {
         }
         let number = view.pr.number;
         let slug = view.key.split('#').next().unwrap_or_default().to_string();
+        // What review mode last checked out there, the one HEAD a refresh
+        // may move away from without stranding commits.
+        let previous = self
+            .pr_checkout
+            .as_ref()
+            .filter(|c| c.number == number)
+            .map(|c| c.oid.clone());
         let repo = self.workspace_root().to_path_buf();
         let Some(path) = crate::git::pr_worktree_path(&repo, number) else {
             self.status = format!(
@@ -52542,8 +52552,14 @@ impl App {
             let remote = crate::git::remote_for_slug(&repo, &slug);
             // Canonical, like the workspace roots it is added to and later
             // removed from.
-            let result = crate::git::checkout_pr_worktree(&repo, &remote, number, &path)
-                .map(|oid| (path.canonicalize().unwrap_or(path), oid));
+            let result = crate::git::checkout_pr_worktree(
+                &repo,
+                &remote,
+                number,
+                &path,
+                previous.as_deref(),
+            )
+            .map(|wt| (path.canonicalize().unwrap_or(path), wt));
             let _ = tx.send(result);
         });
         self.pr_checkout_rx = Some((number, rx));
@@ -52566,20 +52582,91 @@ impl App {
         };
         self.pr_checkout_rx = None;
         match result {
-            Ok((path, oid)) => {
-                if !self.roots.iter().any(|r| r == path) {
-                    self.add_workspace_folder(path.clone());
+            Ok((path, wt)) => {
+                let mut fresh = PrCheckout {
+                    number,
+                    path,
+                    oid: wt.oid,
+                    created: wt.created,
+                };
+                // Review closed, or another PR opened, while this fetched:
+                // no review owns it, so it is settled like a left one.
+                if self.editor.pr_review.as_ref().map(|v| v.pr.number) != Some(number) {
+                    let outcome = self.settle_pr_checkout(fresh);
+                    self.status = format!(
+                        "PR #{number}'s checkout finished after its review closed; {outcome}"
+                    );
+                    return true;
                 }
-                let short: String = oid.chars().take(8).collect();
-                self.status = format!(
-                    "PR #{number} checked out at {short} in {} — leaving review removes it if nothing changed",
-                    path.display()
-                );
-                self.pr_checkout = Some(PrCheckout { number, path, oid });
+                match self.pr_checkout.take() {
+                    // A refresh of the same checkout: still review mode's
+                    // if review mode made it.
+                    Some(old) if old.number == number => fresh.created |= old.created,
+                    // Another PR's: settled before this one replaces it.
+                    Some(old) => {
+                        let _ = self.settle_pr_checkout(old);
+                    }
+                    None => {}
+                }
+                if !self.roots.iter().any(|r| r == fresh.path) {
+                    self.add_workspace_folder(fresh.path.clone());
+                }
+                let short: String = fresh.oid.chars().take(8).collect();
+                self.status = if fresh.created {
+                    format!(
+                        "PR #{number} checked out at {short} in {} — leaving review removes it if nothing changed",
+                        fresh.path.display()
+                    )
+                } else {
+                    format!(
+                        "PR #{number} checked out at {short} in the existing {}, which leaving review keeps",
+                        fresh.path.display()
+                    )
+                };
+                self.pr_checkout = Some(fresh);
             }
             Err(why) => self.status = format!("Could not check out PR #{number}: {why}"),
         }
         true
+    }
+
+    /// Remove a pull request checkout review mode no longer needs, with its
+    /// workspace folder and panes, unless something in it is worth keeping:
+    /// a worktree that existed before review, an unsaved editor tab under
+    /// it, edits or build output on disk, or new commits. Says which.
+    fn settle_pr_checkout(&mut self, checkout: PrCheckout) -> String {
+        let PrCheckout {
+            path, oid, created, ..
+        } = checkout;
+        if !path.exists() {
+            return String::from("its checkout is already gone");
+        }
+        let kept = |why: &str| format!("kept its checkout at {}: {why}", path.display());
+        if !created {
+            return kept("it existed before review");
+        }
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let unsaved = groups
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.dirty)
+            .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(&path)))
+            .map(|p| p.strip_prefix(&path).unwrap_or(p).display().to_string());
+        if let Some(file) = unsaved {
+            return kept(&format!("{file} has unsaved changes"));
+        }
+        if let Some(why) = crate::git::pr_worktree_keep_reason(&path, &oid) {
+            return kept(&why);
+        }
+        match crate::git::remove_worktree_lane(&path) {
+            Ok(()) => {
+                self.close_lane_panes(&path);
+                if self.roots.iter().any(|r| r == path) {
+                    self.remove_workspace_folder(path);
+                }
+                String::from("removed its checkout")
+            }
+            Err(why) => format!("could not remove {}: {why}", path.display()),
+        }
     }
 
     /// Leaving review mode (#365): remove the pull request's checkout and
@@ -52589,30 +52676,9 @@ impl App {
         let Some(checkout) = self.pr_checkout.take() else {
             return;
         };
-        let PrCheckout { number, path, oid } = checkout;
-        if !path.exists() {
-            return;
-        }
-        if let Some(why) = crate::git::pr_worktree_keep_reason(&path, &oid) {
-            self.status = format!(
-                "Left review of PR #{number}; kept its checkout at {}: {why}",
-                path.display()
-            );
-            return;
-        }
-        match crate::git::remove_worktree_lane(&path) {
-            Ok(()) => {
-                self.close_lane_panes(&path);
-                self.remove_workspace_folder(path);
-                self.status = format!("Left review of PR #{number} and removed its checkout");
-            }
-            Err(why) => {
-                self.status = format!(
-                    "Left review of PR #{number}; could not remove {}: {why}",
-                    path.display()
-                );
-            }
-        }
+        let number = checkout.number;
+        let outcome = self.settle_pr_checkout(checkout);
+        self.status = format!("Left review of PR #{number}; {outcome}");
     }
 
     /// SARIF viewer keys (#577). While the filter box has focus, printable
