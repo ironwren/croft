@@ -56082,3 +56082,23 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         assert!(app.pr_gh.is_none());
     });
 }
+
+/// #263: the coverage report opens as a tab, least covered file first,
+/// and without a run it says how to get one.
+#[test]
+fn show_coverage_report_opens_the_last_run_as_a_tab() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::TestingShowCoverageReport);
+    assert!(app.status.contains("No coverage yet"), "{}", app.status);
+    let root = app.active_test_root.clone();
+    app.testing.coverage = Some(crate::testing::coverage::Coverage::from_lcov(
+        "SF:a.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
+        &root,
+    ));
+    app.run_command(Command::TestingShowCoverageReport);
+    assert_eq!(app.editor.path.as_deref(), Some(Path::new("Coverage Report")));
+    assert_eq!(app.editor.lines[0], "Coverage: 50.0% of 2 lines");
+    assert!(app.editor.lines[2].ends_with(" a.rs"), "{:?}", app.editor.lines);
+}

@@ -642,7 +642,10 @@ impl Widget for &mut TestingPanel {
             // green tally: say so.
             let run_failed = self.last_run_ok == Some(false) && !self.run_reported_failed;
             // The marker leads so a narrow panel cannot clip it away.
-            let tally = format!("{passed} passed · {failed} failed · {skipped} skipped");
+            let mut tally = format!("{passed} passed · {failed} failed · {skipped} skipped");
+            if let Some(pct) = self.coverage.as_ref().and_then(|c| c.percent()) {
+                tally.push_str(&format!(" · {pct:.0}% covered"));
+            }
             let summary = if run_failed {
                 format!("run failed · {tally}")
             } else {

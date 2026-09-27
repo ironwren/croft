@@ -21520,6 +21520,23 @@ impl App {
         self.status = String::from("Coverage cleared");
     }
 
+    /// Testing: Show Coverage Report (#263): the last coverage run as a
+    /// tab, one file per line with its percentage, least covered first.
+    fn show_coverage_report(&mut self) {
+        let Some(coverage) = self.testing.coverage.as_ref() else {
+            self.status = String::from("No coverage yet: run Testing: Run All Tests with Coverage");
+            return;
+        };
+        let report = coverage.report(&self.active_test_root);
+        match self
+            .editor
+            .open_text_buffer(Path::new("Coverage Report"), &report)
+        {
+            Ok(()) => self.focus_pane(Pane::Editor),
+            Err(e) => self.status = format!("Could not open the report: {e}"),
+        }
+    }
+
     /// Install the runner's coverage tool in a terminal pane, where its
     /// output and any prompt are visible.
     fn install_coverage_tool(&mut self) {
@@ -40488,6 +40505,7 @@ impl App {
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
+            Cmd::TestingShowCoverageReport => self.show_coverage_report(),
             Cmd::TestingToggleWatchAll => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
