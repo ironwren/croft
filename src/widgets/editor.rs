@@ -3011,6 +3011,9 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// A pull request under review (#365): its files, checks and viewed
+    /// marks. Read-only; the tab has no file behind it.
+    pub pr_review: Option<crate::widgets::pr_review::PrReviewView>,
     /// Three-way merge editor (#253). UNLIKE the other view kinds this is
     /// not read-only and not in `has_non_text_view`: `lines` holds the
     /// editable Result and keeps the whole text path (LSP, undo, save);
@@ -3026,6 +3029,12 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Notebook code cells (indices into `cells`) running or queued in the
+    /// notebook's kernel: the preview shows them as `In [*]` (#355).
+    pub notebook_running: Vec<usize>,
+    /// Coverage marks for this file from the last coverage run (#263),
+    /// painted in the git bar's lane while shown.
+    pub coverage: Option<crate::testing::coverage::CoverageLens>,
     /// Hit-test rect for the "previous change" arrow painted in the diff
     /// header. Empty when the tab isn't a diff or the header was clipped.
     /// `App` consults this on left-click to jump to the previous hunk.
@@ -3208,9 +3217,12 @@ impl Editor {
             hex: None,
             log: None,
             archive: None,
+            pr_review: None,
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            notebook_running: Vec::new(),
+            coverage: None,
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
@@ -4041,6 +4053,28 @@ impl Editor {
         out
     }
 
+    /// A read-only view of `path` as it was at some commit (#371): `text` is
+    /// the file then, `baseline` the parent commit's version, so the git
+    /// gutter shows that commit's own change (a root commit, or a file the
+    /// commit added, has an empty baseline and marks every line added).
+    pub fn historical(path: &Path, text: &str, baseline: Vec<String>) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.lang = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .and_then(lang_for_extension);
+        e.recompute_highlights();
+        e.set_git_head_lines(path.to_path_buf(), Some(baseline));
+        // Never edited, so the marks are computed once, here.
+        e.refresh_git_marks();
+        e
+    }
+
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
     /// last computed marks (call after a render, or after `refresh_git_marks`).
     pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
@@ -4865,6 +4899,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
@@ -4972,6 +5007,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -5026,6 +5062,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -5102,6 +5139,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -5219,6 +5257,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
             bytes: png,
@@ -5276,6 +5315,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -5353,6 +5393,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -5368,6 +5409,7 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            || self.pr_review.is_some()
             // A rendered log's text side is an empty stub, so a save would
             // write one blank line over the file — the #185 truncation class.
             || self.log.is_some()
@@ -5459,6 +5501,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
         self.hex = None;
         self.log = Some(view);
         self.status = format!("Opened {} as a rendered log", path.display());
@@ -5561,6 +5604,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
         // The render dispatch checks `log` BEFORE `hex`, so a stale log would
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
@@ -6356,12 +6400,13 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let scratch = std::env::temp_dir().join("croft-notebook-outputs");
-        let Some((lines, images)) = crate::notebook::render(
+        let Some((lines, images, runnables)) = crate::notebook::render(
             &text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
             &scratch,
+            &self.notebook_running,
         ) else {
             return false;
         };
@@ -6374,7 +6419,7 @@ impl Editor {
             built_seq: self.edit_seq,
             images,
             anchor_rows: Vec::new(),
-            runnables: Vec::new(),
+            runnables,
             run_rows: Vec::new(),
             wrap_key: (0, 0),
             last_area: Rect::default(),
@@ -12646,7 +12691,7 @@ fn follow_moved_bookmark_lines(
 /// position past that `\r` (semantic tokens, diagnostics, hover, definition)
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
-fn split_into_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())
@@ -12865,6 +12910,10 @@ impl Widget for &mut Editor {
         }
         if let Some(view) = self.archive.as_mut() {
             render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
+            return;
+        }
+        if let Some(view) = self.pr_review.as_mut() {
+            crate::widgets::pr_review::render(view, inner, buf, cbg, self.theme);
             return;
         }
         if let Some(view) = self.log.as_mut() {
@@ -13428,6 +13477,32 @@ impl Widget for &mut Editor {
                     y,
                     "\u{2503}", // ┃ heavy vertical
                     Style::default().fg(color),
+                );
+            }
+            // Coverage lens (#263): the same lane, painted over the git bar
+            // while a coverage report is shown. Green run, red never run,
+            // amber run with a branch missed; dimmed once the file changed
+            // after the run. `Coverage: Clear` gives the lane back to git.
+            if (!wrap || row_start == 0)
+                && let Some(lens) = self.coverage.as_ref()
+                && let Some(cov) = lens.lines.get(&line_idx)
+            {
+                use crate::testing::coverage::LineCov;
+                let (rgb, glyph) = match cov {
+                    LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
+                    LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
+                    LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
+                };
+                let (r, g, b) = if lens.stale {
+                    (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
+                } else {
+                    rgb
+                };
+                buf.set_string(
+                    inner.x + gutter_width,
+                    y,
+                    glyph,
+                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
                 );
             }
             // Provenance overlay (#349): the same lane, a thinner bar in the
@@ -15168,6 +15243,10 @@ pub struct Crumb {
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
 pub struct EditorTabs {
+    /// The active editor's rect below the tab strip and breadcrumbs, from
+    /// the last frame: where a view standing in for it (the history
+    /// scrubber's, #371) paints.
+    pub last_body: Rect,
     pub editors: Vec<Editor>,
     active: usize,
     /// Breadcrumb segments for the active file, set by `App` each frame from
@@ -15212,6 +15291,7 @@ pub struct EditorTabs {
 impl EditorTabs {
     pub fn new() -> Self {
         Self {
+            last_body: Rect::default(),
             editors: vec![Editor::new()],
             active: 0,
             breadcrumbs: Vec::new(),
@@ -16025,6 +16105,30 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Open a pull request for review in a fresh tab labelled `PR #n`
+    /// (#365), or re-select the tab already showing it.
+    pub fn open_pr_review(&mut self, view: crate::widgets::pr_review::PrReviewView) {
+        let label = PathBuf::from(format!("PR #{}", view.pr.number));
+        if let Some(idx) = self.find_tab_with_path(&label) {
+            self.editors[idx].pr_review = Some(view);
+            self.select(idx);
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label);
+        e.pr_review = Some(view);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return;
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+    }
+
     /// Open arbitrary text in a scratch tab labelled `label` (no file on
     /// disk). Used by "Show Git Output" to surface the git command log. The
     /// tab has no `disk_stamp`, so the FS-sync layer never tries to reload
@@ -16364,6 +16468,7 @@ impl Widget for &mut EditorTabs {
             };
         }
 
+        self.last_body = body;
         let active_editor = &mut self.editors[active];
         Widget::render(active_editor, body, buf);
     }
