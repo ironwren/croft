@@ -358,7 +358,25 @@ pub struct Prefs {
     /// a command or post to a URL.
     #[serde(default)]
     pub notifications: Vec<NotificationSink>,
+    /// The file as it was read, kept so a save rewrites only what changed.
+    #[serde(skip)]
+    pub(crate) source: SourceDoc,
 }
+
+/// The raw `config.json` object a [`Prefs`] was loaded from. The settings
+/// loader reads keys this struct has no field for (`extends`, the
+/// `macos` / `linux` / `android` blocks, settings of newer versions), so a
+/// save that wrote the struct back alone deleted them. Ignored by equality:
+/// two `Prefs` with the same settings are equal wherever they came from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceDoc(Option<serde_json::Map<String, serde_json::Value>>);
+
+impl PartialEq for SourceDoc {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SourceDoc {}
 
 /// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
 /// test builds: the user's real `config.json` must never steer a test
@@ -382,7 +400,20 @@ impl Prefs {
     pub fn load(path: &Path) -> Result<Self> {
         let json =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&json).context("parsing prefs")
+        Self::parse(&json).context("parsing prefs")
+    }
+
+    /// Parse a `config.json`, which is JSONC like every other settings file
+    /// croft reads: the layer loader accepts comments and trailing commas,
+    /// so a strict parse here threw away every setting in a file that
+    /// merely had a comment, re-enabling disabled extensions among others.
+    fn parse(json: &str) -> serde_json::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(&crate::tasks::strip_jsonc(json))?;
+        let mut prefs: Self = serde_json::from_value(value.clone())?;
+        if let serde_json::Value::Object(map) = value {
+            prefs.source = SourceDoc(Some(map));
+        }
+        Ok(prefs)
     }
 
     /// The preferences a read-modify-write starts from: defaults only when
@@ -391,8 +422,7 @@ impl Prefs {
     /// other settings with defaults.
     pub fn load_for_update(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(json) => serde_json::from_str(&crate::tasks::strip_jsonc(&json))
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(json) => Self::parse(&json).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -403,8 +433,50 @@ impl Prefs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(self).context("serializing prefs")?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        // Written aside and renamed in: a reader on another thread (the MCP
+        // worker's fingerprint check) must never see a truncated file, and a
+        // crash mid-write must not leave one.
+        let tmp = path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        write_keeping_mode(&tmp, path, json.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("replacing {}", path.display())
+        })
+    }
+
+    /// What [`Prefs::save`] writes: the loaded file with only the settings
+    /// that changed since it was read replaced, so keys this struct does not
+    /// model survive. A value is compared against the file's own typed view,
+    /// so an untouched setting is left exactly as the user wrote it.
+    fn document(&self) -> Result<serde_json::Value> {
+        let current = serde_json::to_value(self).context("serializing prefs")?;
+        let Some(mut doc) = self.source.0.clone() else {
+            return Ok(current);
+        };
+        let loaded: Self = serde_json::from_value(serde_json::Value::Object(doc.clone()))
+            .context("re-reading prefs")?;
+        let loaded = serde_json::to_value(&loaded).context("serializing prefs")?;
+        if let (serde_json::Value::Object(current), serde_json::Value::Object(loaded)) =
+            (current, loaded)
+        {
+            // A setting cleared to a value that is skipped when serialized
+            // must leave the file too, or the old value would load again.
+            for key in loaded.keys().filter(|k| !current.contains_key(*k)) {
+                doc.remove(key);
+            }
+            for (key, value) in current {
+                if loaded.get(&key) != Some(&value) {
+                    doc.insert(key, value);
+                }
+            }
+        }
+        Ok(serde_json::Value::Object(doc))
     }
 
     pub fn theme(&self) -> Theme {
@@ -452,10 +524,51 @@ pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Write `bytes` to `tmp`, created no more readable than `dest` already is
+/// (0600 when `dest` is new): the file replaces `dest`, which may hold
+/// notification headers, and must not widen to the umask's 0644.
+pub(crate) fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    // Created fresh, never opened through what is already there: the temp
+    // names are predictable, and create+truncate followed a symlink planted
+    // at one, writing the bytes wherever it pointed. `create_new` (O_EXCL)
+    // refuses a symlink, and a stale file is removed first.
+    let _ = std::fs::remove_file(tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = std::fs::metadata(dest).map_or(0o600, |m| m.permissions().mode() & 0o777);
+        opts.mode(mode);
+        mode
+    };
+    let mut file = opts.open(tmp)?;
+    // `mode` at creation is still narrowed by the umask: set it outright.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(bytes)
+}
+
+/// The settings file under `config_dir`. The real config dir means the
+/// active profile's file (#618), which is what startup reads; saving
+/// consent or disabled extensions to the base file instead let a revoked
+/// consent survive a restart under a profile.
+fn prefs_file_in(config_dir: &Path) -> PathBuf {
+    if config_dir == self::config_dir() {
+        config_path()
+    } else {
+        config_dir.join("config.json")
+    }
+}
+
 /// Persist the set of disabled extension ids, preserving other settings.
 /// Best-effort: a write failure is swallowed by the caller.
 pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disabled_extensions = disabled.clone();
     prefs.save(&path)
@@ -465,7 +578,7 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
 /// dir it was built with, so a test can point it at a scratch dir instead
 /// of mutating the process-wide environment (which races sibling tests).
 pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.mcp_consented.insert(ext_id.to_string());
     prefs.save(&path)
@@ -474,7 +587,7 @@ pub fn save_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// Forget a recorded first-run consent under an explicit config dir; see
 /// [`save_mcp_consent_in`] for why the dir is a parameter.
 pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     if !prefs.mcp_consented.remove(ext_id) {
         return Ok(());
@@ -488,7 +601,7 @@ pub fn forget_mcp_consent_in(config_dir: &Path, ext_id: &str) -> Result<()> {
 /// settings (best-effort: a write failure is swallowed); false when a
 /// different one was recorded before, meaning the tool definition changed.
 pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str) -> bool {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     // An unreadable config can't vouch for a fingerprint, and saving over
     // it would lose every other setting: refuse the call instead.
     let Ok(mut prefs) = Prefs::load_for_update(&path) else {
@@ -509,7 +622,7 @@ pub fn trust_mcp_tool_in(config_dir: &Path, command_id: &str, fingerprint: &str)
 /// Forget the recorded tool fingerprints of `command_ids`, so each tool is
 /// trusted afresh on its next run; see [`trust_mcp_tool_in`].
 pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]) -> Result<()> {
-    let path = config_dir.join("config.json");
+    let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
     let before = prefs.mcp_tool_fingerprints.len();
     prefs
@@ -751,6 +864,73 @@ pub(crate) fn config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_one_setting_keeps_keys_prefs_does_not_model_and_accepts_jsonc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+  // shared base
+  "extends": "base.json",
+  "macos": {"theme": "light"},
+  "future_setting": 7,
+  "theme": "dark",
+  "osk_split": true,
+}"#,
+        )
+        .unwrap();
+        // A comment and trailing comma no longer reset everything.
+        assert!(Prefs::load(&path).unwrap().osk_split);
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        set_disable_secret_redaction(&path, true).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["extends"], "base.json");
+        assert_eq!(doc["macos"]["theme"], "light");
+        assert_eq!(doc["future_setting"], 7);
+        assert_eq!(doc["theme"], "dark");
+        assert_eq!(doc["osk_split"], true);
+        assert_eq!(doc["disable_secret_redaction"], true);
+        let prefs = Prefs::load(&path).unwrap();
+        assert!(prefs.mcp_consented.contains("ext"));
+        assert!(prefs.disable_secret_redaction);
+    }
+
+    #[test]
+    fn saving_prefs_replaces_the_file_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        assert!(
+            Prefs::load_for_update(&path)
+                .unwrap()
+                .mcp_consented
+                .contains("ext")
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
+        assert_eq!(prefs_file_in(dir.path()), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_prefs_keeps_a_private_config_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_mcp_consent_in(dir.path(), "ext").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     /// #624: a test build reads no saved `config.json`, so the MCP
     /// consents, the terminal warning and the extension toggles that

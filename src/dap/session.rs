@@ -629,6 +629,30 @@ pub fn parse_variables(variables_response: &Value) -> Vec<Variable> {
         .unwrap_or_default()
 }
 
+/// Apply `breakpoint` event reports to the unverified-line map, one line at
+/// a time, returning `true` if anything changed. An event carries a single
+/// breakpoint, unlike a `setBreakpoints` response, so it must not replace
+/// its file's set: every other unverified line there would be dropped and
+/// drawn as verified. Pure.
+pub fn update_breakpoint_lines(
+    map: &mut BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    reports: &[BreakpointReport],
+) -> bool {
+    let mut changed = false;
+    for r in reports {
+        let set = map.entry(r.path.clone()).or_default();
+        changed |= if r.verified {
+            set.remove(&r.line)
+        } else {
+            set.insert(r.line)
+        };
+        if set.is_empty() {
+            map.remove(&r.path);
+        }
+    }
+    changed
+}
+
 /// Fold breakpoint reports into a per-path unverified-line map, returning `true`
 /// if anything changed. Each reported path's unverified set is replaced
 /// wholesale (a `setBreakpoints` response describes that file's full set); a path
@@ -1061,8 +1085,10 @@ impl DapSession {
     /// the change takes effect mid-session (debugpy accepts it at any time).
     pub fn set_exception_filters(&mut self, filters: Vec<String>) {
         self.exception_filters = filters;
+        // The active connection: for js-debug that is the child session,
+        // where the debuggee runs; the parent ignores exception filters.
         let _ = self
-            .transport
+            .active()
             .send(set_exception_breakpoints_request(&self.exception_filters));
     }
 
@@ -1300,7 +1326,7 @@ impl DapSession {
         if msg.get("event").and_then(Value::as_str) == Some("breakpoint") {
             if self.js_server.is_none() {
                 let reports = breakpoint_reports(&msg);
-                if self.apply_breakpoint_reports(&reports) {
+                if update_breakpoint_lines(&mut self.unverified_breakpoints, &reports) {
                     out.push(DapEvent::BreakpointsUpdated);
                 }
             }
@@ -1415,13 +1441,23 @@ impl DapSession {
     /// Run to Cursor (#611): add a one-stop breakpoint at 1-based `line` of
     /// `path` and resume.
     pub fn run_to_cursor(&mut self, path: &Path, line: u32) {
-        let mut set = self.breakpoints.get(path).cloned().unwrap_or_default();
-        if !set.iter().any(|b| b.line == line) {
-            set.push(SourceBreakpoint::plain(line));
+        // A second Run to Cursor before the first stopped withdraws the
+        // first one's line, or it would stay behind with no gutter mark.
+        if let Some((old, _)) = self.run_to.take()
+            && old != path
+        {
+            let own = self.breakpoints.get(&old).cloned().unwrap_or_default();
+            let _ = self.active().send(set_breakpoints_request(&old, &own));
         }
-        let _ = self.active().send(set_breakpoints_request(path, &set));
         self.run_to = Some((path.to_path_buf(), line));
+        let own = self.breakpoints.get(path).cloned().unwrap_or_default();
+        let set = self.with_run_to(path, &own);
+        let _ = self.active().send(set_breakpoints_request(path, &set));
         self.continue_execution();
+    }
+
+    fn with_run_to(&self, path: &Path, own: &[SourceBreakpoint]) -> Vec<SourceBreakpoint> {
+        with_run_to(self.run_to.as_ref(), path, own)
     }
 
     /// Break when a variable changes (#611): ask the adapter for the data id
@@ -1465,9 +1501,9 @@ impl DapSession {
         // Kept current so Run to Cursor can restore exactly this set.
         self.breakpoints
             .insert(path.to_path_buf(), breakpoints.to_vec());
-        let _ = self
-            .active()
-            .send(set_breakpoints_request(path, breakpoints));
+        // A pending Run to Cursor in this file keeps its line.
+        let set = self.with_run_to(path, breakpoints);
+        let _ = self.active().send(set_breakpoints_request(path, &set));
     }
 
     /// Step over (`next`), into (`stepIn`), or out (`stepOut`).
@@ -1671,8 +1707,48 @@ mod session_set_tests {
     }
 }
 
+/// `own` plus a pending Run to Cursor line when it is in `path`, as a plain
+/// breakpoint: a logpoint, condition or hit count already on that line would
+/// let the program run straight past it.
+fn with_run_to(
+    run_to: Option<&(PathBuf, u32)>,
+    path: &Path,
+    own: &[SourceBreakpoint],
+) -> Vec<SourceBreakpoint> {
+    let mut set = own.to_vec();
+    if let Some((target, line)) = run_to
+        && target == path
+    {
+        set.retain(|b| b.line != *line);
+        set.push(SourceBreakpoint::plain(*line));
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_to_cursor_stops_even_on_a_logpoint_line() {
+        let src = PathBuf::from("/w/app.py");
+        let logpoint = SourceBreakpoint {
+            line: 9,
+            condition: None,
+            log_message: Some(String::from("x")),
+            hit_condition: None,
+        };
+        let target = (src.clone(), 9);
+        let set = with_run_to(Some(&target), &src, std::slice::from_ref(&logpoint));
+        assert_eq!(set, vec![SourceBreakpoint::plain(9)]);
+        assert_eq!(
+            with_run_to(
+                Some(&target),
+                Path::new("/w/other.py"),
+                std::slice::from_ref(&logpoint)
+            ),
+            vec![logpoint]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1938,6 +2014,30 @@ mod tests {
                 { "verified": true, "line": 0, "source": { "path": "/c.py" } } ]}
         });
         assert!(breakpoint_reports(&unresolved).is_empty());
+    }
+
+    #[test]
+    fn a_breakpoint_event_updates_only_its_own_line() {
+        let p = PathBuf::from("/a.py");
+        let report = |line, verified| BreakpointReport {
+            path: p.clone(),
+            line,
+            verified,
+        };
+        let mut map = BTreeMap::new();
+        fold_breakpoint_reports(&mut map, &[report(3, false), report(7, false)]);
+        // Line 3 verifies: line 7 stays unverified.
+        assert!(update_breakpoint_lines(&mut map, &[report(3, true)]));
+        assert_eq!(map[&p], [7].into_iter().collect());
+        // A new unverified line joins the set rather than replacing it.
+        assert!(update_breakpoint_lines(&mut map, &[report(9, false)]));
+        assert_eq!(map[&p], [7, 9].into_iter().collect());
+        assert!(!update_breakpoint_lines(&mut map, &[report(9, false)]));
+        update_breakpoint_lines(&mut map, &[report(7, true), report(9, true)]);
+        assert!(!map.contains_key(&p), "an empty set is dropped");
+        // Verifying a line never tracked changes nothing and adds no entry.
+        assert!(!update_breakpoint_lines(&mut map, &[report(1, true)]));
+        assert!(map.is_empty());
     }
 
     #[test]

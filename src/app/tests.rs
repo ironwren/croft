@@ -848,7 +848,8 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     assert_eq!(
         app.editor.pdf_page(),
         Some(2),
-        "clicking the internal link must flip the preview to page 2"
+        "clicking the internal link must flip the preview to page 2; status: {}",
+        app.status
     );
 }
 
@@ -4952,6 +4953,48 @@ fn drain_reports_writes_in_a_workspace_under_a_noise_named_ancestor() {
     );
 }
 
+/// A directory made after the watcher started is watched too: on Linux
+/// every directory needs its own watch, installed once at startup, so a
+/// write inside a new folder used to go unreported.
+#[test]
+fn writes_inside_a_directory_made_after_startup_are_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    for _ in 1..=FS_SYNC_TICKS {
+        app.try_install_pending_init();
+        let _ = app.fs_watch.drain(&mut app.tree, &app.editor);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let dir = root.join("newdir");
+    std::fs::create_dir(&dir).unwrap();
+    let early = dir.join("early.rs");
+    std::fs::write(&early, b"1").unwrap();
+    let mut changed: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    for _ in 1..=FS_SYNC_TICKS {
+        changed.extend(app.fs_watch.drain(&mut app.tree, &app.editor).changed_files);
+        if changed.contains(&early) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(changed.contains(&early), "{changed:?}");
+    let late = dir.join("late.rs");
+    std::fs::write(&late, b"2").unwrap();
+    for _ in 1..=FS_SYNC_TICKS {
+        changed.extend(app.fs_watch.drain(&mut app.tree, &app.editor).changed_files);
+        if changed.contains(&late) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        changed.contains(&late),
+        "the new folder is watched: {changed:?}"
+    );
+}
+
 #[test]
 fn fs_watcher_prunes_noise_dirs_nested_below_the_workspace_root() {
     // Regression for the freeze when the workspace root is a *parent of
@@ -6314,6 +6357,27 @@ fn welcome_tagline_constant_is_present() {
     assert!(WELCOME_TAGLINE.contains("LIGHTWEIGHT"));
     assert!(WELCOME_TAGLINE.contains("BLAZINGLY FAST"));
     assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
+}
+
+#[test]
+fn modified_terminal_keys_keep_their_modifiers() {
+    let k = |c, m| key_to_bytes(key(c, m), false);
+    assert_eq!(k(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f");
+    assert_eq!(k(KeyCode::Char(' '), KeyModifiers::CONTROL), vec![0x00]);
+    assert_eq!(k(KeyCode::Char('/'), KeyModifiers::CONTROL), vec![0x1f]);
+    assert_eq!(
+        k(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        b"\x1b\x01"
+    );
+    assert_eq!(k(KeyCode::Left, KeyModifiers::CONTROL), b"\x1b[1;5D");
+    assert_eq!(k(KeyCode::Right, KeyModifiers::SHIFT), b"\x1b[1;2C");
+    assert_eq!(k(KeyCode::Home, KeyModifiers::CONTROL), b"\x1b[1;5H");
+    assert_eq!(k(KeyCode::Delete, KeyModifiers::CONTROL), b"\x1b[3;5~");
+    // Alt alone on Left/Right stays readline's word motion.
+    assert_eq!(k(KeyCode::Left, KeyModifiers::ALT), b"\x1bb");
 }
 
 #[test]
@@ -11664,7 +11728,7 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         "the clear request must be one-shot — consuming twice in a row returns false",
     );
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "resize must also re-mark the icons dirty so the post-draw flush re-emits them after the clear",
     );
 }
@@ -11728,7 +11792,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(&[]);
     assert!(
         !app.consume_activity_image_clear(),
         "the first emit has no prior positions to compare, so it must not arm a clear",
@@ -11736,7 +11800,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     // A resize recenters the bar — every icon row shifts by one.
     place(&mut app, 3);
     app.overlays.activity.mark_dirty();
-    app.flush_activity_image_overlays();
+    app.flush_activity_image_overlays(&[]);
     assert!(
         app.consume_activity_image_clear(),
         "icons that moved since the last emit must arm one terminal.clear() to evict the stale image layer",
@@ -12295,11 +12359,87 @@ fn delete_branch_via_the_menu_opens_the_branch_picker_in_delete_mode() {
     assert_eq!(app.branch_purpose, crate::app::BranchPurpose::Delete);
 }
 
+/// Drain the network git operation in flight until it lands.
+fn wait_for_git_net(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the network git operation",
+        || {
+            app.drain_git_net();
+            app.git_net_job.is_none()
+        },
+    );
+}
+
+/// A push runs on a worker: the call returns with the operation in flight,
+/// a second one is refused while it runs, and the result lands on a drain.
+#[test]
+fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
+    let tmp = make_committed_repo();
+    let bare = tempfile::tempdir().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    git(bare.path(), &["init", "-q", "--bare"]);
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    git(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"two\n").unwrap();
+    git(tmp.path(), &["commit", "-qam", "two"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    assert!(app.git_net_job.is_some(), "the push is in flight");
+    app.pull_source_control();
+    assert!(app.status.contains("still running"), "{}", app.status);
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    let remote_head = git(bare.path(), &["rev-parse", "main"]).stdout;
+    let local_head = git(tmp.path(), &["rev-parse", "HEAD"]).stdout;
+    assert_eq!(remote_head, local_head);
+}
+
+/// Opening a config file must not reload the active tab in place: it held
+/// unsaved edits to another file, which were silently discarded.
+#[test]
+fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "saved\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.lines = vec![String::from("unsaved")];
+    app.editor.dirty = true;
+    let layer = tmp.path().join(".croft").join("config.json");
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    app.open_config_file_in_editor(layer.clone(), ConfigFileSeed::SettingsLayer);
+    assert_eq!(app.editor.path.as_deref(), Some(layer.as_path()));
+    let kept = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("a.txt still has its tab");
+    assert!(kept.dirty);
+    assert_eq!(kept.lines, vec![String::from("unsaved")]);
+}
+
 #[test]
 fn dispatching_fetch_records_a_line_in_the_git_output_log() {
     let tmp = make_committed_repo();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Fetch);
+    wait_for_git_net(&mut app);
     assert!(
         app.git_output_log.iter().any(|l| l.contains("fetch")),
         "every dispatched git op must append to the git output log; saw {:?}",
@@ -12791,6 +12931,8 @@ fn ctrl_enter_in_source_control_commits_and_pushes() {
     app.source_control.message = "fix: bump seed".to_string();
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::CONTROL));
+    // The push runs on a worker.
+    wait_for_git_net(&mut app);
     // Verify the remote received the commit (its log now reports two
     // commits — the initial push + our new one).
     let log = std::process::Command::new("git")
@@ -14884,7 +15026,7 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
         app.consume_shortcuts_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
-    assert!(app.overlays.activity.is_dirty());
+    assert!(app.overlays.activity.dirty());
     assert!(app.overlays.welcome.is_dirty());
     assert!(app.overlays.hero.is_dirty());
 }
@@ -20463,8 +20605,8 @@ fn session_state_round_trip_reopens_tabs_at_saved_cursor_and_active() {
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 2);
     assert_eq!(
-        state.tabs[state.active_tab].path.as_path(),
-        file_a.as_path()
+        state.tabs[state.active_tab].path.as_deref(),
+        Some(file_a.as_path())
     );
 
     let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
@@ -20496,7 +20638,11 @@ fn session_state_preserves_unsaved_buffer_contents() {
     app.editor.editors[idx].dirty = true;
 
     let state = app.capture_session_state();
-    let tab = state.tabs.iter().find(|t| t.path == file).unwrap();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_ref() == Some(&file))
+        .unwrap();
     assert!(tab.dirty);
     assert_eq!(tab.unsaved_text.as_deref(), Some("edited unsaved"));
 
@@ -20512,6 +20658,42 @@ fn session_state_preserves_unsaved_buffer_contents() {
     assert_eq!(ed.lines, vec![String::from("edited unsaved")]);
     // On-disk file must be untouched by the capture/restore.
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\n");
+}
+
+/// A self-update must not drop the only copy of unsaved text: neither an
+/// untitled buffer's nor that of a file deleted while the update ran.
+#[test]
+fn session_state_keeps_unsaved_untitled_and_unreadable_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("gone.txt");
+    std::fs::write(&file, "saved\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("scratch notes")];
+    app.editor.dirty = true;
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.lines = vec![String::from("edited gone")];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+    assert_eq!(state.tabs.len(), 2);
+    std::fs::remove_file(&file).unwrap();
+
+    let mut restored = App::new(tmp.path().to_path_buf()).unwrap();
+    restored.apply_session_state(&state);
+    let eds = &restored.editor.editors;
+    let untitled = eds.iter().find(|e| e.path.is_none()).unwrap();
+    assert!(untitled.dirty);
+    assert_eq!(untitled.lines, vec![String::from("scratch notes")]);
+    let gone = eds
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .unwrap();
+    assert!(gone.dirty);
+    assert_eq!(gone.lines, vec![String::from("edited gone")]);
+    assert_eq!(eds.len(), 2, "the blank initial tab is reused");
+
+    // A blank untitled buffer is not carried.
+    let blank = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(blank.capture_session_state().tabs.is_empty());
 }
 
 #[test]
@@ -25159,7 +25341,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     // Baseline: no hover, icons already emitted (clean).
     app.hovered_activity_icon = None;
     app.overlays.activity.mark_emitted();
-    assert!(!app.overlays.activity.is_dirty());
+    assert!(!app.overlays.activity.dirty());
     let moved = |col: u16, row: u16| crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: col,
@@ -25170,7 +25352,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(0, 5));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "entering an icon re-emits the swapped image"
     );
     // Drifting within the same icon costs nothing: no re-dirty.
@@ -25178,14 +25360,14 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     app.handle_mouse(moved(1, 4));
     assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Search));
     assert!(
-        !app.overlays.activity.is_dirty(),
+        !app.overlays.activity.dirty(),
         "drifting within one icon does not re-emit"
     );
     // Leaving the bar clears the hover and re-emits the resting icon.
     app.handle_mouse(moved(40, 20));
     assert_eq!(app.hovered_activity_icon, None);
     assert!(
-        app.overlays.activity.is_dirty(),
+        app.overlays.activity.dirty(),
         "leaving the icon re-emits its resting variant"
     );
 }
@@ -37123,6 +37305,7 @@ fn a_stale_color_presentation_pick_is_refused_after_a_buffer_change() {
             start: (0, 11),
             end: (0, 18),
             new_text: String::from("rgb(255, 0, 0)"),
+            utf16: false,
         }],
     )];
     app.pending_color_context = Some((path.clone(), app.editor.edit_seq));
@@ -43014,6 +43197,60 @@ fn one_tab_speaks_for_a_file_to_the_language_server() {
     assert_eq!(seen, vec![active, active, active], "no tick resends");
 }
 
+/// An LSP edit applied to the file's tab while its symbol tab is active
+/// survives the next keystroke in the symbol tab: both tabs changed, and
+/// the keystroke's tab used to be copied over the rename.
+#[test]
+fn a_rename_landing_before_a_keystroke_in_a_symbol_tab_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.sync_symbol_views();
+    app.focus = Pane::Editor;
+    let edits = vec![(
+        file.clone(),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 3),
+            end: (0, 4),
+            new_text: String::from("renamed"),
+            utf16: false,
+        }],
+    )];
+    app.apply_rename_edits(&edits).unwrap();
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ))
+    .unwrap();
+    app.sync_symbol_views();
+    let file_tab = app
+        .editor
+        .editors
+        .iter()
+        .find(|t| t.symbol_view.is_none() && t.path.as_deref() == Some(file.as_path()))
+        .expect("the file's own tab");
+    assert!(
+        file_tab.lines[0].contains("renamed"),
+        "{:?}",
+        file_tab.lines
+    );
+    assert!(
+        file_tab.lines.iter().any(|l| l.contains('x')),
+        "{:?}",
+        file_tab.lines
+    );
+}
+
+#[test]
+fn peek_references_with_nothing_to_ask_does_not_arm_on_a_stale_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.references_request_id = Some(7);
+    app.peek_references_at_cursor();
+    assert!(!app.references_want_peek);
+    assert_eq!(app.references_request_id, None);
+}
+
 /// A file of three functions with a symbol tab on the middle one, `b`
 /// (lines 3 to 5), active, and vim on.
 fn vim_symbol_tab_on_b(tmp: &tempfile::TempDir) -> App {
@@ -43834,7 +44071,7 @@ fn session_capture_keeps_a_symbol_tab_only_when_it_is_the_files_last_tab() {
     app.editor.dirty = true;
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
     assert!(
         state.tabs[0]
             .unsaved_text
@@ -43941,6 +44178,7 @@ fn a_collaborators_edit_on_a_symbols_edge_is_not_the_tabs_own() {
             start: (3, 0),
             end: (3, 0),
             new_text: String::from("\n"),
+            utf16: false,
         }]);
         // The local caret sits just past the new line, where a caret that
         // had typed it would be.
@@ -44080,7 +44318,7 @@ fn session_capture_keeps_one_tab_for_orphaned_symbol_tabs_of_a_file() {
     assert_eq!(app.editor.editors.len(), 2);
     let state = app.capture_session_state();
     assert_eq!(state.tabs.len(), 1);
-    assert_eq!(state.tabs[0].path, file);
+    assert_eq!(state.tabs[0].path.as_ref(), Some(&file));
 }
 
 /// #369: deleting a symbol tab's whole symbol closes the tab while a tab of
@@ -49780,17 +50018,20 @@ fn one_drain_answers_every_client_already_waiting() {
     std::fs::write(&first, "one").unwrap();
     std::fs::write(&second, "two").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Production's 20ms is shorter than one file open under a loaded full
+    // suite, and then the drain rightly defers client 1 to the next frame.
+    // Stretched, a drain that stops after the first client still fails.
+    app.view_drain_budget =
+        crate::test_budget::spawn_budget(crate::test_budget::tests::VIEW_DRAIN_BASE);
     let sock = seat_view_listener(&mut app, tmp.path());
 
     let mut clients = Vec::new();
     for target in [&first, &second] {
         let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-        // A read timeout, so losing FAILS rather than hangs. Whether both are
-        // served in one drain rests on production's 20ms budget, which no
-        // test scale can stretch: if the first open costs most of it, the
-        // drain returns having served client 0, the assert below still passes
-        // because something opened, and an untimed `read_line` on client 1
-        // blocks forever. That is a CI timeout with no message, which two
+        // A read timeout, so losing FAILS rather than hangs: a drain that
+        // serves only client 0 still passes the assert below, because
+        // something opened, and an untimed `read_line` on client 1 would then
+        // block forever. That is a CI timeout with no message, which two
         // other tests in this file go out of their way to avoid.
         c.set_read_timeout(Some(crate::test_budget::spawn_budget(
             crate::test_budget::tests::VIEW_DRAIN_BASE,
@@ -51073,6 +51314,7 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
             start: (0, 7),
             end: (0, 11),
             new_text: String::from("helpers"),
+            utf16: false,
         }],
     )];
     app.finish_file_move(pending, edits);
@@ -51087,6 +51329,128 @@ fn a_file_move_applies_the_servers_edits_before_renaming() {
         app.status.contains("references updated in 1 file"),
         "{}",
         app.status
+    );
+}
+
+#[test]
+fn moving_files_and_folders_carries_every_open_tab_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("dir/b.txt"), "b").unwrap();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("dir/b.txt")).unwrap();
+    app.editor.open_in_new_tab(&root.join("c.txt")).unwrap();
+    // c.txt is active; a.txt and dir/b.txt sit in background tabs.
+    assert!(app.apply_paste_or_drop(
+        &root.join("dest"),
+        &[root.join("a.txt"), root.join("dir")],
+        ExplorerClipMode::Cut
+    ));
+    let paths: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
+    assert!(paths.contains(&root.join("dest/dir/b.txt")), "{paths:?}");
+}
+
+/// A move re-points the file's tab in the OTHER split too, not only in the
+/// focused group.
+#[test]
+fn moving_a_file_repoints_its_tab_in_every_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    // The focused (right) group moves on to another file; a.txt stays open
+    // in the left one.
+    app.editor.open_pinned(&root.join("c.txt")).unwrap();
+    app.editor.close_tab(0);
+    assert!(app.apply_paste_or_drop(
+        &root.join("dest"),
+        &[root.join("a.txt")],
+        ExplorerClipMode::Cut
+    ));
+    let groups = app.editor_layout.inactive_groups_mut();
+    let paths: Vec<_> = groups[0]
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert!(paths.contains(&root.join("dest/a.txt")), "{paths:?}");
+}
+
+#[test]
+fn a_failed_move_leaves_the_importers_alone_and_edits_follow_a_moved_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("pkg/sub")).unwrap();
+    std::fs::write(root.join("main.rs"), "use pkg;\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let edit = |path: PathBuf| {
+        vec![(
+            path,
+            vec![crate::widgets::editor::TextSpanEdit {
+                start: (0, 4),
+                end: (0, 7),
+                new_text: String::from("pkg::sub::pkg"),
+                utf16: false,
+            }],
+        )]
+    };
+    // A folder into its own child: refused, and main.rs must not change.
+    let pending = PendingFileMove {
+        request_id: 1,
+        op: FileMove::Paste {
+            dest_dir: root.join("pkg/sub"),
+            paths: vec![root.join("pkg")],
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("pkg"),
+            new: root.join("pkg/sub/pkg"),
+            is_dir: true,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    app.finish_file_move(pending, edit(root.join("main.rs")));
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.rs")).unwrap(),
+        "use pkg;\n"
+    );
+    assert!(root.join("pkg/sub").is_dir());
+
+    // An edit to a file inside the moved folder lands at its new place.
+    std::fs::write(root.join("pkg/lib.rs"), "use pkg;\n").unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    let pending = PendingFileMove {
+        request_id: 2,
+        op: FileMove::Paste {
+            dest_dir: root.join("dest"),
+            paths: vec![root.join("pkg")],
+        },
+        renames: vec![crate::lsp::manager::FileRenameOp {
+            old: root.join("pkg"),
+            new: root.join("dest/pkg"),
+            is_dir: true,
+        }],
+        deadline: std::time::Instant::now(),
+    };
+    app.finish_file_move(pending, edit(root.join("pkg/lib.rs")));
+    assert_eq!(
+        std::fs::read_to_string(root.join("dest/pkg/lib.rs")).unwrap(),
+        "use pkg::sub::pkg;\n"
     );
 }
 
@@ -51393,7 +51757,12 @@ fn a_probe_reports_whether_the_file_is_still_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", "pick a b\n");
     let path = app.editor.path.clone().unwrap();
-    assert_eq!(app.probe_view_path(&path), crate::view_ipc::ViewReply::Ok);
+    assert_eq!(
+        app.probe_view_path(&path),
+        crate::view_ipc::ViewReply::Err {
+            message: String::from(crate::view_ipc::PROBE_OPEN)
+        }
+    );
     app.run_command(crate::widgets::command_palette::Command::CloseEditor);
     assert!(matches!(
         app.probe_view_path(&path),
@@ -51435,7 +51804,7 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
     app.keybindings_file = tmp.path().join("keybindings.json");
     app.open_keyboard_shortcuts();
     let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
-    app.recording_shortcut = Some(cmd);
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
     // Plain typing is refused and ends the recording.
     app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
         .unwrap();
@@ -51445,7 +51814,7 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
         app.status
     );
     assert!(!app.keybindings_file.exists());
-    app.recording_shortcut = Some(cmd);
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
     app.handle_key(key(
         KeyCode::Char('j'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -51466,11 +51835,41 @@ fn escape_leaves_the_shortcut_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.keybindings_file = tmp.path().join("keybindings.json");
-    app.recording_shortcut = Some(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.recording_shortcut = Some((
+        crate::widgets::command_palette::Command::ToggleLiveRun,
+        std::time::Instant::now(),
+    ));
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.status, "Shortcut unchanged");
     assert!(!app.keybindings_file.exists());
+}
+
+#[test]
+fn a_stale_or_clicked_away_shortcut_prompt_records_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
+    let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    app.recording_shortcut = Some((cmd, long_ago));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        !app.keybindings_file.exists(),
+        "a late chord is not recorded"
+    );
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.recording_shortcut.is_none(),
+        "a click cancels the prompt"
+    );
 }
 
 // ---- Profiles (#618) ----
@@ -51563,6 +51962,47 @@ fn fake_messages_endpoint(text: &'static str) -> (String, std::sync::mpsc::Recei
         let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
     });
     (url, rx)
+}
+
+/// #614: a key typed after a suggestion was painted makes it stale; Right
+/// before the echo arrives moves the cursor instead of typing the old
+/// suggestion's rest after the new key.
+#[test]
+fn right_does_not_accept_a_terminal_suggestion_the_typing_outran() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.term_suggestion = Some((0, String::from("g"), String::from("it status")));
+    app.handle_terminal_key(key(KeyCode::Char('i'), KeyModifiers::NONE));
+    app.term_suggestion = Some((0, String::from("g"), String::from("it status")));
+    app.handle_terminal_key(key(KeyCode::Right, KeyModifiers::NONE));
+    let written = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned();
+    assert!(!written.contains("it status"), "{written:?}");
+}
+
+#[test]
+fn a_failed_inline_suggestion_is_not_asked_again_until_the_caret_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "let x = \n");
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: String::from("http://127.0.0.1:1"),
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let first = app.inline_next_id;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        app.tick_inline_complete();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.inline_next_id - first, 1, "one request for one caret");
 }
 
 #[test]
@@ -51716,6 +52156,10 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     let (_tmp, root, f, log, stdin, gh) = review_fixture();
     let mut app = review_app(&root, &f, &gh);
     app.load_review_threads();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the threads", || {
+        app.drain_review_ops();
+        app.review_boxes.is_some()
+    });
     let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
     assert_eq!(threads.len(), 1);
     assert!(!threads[0].resolved);
@@ -51804,12 +52248,33 @@ fn pending_comments_stay_with_their_pull_request() {
     assert_eq!(app.navigator_notes["a.rs"].len(), 1);
 }
 
+/// A failed reply or thread load while a review is being submitted does not
+/// end the submission: only the submission's own answer does.
+#[test]
+fn only_the_submissions_own_failure_ends_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.review_submitting = true;
+    app.review_tx
+        .send(crate::review_ops::Outcome::Failed(String::from(
+            "Reply failed",
+        )))
+        .unwrap();
+    app.drain_review_ops();
+    assert!(app.review_submitting);
+    app.review_tx
+        .send(crate::review_ops::Outcome::SubmitFailed(String::from("no")))
+        .unwrap();
+    app.drain_review_ops();
+    assert!(!app.review_submitting);
+}
+
 /// #368: the navigator's notes and pending comments are previewed, then
 /// posted as one review with the navigator's marked as AI-authored; a note
 /// off the diff lands in the summary, and posted notes leave the editor.
 #[test]
 fn comments_export_to_the_pull_request_after_a_preview() {
-    let (_tmp, root, f, _log, stdin, gh) = review_fixture();
+    let (_tmp, root, f, log, stdin, gh) = review_fixture();
     let mut app = review_app(&root, &f, &gh);
     app.navigator_notes.insert(
         String::from("a.rs"),
@@ -51825,12 +52290,19 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             body: String::from("mine"),
         });
     app.open_export_comments();
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the preview", || {
+        app.drain_review_ops();
+        app.list_picker.is_some()
+    });
     let picker = app.list_picker.as_ref().expect("the preview is shown");
     assert_eq!(
         picker.rows[0].label,
         "Post to PR #7: 2 inline, 1 in the summary"
     );
     assert_eq!(picker.rows.len(), 4);
+    // A thread load answering for another PR meanwhile does not redirect
+    // the post away from the PR the preview named.
+    app.review_pr = Some((root.clone(), String::from("8")));
     app.post_exported_comments();
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
         app.drain_review_ops();
@@ -51853,6 +52325,11 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             .contains("`a.rs:41`: [AI, croft navigator] far")
     );
     assert!(app.review_pending.is_empty());
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains("pulls/7/reviews") && !log.contains("pulls/8/"),
+        "{log}"
+    );
 }
 
 /// #367: a sticky note hangs under its line as a box, follows the line when
@@ -52080,6 +52557,72 @@ tool = "go"
     );
 }
 
+#[test]
+fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #375: a binary inside Homebrew's Cellar must not be rebuilt or swapped
+    // by croft: the popup names `brew upgrade croft` and has no Update.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.install_source = crate::update_check::InstallSource::Homebrew;
+        app.update_check = Some(crate::update_check::UpdateCheck::preloaded(Some(
+            "9.9.9".into(),
+        )));
+        assert!(app.poll_update_watch());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buttons = app.update_toast.as_ref().unwrap().buttons.clone();
+        assert!(
+            !buttons
+                .iter()
+                .any(|(_, a)| matches!(a, super::UpdateToastAction::Update)),
+            "no Update button on a Homebrew install"
+        );
+        assert!(
+            buttons
+                .iter()
+                .any(|(_, a)| matches!(a, super::UpdateToastAction::Later)),
+            "Later still dismisses the offer"
+        );
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            screen.contains("brew upgrade croft"),
+            "the popup names the command to run"
+        );
+        // Even a direct request cannot stage a build over the Cellar.
+        app.start_staged_update("9.9.9".into());
+        assert!(app.staged_install.is_none(), "nothing staged");
+        assert!(app.status.contains("brew upgrade croft"), "{}", app.status);
+    });
+}
+
+#[test]
+fn a_self_managed_install_still_offers_update() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            app.install_source,
+            crate::update_check::InstallSource::SelfManaged,
+            "a test binary under target/ is not Homebrew-owned"
+        );
+    });
+}
+
 const EXITED_EVENT: &str = r#"{"seq":1,"type":"event","event":"exited","body":{"exitCode":0}}"#;
 const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"#;
 
@@ -52129,6 +52672,20 @@ fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
         "F ended and must go"
     );
     app.debug_stop();
+}
+
+/// #679: outside a persistent session there is nothing to detach from,
+/// and saying so beats a chord that silently does nothing.
+#[test]
+fn session_detach_outside_a_session_says_there_is_nothing_to_detach_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_channel = None;
+    app.run_command(crate::widgets::command_palette::Command::SessionDetach);
+    assert_eq!(
+        app.status,
+        "Not attached to a persistent session: nothing to detach from"
+    );
 }
 
 /// #678: Claude Code (or tmux, nvim) copying a selection through OSC 52 in
@@ -52192,4 +52749,208 @@ fn the_cells_under_an_image_fingerprint_writes_inside_it_only() {
     assert_ne!(super::cells_fingerprint(&buf, 2, 2, 5, 3), before);
     // A rectangle past the edge is clamped, not a panic.
     let _ = super::cells_fingerprint(&buf, 18, 8, 10, 10);
+}
+
+/// On Kitty an image lives on its own layer, so text redrawn beneath it
+/// never makes croft resend it; on iTerm2 it does.
+#[test]
+fn only_cell_buffer_protocols_resend_an_image_when_text_beneath_changes() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.terminal_image.set(
+        String::from("img"),
+        super::TerminalImageLayout {
+            cell_x: 1,
+            cell_y: 1,
+            cell_w: 4,
+            cell_h: 2,
+            seq: 0,
+            pane: 0,
+        },
+    );
+    let quiet = Buffer::empty(Rect::new(0, 0, 10, 5));
+    let mut busy = quiet.clone();
+    busy[(2, 1)].set_symbol("x");
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert_ne!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert_eq!(
+        app.image_underlays(&quiet).terminal,
+        app.image_underlays(&busy).terminal
+    );
+}
+
+/// #682: typing re-bakes the minimap at most every `MINIMAP_EDIT_REBAKE`,
+/// and the deferred bake still lands once the wait is over.
+#[test]
+fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cell_pixel = Some((8, 16));
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.editor.lines = (0..80).map(|i| format!("line {i}")).collect();
+    let strip = ratatui::layout::Rect {
+        x: 100,
+        y: 1,
+        width: 6,
+        height: 40,
+    };
+    app.update_minimap_overlay(strip);
+    let first = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    assert!(first.is_some());
+    app.editor.lines[0] = String::from("changed");
+    app.editor.edit_seq += 1;
+    app.update_minimap_overlay(strip);
+    assert_eq!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "a keystroke right after a bake waits"
+    );
+    assert!(!app.tick_minimap(), "not due yet");
+    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    assert!(app.tick_minimap(), "the wait is over: redraw");
+    assert!(
+        !app.tick_minimap(),
+        "one redraw per deferred bake, even if the minimap is gone by then"
+    );
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        first,
+        "the deferred edit is baked"
+    );
+    assert!(!app.tick_minimap());
+    // Scrolling is not held back.
+    app.editor.scroll = 5;
+    let before = app.minimap_image_payload().map(|(o, _)| o.to_string());
+    app.update_minimap_overlay(strip);
+    assert_ne!(
+        app.minimap_image_payload().map(|(o, _)| o.to_string()),
+        before
+    );
+}
+
+/// #682: only iTerm2 needs the idle icon keepalive.
+#[test]
+fn only_iterm2_keeps_the_activity_icons_alive() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (p, want) in [
+        (InlineImageProtocol::ITerm2, true),
+        (InlineImageProtocol::Kitty, false),
+        (InlineImageProtocol::Sixel, false),
+    ] {
+        app.inline_protocol = p;
+        assert_eq!(app.activity_keepalive_allowed(), want, "{p:?}");
+    }
+}
+
+/// #682: the minimap PNG is compressed hard; a typical strip encodes to a
+/// fraction of its default size.
+#[test]
+fn the_minimap_png_is_small() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = (0..400)
+        .map(|i| format!("    let value_{i} = compute(a, b, {i}); // note"))
+        .collect();
+    let (w, h) = (6 * 9, 45 * 18);
+    let rgba = app
+        .editor
+        .minimap_rgba(w, h, h, (30, 30, 30), (200, 200, 200));
+    let png = super::rgba_to_png(rgba, w, h).unwrap();
+    assert!(png.len() < 1500, "{} bytes", png.len());
+    assert!(image::load_from_memory(&png).is_ok());
+}
+
+/// #682: small chrome images go out when new, changed, moved, back from
+/// hiding, or (iTerm2) repainted around; not on every frame.
+#[test]
+fn a_chrome_image_is_sent_only_when_it_could_be_missing() {
+    use crate::iterm2_inline::InlineImageProtocol;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let at = Rect::new(2, 2, 3, 1);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+    app.drawn_buffer = Some(buf.clone());
+    app.inline_protocol = InlineImageProtocol::ITerm2;
+    assert!(app.chrome_image_due("k", "img", at), "new");
+    app.end_chrome_flush();
+    assert!(!app.chrome_image_due("k", "img", at), "unchanged frame");
+    app.end_chrome_flush();
+    assert!(app.chrome_image_due("k", "img2", at), "changed");
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "moved"
+    );
+    app.end_chrome_flush();
+    buf[(2, 2)].set_symbol("x");
+    app.drawn_buffer = Some(buf.clone());
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "a neighbour repainted on iTerm2"
+    );
+    app.end_chrome_flush();
+    app.end_chrome_flush();
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "back after a frame hidden"
+    );
+    app.end_chrome_flush();
+    app.inline_protocol = InlineImageProtocol::Kitty;
+    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)));
+    app.end_chrome_flush();
+    buf[(2, 3)].set_symbol("y");
+    app.drawn_buffer = Some(buf);
+    assert!(
+        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        "Kitty ignores neighbours"
+    );
+}
+
+/// A PROBLEMS count that goes to zero clears the screen only if a badge was
+/// drawn: start-up and graphics re-inits no longer wipe the screen.
+#[test]
+fn a_zero_problem_count_clears_nothing_when_no_badge_was_drawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays
+        .activity
+        .set_images(super::ActivityBarImages::default());
+    app.problems_badge_count = usize::MAX;
+    app.refresh_problems_badge();
+    assert!(!app.consume_problems_badge_image_clear());
+}
+
+/// A comment written while a review is being submitted stays pending, and a
+/// second submit while the first runs is refused rather than posted twice.
+#[test]
+fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
+    let (_tmp, root, f, _log, _stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("first", rel.clone());
+    app.submit_review(String::from("Looks good"));
+    assert!(app.review_submitting);
+    app.editor.cursor_row = 1;
+    app.add_pending_review_comment("written meanwhile", rel);
+    app.submit_review(String::from("again"));
+    assert!(app.status.contains("already"), "{}", app.status);
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the submit", || {
+        app.drain_review_ops();
+        !app.review_submitting
+    });
+    let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
+    assert_eq!(left, vec![String::from("written meanwhile")]);
 }
