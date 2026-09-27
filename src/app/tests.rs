@@ -54890,6 +54890,149 @@ fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
     });
 }
 
+#[test]
+fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Databases view renames, sorts, shows the folder of
+    // and removes a database; removing deletes only what croft downloaded.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = make_codeql_db(tmp.path(), "flask-db", "python");
+        let cached_root = App::codeql_db_cache_dir().join("kafka");
+        let cached = make_codeql_db(&cached_root, "java", "java");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        for db in [&mine, &cached] {
+            app.submit_codeql_database(
+                crate::widgets::input_prompt::CodeqlDbSource::Folder,
+                &db.display().to_string(),
+            );
+        }
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+
+        // F2 renames, starting from the current name.
+        app.codeql.select_database(0);
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "flask-db");
+        for _ in 0.."flask-db".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "web".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.databases[0].name, "web", "{}", app.status);
+        assert_eq!(
+            crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path()).databases[0].name,
+            "web",
+            "saved"
+        );
+
+        // `s` sorts by name; the current database and the selection follow.
+        press(&mut app, KeyCode::Char('s'));
+        let names: Vec<_> = app
+            .codeql
+            .databases
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(names, ["java", "web"]);
+        assert_eq!(app.codeql.current_db, Some(0), "kafka's is still current");
+        assert_eq!(app.codeql.selected_database(), Some(1), "still on web");
+
+        // `e` shows its folder in the Explorer.
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.sidebar_view, SidebarView::Explorer);
+        assert_eq!(app.tree.nodes[app.tree.selected].path, mine);
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+
+        // Delete asks first; Esc keeps it.
+        app.codeql.select_database(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("folder stays"),
+            "the user's own folder is only forgotten"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.codeql.databases.len(), 2, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
+        assert!(mine.is_dir(), "not croft's to delete");
+        assert_eq!(app.codeql.selected_database(), Some(0), "stays in the list");
+
+        // The downloaded copy goes with its files.
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("files are deleted"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.codeql.databases.is_empty(), "{}", app.status);
+        assert!(!cached_root.exists(), "the whole cached copy is gone");
+        assert_eq!(app.codeql.current_db, None);
+    });
+}
+
+#[test]
+fn codeql_database_palette_commands_act_on_the_current_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlRemoveDatabase);
+        assert!(
+            app.status.contains("Select a CodeQL database"),
+            "{}",
+            app.status
+        );
+        assert!(app.input_prompt.is_none());
+        let db = make_codeql_db(tmp.path(), "flask-db", "python");
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        app.run_command(Command::CodeqlRenameDatabase);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(
+                &crate::widgets::input_prompt::InputPurpose::CodeqlRenameDatabase {
+                    path: db.clone()
+                }
+            )
+        );
+        app.close_input_prompt();
+        app.run_command(Command::CodeqlSortDatabases);
+        assert_eq!(app.codeql.db_sort, Some(crate::codeql_db::DbSort::Name));
+        assert_eq!(
+            Command::from_id("codeql_reveal_database"),
+            Some(Command::CodeqlRevealDatabase)
+        );
+        assert_eq!(
+            Command::CodeqlRemoveDatabase.title(),
+            "CodeQL: Remove Database"
+        );
+    });
+}
+
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
 /// `--output=` names, and exits with `code` (printing `err` on stderr).
 #[cfg(unix)]
@@ -54930,8 +55073,10 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
             name: String::from("app"),
             path: db,
             language: Some(String::from("rust")),
+            added: 0,
         }],
         current: Some(0),
+        sort_by: None,
     };
     store.save(&App::codeql_db_store_path()).unwrap();
     let q = tmp.join("q.ql");
@@ -57179,6 +57324,33 @@ fn sarif_export_writes_the_visible_results_as_sarif_or_csv() {
     app.submit_sarif_export("out.csv");
     let csv = std::fs::read_to_string(tmp.path().join("out.csv")).unwrap();
     assert!(csv.starts_with("rule,level,file"), "{csv}");
+}
+
+#[test]
+fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
+    // #262: the palette command types `croft sync-config <host>` into a
+    // new terminal, so the host must be an alias, never shell text.
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("remote_sync_config_now"),
+        Some(Command::RemoteSyncConfigNow)
+    );
+    assert_eq!(
+        Command::RemoteSyncConfigNow.title(),
+        "Remote: Sync Config Now"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for bad in ["dev box", "x;rm -rf ~", "-oProxyCommand=x", ""] {
+        app.sync_config_to(bad);
+        assert!(
+            app.status.contains("not an ssh host alias"),
+            "{bad:?}: {}",
+            app.status
+        );
+    }
+    app.sync_config_to("user@dev-box.lan");
+    assert_eq!(app.status, "Syncing config to user@dev-box.lan");
 }
 
 #[test]

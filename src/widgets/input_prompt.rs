@@ -42,11 +42,22 @@ pub enum InputPurpose {
     NewWorktreeLane,
     /// The command to run across the fleet (#363).
     FleetCommand,
+    /// The host to push the syncable config to now (#262).
+    SyncConfigHost,
     /// The pull request to review (#365): a number, `#n`, or its URL.
     PullRequestNumber,
     /// Where to add a CodeQL database from (#578).
     CodeqlDatabase {
         source: CodeqlDbSource,
+    },
+    /// Confirm removing the CodeQL database at `path` (#578). Submitting
+    /// (Enter) removes it; Esc keeps it. The value is a sentinel.
+    CodeqlRemoveDatabase {
+        path: PathBuf,
+    },
+    /// A new display name for the CodeQL database at `path` (#578).
+    CodeqlRenameDatabase {
+        path: PathBuf,
     },
     /// Where a SARIF result's file lives on this machine (#577): the value
     /// is a path; `uri` is the location the log named.
