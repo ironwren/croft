@@ -60057,3 +60057,242 @@ fn leaving_the_tour_closes_the_samples_tabs_even_edited_ones() {
         assert!(left.is_empty(), "tabs naming the deleted sample: {left:?}");
     });
 }
+
+/// #356: a run of one colour stays one SGR run across the soft-wrap column
+/// and across a wide character. Both carry cell flags that are layout, not
+/// style, and keyed on those the run was reset and set again around them.
+#[test]
+fn a_colour_run_is_not_split_by_the_wrap_column_or_a_wide_char() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].resize(20, 6);
+    let long = "y".repeat(30);
+    app.terminals[0].feed_bytes_for_test(
+        format!("\r\n\x1b[33m{long}\x1b[0m\r\n\x1b[32mab\u{4e2d}cd\x1b[0m\r\n").as_bytes(),
+    );
+    let (rows, _) = app.terminals[0].screen_ansi_wrapped();
+    let ansi: Vec<&str> = rows.iter().map(|(_, a, _)| a.as_str()).collect();
+    let first = format!("\x1b[33m{}\x1b[0m", "y".repeat(20));
+    assert!(
+        ansi.contains(&first.as_str()),
+        "the wrapped row is one run: {ansi:?}"
+    );
+    assert!(
+        ansi.contains(&"\x1b[32mab\u{4e2d}cd\x1b[0m"),
+        "the wide char sits inside its run: {ansi:?}"
+    );
+}
+
+/// Pick the launch.json configuration `label` in the Run and Debug picker,
+/// which starts it, as the user's click does.
+fn start_debug_config(app: &mut App, label: &str) {
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .expect("picker open")
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with(label))
+        .unwrap_or_else(|| panic!("{label} is listed"));
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+}
+
+/// Drive the app's debug machinery (the preLaunchTask pane and the adapter)
+/// until the focused session is stopped with `local` loaded, or `secs` pass.
+fn debug_until_local(app: &mut App, local: &str, secs: u64) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        app.drain_terminal_bells();
+        app.poll_dap();
+        if let Some(v) = app
+            .debug_sessions
+            .focused()
+            .and_then(|s| s.lookup_local(local))
+        {
+            return Some(v.value.clone());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// #250, against a real debugpy: a VS Code launch.json config with `args`
+/// and an `envFile` launches the program with both, so a breakpoint after
+/// they are read sees their values. Needs `~/.croft/debug-venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn a_launch_json_python_config_passes_args_and_env_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("app.py"),
+        "import os, sys\nwho = sys.argv[1]\ngreeting = os.environ[\"GREETING\"]\nprint(f\"{greeting}, {who}\")\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".env"), "GREETING=hi from envFile\n").unwrap();
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(
+        root.join(".vscode/launch.json"),
+        r#"{ "version": "0.2.0", "configurations": [
+            // Written for VS Code: comments, and keys croft does not map.
+            { "name": "Py", "type": "debugpy", "request": "launch",
+              "program": "${workspaceFolder}/app.py", "args": ["croft"],
+              "envFile": "${workspaceFolder}/.env", "console": "integratedTerminal",
+              "justMyCode": true }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(root.join("app.py"))
+        .or_default()
+        .insert(4);
+    start_debug_config(&mut app, "Py");
+    let greeting = debug_until_local(&mut app, "greeting", 90);
+    let who = app
+        .debug_sessions
+        .focused()
+        .and_then(|s| s.lookup_local("who"))
+        .map(|v| v.value.clone());
+    app.debug_stop();
+    assert_eq!(
+        greeting.as_deref(),
+        Some("'hi from envFile'"),
+        "status {:?}, feedback {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+    assert_eq!(who.as_deref(), Some("'croft'"));
+}
+
+/// #250, against a real lldb-dap: a Rust binary that needs a CLI argument
+/// and an env var is debugged from a config whose `cargo build`
+/// preLaunchTask builds it first. Needs cargo and lldb-dap.
+#[test]
+#[ignore = "requires cargo and lldb-dap"]
+fn a_launch_json_rust_config_builds_first_and_passes_args_and_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() {\n    let n: i32 = std::env::args().nth(1).unwrap().parse().unwrap();\n    \
+         let k: i32 = std::env::var(\"K\").unwrap().parse().unwrap();\n    \
+         println!(\"{}\", n + k);\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(
+        root.join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "cargo build", "type": "shell", "command": "cargo build" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Rs", "type": "lldb", "request": "launch",
+              "program": "${workspaceFolder}/target/debug/t", "args": ["35"],
+              "env": { "K": "7" }, "cwd": "${workspaceFolder}",
+              "preLaunchTask": "cargo build", "sourceLanguages": ["rust"] }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(root.join("src/main.rs"))
+        .or_default()
+        .insert(4);
+    start_debug_config(&mut app, "Rs");
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "the launch waits for the build: {}",
+        app.status
+    );
+    let k = debug_until_local(&mut app, "k", 240);
+    let n = app
+        .debug_sessions
+        .focused()
+        .and_then(|s| s.lookup_local("n"))
+        .map(|v| v.value.clone());
+    app.debug_stop();
+    assert!(
+        root.join("target/debug/t").is_file(),
+        "the preLaunchTask built the binary"
+    );
+    assert_eq!(
+        k.as_deref(),
+        Some("7"),
+        "status {:?}, feedback {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+    assert_eq!(n.as_deref(), Some("35"));
+}
+
+/// #250, against a real vscode-js-debug: a `request: attach` config with a
+/// `port` attaches to a running Node server and stops at a breakpoint in
+/// it. Needs node and `~/.croft/js-debug`.
+#[test]
+#[ignore = "requires node and ~/.croft/js-debug"]
+fn a_launch_json_node_attach_config_attaches_by_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("server.js"),
+        "let n = 0;\nsetInterval(() => {\n  n += 1;\n  const label = `tick ${n}`;\n  if (label === '') console.log(label);\n}, 100);\n",
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut node = std::process::Command::new("node")
+        .arg(format!("--inspect=127.0.0.1:{port}"))
+        .arg(root.join("server.js"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node runs");
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(
+        root.join(".vscode/launch.json"),
+        format!(
+            r#"{{ "configurations": [
+                {{ "name": "Attach", "type": "node", "request": "attach",
+                  "port": {port}, "skipFiles": ["<node_internals>/**"] }}
+            ]}}"#
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(root.join("server.js"))
+        .or_default()
+        .insert(5);
+    start_debug_config(&mut app, "Attach");
+    let label = debug_until_local(&mut app, "label", 90);
+    app.debug_stop();
+    let _ = node.kill();
+    let _ = node.wait();
+    let label = label.unwrap_or_else(|| {
+        panic!(
+            "no stop: status {:?}, feedback {:?}",
+            app.status, app.run_debug.feedback
+        )
+    });
+    assert!(label.contains("tick "), "{label}");
+}
