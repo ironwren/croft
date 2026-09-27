@@ -503,6 +503,8 @@ Writing a session as an asciicast v2 recording, behind "Session: Record Terminal
 
 **It records the screen, not the byte stream.** The PTY bytes are consumed by the grid before the app sees them. Sampling comes from the dirty-drain, so an idle session records nothing rather than a frame per tick.
 
+**Colour and cursor come from the grid.** A frame is the screen read in one lock (`screen_ansi_wrapped`): each row re-emits its cells' colours and attributes as SGR per run of equal style, and the frame ends by moving the player's cursor to the pane's cursor and showing it, or hiding it when the program hid it, so no frame inherits the previous frame's cursor. Redaction runs on the plain twin of each row; a row a rule touches is written as its masked plain text and gives up its colour, because a mask spliced between escapes could break them.
+
 **Two sizing traps, both caught in review.** The header and the `r` events take the pane's INNER rect, because `Borders::ALL` costs a cell each side and the PTY is sized from the inner one; recording the outer size declares a terminal two columns too wide and the player re-wraps every long line at the wrong column. And a frame carries only the VISIBLE rows: `grid_lines` starts at `topmost_line()`, which is negative scrollback of up to 5000 rows, so writing all of it after a clear scrolls the live screen off the top. The cast would then show the tail of the history rather than what the user was looking at, at roughly 400 KB per frame.
 
 ### pair.rs
