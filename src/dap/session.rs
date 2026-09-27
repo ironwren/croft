@@ -218,6 +218,22 @@ pub fn delve_zero_config_request(file: &Path) -> Value {
     })
 }
 
+/// delve's `test` mode for the package in `dir`, with `args` for the test
+/// binary: `-test.run` scopes it to one test (#264).
+pub fn delve_test_request(dir: &Path, args: &[String]) -> Value {
+    json!({
+        "type": "request",
+        "command": "launch",
+        "arguments": {
+            "mode": "test",
+            "program": dir.to_string_lossy(),
+            "cwd": dir.to_string_lossy(),
+            "args": args,
+            "stopOnEntry": false,
+        }
+    })
+}
+
 /// Build the lldb-dap `launch` request for a compiled `program` binary. Unlike
 /// debugpy there is no interpreter; lldb-dap loads the binary and its DWARF.
 pub fn lldb_launch_request(program: &Path, stop_on_entry: bool) -> Value {
@@ -1895,6 +1911,48 @@ mod tests {
         let (file, line) = s.current_location.clone().expect("a stop location");
         assert_eq!(line, 7);
         assert_eq!(file.canonicalize().unwrap(), main);
+        s.disconnect();
+    }
+
+    /// Debug-a-test for Go (#264): delve's test mode scoped with
+    /// `-test.run` stops in the chosen test, never at a breakpoint in a
+    /// sibling test that runs first when unscoped. Needs Go and `dlv`, so
+    /// it is ignored by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_test_mode_runs_only_the_chosen_test() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let file = tmp.path().join("a_test.go");
+        std::fs::write(
+            &file,
+            "package t\n\nimport \"testing\"\n\n\
+             func TestA(t *testing.T) {\n\tt.Log(\"a\")\n}\n\n\
+             func TestB(t *testing.T) {\n\tt.Log(\"b\")\n}\n",
+        )
+        .unwrap();
+        let file = file.canonicalize().unwrap();
+        let dir = file.parent().unwrap().to_path_buf();
+        let mut bps = BTreeMap::new();
+        bps.insert(
+            file.clone(),
+            vec![SourceBreakpoint::plain(6), SourceBreakpoint::plain(10)],
+        );
+        let request =
+            delve_test_request(&dir, &crate::testing::gotest::test_binary_args(".::TestB"));
+        let mut s = DapSession::launch_delve(&dlv, &dir, request, bps).expect("delve starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while s.current_location.is_none() && std::time::Instant::now() < deadline {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (at, line) = s.current_location.clone().expect("a stop location");
+        assert_eq!(line, 10, "stopped in TestB, not TestA");
+        assert_eq!(at.canonicalize().unwrap(), file);
         s.disconnect();
     }
 

@@ -154,6 +154,7 @@ fn chip_for(id: &str) -> Option<(char, Color)> {
         "test-pytest" => ('\u{ea79}', (0x37, 0x76, 0xab)), // cod-beaker, python blue
         "test-vitest" => ('\u{ea79}', (0x72, 0x9b, 0x1b)), // cod-beaker, vitest green
         "test-jest" => ('\u{ea79}', (0xc2, 0x13, 0x25)), // cod-beaker, jest red
+        "test-go" => ('\u{ea79}', (0x00, 0xad, 0xd8)), // cod-beaker, go blue
         "mcp-fetch" => ('\u{eb01}', (0x4e, 0x9a, 0xff)), // cod-globe, web blue
         "themes" => ('\u{eb5c}', (0xc5, 0x86, 0xc0)), // cod-symbol_color, theme purple
         _ => return None,
