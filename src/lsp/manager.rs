@@ -2692,11 +2692,12 @@ impl WorkerState {
         let first_attempt = !self.clients.contains_key(&key);
         // A key whose servers crash-looped stays down (#694): the empty-list
         // re-probe below would otherwise respawn them on every open.
-        let should_try = !self.restarts.gave_up.contains(&key) && first_attempt
-            || self
-                .clients
-                .get(&key)
-                .is_some_and(|clients| clients.is_empty());
+        let should_try = !self.restarts.gave_up.contains(&key)
+            && (first_attempt
+                || self
+                    .clients
+                    .get(&key)
+                    .is_some_and(|clients| clients.is_empty()));
         if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             // Spawn every server for this root concurrently rather than awaiting
@@ -2960,6 +2961,13 @@ impl WorkerState {
     }
 
     async fn open_doc(&mut self, path: PathBuf, text: String) {
+        // The app re-sends every tab after a restart (#694). A document whose
+        // servers did not restart is still open there, and a second didOpen
+        // would break the protocol, so it goes out as a full-text change.
+        if self.docs.contains_key(&path) {
+            self.change_doc(path, text).await;
+            return;
+        }
         let Some(lang) = path_to_language(&path) else {
             return;
         };
@@ -9304,7 +9312,36 @@ while True:
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(started(2).len(), 2);
         assert!(!restarted.load(Ordering::Relaxed));
+
+        // The app re-sends every tab after a restart. The first open reaches
+        // the new server as didOpen; a repeat is a change, not a second open.
+        handle.block_on(state.open_doc(file.clone(), String::from("x = 1\n")));
+        handle.block_on(state.open_doc(file.clone(), String::from("x = 2\n")));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let methods = loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("textDocument/didChange") || Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Both servers share the log; count only what the new one received.
+        let new_server = methods.rsplit("initialize\n").next().unwrap_or_default();
+        assert_eq!(
+            new_server.matches("textDocument/didOpen").count(),
+            1,
+            "a document is opened once per server: {methods:?}"
+        );
+        assert!(new_server.contains("textDocument/didChange"), "{methods:?}");
         handle.block_on(state.shutdown_all());
+
+        // A key that used up its restarts is not re-probed through an empty
+        // client list either.
+        state.restarts.gave_up.insert(key.clone());
+        state.clients.insert(key.clone(), Vec::new());
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started(2).len(), 2, "a given-up server must stay down");
     }
 
     /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
