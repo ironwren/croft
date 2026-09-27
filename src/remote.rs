@@ -5138,15 +5138,30 @@ Host !blocked *.internal
         assert!(cleared > install);
     }
 
-    /// Run the rendered install script under `sh` with stub tools, and
-    /// report what the stub `cargo` saw of the build marker while it ran.
+    /// The rendered install script as a `sh` command under a scratch home in
+    /// `dir`, with stub tools, not yet started.
     ///
     /// Stubs stand in for everything the script would otherwise install or
     /// probe, so it goes straight to the compile: `cc`, `pkg-config` and
-    /// `dtach` exist, `pgrep` finds no live croft (so no 5 s wait), and
-    /// `systemd-run` is absent (no cap to probe).
+    /// `dtach` exist, and `pgrep` finds no live croft (so no 5 s wait).
+    /// `systemd-run` is the stub `systemd_run` rather than the host's: the
+    /// host's may well be on `PATH`, and its probe then fails only because
+    /// `env_clear` drops the user bus, which is not what a test should rest
+    /// on (#737).
+    ///
+    /// The stub `cargo` waits, within a load-scaled budget rather than a
+    /// fixed sleep, until the marker names its own pid, writes `<its pid>
+    /// <the pid the marker holds> <the marker's boot sidecar>` to `seen`,
+    /// then, given `hold`, touches `<hold>.ready` and waits for `hold` to
+    /// exist before exiting with `cargo_exit`.
     #[cfg(unix)]
-    fn run_install_script(dir: &std::path::Path, cargo_exit: u8) -> (bool, String) {
+    fn install_command(
+        dir: &std::path::Path,
+        cargo_exit: u8,
+        systemd_run: &str,
+        seen: &std::path::Path,
+        hold: Option<&std::path::Path>,
+    ) -> std::process::Command {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("bin");
         let home = dir.join("home");
@@ -5161,31 +5176,200 @@ Host !blocked *.internal
             stub(ok, "exit 0");
         }
         stub("pgrep", "exit 1");
-        // Waits for the script to record its pid, then reports the marker
-        // it finds alongside its own pid (nice/ionice exec, so it is cargo's).
+        stub("systemd-run", systemd_run);
+        let tries =
+            crate::test_budget::spawn_budget(std::time::Duration::from_secs(5)).as_millis() / 50;
         stub(
             "cargo",
             &format!(
-                "sleep 0.5\n\
-                 for f in \"$HOME\"/.cache/croft/building.*; do case \"$f\" in *.boot) b=$(cat \"$f\");; *) m=$(cat \"$f\");; esac; done\n\
-                 printf '%s %s %s' \"$$\" \"$m\" \"$b\" > \"{}\"\n\
-                 exit {cargo_exit}",
-                dir.join("seen").display()
+                r#"i=0
+while [ "$i" -lt {tries} ]; do
+  for f in "$HOME"/.cache/croft/building.*; do
+    case "$f" in
+      *.boot) ;;
+      *) if [ "$(cat "$f" 2>/dev/null)" = "$$" ]; then m=$$; b=$(cat "$f.boot" 2>/dev/null); break 2; fi ;;
+    esac
+  done
+  sleep 0.05; i=$((i+1))
+done
+printf '%s %s %s' "$$" "$m" "$b" > "$CROFT_TEST_SEEN"
+if [ -n "$CROFT_TEST_HOLD" ]; then
+  : > "$CROFT_TEST_HOLD.ready"
+  j=0
+  while [ ! -e "$CROFT_TEST_HOLD" ] && [ "$j" -lt {tries} ]; do sleep 0.05; j=$((j+1)); done
+fi
+exit {cargo_exit}"#
             ),
         );
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let status = std::process::Command::new("sh")
-            .arg("-c")
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
             .arg(remote_install_command("abc123"))
             .env_clear()
             .env("HOME", &home)
             .env("PATH", path)
+            .env("CROFT_TEST_SEEN", seen)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(hold) = hold {
+            cmd.env("CROFT_TEST_HOLD", hold);
+        }
+        cmd
+    }
+
+    /// Run the rendered install script to the end (see [`install_command`])
+    /// and report whether it succeeded and what the stub `cargo` saw.
+    #[cfg(unix)]
+    fn run_install_script(dir: &std::path::Path, cargo_exit: u8) -> (bool, String) {
+        let seen = dir.join("seen");
+        let status = install_command(dir, cargo_exit, "exit 1", &seen, None)
             .status()
             .unwrap();
-        let seen = std::fs::read_to_string(dir.join("seen")).unwrap_or_default();
+        let seen = std::fs::read_to_string(seen).unwrap_or_default();
         (status.success(), seen)
+    }
+
+    /// Alive and not a zombie: a killed script's cargo is reparented, and
+    /// reads as alive to `kill -0` until its new parent reaps it.
+    #[cfg(target_os = "linux")]
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    /// Whether croft would see a live build in the scratch home's cache.
+    #[cfg(target_os = "linux")]
+    fn build_seen(dir: &std::path::Path) -> bool {
+        crate::update_watch::source_build_running(
+            &dir.join("home/.cache/croft"),
+            crate::update_watch::boot_id,
+            crate::update_watch::boot_time,
+            running,
+        )
+    }
+
+    /// #737: SIGTERM to the script's shell mid-compile leaves cargo running,
+    /// and the marker keeps naming it: croft still sees the build, and sees
+    /// it end when cargo does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_killed_install_shell_leaves_the_marker_naming_the_live_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = tmp.path().join("hold");
+        let seen = tmp.path().join("seen");
+        let mut shell = install_command(tmp.path(), 0, "exit 1", &seen, Some(&hold))
+            .spawn()
+            .unwrap();
+        let ready = tmp.path().join("hold.ready");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the stub compile to start",
+            || ready.exists(),
+        );
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let cargo: u32 = seen.split(' ').next().unwrap().parse().unwrap();
+        assert!(seen.starts_with(&format!("{cargo} {cargo}")), "{seen}");
+
+        // SAFETY: signals the shell this test spawned, by its own pid.
+        unsafe {
+            libc::kill(shell.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = shell.wait();
+        assert!(running(cargo), "the compile must outlive its shell");
+        assert_eq!(
+            leftover_markers(tmp.path())
+                .iter()
+                .filter(|n| !n.ends_with(".boot"))
+                .map(
+                    |n| std::fs::read_to_string(tmp.path().join("home/.cache/croft").join(n))
+                        .unwrap()
+                )
+                .collect::<Vec<_>>(),
+            vec![cargo.to_string()],
+            "the marker must keep naming the compile"
+        );
+        assert!(build_seen(tmp.path()), "croft must still see the build");
+
+        std::fs::write(&hold, "").unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the build to read as over once the compile exits",
+            || !build_seen(tmp.path()),
+        );
+    }
+
+    /// #737: two installs at once each keep their own marker, so the one
+    /// finishing first cannot make the other's build look over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_install_finishing_first_leaves_the_first_ones_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = tmp.path().join("hold");
+        let mut long = install_command(
+            tmp.path(),
+            0,
+            "exit 1",
+            &tmp.path().join("seen-long"),
+            Some(&hold),
+        )
+        .spawn()
+        .unwrap();
+        let ready = tmp.path().join("hold.ready");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the long build's compile to start",
+            || ready.exists(),
+        );
+        let short = install_command(
+            tmp.path(),
+            0,
+            "exit 1",
+            &tmp.path().join("seen-short"),
+            None,
+        )
+        .status()
+        .unwrap();
+        assert!(short.success());
+        assert!(
+            build_seen(tmp.path()),
+            "the short build's end hid the long one: {:?}",
+            leftover_markers(tmp.path())
+        );
+
+        std::fs::write(&hold, "").unwrap();
+        assert!(long.wait().unwrap().success());
+        assert!(leftover_markers(tmp.path()).is_empty());
+    }
+
+    /// #737: the compile runs under the memory cap only when the probe reads
+    /// the limit back from its test scope; `max` means the controller is not
+    /// delegated and the limit would be ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_script_caps_the_compile_only_when_the_limit_reads_back() {
+        for (probe, capped) in [("67108864", true), ("max", false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("capped");
+            let systemd_run = format!(
+                r#"while [ $# -gt 0 ]; do case "$1" in -p) shift 2 ;; --*) shift ;; *) break ;; esac; done
+if [ "$1" = sh ]; then echo {probe}; exit 0; fi
+: > "{}"
+exec "$@""#,
+                log.display()
+            );
+            let seen = tmp.path().join("seen");
+            let status = install_command(tmp.path(), 0, &systemd_run, &seen, None)
+                .status()
+                .unwrap();
+            assert!(status.success(), "probe {probe}");
+            assert_eq!(log.exists(), capped, "probe {probe}");
+            // Capped or not, the marker named the compile itself.
+            let seen = std::fs::read_to_string(&seen).unwrap();
+            let mut f = seen.split(' ');
+            assert_eq!(f.next(), f.next(), "probe {probe}: {seen}");
+        }
     }
 
     /// Any `building.*` marker left under the scratch home.

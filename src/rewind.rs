@@ -26,7 +26,8 @@
 //! about memory. `yes` produces millions of tiny frames and a `cat` of a
 //! large file produces a few enormous ones, and a frame-capped buffer is
 //! either useless for the first or unbounded for the second. The cap here is
-//! the summed payload length, and eviction is by age until the total fits.
+//! on bytes held — each frame's payload and its bookkeeping (below) — and
+//! eviction is by age until the total fits.
 //!
 //! A single frame larger than the whole budget is truncated rather than
 //! dropped: losing the tail of one enormous write is recoverable, while
@@ -220,13 +221,12 @@ impl RewindBuffer {
         if self.capacity == 0 {
             return false;
         }
-        // An empty write records nothing. `bytes` sums payload lengths and
-        // `evict` runs while `bytes > capacity`, so a zero-length frame adds
-        // an entry while adding nothing to the figure that would evict it —
-        // repeated empty pushes would grow `frames` without bound, in the one
-        // structure here whose purpose is to stay bounded. The reader cannot
-        // emit one today (`Ok(0)` ends its loop), but this is public and the
-        // replay half will add callers.
+        // An empty write records nothing: a frame with no output replays as
+        // nothing, and would still cost its slots and a minimum allocation
+        // (`frame_cost(0)`). When `bytes` summed payload alone, it also cost
+        // nothing, and repeated empty pushes grew `frames` without bound.
+        // The reader cannot emit one today (`Ok(0)` ends its loop), but this
+        // is public and the replay half will add callers.
         if data.is_empty() {
             return false;
         }
@@ -1062,11 +1062,11 @@ mod tests {
 
     /// Empty writes must not accumulate frames the cap can never evict.
     ///
-    /// `bytes` sums payload lengths, and `evict` runs `while bytes > capacity`
-    /// — so a zero-length write adds a `Frame` while adding nothing to the
-    /// figure that triggers eviction. Repeated empty pushes therefore grew
-    /// `frames` without bound, in a buffer whose entire purpose is to be
-    /// bounded. The reader cannot emit one today (`Ok(0) => break` ends the
+    /// When `bytes` summed payload lengths alone, a zero-length write added
+    /// a `Frame` while adding nothing to the figure that triggers eviction,
+    /// so repeated empty pushes grew `frames` without bound, in a buffer
+    /// whose entire purpose is to be bounded. Every frame is now charged its
+    /// slots too, but an empty one is still refused: it records nothing. The reader cannot emit one today (`Ok(0) => break` ends the
     /// loop), but `push` is public and the replay half will add callers.
     #[test]
     fn empty_writes_do_not_accumulate_unevictable_frames() {
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(configured_budget_bytes(Some(32), true), 32 << 20);
         assert_eq!(
             configured_budget_bytes(Some(usize::MAX), false),
-            MAX_BUDGET_MB << 20,
+            MAX_BUDGET_MB.saturating_mul(1 << 20),
             "an absurd value must clamp, not overflow"
         );
     }
