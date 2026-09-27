@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
-use crate::agent_approval::{ApprovalUi, Pending, diff_rows};
+use crate::agent_approval::{ApprovalUi, Pending, diff_rows_numbered};
 use crate::theme::Theme;
 
 /// The popup's box: most of the screen, so a real diff fits.
@@ -43,6 +43,7 @@ pub fn title(head: &Pending, pending: usize, root: &Path) -> String {
     format!(" {} wants to {verb} {shown}{more} ", head.request.agent)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     area: Rect,
     buf: &mut Buffer,
@@ -51,6 +52,7 @@ pub fn render(
     ui: &ApprovalUi,
     pending: usize,
     root: &Path,
+    check: Option<&crate::agent_approval::ProposalCheck>,
 ) {
     let rect = popup_rect(area);
     let accent = theme.ui(Color::Rgb(0xd7, 0x99, 0x21));
@@ -71,21 +73,50 @@ pub fn render(
     if inner.height < 2 {
         return;
     }
-    let body = Rect {
+    let mut body = Rect {
         height: inner.height - 1,
         ..inner
     };
+    // What the language server makes of the proposal (#347), above the
+    // diff; the rows it names carry the problem at their end.
+    let diagnostics = check.map(|c| c.diagnostics()).unwrap_or_default();
+    if let Some(check) = check
+        && body.height > 1
+    {
+        use crate::lsp::manager::DiagnosticSeverity as S;
+        let color = if !check.heard() {
+            Color::Rgb(0x9a, 0xa4, 0xb2)
+        } else if diagnostics.iter().any(|d| d.severity == S::Error) {
+            Color::Rgb(0xe5, 0x73, 0x73)
+        } else if diagnostics.iter().any(|d| d.severity == S::Warning) {
+            Color::Rgb(0xe5, 0xc0, 0x7b)
+        } else {
+            Color::Rgb(0x81, 0xc7, 0x84)
+        };
+        Paragraph::new(Line::from(Span::styled(
+            check.summary(std::time::Instant::now()),
+            Style::default()
+                .fg(theme.ui(color))
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(Rect { height: 1, ..body }, buf);
+        body = Rect {
+            y: body.y + 1,
+            height: body.height - 1,
+            ..body
+        };
+    }
     let footer = Rect {
         y: inner.y + inner.height - 1,
         height: 1,
         ..inner
     };
-    let rows = diff_rows(&head.proposal);
+    let rows = diff_rows_numbered(&head.proposal);
     let lines: Vec<Line> = rows
         .iter()
         .skip(ui.scroll)
         .take(body.height as usize)
-        .map(|(tag, text)| {
+        .map(|(tag, text, new_line)| {
             let fg = match tag {
                 '+' => theme.ui(Color::Rgb(0x81, 0xc7, 0x84)),
                 '-' => theme.ui(Color::Rgb(0xe5, 0x73, 0x73)),
@@ -97,7 +128,31 @@ pub fn render(
             } else {
                 format!("{tag} {text}")
             };
-            Line::from(Span::styled(shown, Style::default().fg(fg)))
+            let mut spans = vec![Span::styled(shown, Style::default().fg(fg))];
+            // The worst problem the server found on this proposed line.
+            if let Some(d) = new_line.and_then(|n| {
+                diagnostics.iter().find(|d| {
+                    (d.start_line as usize..=d.end_line as usize).contains(&n)
+                        && matches!(
+                            d.severity,
+                            crate::lsp::manager::DiagnosticSeverity::Error
+                                | crate::lsp::manager::DiagnosticSeverity::Warning
+                        )
+                })
+            }) {
+                let color = match d.severity {
+                    crate::lsp::manager::DiagnosticSeverity::Error => Color::Rgb(0xe5, 0x73, 0x73),
+                    _ => Color::Rgb(0xe5, 0xc0, 0x7b),
+                };
+                spans.push(Span::styled(
+                    format!(
+                        "  \u{25c0} {}",
+                        d.message.lines().next().unwrap_or_default()
+                    ),
+                    Style::default().fg(theme.ui(color)),
+                ));
+            }
+            Line::from(spans)
         })
         .collect();
     Paragraph::new(lines).render(body, buf);

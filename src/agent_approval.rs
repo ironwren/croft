@@ -411,18 +411,29 @@ impl ApprovalUi {
 
 /// The proposal as unified-diff rows: `(' ' | '+' | '-' | '@', text)`.
 pub fn diff_rows(p: &Proposal) -> Vec<(char, String)> {
+    diff_rows_numbered(p)
+        .into_iter()
+        .map(|(tag, text, _)| (tag, text))
+        .collect()
+}
+
+/// [`diff_rows`] with each row's 0-based line in the PROPOSED file, for the
+/// rows that are in it (context and additions), so a diagnostic about the
+/// proposal can be shown against the row it names (#347).
+pub fn diff_rows_numbered(p: &Proposal) -> Vec<(char, String, Option<usize>)> {
     let before = p.before.as_deref().unwrap_or("");
     let diff = similar::TextDiff::from_lines(before, &p.after);
     let mut rows = Vec::new();
     for group in diff.grouped_ops(3) {
-        let (first, last) = (&group[0], &group[group.len() - 1]);
+        let first = &group[0];
         rows.push((
             '@',
             format!(
                 "@@ -{} +{} @@",
                 first.old_range().start + 1,
-                last.new_range().start + 1
+                first.new_range().start + 1
             ),
+            None,
         ));
         for op in &group {
             for change in diff.iter_changes(op) {
@@ -431,11 +442,92 @@ pub fn diff_rows(p: &Proposal) -> Vec<(char, String)> {
                     similar::ChangeTag::Delete => '-',
                     similar::ChangeTag::Insert => '+',
                 };
-                rows.push((tag, change.value().trim_end_matches('\n').to_string()));
+                rows.push((
+                    tag,
+                    change.value().trim_end_matches('\n').to_string(),
+                    change.new_index(),
+                ));
             }
         }
     }
     rows
+}
+
+/// How long the popup says the proposal is being checked before it admits
+/// no server has answered.
+pub const CHECK_PATIENCE: Duration = Duration::from_secs(15);
+
+/// The language server's verdict on the proposal at the head of the queue
+/// (#347): its text is sent as the file's content, and what the servers
+/// publish for that path lands here rather than in the editor, until the
+/// proposal leaves the head and the file's real text goes back.
+#[derive(Debug)]
+pub struct ProposalCheck {
+    /// Which proposal: its arrival, as the queue head is told apart.
+    pub arrived: Instant,
+    /// When its text went to the server.
+    pub started: Instant,
+    pub path: PathBuf,
+    /// Whether the check opened the file with the server (no tab had it),
+    /// so ending it closes the file rather than restoring a buffer.
+    pub opened: bool,
+    /// Each server's latest diagnostics for the proposal.
+    pub by_server: std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+}
+
+impl ProposalCheck {
+    /// Whether any server has answered yet.
+    pub fn heard(&self) -> bool {
+        !self.by_server.is_empty()
+    }
+
+    /// Every server's diagnostics, worst first, then by line.
+    pub fn diagnostics(&self) -> Vec<crate::lsp::manager::Diagnostic> {
+        let mut all: Vec<_> = self.by_server.values().flatten().cloned().collect();
+        all.sort_by_key(|d| (severity_rank(d.severity), d.start_line, d.start_char));
+        all
+    }
+
+    /// One line on what the servers found: nothing yet (or, after
+    /// [`CHECK_PATIENCE`], that none has answered), all clear, or the counts
+    /// and the first problem.
+    pub fn summary(&self, now: Instant) -> String {
+        use crate::lsp::manager::DiagnosticSeverity as S;
+        if !self.heard() {
+            return if now.duration_since(self.started) < CHECK_PATIENCE {
+                String::from("Checking the proposed file with the language server…")
+            } else {
+                String::from("The language server has not reported on the proposed file")
+            };
+        }
+        let all = self.diagnostics();
+        let count = |s: S| all.iter().filter(|d| d.severity == s).count();
+        let (errors, warnings) = (count(S::Error), count(S::Warning));
+        let Some(first) = all
+            .iter()
+            .find(|d| matches!(d.severity, S::Error | S::Warning))
+        else {
+            return String::from("No problems in the proposed file");
+        };
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        format!(
+            "{}, {} in the proposed file — line {}: {}",
+            plural(errors, "error"),
+            plural(warnings, "warning"),
+            first.start_line + 1,
+            first.message.lines().next().unwrap_or_default()
+        )
+    }
+}
+
+fn severity_rank(s: crate::lsp::manager::DiagnosticSeverity) -> u8 {
+    use crate::lsp::manager::DiagnosticSeverity as S;
+    match s {
+        S::Error => 0,
+        S::Warning => 1,
+        S::Information => 2,
+        S::Hint => 3,
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +896,80 @@ mod tests {
         queue[0].arrived = Instant::now() - ANSWER_WINDOW;
         assert!(!decide(&listener, &sock, &mut queue, &token, true).ok);
         assert_eq!(queue.len(), 1, "the app's own pass drops the expired one");
+    }
+
+    /// #347: each diff row knows its line in the PROPOSED file, which is
+    /// what a server's diagnostic about the proposal names.
+    #[test]
+    fn diff_rows_carry_their_line_in_the_proposed_file() {
+        let p = Proposal {
+            path: PathBuf::from("a.py"),
+            before: Some(String::from("a\nb\nc\n")),
+            after: String::from("a\nB\nc\nd\n"),
+        };
+        let rows = diff_rows_numbered(&p);
+        let numbered: Vec<(char, &str, Option<usize>)> =
+            rows.iter().map(|(t, s, n)| (*t, s.as_str(), *n)).collect();
+        assert_eq!(
+            numbered,
+            [
+                ('@', "@@ -1 +1 @@", None),
+                (' ', "a", Some(0)),
+                ('-', "b", None),
+                ('+', "B", Some(1)),
+                (' ', "c", Some(2)),
+                ('+', "d", Some(3)),
+            ]
+        );
+        assert_eq!(diff_rows(&p).len(), rows.len());
+    }
+
+    /// #347: the check's one-line verdict: waiting, clear, or the counts
+    /// and the worst problem first.
+    #[test]
+    fn a_proposal_check_sums_up_what_the_servers_found() {
+        use crate::lsp::manager::{Diagnostic, DiagnosticSeverity as S};
+        let d = |line: u32, severity: S, message: &str| Diagnostic {
+            start_line: line,
+            start_char: 0,
+            end_line: line,
+            end_char: 1,
+            severity,
+            message: message.into(),
+        };
+        let now = Instant::now();
+        let mut check = ProposalCheck {
+            arrived: now,
+            started: now,
+            path: PathBuf::from("a.py"),
+            opened: true,
+            by_server: Default::default(),
+        };
+        assert!(check.summary(now).starts_with("Checking"));
+        assert!(
+            check
+                .summary(now + CHECK_PATIENCE)
+                .contains("has not reported")
+        );
+        check
+            .by_server
+            .insert("ruff".into(), vec![d(0, S::Hint, "style")]);
+        assert_eq!(check.summary(now), "No problems in the proposed file");
+        check.by_server.insert(
+            "ruff".into(),
+            vec![d(4, S::Warning, "unused"), d(2, S::Error, "nope\nmore")],
+        );
+        check
+            .by_server
+            .insert("pyright".into(), vec![d(9, S::Error, "bad type")]);
+        assert_eq!(
+            check.summary(now),
+            "2 errors, 1 warning in the proposed file — line 3: nope"
+        );
+        assert_eq!(
+            check.diagnostics()[0].message,
+            "nope\nmore",
+            "worst, then first"
+        );
     }
 }
