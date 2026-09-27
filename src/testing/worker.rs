@@ -999,9 +999,13 @@ fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
         Runner::Pytest => pytest_cmd(root, &["--help"])
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--cov")),
-        Runner::Vitest => ["coverage-v8", "coverage-istanbul"]
-            .iter()
-            .any(|p| root.join("node_modules/@vitest").join(p).is_dir()),
+        // Node resolves a package from the nearest `node_modules` up the
+        // tree, so a monorepo's hoisted install at the repository root counts.
+        Runner::Vitest => root.ancestors().any(|dir| {
+            ["coverage-v8", "coverage-istanbul"]
+                .iter()
+                .any(|p| dir.join("node_modules/@vitest").join(p).is_dir())
+        }),
         Runner::Jest | Runner::Go => true,
     }
 }
@@ -1807,5 +1811,17 @@ mod tests {
             coverage_install(Runner::Cargo, d.path()).unwrap().0,
             "cargo-llvm-cov"
         );
+    }
+
+    /// #263: a monorepo hoists `@vitest/coverage-v8` to the repository's
+    /// `node_modules`, where Node resolves it from a package below.
+    #[test]
+    fn vitest_coverage_is_found_in_a_hoisted_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("packages/app");
+        std::fs::create_dir_all(&pkg).unwrap();
+        assert!(!coverage_tool_present(Runner::Vitest, &pkg));
+        std::fs::create_dir_all(tmp.path().join("node_modules/@vitest/coverage-v8")).unwrap();
+        assert!(coverage_tool_present(Runner::Vitest, &pkg));
     }
 }
