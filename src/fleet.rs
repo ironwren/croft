@@ -261,25 +261,27 @@ pub fn is_local_target(target: &str) -> bool {
             .is_some_and(|n| !n.is_empty())
 }
 
-/// The local targets a fleet may name besides ssh hosts: `localhost`, and
-/// `docker:<name>` for every running container (none when Docker is not
-/// installed or its daemon is down).
-pub fn local_targets() -> Vec<String> {
+/// The local targets a fleet `request` may name besides ssh hosts:
+/// `localhost`, and every `docker:<name>` the request or one of `groups`
+/// names. Containers are not listed with `docker ps`: that waits on the
+/// Docker daemon, and a hung daemon would freeze the editor before the run
+/// even started. A container that does not exist fails in its own result,
+/// with docker's message.
+pub fn local_targets_in(
+    request: &str,
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut out = vec![String::from("localhost")];
-    if let Ok(o) = std::process::Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        && o.status.success()
-    {
-        out.extend(
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
-                .map(|n| format!("docker:{n}")),
-        );
+    let spec = split_request(request).map_or("", |(spec, _)| spec);
+    let named = spec
+        .split(',')
+        .chain(groups.values().flatten().map(String::as_str))
+        .map(str::trim)
+        .filter(|n| n.strip_prefix("docker:").is_some_and(|c| !c.is_empty()));
+    for n in named {
+        if !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
     }
     out
 }
@@ -305,20 +307,27 @@ pub fn target_command(target: &str, command: &str) -> (String, Vec<String>) {
     (String::from("ssh"), fleet_ssh_args(target, command))
 }
 
-/// For each line of `output`, whether it differs from the reference: a line
-/// the reference does not have in that place (§ diff mode's highlight).
-pub fn changed_lines(reference: &str, output: &str) -> Vec<bool> {
+/// How `output` differs from the reference, line by line and in order:
+/// `+ line` for what the host printed that the reference lacks, `- line`
+/// for a reference line the host's output is missing. Both sides, so a
+/// host that dropped a line says which one, not only that it differs.
+pub fn differing_lines(reference: &str, output: &str) -> Vec<String> {
     use crate::widgets::diff::{DiffRow, build_diff_rows};
     let old: Vec<String> = reference.lines().map(str::to_string).collect();
     let new: Vec<String> = output.lines().map(str::to_string).collect();
-    let mut changed = vec![false; new.len()];
+    let mut out = Vec::new();
     for row in build_diff_rows(&old, &new) {
         match row {
-            DiffRow::Added { right } | DiffRow::Replaced { right, .. } => changed[right] = true,
-            DiffRow::Equal { .. } | DiffRow::Removed { .. } => {}
+            DiffRow::Equal { .. } => {}
+            DiffRow::Removed { left } => out.push(format!("- {}", old[left])),
+            DiffRow::Added { right } => out.push(format!("+ {}", new[right])),
+            DiffRow::Replaced { left, right } => {
+                out.push(format!("- {}", old[left]));
+                out.push(format!("+ {}", new[right]));
+            }
         }
     }
-    changed
+    out
 }
 
 /// Run `command` on every host in parallel, one thread each.
@@ -533,6 +542,28 @@ mod tests {
     }
 
     #[test]
+    fn local_targets_are_what_the_request_or_a_group_names() {
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(
+            String::from("web"),
+            vec![String::from("docker:front"), String::from("db-1")],
+        );
+        assert_eq!(
+            local_targets_in("docker:api, localhost: uptime", &groups),
+            vec!["localhost", "docker:api", "docker:front"]
+        );
+        assert_eq!(
+            local_targets_in("db-1: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"]
+        );
+        assert_eq!(
+            local_targets_in("docker:: uptime", &std::collections::BTreeMap::new()),
+            vec!["localhost"],
+            "an empty container name is not a target"
+        );
+    }
+
+    #[test]
     fn star_means_every_ssh_host_not_local_targets() {
         let known: Vec<String> = ["db-1", "localhost", "docker:web", "db-2"]
             .into_iter()
@@ -569,20 +600,19 @@ mod tests {
     }
 
     #[test]
-    fn changed_lines_mark_what_the_reference_lacks() {
+    fn differing_lines_show_both_what_is_extra_and_what_is_missing() {
         let reference = "Linux\n6.8.0-45\nx86_64\n";
+        assert!(differing_lines(reference, reference).is_empty());
         assert_eq!(
-            changed_lines(reference, reference),
-            vec![false, false, false]
+            differing_lines(reference, "Linux\n6.8.0-31\nx86_64\n"),
+            vec!["- 6.8.0-45", "+ 6.8.0-31"]
         );
         assert_eq!(
-            changed_lines(reference, "Linux\n6.8.0-31\nx86_64\n"),
-            vec![false, true, false]
+            differing_lines(reference, "Linux\n6.8.0-45\nx86_64\nextra\n"),
+            vec!["+ extra"]
         );
-        assert_eq!(
-            changed_lines(reference, "Linux\n6.8.0-45\nx86_64\nextra\n"),
-            vec![false, false, false, true]
-        );
+        // A host missing a line says which.
+        assert_eq!(differing_lines("a\nb\nc\n", "a\nc\n"), vec!["- b"]);
     }
 
     #[test]
