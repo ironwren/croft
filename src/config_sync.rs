@@ -212,9 +212,204 @@ pub fn remote_dest(host: &str, name: &str) -> String {
     format!("{host}:.config/croft/{name}")
 }
 
+/// The sha256 of `bytes`, as the hex `sha256sum` prints.
+pub fn content_hash(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// The remote shell script that prints `sha256sum`'s `<hash>  <name>` for
+/// each syncable file present in `~/.config/croft`, and nothing for one
+/// that is absent. `shasum -a 256` for a box without coreutils.
+pub fn remote_hash_script() -> String {
+    let names: Vec<&str> = SYNCABLE.iter().map(|s| s.name).collect();
+    let names = names.join(" ");
+    format!(
+        "cd ~/.config/croft 2>/dev/null || exit 0; for f in {names}; do [ -f \"$f\" ] || continue; \
+         if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$f\"; else shasum -a 256 \"$f\"; fi; done"
+    )
+}
+
+/// Parse [`remote_hash_script`]'s output into file name → hash. Only
+/// syncable names count: anything else on the line is not ours to trust.
+pub fn parse_remote_hashes(out: &str) -> std::collections::BTreeMap<String, String> {
+    out.lines()
+        .filter_map(|l| {
+            let (hash, name) = l.trim().split_once(char::is_whitespace)?;
+            let name = name.trim().trim_start_matches('*');
+            let known = SYNCABLE.iter().any(|s| s.name == name);
+            (known && hash.len() == 64).then(|| (name.to_string(), hash.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// What config sync last agreed with one file on one host (#262).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileState {
+    /// The hash last pushed there. A remote copy still at this hash is
+    /// ours to replace; anything else was edited there since.
+    #[serde(default)]
+    pub pushed: Option<String>,
+    /// "Keep the remote copy": its hash, and the local hash it was kept
+    /// against. The push leaves it alone until either side changes.
+    #[serde(default)]
+    pub kept: Option<(String, String)>,
+}
+
+/// Config sync's memory, per host (ssh alias, lowercased) and file. Kept
+/// in croft's cache dir: losing it only makes the next push ask about a
+/// remote copy that differs, never overwrite one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SyncState {
+    #[serde(default)]
+    pub hosts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, FileState>>,
+}
+
+impl SyncState {
+    pub fn path() -> PathBuf {
+        crate::app::croft_cache_dir().join("config-sync.json")
+    }
+
+    /// Unreadable or absent state is empty state, which is the careful one.
+    pub fn load(path: &std::path::Path) -> SyncState {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, text)
+    }
+
+    pub fn file(&self, host: &str, name: &str) -> Option<&FileState> {
+        self.hosts.get(&host.to_ascii_lowercase())?.get(name)
+    }
+
+    pub fn file_mut(&mut self, host: &str, name: &str) -> &mut FileState {
+        self.hosts
+            .entry(host.to_ascii_lowercase())
+            .or_default()
+            .entry(name.to_string())
+            .or_default()
+    }
+}
+
+/// What the push does with one file (#262).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Absent there, or still what croft last pushed: send it.
+    Push,
+    /// The remote already has exactly this content.
+    UpToDate,
+    /// The user chose to keep the remote copy, and neither side changed.
+    Kept,
+    /// Edited on the remote since the last push (or never pushed, and
+    /// different): left alone until the user chooses.
+    Conflict,
+}
+
+/// Decide one file's fate from its local hash, the remote's (if the file
+/// exists there), and what was last agreed. Local is the source of truth,
+/// but never over an edit made on the remote.
+pub fn plan(local: &str, remote: Option<&str>, state: Option<&FileState>) -> Plan {
+    let Some(remote) = remote else {
+        return Plan::Push;
+    };
+    if remote == local {
+        return Plan::UpToDate;
+    }
+    let state = state.cloned().unwrap_or_default();
+    if state
+        .kept
+        .as_ref()
+        .is_some_and(|(r, l)| r == remote && l == local)
+    {
+        return Plan::Kept;
+    }
+    if state.pushed.as_deref() == Some(remote) {
+        return Plan::Push;
+    }
+    Plan::Conflict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_push_never_overwrites_a_copy_edited_on_the_remote() {
+        let pushed = |h: &str| FileState {
+            pushed: Some(h.into()),
+            kept: None,
+        };
+        // A fresh box, and one still holding what croft pushed.
+        assert_eq!(plan("L2", None, None), Plan::Push);
+        assert_eq!(plan("L2", Some("L1"), Some(&pushed("L1"))), Plan::Push);
+        assert_eq!(plan("L2", Some("L2"), None), Plan::UpToDate);
+        // Edited there since the last push, or different and never pushed.
+        assert_eq!(plan("L2", Some("R"), Some(&pushed("L1"))), Plan::Conflict);
+        assert_eq!(plan("L2", Some("R"), None), Plan::Conflict);
+        // Kept, until either side moves.
+        let kept = FileState {
+            pushed: Some("L1".into()),
+            kept: Some(("R".into(), "L2".into())),
+        };
+        assert_eq!(plan("L2", Some("R"), Some(&kept)), Plan::Kept);
+        assert_eq!(plan("L3", Some("R"), Some(&kept)), Plan::Conflict);
+        assert_eq!(plan("L2", Some("R2"), Some(&kept)), Plan::Conflict);
+    }
+
+    #[test]
+    fn remote_hashes_parse_for_syncable_names_only() {
+        let h = "a".repeat(64);
+        let out = format!("{h}  keybindings.json\n{h} *snippets.json\n{h}  config.json\nnoise\n");
+        let got = parse_remote_hashes(&out);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got.get("snippets.json"), Some(&h));
+        assert!(!got.contains_key("config.json"));
+        // The script itself, run by a real shell against a config dir.
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config/croft");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keybindings.json"), "{}\n").unwrap();
+        std::fs::write(dir.join("config.json"), "{}\n").unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &remote_hash_script()])
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let got = parse_remote_hashes(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            [(String::from("keybindings.json"), content_hash(b"{}\n"))]
+        );
+        assert_eq!(content_hash(b"").len(), 64);
+    }
+
+    #[test]
+    fn sync_state_round_trips_per_host_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let mut st = SyncState::default();
+        st.file_mut("DevBox", "keybindings.json").pushed = Some("x".into());
+        st.save(&path).unwrap();
+        let back = SyncState::load(&path);
+        assert_eq!(
+            back.file("devbox", "keybindings.json")
+                .and_then(|f| f.pushed.as_deref()),
+            Some("x")
+        );
+        assert_eq!(
+            SyncState::load(&dir.path().join("none")),
+            SyncState::default()
+        );
+    }
 
     #[test]
     fn the_trust_carrying_config_never_becomes_syncable() {
