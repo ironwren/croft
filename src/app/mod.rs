@@ -694,6 +694,7 @@ struct SidebarAreas {
 /// state. Encoded once in `App::init_graphics` (no PNG re-encoding per
 /// frame) and rewritten under the activity-bar block after every ratatui
 /// frame draw, since ratatui's bg-clear overdraws the image.
+#[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
     explorer_active: String,
     explorer_inactive: String,
@@ -1540,6 +1541,10 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What a network git operation's worker hands back: the UI-thread half
+/// of the operation, applied to the app when it arrives.
+type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -1656,6 +1661,16 @@ fn search_editor_label(query: &str) -> PathBuf {
         String::from("Search Editor")
     } else {
         format!("Search: {q}")
+    })
+}
+
+/// Whether a tab is a Search Editor by its label, not just by its text: a
+/// real file that happens to open with `# Query: ` must keep its Enter key,
+/// and must never have a rerun overwrite it.
+fn is_search_editor_tab(path: Option<&Path>) -> bool {
+    path.is_some_and(|p| {
+        let p = p.to_string_lossy();
+        p == "Search Editor" || p.starts_with("Search: ")
     })
 }
 
@@ -2369,6 +2384,7 @@ struct Prompt {
 struct PendingDiscard {
     rel_path: String,
     untracked: bool,
+    staged: bool,
 }
 
 /// A revert-hunk request waiting on its confirm popup. Holds the
@@ -2695,6 +2711,9 @@ pub struct App {
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
+    /// The network git operation in flight (push, pull, fetch, clone...),
+    /// named for the status line, and where its finisher arrives.
+    git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -3039,6 +3058,17 @@ pub struct App {
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
     minimap_content_h: u32,
+    /// When the minimap image was last baked, and whether an edit since then
+    /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
+    minimap_baked_at: Option<std::time::Instant>,
+    minimap_edit_pending: bool,
+    /// The buffer ratatui drew last, and what each small chrome image (the
+    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
+    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
+    /// checked in a frame (the image was hidden) are dropped.
+    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    chrome_sent: std::collections::HashMap<&'static str, u64>,
+    chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
     minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
@@ -3136,6 +3166,10 @@ pub struct App {
     /// A field carrying a promise the code does not keep is worse than no
     /// field.
     view_listener: Option<std::os::unix::net::UnixListener>,
+    /// How long one frame may spend serving `croft view` clients (see
+    /// `drain_view_requests`). A field so a test on a loaded machine can
+    /// stretch it: the fixed 20ms is shorter than one file open there.
+    view_drain_budget: std::time::Duration,
     /// URL awaiting the user's local-browser confirmation (remote-
     /// launched croft only). When `Some`, a modal asks Y/A/N and all
     /// other keys are swallowed.
@@ -3440,9 +3474,9 @@ pub struct App {
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
-    term_suggestion: Option<(usize, String)>,
+    term_suggestion: Option<(usize, String, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
-    recording_shortcut: Option<crate::widgets::command_palette::Command>,
+    recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -3451,6 +3485,7 @@ pub struct App {
     inline_worker: Option<crate::inline_complete::Worker>,
     inline_config: Option<crate::inline_complete::Config>,
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
     /// or under test a scratch file, so a test run never edits the real one.
@@ -3614,6 +3649,9 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
+    /// A Submit Review or export is in flight; another is refused until it
+    /// reports, so the same comments are never posted twice.
+    review_submitting: bool,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -3629,6 +3667,9 @@ pub struct App {
         Vec<crate::widgets::list_picker::ListRow>,
     )>,
     review_export_sticky: Vec<String>,
+    /// The PR the export preview named: posting goes there, even if a
+    /// thread load answered for another PR in between.
+    review_export_pr: Option<(PathBuf, String)>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
     review_nodes: std::collections::HashMap<u64, String>,
@@ -3738,6 +3779,9 @@ pub struct App {
     /// The "vX available" popup, present from the offer landing until the
     /// user picks Update, Later, or (once staged) Relaunch.
     update_toast: Option<UpdateToast>,
+    /// Whether this binary may update itself, or belongs to a package
+    /// manager that must do it (#375). Read once at startup.
+    install_source: crate::update_check::InstallSource,
     /// A background `cargo install --root <cache>/staged` of the offered
     /// release. Reported through the same UpdateEvent lifecycle as the
     /// remote watcher; the binary on PATH is untouched until Relaunch.
@@ -4236,6 +4280,9 @@ const MINIMAP_WIDTH_CELLS: u16 = 6;
 /// Minimum editor-text width that must remain after carving the strip; below
 /// this the minimap is suppressed so the code never gets squeezed to nothing.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 44;
+/// While only the text changes, the minimap image is re-baked at most this
+/// often: each bake is a fresh PNG of the whole strip (#682).
+const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_millis(300);
 /// Maximum pixel height per source line in the minimap. Only kicks in for very
 /// short files: it caps a six-line file to a compact sliver instead of
 /// stretching those lines down the whole strip. Any file long enough that its
@@ -4379,10 +4426,17 @@ fn composite_minimap_viewport(base: &[u8], w: u32, h: u32, ov: MinimapOverlay) -
 
 /// Encode an RGBA pixel buffer to PNG (the format `build_inline_image` wants).
 fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
-    let img: image::RgbaImage = image::ImageBuffer::from_raw(w, h, rgba)?;
+    use image::ImageEncoder as _;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    // Best compression with adaptive filters: the minimap is a small strip
+    // of flat colour runs, so this costs well under a millisecond and makes
+    // each bake about a quarter the size, which is what SSH carries (#682).
     let mut out = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+    PngEncoder::new_with_quality(&mut out, CompressionType::Best, FilterType::Adaptive)
+        .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
         .ok()?;
     Some(out)
 }
@@ -4879,6 +4933,7 @@ impl App {
             blame_rx,
             blame_tx,
             blame_fetched: None,
+            git_net_job: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -5003,6 +5058,11 @@ impl App {
             minimap_base: None,
             minimap_img_rect: Rect::default(),
             minimap_content_h: 0,
+            minimap_baked_at: None,
+            minimap_edit_pending: false,
+            drawn_buffer: None,
+            chrome_sent: std::collections::HashMap::new(),
+            chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
@@ -5031,6 +5091,7 @@ impl App {
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
             view_listener,
+            view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
             pending_revert_hunk: None,
@@ -5121,6 +5182,7 @@ impl App {
             inline_worker: None,
             inline_config: None,
             inline_job: None,
+            inline_asked: None,
             inline_next_id: 0,
             keybindings_file: if cfg!(test) {
                 std::env::temp_dir().join(format!(
@@ -5156,6 +5218,7 @@ impl App {
             self_install: None,
             update_check: None,
             update_toast: None,
+            install_source: crate::update_check::current_install_source(),
             staged_install: None,
             staged_status: UpdateStatus::Idle,
             update_status: UpdateStatus::Idle,
@@ -5317,6 +5380,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
+            review_submitting: false,
             notes: notes_path
                 .as_deref()
                 .map(crate::sticky_notes::Notes::load)
@@ -5326,6 +5390,7 @@ impl App {
             notes_shown_gen: 0,
             review_export: None,
             review_export_sticky: Vec::new(),
+            review_export_pr: None,
             review_ai_prefix: loaded_prefs
                 .review_ai_prefix
                 .clone()
@@ -5805,9 +5870,18 @@ impl App {
             self.overlays.run_debug.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.run_debug.image() else {
+        let Some(osc) = self.overlays.run_debug.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
+            height: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
+        };
+        if !self.chrome_image_due("run_debug", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5857,9 +5931,18 @@ impl App {
             self.overlays.problems_badge.clear_emitted();
             return;
         }
-        let Some(osc) = self.overlays.problems_badge.image() else {
+        let Some(osc) = self.overlays.problems_badge.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count),
+            height: 1,
+        };
+        if !self.chrome_image_due("problems_badge", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5938,9 +6021,12 @@ impl App {
                 self.overlays.hero.set(osc, desired);
             }
         }
-        let Some(osc) = self.overlays.hero.image() else {
+        let Some(osc) = self.overlays.hero.image().map(str::to_owned) else {
             return;
         };
+        if !self.chrome_image_due("hero", &osc, hero) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -5980,9 +6066,18 @@ impl App {
         let Some((cx, cy)) = self.remote.last_image_cell else {
             return;
         };
-        let Some(osc) = self.overlays.ssh.image() else {
+        let Some(osc) = self.overlays.ssh.image().map(str::to_owned) else {
             return;
         };
+        let at = Rect {
+            x: cx,
+            y: cy,
+            width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
+            height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
+        };
+        if !self.chrome_image_due("ssh", &osc, at) {
+            return;
+        }
         let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -6370,6 +6465,12 @@ impl App {
         })
     }
 
+    /// Only iTerm2 evicts cached images, so only there do the activity
+    /// icons need re-sending while nothing changed.
+    fn activity_keepalive_allowed(&self) -> bool {
+        self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::ITerm2
+    }
+
     /// Post-draw flush of the activity-bar icons. Re-emits the pre-encoded
     /// OSC-1337 image bytes each frame (ratatui doesn't track image cells, so
     /// neighbouring SGR traffic can evict them from iTerm2's cache) — but
@@ -6382,16 +6483,19 @@ impl App {
     /// into its OR chain), forgets the emit positions, and skips painting
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
-    pub fn flush_activity_image_overlays(&mut self) {
+    pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
         use std::io::Write;
-        // The keepalive re-emit fights iTerm2's image-cache eviction; the sixel
-        // cell buffer doesn't evict, so its icons re-emit only when dirty.
-        let allow_keepalive =
-            self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Sixel;
+        // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
+        // the sixel cell buffer nor Kitty's image layer evicts, so there the
+        // icons re-emit only when dirty: on Kitty the keepalive cost about
+        // 13 KB every two seconds, idle, over SSH (#682).
+        let dirty = self.overlays.activity.dirty();
+        let allow_keepalive = self.activity_keepalive_allowed()
+            && (0..around.len()).any(|i| self.overlays.activity.neighbourhood_changed(i, around));
         if !self.overlays.activity.should_refresh(allow_keepalive) {
             return;
         }
-        let overlays = self.pending_activity_image_overlays();
+        let mut overlays = self.pending_activity_image_overlays();
         if overlays.is_empty() {
             return;
         }
@@ -6399,6 +6503,41 @@ impl App {
         if self.overlays.activity.positions_moved(&positions) {
             self.overlays.activity.request_clear();
             self.overlays.activity.forget_positions();
+            self.overlays.activity.forget_sent();
+            return;
+        }
+        let hashes: Vec<u64> = overlays
+            .iter()
+            .map(|(_, seq)| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seq.hash(&mut h);
+                h.finish()
+            })
+            .collect();
+        let sent: Vec<((u16, u16), u64)> = positions.iter().copied().zip(hashes).collect();
+        // Everything goes out after a wipe or on the first frame. Otherwise
+        // a dirty flush sends only the slots whose cell or image changed,
+        // and a keepalive only the icons whose surroundings changed (`around`
+        // is in the order of the unchanged positions).
+        if !self.overlays.activity.nothing_sent() {
+            let same = positions.as_slice() == self.overlays.activity.last_positions();
+            let mut i = 0;
+            overlays.retain(|_| {
+                let keep = if dirty {
+                    !self.overlays.activity.was_sent(sent[i].0, sent[i].1)
+                } else {
+                    same && self.overlays.activity.neighbourhood_changed(i, around)
+                };
+                i += 1;
+                keep
+            });
+        }
+        if overlays.is_empty() {
+            self.overlays.activity.mark_emitted();
+            self.overlays.activity.store_positions(positions);
+            self.overlays.activity.set_neighbourhood(around.to_vec());
+            self.overlays.activity.set_sent(sent);
             return;
         }
         let mut out = stdout();
@@ -6431,6 +6570,8 @@ impl App {
         let _ = out.flush();
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
+        self.overlays.activity.set_neighbourhood(around.to_vec());
+        self.overlays.activity.set_sent(sent);
     }
 
     /// Whether a post-draw overlay at this cell rect may be emitted (#513).
@@ -7073,8 +7214,11 @@ impl App {
         }
         self.problems_badge_count = count;
         if count == 0 {
+            // Clear the screen only if a badge was actually drawn: at start-up
+            // and on every graphics re-init the count goes from unknown to 0,
+            // and on iTerm2 a needless clear is a whole-screen repaint.
             self.overlays.problems_badge.clear_image();
-            self.overlays.problems_badge.request_clear();
+            self.clear_problems_badge_if_emitted();
             return;
         }
         if let Some(img) = self.build_count_badge_image(
@@ -9705,7 +9849,7 @@ impl App {
     fn activate_open_editor(&mut self, path: PathBuf) {
         if let Some(idx) = self.editor.find_tab_with_path(&path) {
             self.editor.select(idx);
-        } else if self.editor.open(&path).is_err() {
+        } else if self.editor.open_pinned(&path).is_err() {
             self.status = format!("Could not open {}", path.display());
             return;
         }
@@ -10170,12 +10314,13 @@ impl App {
         if !responded {
             return false;
         }
+        let peek = std::mem::take(&mut self.references_want_peek);
         if unsupported {
             self.status =
                 String::from("Go to References: not supported by this file's language server");
             return true;
         }
-        if std::mem::take(&mut self.references_want_peek) && !targets.is_empty() {
+        if peek && !targets.is_empty() {
             self.peek_refs = Some((targets, 0));
             self.show_peeked_reference();
             return true;
@@ -11669,6 +11814,11 @@ impl App {
     /// `⇧F12` keybinding. The server almost always returns many uses, which
     /// `drain_lsp_references` then offers as a picker.
     fn request_references_at_cursor(&mut self) {
+        // A request not sent (no path, no server) must not leave the last
+        // one's id, or Peek would arm itself on it and a later plain Go to
+        // References would open in the peek popup.
+        self.references_request_id = None;
+        self.references_want_peek = false;
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
@@ -13881,18 +14031,18 @@ impl App {
                     // ALT_SCREEN guard of its own, so the check lives here.
                     Vec::new()
                 } else {
-                    let (lines, _) = t.grid_lines();
+                    let (lines, wraps, _) = t.grid_lines_wrapped();
                     let end = lines
                         .iter()
                         .rposition(|l| !l.trim().is_empty())
                         .map_or(0, |i| i + 1);
-                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
+                    // Masked before the cut, over wrapped rows joined, so a
+                    // secret straddling a wrap (or the cut) is still masked.
                     // Persisted to disk and replayed next launch: every
                     // redact rule applies (#360), as for the dump.
-                    lines[start..end]
-                        .iter()
-                        .map(|l| crate::triggers::mask_text(l, &triggers, false))
-                        .collect()
+                    let masked = crate::triggers::mask_rows(&lines[..end], &wraps, &triggers);
+                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
+                    masked[start..end].to_vec()
                 },
             })
             .collect();
@@ -18510,10 +18660,15 @@ impl App {
         let staging = self.staged_status == UpdateStatus::InProgress && !ready;
         let accent = self.theme.accent();
         let btn_bg = self.theme.button();
+        let brew = self.install_source == crate::update_check::InstallSource::Homebrew;
         let actions: Vec<(String, UpdateToastAction)> = if ready {
             vec![(" Relaunch ".to_string(), UpdateToastAction::Relaunch)]
         } else if staging {
             Vec::new()
+        } else if brew {
+            // Homebrew upgrades it (#375); the popup can only name the
+            // command and be dismissed.
+            vec![(" Later ".to_string(), UpdateToastAction::Later)]
         } else {
             vec![
                 (" Update ".to_string(), UpdateToastAction::Update),
@@ -18526,6 +18681,11 @@ impl App {
             format!(
                 "{} building croft v{version} in the background",
                 self.update_spinner_glyph()
+            )
+        } else if brew {
+            format!(
+                "\u{27f3} croft v{version} is available - run `{}`",
+                crate::update_check::BREW_UPGRADE
             )
         } else {
             format!(
@@ -19009,6 +19169,13 @@ impl App {
                 self.goto_last_edit_location();
                 true
             }
+            // Cmd+K Shift+Q: Session: Detach (#679). Normally the attach
+            // client takes this chord before it reaches croft; this arm
+            // serves a leader the client released after its pause.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'q') => {
+                self.detach_session_client();
+                true
+            }
             // Cmd+K Q: ask the navigator about the caret line, or the
             // selected lines when a selection is active (Q for question).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'q') => {
@@ -19443,7 +19610,11 @@ impl App {
             return Ok(());
         }
         // Keyboard Shortcuts editor (#612): the next key is the new chord.
-        if let Some(cmd) = self.recording_shortcut.take() {
+        // Only the key that answers the prompt: once the user has clicked
+        // away or let it sit, a later Cmd+S must save, not become a binding.
+        if let Some((cmd, at)) = self.recording_shortcut.take()
+            && at.elapsed() < SHORTCUT_RECORD_WINDOW
+        {
             self.record_shortcut(cmd, key);
             return Ok(());
         }
@@ -19692,8 +19863,7 @@ impl App {
                 // drift rebuild, or a remote install): bare F9 re-execs
                 // into it. `run()` swaps the staged binary in first when
                 // that is the one that landed.
-                self.pending_reexec = true;
-                self.quit = true;
+                self.arm_reexec();
             } else if self.f9_update_armed() && self.update_status == UpdateStatus::Idle {
                 // The drift hint is armed (#242): bare F9 rebuilds and
                 // reinstalls the local croft in the background.
@@ -19984,6 +20154,11 @@ impl App {
                         return Ok(());
                     }
                 }
+                // Settle edits that landed since the last pass first (an
+                // LSP rename or quick fix applied to the file's tab): with
+                // two tabs changed at once, the keystroke's tab would be
+                // copied over the other and erase that edit.
+                self.sync_symbol_views();
                 self.handle_editor_key(key);
                 // Settle the clip on this edit before clamping the caret to
                 // it: a line opened at the symbol's end grows the clip, so
@@ -20172,25 +20347,30 @@ impl App {
     fn confirm_pending_replace_all(&mut self) {
         self.pending_replace_all = None;
         let dirty = self.dirty_open_paths();
-        let (n, skipped) = self.search.replace_all_skipping(&dirty);
-        self.status = if skipped.is_empty() {
-            format!("Replace All: replaced {n} occurrence(s)")
-        } else {
-            let names: Vec<String> = skipped
-                .iter()
-                .take(2)
-                .map(|p| self.status_path(p))
-                .collect();
-            let more = skipped.len().saturating_sub(names.len());
-            let list = if more > 0 {
+        let (n, skipped, failed) = self.search.replace_all_skipping(&dirty);
+        let list = |paths: &[PathBuf]| {
+            let names: Vec<String> = paths.iter().take(2).map(|p| self.status_path(p)).collect();
+            let more = paths.len().saturating_sub(names.len());
+            if more > 0 {
                 format!("{} and {more} more", names.join(", "))
             } else {
                 names.join(", ")
-            };
-            format!(
-                "Replace All: replaced {n} occurrence(s); skipped {list} (unsaved changes — save first)"
-            )
+            }
         };
+        let mut status = format!("Replace All: replaced {n} occurrence(s)");
+        if !skipped.is_empty() {
+            status.push_str(&format!(
+                "; skipped {} (unsaved changes — save first)",
+                list(&skipped)
+            ));
+        }
+        if !failed.is_empty() {
+            status.push_str(&format!(
+                "; could not rewrite {} (not UTF-8, or unwritable)",
+                list(&failed)
+            ));
+        }
+        self.status = status;
         self.submit_search_query();
     }
 
@@ -22004,7 +22184,9 @@ impl App {
             ));
             return;
         };
-        let command = task.command.clone();
+        let command = self
+            .task_command_line(&task)
+            .unwrap_or_else(|_| task.command.clone());
         let Some(pane) = self.run_project_task(task) else {
             // run_project_task already reported why the pane failed.
             return;
@@ -22186,7 +22368,9 @@ impl App {
             ));
             return;
         };
-        let command = task.command.clone();
+        let command = self
+            .task_command_line(&task)
+            .unwrap_or_else(|_| task.command.clone());
         let Some(pane) = self.run_project_task(task) else {
             // run_project_task already reported why the pane failed.
             return;
@@ -22233,7 +22417,9 @@ impl App {
                 ));
                 return;
             };
-            let command = task.command.clone();
+            let command = self
+                .task_command_line(&task)
+                .unwrap_or_else(|_| task.command.clone());
             let Some(pane) = self.run_project_task(task) else {
                 // run_project_task already reported why the pane failed.
                 return;
@@ -23579,7 +23765,15 @@ impl App {
     /// "Push" item so users can ship already-committed work without
     /// having to type a no-op commit message first.
     pub fn push_source_control(&mut self) {
-        match crate::git::push_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("push", move || {
+            let r = crate::git::push_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_push(r))
+        });
+    }
+
+    fn finish_push(&mut self, result: Result<String, String>) {
+        match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pushed".to_string()
@@ -23602,7 +23796,15 @@ impl App {
     /// Pull the current branch from its upstream. Sibling of
     /// `push_source_control`, reached from the commit dropdown's "Pull".
     pub fn pull_source_control(&mut self) {
-        match crate::git::pull_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("pull", move || {
+            let r = crate::git::pull_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_pull(r))
+        });
+    }
+
+    fn finish_pull(&mut self, result: Result<String, String>) {
+        match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
@@ -23627,7 +23829,17 @@ impl App {
     /// pull short-circuits (we never push on top of an unmerged tree); a
     /// successful pull followed by a failed push reports both halves.
     pub fn sync_source_control(&mut self) {
-        let pull_summary = match crate::git::pull_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("sync", move || {
+            let pull = crate::git::pull_current_branch(&root);
+            // Never push on top of a failed pull.
+            let push = pull.is_ok().then(|| crate::git::push_current_branch(&root));
+            Box::new(move |app: &mut App| app.finish_sync(pull, push))
+        });
+    }
+
+    fn finish_sync(&mut self, pull: Result<String, String>, push: Option<Result<String, String>>) {
+        let pull_summary = match pull {
             Ok(s) => s,
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
@@ -23639,7 +23851,7 @@ impl App {
                 return;
             }
         };
-        match crate::git::push_current_branch(&self.scm_root()) {
+        match push.unwrap_or_else(|| Err(String::from("push did not run"))) {
             Ok(push_summary) => {
                 self.source_control.commit_feedback = Some(format!(
                     "synced (pulled: {pull_summary} | pushed: {push_summary})"
@@ -23764,6 +23976,83 @@ impl App {
         self.refresh_source_control();
     }
 
+    /// Run a network git operation (push, pull, fetch, clone...) on a
+    /// worker thread. Run inline, a slow remote or a large clone froze the
+    /// whole UI until git returned. `job` runs off the UI thread and returns
+    /// the half that updates the app, which `drain_git_net` applies. One at
+    /// a time: two pushes racing each other help nobody.
+    fn spawn_git_net(&mut self, what: &str, job: impl FnOnce() -> GitNetDone + Send + 'static) {
+        if self.git_net_busy() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_net_job = Some((what.to_string(), rx));
+        self.status = format!("Git: {what}\u{2026}");
+    }
+
+    /// Whether a network git operation is still running, saying so.
+    fn git_net_busy(&mut self) -> bool {
+        let Some((running, _)) = &self.git_net_job else {
+            return false;
+        };
+        self.status = format!("Git: {running} is still running");
+        true
+    }
+
+    /// [`spawn_git_net`] for an operation whose result is reported by
+    /// [`run_scm_op`].
+    fn spawn_scm_op(
+        &mut self,
+        label: &'static str,
+        ok_prefix: &'static str,
+        op: impl FnOnce(&Path) -> Result<String, String> + Send + 'static,
+    ) {
+        let root = self.scm_root();
+        self.spawn_git_net(label, move || {
+            let r = op(&root);
+            Box::new(move |app: &mut App| app.run_scm_op(label, r, ok_prefix))
+        });
+    }
+
+    fn finish_clone(&mut self, result: Result<PathBuf, String>) {
+        match result {
+            Ok(dest) => {
+                self.log_git("clone", &Ok(format!("into {}", dest.display())));
+                self.status = format!("Cloned into {}", self.status_path(&dest));
+                self.change_workspace_root(dest);
+            }
+            Err(err) => {
+                self.log_git("clone", &Err(err.clone()));
+                self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Clone failed: {err}");
+            }
+        }
+    }
+
+    /// Apply a finished network git operation. True when one landed.
+    fn drain_git_net(&mut self) -> bool {
+        let Some((what, rx)) = &self.git_net_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_net_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = format!("Git: {what} ended without a result");
+                self.git_net_job = None;
+                true
+            }
+        }
+    }
+
     pub fn stage_all_source_control(&mut self) {
         let r = crate::git::stage_all(&self.scm_root());
         self.run_scm_op("add -A", r, "Staged all");
@@ -23847,6 +24136,9 @@ impl App {
     }
 
     fn commit_and_sync_source_control(&mut self) {
+        if self.git_net_busy() {
+            return;
+        }
         let Some(message) = self.require_commit_message() else {
             return;
         };
@@ -23869,8 +24161,9 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        let r = crate::git::publish_branch(&self.scm_root(), &branch);
-        self.run_scm_op("push -u origin", r, "Published");
+        self.spawn_scm_op("push -u origin", "Published", move |root| {
+            crate::git::publish_branch(root, &branch)
+        });
     }
 
     /// Open the read-only "Git Output" log in an editor tab (VS Code's Git
@@ -23959,8 +24252,7 @@ impl App {
             )),
             ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
             ScmAction::Fetch => {
-                let r = crate::git::fetch_all(&self.scm_root());
-                self.run_scm_op("fetch --all --prune", r, "Fetched");
+                self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
             ScmAction::Commit => self.commit_source_control(),
@@ -23974,13 +24266,15 @@ impl App {
             ScmAction::DiscardAll => self.request_discard_all_source_control(),
             ScmAction::Sync => self.sync_source_control(),
             ScmAction::PullRebase => {
-                let r = crate::git::pull_rebase(&self.scm_root());
-                self.run_scm_op("pull --rebase", r, "Pulled (rebase)");
+                self.spawn_scm_op("pull --rebase", "Pulled (rebase)", crate::git::pull_rebase);
             }
             ScmAction::PushTo => self.open_push_to_remote_picker(),
             ScmAction::PushForce => {
-                let r = crate::git::push_force(&self.scm_root());
-                self.run_scm_op("push --force-with-lease", r, "Force-pushed");
+                self.spawn_scm_op(
+                    "push --force-with-lease",
+                    "Force-pushed",
+                    crate::git::push_force,
+                );
             }
             ScmAction::PublishBranch => self.publish_branch_source_control(),
             ScmAction::CreateBranch => self.open_branch_picker_for(BranchPurpose::Checkout),
@@ -24213,19 +24507,10 @@ impl App {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| self.tree.root.clone());
-                match crate::git::clone_into(&parent, &value) {
-                    Ok(dest) => {
-                        self.log_git("clone", &Ok(format!("into {}", dest.display())));
-                        self.status = format!("Cloned into {}", self.status_path(&dest));
-                        self.change_workspace_root(dest);
-                    }
-                    Err(err) => {
-                        self.log_git("clone", &Err(err.clone()));
-                        self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
-                        self.source_control.commit_feedback_is_error = true;
-                        self.status = format!("Clone failed: {err}");
-                    }
-                }
+                self.spawn_git_net("clone", move || {
+                    let r = crate::git::clone_into(&parent, &value);
+                    Box::new(move |app: &mut App| app.finish_clone(r))
+                });
             }
             InputPurpose::RenameBranch => {
                 self.close_input_prompt();
@@ -24312,7 +24597,17 @@ impl App {
             }
             InputPurpose::ReloadConflict { paths } => {
                 self.close_input_prompt();
-                let reverted = self.editor.revert_paths_to_disk(&paths);
+                // Every group: the prompt lists conflicts from the other
+                // splits too, and reverting only the focused one left theirs
+                // unreloaded with the prompt never coming back.
+                let mut reverted = self.editor.revert_paths_to_disk(&paths);
+                for group in self.editor_layout.inactive_groups_mut() {
+                    for p in group.revert_paths_to_disk(&paths) {
+                        if !reverted.contains(&p) {
+                            reverted.push(p);
+                        }
+                    }
+                }
                 self.sync_open_file_poll_mtime();
                 // A failed reload (file deleted since the popup opened) keeps
                 // its unsaved edits — say so instead of silently doing nothing.
@@ -24372,6 +24667,42 @@ impl App {
             rows,
         );
         self.open_list_picker(picker, "No participants yet");
+    }
+
+    /// Session: Detach (#679): disconnect the client that asked, when only
+    /// one client can have (see `sole_detach_target`). The session keeps
+    /// running, and the client restores its terminal on the way out.
+    fn detach_session_client(&mut self) {
+        if self.session_channel.is_none() {
+            self.status =
+                String::from("Not attached to a persistent session: nothing to detach from");
+            return;
+        }
+        // Only a control holder's keys reach croft, so with one control
+        // holder (or one client) the invoker is known. With several, the
+        // typing attribution can race another writer's keys, so refuse
+        // rather than disconnect the wrong client: the chord, caught by the
+        // attach client itself, always detaches its own client.
+        let Some(id) = crate::session_host::sole_detach_target(&self.session_participants) else {
+            self.status = String::from(
+                "Several clients can type here: press Cmd+K Shift+Q in the client to leave, or use Session: Participants (Cmd+K A)",
+            );
+            return;
+        };
+        let name = self
+            .session_participants
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("participant {id}"));
+        let Some(channel) = self.session_channel.as_mut() else {
+            return;
+        };
+        self.status = if channel.kick(id) {
+            format!("{name} detached; the session keeps running")
+        } else {
+            String::from("Session host unreachable")
+        };
     }
 
     /// Second-level picker for one participant: grant or revoke write
@@ -25093,7 +25424,7 @@ impl App {
 
     /// The owner (or a lone croft) writes the notes; a guest's copy lives
     /// with the owner.
-    fn save_notes(&self, session: Option<&crate::collab::CollabSession>) {
+    fn save_notes(&mut self, session: Option<&crate::collab::CollabSession>) {
         if session.is_some_and(|s| s.role == crate::collab::CollabRole::Guest) {
             return;
         }
@@ -25255,6 +25586,10 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
         if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
@@ -25267,10 +25602,14 @@ impl App {
                 event,
                 summary,
                 pending: self.review_pending.clone(),
-                settles: crate::review_ops::Settles::default(),
+                settles: crate::review_ops::Settles {
+                    pending: self.review_pending.clone(),
+                    ..Default::default()
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Submitting review…");
     }
 
@@ -25371,8 +25710,11 @@ impl App {
                     folded,
                     settles,
                 } => {
-                    self.review_pending.clear();
-                    self.review_pending_pr = None;
+                    self.review_submitting = false;
+                    self.review_pending.retain(|c| !settles.pending.contains(c));
+                    if self.review_pending.is_empty() {
+                        self.review_pending_pr = None;
+                    }
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
                     // Exported sticky notes are settled: resolved for everyone.
@@ -25402,6 +25744,29 @@ impl App {
                         ),
                     };
                 }
+                Outcome::Threads {
+                    root,
+                    number,
+                    path,
+                    rel,
+                    threads,
+                    states,
+                } => self.show_review_threads(root, number, path, rel, threads, states),
+                Outcome::ExportReady {
+                    root,
+                    number,
+                    comments,
+                    notes,
+                    inline,
+                } => self.show_export_ready(root, number, comments, notes, inline),
+                Outcome::NoPr => {
+                    self.status = String::from("No PR for this branch — check it out first");
+                }
+                Outcome::SubmitFailed(e) => {
+                    self.review_submitting = false;
+                    self.status = e;
+                }
+                // A failed reply or load leaves a submission in flight alone.
                 Outcome::Failed(e) => self.status = e,
             }
         }
@@ -26199,6 +26564,7 @@ impl App {
                     start: (sr, sc),
                     end: (er, ec),
                     new_text: s.inserted.clone(),
+                    utf16: false,
                 }]);
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
@@ -26324,8 +26690,10 @@ impl App {
                 self.run_scm_op("tag -d", r, "Deleted tag");
             }
             ListPurpose::PushToRemote => {
-                let r = crate::git::push_to_remote(&self.scm_root(), &row.id);
-                self.run_scm_op("push", r, "Pushed");
+                let remote = row.id.clone();
+                self.spawn_scm_op("push", "Pushed", move |root| {
+                    crate::git::push_to_remote(root, &remote)
+                });
             }
             ListPurpose::MergeConflict => {
                 let res = match row.id.as_str() {
@@ -26499,7 +26867,7 @@ impl App {
                     .strip_prefix("kb:")
                     .and_then(crate::widgets::command_palette::Command::from_id)
                 {
-                    self.recording_shortcut = Some(cmd);
+                    self.recording_shortcut = Some((cmd, std::time::Instant::now()));
                     self.status = format!(
                         "Press the new shortcut for \u{201c}{}\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
                         cmd.title()
@@ -26805,6 +27173,16 @@ impl App {
         );
     }
 
+    /// The line `run_project_task` types for `task`: tasks.json variables
+    /// expanded against the active workspace and file. The preLaunchTask
+    /// gate matches the pane's finished command against this same line.
+    fn task_command_line(&self, task: &crate::tasks::Task) -> Result<String, String> {
+        task.command_line(&crate::dap::configs::SubstCtx {
+            workspace_folder: self.active_workspace_root(),
+            file: self.editor.path.clone(),
+        })
+    }
+
     /// Run `task` in its own named terminal pane. Rerunning a task whose
     /// pane sits idle at a prompt writes the command into that pane
     /// instead of stacking a new one; a busy pane gets a fresh sibling.
@@ -26824,7 +27202,14 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let command = format!("\x05\x15{}\r", task.command);
+        let line = match self.task_command_line(&task) {
+            Ok(line) => line,
+            Err(e) => {
+                self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
+                return None;
+            }
+        };
+        let command = format!("\x05\x15{line}\r");
         self.last_task = Some(task.clone());
         // Reuse only a pane whose shell is standing exactly where this
         // task will run: after a re-root the old pane's label still
@@ -27075,6 +27460,11 @@ impl App {
     }
 
     pub fn commit_and_push_source_control(&mut self) {
+        // Checked before committing: a commit whose push is then refused
+        // would leave the user thinking it had been pushed.
+        if self.git_net_busy() {
+            return;
+        }
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
             self.source_control.commit_feedback = Some(String::from("Empty commit message"));
@@ -27092,7 +27482,18 @@ impl App {
         };
         self.source_control.clear_message();
         self.status = format!("Committed: {commit_summary}");
-        match crate::git::push_current_branch(&self.scm_root()) {
+        let root = self.scm_root();
+        self.spawn_git_net("push", move || {
+            let r = crate::git::push_current_branch(&root);
+            Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
+        });
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
+        match push {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
                     commit_summary
@@ -27138,24 +27539,20 @@ impl App {
     /// the diff caret. Sets a status message and returns `None` when the
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let built = match self.editor.diff.as_ref() {
             None => Err("Hunk actions work inside a Source Control diff"),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
-            Some(diff) => match diff.right_path.strip_prefix(&root) {
-                Err(_) => Err("File is outside the workspace"),
-                Ok(rel) => {
-                    let rel = rel.to_string_lossy().to_string();
-                    match diff.hunk_range_at(diff.action_row()) {
-                        None => Err("No change hunk at the cursor"),
-                        Some(range) => {
-                            let patch = diff.hunk_patch(&rel, range);
-                            Ok((rel, patch))
-                        }
+            Some(diff) => match self.repo_relative_path(&diff.right_path) {
+                None => Err("File is outside the repository"),
+                Some(rel) => match diff.hunk_range_at(diff.action_row()) {
+                    None => Err("No change hunk at the cursor"),
+                    Some(range) => {
+                        let patch = diff.hunk_patch(&rel, range);
+                        Ok((rel, patch))
                     }
-                }
+                },
             },
         };
         match built {
@@ -27172,7 +27569,6 @@ impl App {
     /// `None` when there is no selection spanning a changed row, so the
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
-        let root = self.tree.root.clone();
         let diff = self.editor.diff.as_ref()?;
         if !diff.left_is_git_head {
             return None;
@@ -27181,11 +27577,33 @@ impl App {
         if !sel.has_area() {
             return None;
         }
-        let rel = diff.right_path.strip_prefix(&root).ok()?;
-        let rel = rel.to_string_lossy().to_string();
+        let rel = self.repo_relative_path(&diff.right_path)?;
         let (start, end) = sel.normalized();
         let patch = diff.selected_lines_patch(&rel, (start.0, end.0))?;
         Some((rel, patch))
+    }
+
+    /// `path` relative to the repository top level, where `git apply` runs
+    /// (#139's convention). Relative to the WORKSPACE, a workspace opened on
+    /// `repo/sub` sent `x` for `sub/x`, and every hunk action failed or hit
+    /// a same-named file at the top level.
+    fn repo_relative_path(&self, path: &Path) -> Option<String> {
+        let root = self.scm_root();
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path
+                .canonicalize()
+                .ok()?
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        };
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     /// Cycle the open diff's ignore-whitespace mode (off → leading → all).
@@ -27514,9 +27932,17 @@ impl App {
             return;
         };
         let untracked = matches!(entry.kind, ChangeKind::Untracked);
+        let staged = matches!(
+            entry.kind,
+            ChangeKind::StagedAdded
+                | ChangeKind::StagedModified
+                | ChangeKind::StagedDeleted
+                | ChangeKind::StagedRenamed
+        );
         self.pending_discard = Some(PendingDiscard {
             rel_path: entry.path,
             untracked,
+            staged,
         });
     }
 
@@ -27524,7 +27950,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked) {
+        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.active_git_bypass_debounce();
@@ -28249,6 +28675,14 @@ impl App {
     /// in, the file, its repo-relative path, the branch's PR number), or
     /// `None` with the reason in the status bar.
     fn review_context(&mut self) -> Option<(PathBuf, PathBuf, String, String)> {
+        let (root, path, rel) = self.review_file_context()?;
+        let number = self.review_pr_number(&root)?;
+        Some((root, path, rel, number))
+    }
+
+    /// [`Self::review_context`] without the PR number, which costs a `gh`
+    /// call: the root, the file and its repo-relative path.
+    fn review_file_context(&mut self) -> Option<(PathBuf, PathBuf, String)> {
         let Some(path) = self.editor.path.clone() else {
             self.status = String::from("Open a file from the PR first");
             return None;
@@ -28282,8 +28716,7 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let number = self.review_pr_number(&root)?;
-        Some((root, path, rel, number))
+        Some((root, path, rel))
     }
 
     /// The PR number for `root`'s branch, remembered for the write side, or
@@ -28350,26 +28783,30 @@ impl App {
             self.status = String::from("No comments to export");
             return;
         }
-        let Some(number) = self.review_pr_number(&root) else {
-            return;
-        };
         comments.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-        // The preview says which comments GitHub will take inline, so a
-        // comment folded into the summary is no surprise after posting.
-        let diff = std::process::Command::new(&self.review_gh)
-            .args(["pr", "diff", &number])
-            .current_dir(&root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let inline = comments
-            .iter()
-            .filter(|c| {
-                crate::review_threads::commentable_lines(&diff, &c.path).contains(&(c.line + 1))
-            })
-            .count();
+        // Finding the PR and reading its diff are `gh` calls, which can take
+        // as long as the network does: off the frame loop, the preview
+        // opens when they answer.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::ExportPreview { comments, notes },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Preparing the export\u{2026}");
+    }
+
+    /// Open the export preview once its PR and diff are known.
+    fn show_export_ready(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        comments: Vec<crate::review_threads::PendingComment>,
+        notes: Vec<u64>,
+        inline: usize,
+    ) {
+        self.review_pr = Some((root.clone(), number.clone()));
+        self.review_export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
             label: format!(
@@ -28412,13 +28849,23 @@ impl App {
         let Some((comments, notes, _)) = self.review_export.take() else {
             return;
         };
-        let Some((root, number)) = self.review_pr.clone() else {
+        let Some((root, number)) = self.review_export_pr.take() else {
             return;
         };
         let sticky = std::mem::take(&mut self.review_export_sticky);
         if !self.pending_is_for(&root, &number) {
             return;
         }
+        if self.review_submitting {
+            self.status = String::from("A review is already being submitted");
+            return;
+        }
+        let pending: Vec<_> = self
+            .review_pending
+            .iter()
+            .filter(|c| comments.contains(c))
+            .cloned()
+            .collect();
         crate::review_ops::spawn(
             self.review_gh.clone(),
             root,
@@ -28427,10 +28874,15 @@ impl App {
                 event: crate::review_threads::ReviewEvent::Comment,
                 summary: String::new(),
                 pending: comments,
-                settles: crate::review_ops::Settles { notes, sticky },
+                settles: crate::review_ops::Settles {
+                    notes,
+                    sticky,
+                    pending,
+                },
             },
             self.review_tx.clone(),
         );
+        self.review_submitting = true;
         self.status = String::from("Posting comments…");
     }
 
@@ -28442,79 +28894,31 @@ impl App {
     /// would put them against unrelated code — the same failure as placing
     /// an outdated thread silently, arriving through the other axis.
     fn load_review_threads(&mut self) {
-        let Some((root, path, rel, number)) = self.review_context() else {
+        let Some((root, path, rel)) = self.review_file_context() else {
             return;
         };
-        let api = std::process::Command::new(&self.review_gh)
-            .args([
-                "api",
-                &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
-                "--paginate",
-            ])
-            .current_dir(&root)
-            .output();
-        let json = match api {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            Ok(o) => {
-                // gh's own message names the problem — a missing scope, a
-                // rate limit — far better than anything invented here.
-                let err = String::from_utf8_lossy(&o.stderr);
-                self.status = format!(
-                    "Could not read the PR's comments: {}",
-                    err.trim().lines().next().unwrap_or("gh failed")
-                );
-                return;
-            }
-            Err(e) => {
-                self.status = format!("Could not run gh: {e}");
-                return;
-            }
-        };
-        let mut threads: Vec<crate::review_threads::Thread> =
-            crate::review_threads::parse_threads(&json)
-                .into_iter()
-                .filter(|t| t.path == rel)
-                .collect();
-        // Resolution and the node id Resolve needs live only in GraphQL.
-        // Best effort: without it every thread reads as unresolved, the safe
-        // default, and Resolve says why it can't act.
-        // Every page: a PR past 100 threads would otherwise show the rest
-        // as unresolved and leave them without the id Resolve needs.
-        let mut states = std::collections::HashMap::new();
-        let mut after: Option<String> = None;
-        loop {
-            let mut args = vec![
-                String::from("api"),
-                String::from("graphql"),
-                String::from("-F"),
-                String::from("owner={owner}"),
-                String::from("-F"),
-                String::from("repo={repo}"),
-                String::from("-F"),
-                format!("number={number}"),
-                String::from("-f"),
-                format!("query={}", crate::review_threads::THREADS_QUERY),
-            ];
-            if let Some(cursor) = &after {
-                args.push(String::from("-f"));
-                args.push(format!("after={cursor}"));
-            }
-            let Some(page) = std::process::Command::new(&self.review_gh)
-                .args(&args)
-                .current_dir(&root)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            else {
-                break;
-            };
-            states.extend(crate::review_threads::parse_thread_states(&page));
-            match crate::review_threads::next_page(&page) {
-                Some(cursor) if after.as_deref() != Some(cursor.as_str()) => after = Some(cursor),
-                _ => break,
-            }
-        }
+        // `gh` over the network, several calls for a big PR: off the frame
+        // loop. The threads come back keyed to `path`, the file asked about.
+        crate::review_ops::spawn(
+            self.review_gh.clone(),
+            root,
+            crate::review_ops::Job::LoadThreads { path, rel },
+            self.review_tx.clone(),
+        );
+        self.status = String::from("Loading review comments\u{2026}");
+    }
+
+    /// Show threads read by [`Self::load_review_threads`].
+    fn show_review_threads(
+        &mut self,
+        root: PathBuf,
+        number: String,
+        path: PathBuf,
+        rel: String,
+        mut threads: Vec<crate::review_threads::Thread>,
+        states: std::collections::HashMap<u64, (String, bool)>,
+    ) {
+        self.review_pr = Some((root, number));
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
@@ -28531,13 +28935,9 @@ impl App {
             .count();
         // Stored against the file they describe; the render derives each
         // box's row and title from the buffer as it is at that moment.
-        // `path` is the binding taken at the top of this function, so the
-        // threads are keyed to the file the `gh` query was actually about
-        // rather than to whatever `editor.path` says afterwards. Today those
-        // cannot differ — the event loop is single-threaded and `gh` blocks
-        // it, so no keystroke is handled mid-call — but keying to the
-        // queried file is the property that matters, and it stops being
-        // free the moment this moves off the main thread.
+        // `path` is the file the `gh` query was about, carried through the
+        // worker, not whatever `editor.path` says now: the user may have
+        // switched tabs while it ran.
         self.review_boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
@@ -29352,6 +29752,15 @@ impl App {
     /// state machine takes it from here: spinner while cargo runs, then
     /// the popup and the status bar both offer Relaunch.
     fn start_staged_update(&mut self, version: String) {
+        // Homebrew owns a Cellar binary (#375): staging and swapping it
+        // would leave brew's records describing a file croft replaced.
+        if self.install_source == crate::update_check::InstallSource::Homebrew {
+            self.status = format!(
+                "croft v{version} is available - this install is managed by Homebrew: run `{}`",
+                crate::update_check::BREW_UPGRADE
+            );
+            return;
+        }
         self.staged_status = UpdateStatus::Idle;
         self.staged_install = Some(crate::update_check::StagedInstall::start(
             croft_cache_dir(),
@@ -29593,6 +30002,29 @@ impl App {
         }
     }
 
+    /// Quit into the freshly installed binary, but only once the session,
+    /// with every dirty buffer's unsaved text, is safely on disk: the
+    /// relaunch used to go ahead when the save failed (a full disk, an
+    /// unwritable cache) and those edits were gone.
+    fn arm_reexec(&mut self) {
+        // Tests arm the relaunch too, and must not write into the real cache.
+        let path = if cfg!(test) {
+            std::env::temp_dir().join(format!(
+                "croft-test-session-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+        } else {
+            crate::session_state::handoff_path()
+        };
+        if let Err(e) = self.capture_session_state().save(&path) {
+            self.status = format!("Relaunch cancelled: could not save the session ({e:#})");
+            return;
+        }
+        self.pending_reexec = true;
+        self.quit = true;
+    }
+
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
@@ -29603,17 +30035,20 @@ impl App {
             if ed.has_non_text_view() {
                 continue;
             }
-            let Some(path) = ed.path.clone() else {
+            // An untitled buffer has no file to reopen, so it is carried only
+            // for its unsaved text; a blank one would reappear as clutter.
+            if ed.path.is_none() && !ed.dirty {
                 continue;
-            };
+            }
+            let path = ed.path.clone();
             // A symbol tab is a view over its file's tab (#369): the file tab
             // carries the text, so only an orphaned symbol tab is kept, as a
             // plain file tab, to keep its unsaved edits.
-            if ed.symbol_view.is_some()
+            if let Some(path) = path.clone().filter(|_| ed.symbol_view.is_some())
                 && (self.editor.find_tab_with_path(&path).is_some()
-                    || tabs
-                        .iter()
-                        .any(|t: &crate::session_state::OpenTabState| t.path == path))
+                    || tabs.iter().any(|t: &crate::session_state::OpenTabState| {
+                        t.path.as_ref() == Some(&path)
+                    }))
             {
                 if idx == self.editor.active_index() {
                     active_path = Some(path);
@@ -29639,7 +30074,7 @@ impl App {
             });
         }
         if let Some(path) = active_path
-            && let Some(i) = tabs.iter().position(|t| t.path == path)
+            && let Some(i) = tabs.iter().position(|t| t.path.as_ref() == Some(&path))
         {
             active_tab = i;
         }
@@ -29656,20 +30091,30 @@ impl App {
 
     fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
         for tab in &state.tabs {
-            if self.editor.open_pinned(&tab.path).is_err() {
-                continue;
-            }
-            let Some(ed) = self
-                .editor
-                .editors
-                .iter_mut()
-                .find(|e| e.path.as_deref() == Some(tab.path.as_path()))
-            else {
+            let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
+            let opened = tab
+                .path
+                .as_deref()
+                .is_some_and(|p| self.editor.open_pinned(p).is_ok());
+            let ed = if opened {
+                let path = tab.path.as_deref();
+                self.editor
+                    .editors
+                    .iter_mut()
+                    .find(|e| e.path.as_deref() == path)
+            } else if unsaved.is_some() {
+                // An untitled buffer, or a file that can no longer be read
+                // (deleted, permissions changed while the update ran): the
+                // unsaved text is the only copy, so it comes back (below) as a
+                // dirty tab rather than being dropped.
+                Some(self.editor.open_unreadable_tab(tab.path.clone()))
+            } else {
+                None
+            };
+            let Some(ed) = ed else {
                 continue;
             };
-            if tab.dirty
-                && let Some(text) = &tab.unsaved_text
-            {
+            if let Some(text) = unsaved {
                 ed.lines = text.split('\n').map(str::to_string).collect();
                 if ed.lines.is_empty() {
                     ed.lines.push(String::new());
@@ -31852,10 +32297,10 @@ impl App {
         // Plain and coloured rows come from ONE grid read, so a redact rule
         // is applied to the row it matches and never to a neighbour that
         // shifted in while a second read was taken.
-        let rows_both = self.terminal().grid_lines_ansi();
+        let rows_both = self.terminal().grid_lines_ansi_wrapped();
         let last = rows_both
             .iter()
-            .rposition(|(plain, _)| !plain.trim().is_empty())
+            .rposition(|(plain, _, _)| !plain.trim().is_empty())
             .map_or(0, |i| i + 1);
         let pane = self.terminal().label();
         let pane = if pane.is_empty() { "terminal" } else { pane };
@@ -31867,8 +32312,12 @@ impl App {
         let mut plain_rows: Vec<String> = Vec::with_capacity(last);
         let mut rows: Vec<String> = Vec::with_capacity(last);
         let mut fallback_reason: Option<String> = None;
-        for (plain, ansi) in &rows_both[..last] {
-            let masked = crate::triggers::mask_text(plain, &self.triggers, false);
+        // Wrapped rows are masked as the logical line they form, so a secret
+        // cut by a soft wrap is masked on both rows.
+        let plains: Vec<String> = rows_both[..last].iter().map(|r| r.0.clone()).collect();
+        let wraps: Vec<bool> = rows_both[..last].iter().map(|r| r.2).collect();
+        let masked_rows = crate::triggers::mask_rows(&plains, &wraps, &self.triggers);
+        for ((plain, ansi, _), masked) in rows_both[..last].iter().zip(masked_rows) {
             rows.push(if masked == *plain {
                 ansi.clone()
             } else {
@@ -32473,8 +32922,10 @@ impl App {
         // painted after it (#614), as in fish; anywhere else it moves.
         if key.code == KeyCode::Right
             && key.modifiers.is_empty()
-            && let Some((pane, rest)) = self.term_suggestion.take()
+            && let Some((pane, typed, rest)) = self.term_suggestion.take()
             && pane == self.active_terminal
+            && !self.terminal().awaiting_echo()
+            && self.terminal().prompt_tail().is_some_and(|t| t.0 == typed)
         {
             self.terminal_mut().write_input(rest.as_bytes());
             return;
@@ -33844,7 +34295,7 @@ impl App {
         if self.view_listener.is_none() {
             return false;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + self.view_drain_budget;
         let mut changed = false;
         loop {
             // Do not accept what we cannot serve. `read_line_by_deadline`
@@ -34615,8 +35066,7 @@ impl App {
                 // The popup describes the staged release: only ITS
                 // readiness may fire it, never a drift rebuild's.
                 if self.staged_update_binary().is_some() {
-                    self.pending_reexec = true;
-                    self.quit = true;
+                    self.arm_reexec();
                 }
             }
         }
@@ -35852,8 +36302,17 @@ impl App {
     /// second, which then times out with its tunnel already up.
     fn relay_request_id(kind: &str) -> String {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // A per-run nonce as well as the pid: claims outlive the process in
+        // the relay dir, and a later croft reusing this pid (after a reboot,
+        // in a container) would find every one of its ids already claimed.
+        static NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let nonce = NONCE.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        });
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{kind}-{}-{n}", std::process::id())
+        format!("{kind}-{}-{nonce:x}-{n}", std::process::id())
     }
 
     /// Ask the local launcher (via the drop relay) to forward `port` home over
@@ -38125,6 +38584,7 @@ impl App {
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
             Cmd::SessionParticipants => self.open_participants_picker(),
+            Cmd::SessionDetach => self.detach_session_client(),
             Cmd::CollabCancelStream => self.collab_cancel_stream(),
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
@@ -38326,7 +38786,7 @@ impl App {
         }
         if let Some(idx) = self.editor.find_tab_with_path(&path) {
             self.editor.select(idx);
-        } else if self.editor.open(&path).is_err() {
+        } else if self.editor.open_pinned(&path).is_err() {
             self.status = format!("Could not open {}", path.display());
             return;
         }
@@ -39174,11 +39634,13 @@ impl App {
         // A hex run or a number inside a masked span would be a fragment of
         // the secret one keystroke from the clipboard (#360): no hint there.
         if self.triggers.has_redactions() && !self.redactions_revealed() {
+            // Over wrapped rows joined, as the painter masks them.
+            let masked = crate::triggers::redacted_row_ranges(&lines, &wraps, &self.triggers);
             let clear = |row: usize, start: usize, len: usize| {
-                lines.get(row).is_none_or(|line| {
-                    crate::triggers::redact_spans(line, &self.triggers)
+                masked.get(row).is_none_or(|ranges| {
+                    ranges
                         .iter()
-                        .all(|s| start + len <= s.start || start >= s.start + s.len)
+                        .all(|&(s, l)| start + len <= s || start >= s + l)
                 })
             };
             // A match that wraps the pane edge continues in `tail`; every
@@ -40481,6 +40943,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // A click means the user moved on from a pending shortcut prompt.
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
+            self.status = String::from("Shortcut unchanged");
+        }
         // On-screen keyboard taps outrank every other gate - including the
         // modal overlays - because the OSK is how Termux users type into
         // those modals. Its band is laid out disjoint from all panes, so
@@ -43699,6 +44165,11 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A merge with conflicts still open: its Result holds only
+                // the base text there, and writing it would drop both
+                // sides from disk. Complete Merge (or an explicit Cmd+S) is
+                // the user's call.
+                && !e.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0)
                 && !(guest
                     && e.path
                         .as_ref()
@@ -43968,8 +44439,23 @@ impl App {
         let chord = crate::keymap::Chord::from_event(key).to_config_string();
         let previous = self.keymap.command_for(key).filter(|c| *c != cmd);
         let path = self.keybindings_file.clone();
-        let src = std::fs::read_to_string(&path).ok();
-        let text = crate::keymap::rebind_text(src.as_deref(), cmd.id(), &chord);
+        // Only a missing file starts fresh: one that exists but cannot be
+        // read would otherwise be overwritten with this single binding.
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e}", path.display());
+                return;
+            }
+        };
+        let Some(text) = crate::keymap::rebind_text(src.as_deref(), cmd.id(), &chord) else {
+            self.status = format!(
+                "{} does not parse; fix it before recording a shortcut",
+                path.display()
+            );
+            return;
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -43996,6 +44482,7 @@ impl App {
             self.inline_enabled = false;
             self.editor.ghost = None;
             self.inline_job = None;
+            self.inline_asked = None;
             self.status = String::from("Inline suggestions: off");
             return;
         }
@@ -44072,6 +44559,13 @@ impl App {
             .ghost
             .as_ref()
             .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            // Asked already at this caret and edit: an empty answer, an
+            // error or an Esc'd ghost must not send the request again on
+            // the next tick, which looped hundreds of paid calls a second.
+            || self
+                .inline_asked
+                .as_ref()
+                .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
             || self
                 .inline_job
                 .as_ref()
@@ -44096,6 +44590,7 @@ impl App {
             config: config.clone(),
             prompt: crate::inline_complete::prompt(&ed.lines, row, col),
         });
+        self.inline_asked = Some((path.clone(), seq, row, col));
         self.inline_job = Some((id, path, seq, row, col));
         changed
     }
@@ -44316,6 +44811,11 @@ impl App {
         let Some(term) = self.terminals.get(idx) else {
             return;
         };
+        // Typed keys not echoed yet: the line on screen is behind, and a
+        // suggestion for it would be accepted after the keys that followed.
+        if term.awaiting_echo() {
+            return;
+        }
         let Some((typed, x, y, right)) = term.prompt_tail() else {
             return;
         };
@@ -44334,7 +44834,7 @@ impl App {
         frame
             .buffer_mut()
             .set_string(x, y, &shown, Style::default().fg(self.theme.ignored_fg()));
-        self.term_suggestion = Some((idx, rest));
+        self.term_suggestion = Some((idx, typed, rest));
     }
 
     /// Terminal: Toggle Command Suggestions (#614).
@@ -44368,7 +44868,9 @@ impl App {
             )
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
-            crate::view_ipc::ViewReply::Ok
+            crate::view_ipc::ViewReply::Err {
+                message: String::from(crate::view_ipc::PROBE_OPEN),
+            }
         } else {
             crate::view_ipc::ViewReply::Err {
                 message: String::from(crate::view_ipc::PROBE_CLOSED),
@@ -44408,6 +44910,7 @@ impl App {
                 start: (row, 0),
                 end: (row, line.chars().count()),
                 new_text: new_line,
+                utf16: false,
             }]);
         self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
         self.editor.cursor_col = 0;
@@ -44439,6 +44942,7 @@ impl App {
                 start: (0, 0),
                 end: (end, end_col),
                 new_text: String::new(),
+                utf16: false,
             }]);
         self.save();
         self.run_command(crate::widgets::command_palette::Command::CloseEditor);
@@ -44474,7 +44978,10 @@ impl App {
     /// Search Editor: Rerun (#615, Cmd+K Shift+R): search again for the query
     /// the active Search Editor's header spells, off the UI thread.
     fn rerun_search_editor(&mut self) {
-        let Some(header) = crate::search_editor::parse_header(&self.editor.lines) else {
+        let header = is_search_editor_tab(self.editor.path.as_deref())
+            .then(|| crate::search_editor::parse_header(&self.editor.lines))
+            .flatten();
+        let Some(header) = header else {
             self.status = String::from("Not a Search Editor");
             return;
         };
@@ -44541,7 +45048,9 @@ impl App {
     /// Open the match under the caret when the active tab is a Search Editor
     /// and the caret is on a result row. Returns whether it did.
     fn open_search_editor_result(&mut self) -> bool {
-        if !crate::search_editor::is_search_editor(&self.editor.lines) {
+        if !is_search_editor_tab(self.editor.path.as_deref())
+            || !crate::search_editor::is_search_editor(&self.editor.lines)
+        {
             return false;
         }
         let Some((path, line)) = crate::search_editor::location_at(
@@ -44643,6 +45152,7 @@ impl App {
                     is_build: false,
                     is_default: false,
                     problem_matcher: None,
+                    vscode: None,
                 });
             }
             crate::code_lens::LensAction::DebugAt(line) => {
@@ -45272,10 +45782,16 @@ impl App {
             );
         } else if path == crate::triggers::triggers_path() {
             self.triggers = load_trigger_set(self.secret_redaction);
-            self.status = format!(
-                "Triggers reloaded ({} active)",
-                self.triggers.triggers.len()
-            );
+            self.status = match &self.triggers.problem {
+                Some(problem) => format!(
+                    "Triggers reloaded ({} of your rules active; {problem})",
+                    self.triggers.user_rules
+                ),
+                None => format!(
+                    "Triggers reloaded ({} of your rules active)",
+                    self.triggers.user_rules
+                ),
+            };
         } else if path == crate::problem_matchers::matchers_path()
             || path == crate::problem_matchers::workspace_matchers_path(self.workspace_root())
         {
@@ -45659,6 +46175,13 @@ impl App {
     fn prompt_encoding_loss(&mut self) {
         self.editor.lossy_save_armed = true;
         let chars = self.editor.unmappable_chars();
+        if chars.is_empty() && self.editor.decode_lossy {
+            self.status = format!(
+                "Not saved: this file has bytes that are not valid {}, shown as \u{fffd} - press Cmd+S again to write them as \u{fffd} (irreversible), or Reopen with Encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        }
         let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
         self.status = format!(
             "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",
@@ -47596,6 +48119,38 @@ impl App {
                     desired.cell_h,
                 )
         });
+        // Typing re-bakes the whole strip image, several kilobytes a key
+        // over SSH (#682). While only the text changed, the strip catches up
+        // at most every `MINIMAP_EDIT_REBAKE`; `tick_minimap` redraws once
+        // the wait is over so the last edit always lands.
+        let text_only = !placement_moved
+            && self.overlays.minimap.layout().is_some_and(|prev| {
+                (
+                    prev.top,
+                    prev.rows,
+                    prev.side,
+                    prev.bg,
+                    prev.selection,
+                    prev.doc,
+                ) == (
+                    desired.top,
+                    desired.rows,
+                    desired.side,
+                    desired.bg,
+                    desired.selection,
+                    desired.doc,
+                )
+            });
+        if text_only
+            && self
+                .minimap_baked_at
+                .is_some_and(|t| t.elapsed() < MINIMAP_EDIT_REBAKE)
+        {
+            self.minimap_edit_pending = true;
+            return;
+        }
+        self.minimap_edit_pending = false;
+        self.minimap_baked_at = Some(std::time::Instant::now());
         if placement_moved {
             self.overlays.minimap.request_clear_if_displayed();
         }
@@ -47670,6 +48225,21 @@ impl App {
             );
             self.overlays.minimap.set(osc, desired);
         }
+    }
+
+    /// True once a deferred minimap bake is due, so the loop redraws and
+    /// the strip shows the last edit. Consumes the pending flag: that redraw
+    /// bakes (the wait is over), and if the minimap was hidden meanwhile
+    /// nothing is left pending to redraw for, forever.
+    pub fn tick_minimap(&mut self) -> bool {
+        let due = self.minimap_edit_pending
+            && self
+                .minimap_baked_at
+                .is_none_or(|t| t.elapsed() >= MINIMAP_EDIT_REBAKE);
+        if due {
+            self.minimap_edit_pending = false;
+        }
+        due
     }
 
     fn disable_minimap_image(&mut self) {
@@ -48818,6 +49388,16 @@ impl App {
         );
     }
 
+    /// Re-point the tabs of a renamed or moved path in every editor group,
+    /// not just the focused one: a tab in the other split kept the old path,
+    /// raised a disk conflict, and a save brought the old file back.
+    fn rename_open_path_everywhere(&mut self, old: &Path, new: &Path) {
+        self.editor.rename_open_path(old, new);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.rename_open_path(old, new);
+        }
+    }
+
     /// Perform the confirmed trash of `paths` (the popup's Enter path).
     fn perform_delete_paths(&mut self, paths: Vec<PathBuf>) {
         let total = paths.len();
@@ -48843,14 +49423,17 @@ impl App {
         };
         match result {
             Ok(()) => {
+                // Every group's tabs, and files under a deleted folder too.
+                // A tab with unsaved edits is kept open: closing it threw the
+                // edits away while the trash only held the saved copy.
+                let mut kept = 0;
                 for path in &paths {
-                    if self.editor.matches_open_path(path) {
-                        if !self.editor.close_active() {
-                            *self.editor = Editor::new();
-                        }
-                        self.sync_open_file_poll_mtime();
+                    kept += self.editor.close_clean_tabs_under(path);
+                    for group in self.editor_layout.inactive_groups_mut() {
+                        kept += group.close_clean_tabs_under(path);
                     }
                 }
+                self.sync_open_file_poll_mtime();
                 for dir in &affected_dirs {
                     if let Some(idx) = self.tree.index_of_dir(dir) {
                         self.tree.refresh_children(idx);
@@ -48862,6 +49445,12 @@ impl App {
                 } else {
                     format!("Moved {total} items to Trash")
                 };
+                if kept > 0 {
+                    self.status.push_str(&format!(
+                        "; {kept} tab{} with unsaved changes kept open",
+                        if kept == 1 { "" } else { "s" }
+                    ));
+                }
             }
             Err(e) => {
                 for dir in &affected_dirs {
@@ -48986,7 +49575,7 @@ impl App {
         mode: ExplorerClipMode,
     ) {
         if matches!(mode, ExplorerClipMode::Copy) {
-            self.apply_paste_or_drop(dest_dir, paths, mode);
+            let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
             return;
         }
         let renames = paths
@@ -49057,31 +49646,34 @@ impl App {
         true
     }
 
-    /// Apply the servers' edits, run the move, then tell the servers it
-    /// happened. Edits go first because they name the files at their old
-    /// paths.
+    /// Run the move, then apply the servers' edits and tell the servers it
+    /// happened. The move goes first: a move that fails (a folder into its
+    /// own child, a name already taken) must not leave every importer
+    /// rewritten to a path that does not exist. The edits name files at
+    /// their old paths, so they are carried to where the move put them.
     fn finish_file_move(
         &mut self,
         pending: PendingFileMove,
         edits: Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>,
     ) {
-        let updated = if edits.is_empty() {
-            None
-        } else {
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => Some(files),
-                Err(e) => {
-                    self.status = format!("Could not update references: {e}");
-                    None
-                }
-            }
-        };
-        let moved = self.run_file_move(pending.op);
-        if moved && let Some(lsp) = self.lsp.as_mut() {
-            lsp.did_rename_files(pending.renames);
+        if !self.run_file_move(pending.op) {
+            return;
         }
-        if moved && let Some(files) = updated {
-            self.status = format!("{}, references updated in {files} file(s)", self.status);
+        let moved_status = self.status.clone();
+        if !edits.is_empty() {
+            let edits: Vec<_> = edits
+                .into_iter()
+                .map(|(path, e)| (moved_path(&path, &pending.renames), e))
+                .collect();
+            match self.apply_rename_edits(&edits) {
+                Ok((files, _)) => {
+                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+                }
+                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
+            }
+        }
+        if let Some(lsp) = self.lsp.as_mut() {
+            lsp.did_rename_files(pending.renames);
         }
     }
 
@@ -49089,8 +49681,7 @@ impl App {
     fn run_file_move(&mut self, op: FileMove) -> bool {
         match op {
             FileMove::Paste { dest_dir, paths } => {
-                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut);
-                true
+                self.apply_paste_or_drop(&dest_dir, &paths, ExplorerClipMode::Cut)
             }
             FileMove::Rename {
                 parent,
@@ -49107,7 +49698,7 @@ impl App {
                             self.tree.select(new_idx);
                         }
                     }
-                    self.editor.rename_open_path(&old, &new_path);
+                    self.rename_open_path_everywhere(&old, &new_path);
                     self.rename_review_boxes_path(&old, &new_path);
                     self.sync_open_file_poll_mtime();
                     true
@@ -49122,7 +49713,13 @@ impl App {
 
     /// Shared implementation for explorer paste and drag-drop. `mode`
     /// distinguishes a move (Cut/drag) from a copy (Copy/Alt-drag).
-    fn apply_paste_or_drop(&mut self, dest_dir: &Path, paths: &[PathBuf], mode: ExplorerClipMode) {
+    /// Returns whether every item landed.
+    fn apply_paste_or_drop(
+        &mut self,
+        dest_dir: &Path,
+        paths: &[PathBuf],
+        mode: ExplorerClipMode,
+    ) -> bool {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(dest_dir.to_path_buf());
         let mut placed: Vec<PathBuf> = Vec::new();
@@ -49141,8 +49738,10 @@ impl App {
             };
             match result {
                 Ok(p) => {
-                    if matches!(mode, ExplorerClipMode::Cut) && self.editor.matches_open_path(src) {
-                        self.editor.rename_open_path(src, &p);
+                    // Every tab, not just the active one: a background tab of
+                    // a moved file kept the old path and recreated it on save.
+                    if matches!(mode, ExplorerClipMode::Cut) {
+                        self.rename_open_path_everywhere(src, &p);
                         self.rename_review_boxes_path(src, &p);
                     }
                     placed.push(p);
@@ -49185,6 +49784,7 @@ impl App {
                 self.status_path(dest_dir)
             );
         }
+        errors.is_empty()
     }
 
     fn open_create_prompt(&mut self, kind: CreateKind, target_dir: PathBuf) {
@@ -49314,7 +49914,9 @@ impl App {
                             }
                         }
                         if create_kind == CreateKind::File {
-                            if let Err(e) = self.editor.open(&path) {
+                            // A tab of its own: `open` reloads the ACTIVE tab
+                            // in place, discarding its unsaved edits.
+                            if let Err(e) = self.editor.open_pinned(&path) {
                                 self.status = format!("Created but could not open: {e}");
                             } else {
                                 self.sync_open_file_poll_mtime();
@@ -52876,6 +53478,19 @@ fn reexec_binary_path(local_install: Option<&crate::update_watch::SelfInstall>) 
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
 }
 
+/// How long a Keyboard Shortcuts prompt waits for its chord.
+const SHORTCUT_RECORD_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where `path` is after `renames` ran: under a moved file or folder, its
+/// new place; anywhere else, unchanged.
+fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> PathBuf {
+    renames
+        .iter()
+        .find_map(|r| path.strip_prefix(&r.old).ok().map(|rest| r.new.join(rest)))
+        .map(|p| p.components().collect())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 fn sidebar_view_label(view: SidebarView) -> &'static str {
     match view {
         SidebarView::Explorer => "Explorer",
@@ -53202,61 +53817,96 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     use KeyCode::*;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let cursor =
-        |app: &'static [u8], normal: &'static [u8]| if app_cursor { app } else { normal }.to_vec();
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm's modifier parameter: 1 + Shift 1 + Alt 2 + Ctrl 4. A modified
+    // cursor or editing key carries it (`Ctrl+Left` is `\e[1;5D`); sending
+    // the plain sequence dropped the modifier, so word motion and selection
+    // bindings in shells and editors never fired.
+    let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let cursor = |app: &'static [u8], normal: &'static [u8], fin: char| {
+        if m > 1 {
+            format!("\x1b[1;{m}{fin}").into_bytes()
+        } else if app_cursor {
+            app.to_vec()
+        } else {
+            normal.to_vec()
+        }
+    };
+    let tilde = |n: u8| {
+        if m > 1 {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+    let esc_if_alt = |mut v: Vec<u8>| {
+        if alt && !v.is_empty() {
+            v.insert(0, 0x1b);
+        }
+        v
+    };
     match key.code {
-        Enter => vec![b'\r'],
+        Enter => esc_if_alt(vec![b'\r']),
         Tab => vec![b'\t'],
         BackTab => b"\x1b[Z".to_vec(),
-        Backspace => vec![0x7f],
+        // Alt+Backspace deletes a word in readline; Ctrl+Backspace sends ^H.
+        Backspace => esc_if_alt(vec![if ctrl { 0x08 } else { 0x7f }]),
         Esc => vec![0x1b],
-        Up => cursor(b"\x1bOA", b"\x1b[A"),
-        Down => cursor(b"\x1bOB", b"\x1b[B"),
-        Right if alt => b"\x1bf".to_vec(),
-        Left if alt => b"\x1bb".to_vec(),
-        Right => cursor(b"\x1bOC", b"\x1b[C"),
-        Left => cursor(b"\x1bOD", b"\x1b[D"),
-        Home => cursor(b"\x1bOH", b"\x1b[H"),
-        End => cursor(b"\x1bOF", b"\x1b[F"),
-        PageUp => b"\x1b[5~".to_vec(),
-        PageDown => b"\x1b[6~".to_vec(),
-        Insert => b"\x1b[2~".to_vec(),
-        Delete => b"\x1b[3~".to_vec(),
+        // Alt alone on Left/Right keeps readline's word motion (`\eb`/`\ef`),
+        // which every shell binds; other modifiers use the xterm form.
+        Right if alt && !ctrl && !shift => b"\x1bf".to_vec(),
+        Left if alt && !ctrl && !shift => b"\x1bb".to_vec(),
+        Up => cursor(b"\x1bOA", b"\x1b[A", 'A'),
+        Down => cursor(b"\x1bOB", b"\x1b[B", 'B'),
+        Right => cursor(b"\x1bOC", b"\x1b[C", 'C'),
+        Left => cursor(b"\x1bOD", b"\x1b[D", 'D'),
+        Home => cursor(b"\x1bOH", b"\x1b[H", 'H'),
+        End => cursor(b"\x1bOF", b"\x1b[F", 'F'),
+        PageUp => tilde(5),
+        PageDown => tilde(6),
+        Insert => tilde(2),
+        Delete => tilde(3),
         F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
+            1..=4 => {
+                let fin = b"PQRS"[usize::from(n - 1)] as char;
+                if m > 1 {
+                    format!("\x1b[1;{m}{fin}").into_bytes()
+                } else {
+                    format!("\x1bO{fin}").into_bytes()
+                }
+            }
+            5 => tilde(15),
+            6 => tilde(17),
+            7 => tilde(18),
+            8 => tilde(19),
+            9 => tilde(20),
+            10 => tilde(21),
+            11 => tilde(23),
+            12 => tilde(24),
             _ => Vec::new(),
         },
         Char(c) => {
             if ctrl {
                 let lc = c.to_ascii_lowercase();
-                if lc.is_ascii_lowercase() {
-                    return vec![(lc as u8) - b'a' + 1];
-                }
-                match c {
-                    '@' => vec![0x00],
-                    '\\' => vec![0x1c],
-                    ']' => vec![0x1d],
-                    _ => Vec::new(),
-                }
-            } else if alt {
-                let mut v = vec![0x1b];
-                let mut buf = [0u8; 4];
-                v.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                v
+                let byte = if lc.is_ascii_lowercase() {
+                    Some((lc as u8) - b'a' + 1)
+                } else {
+                    match c {
+                        ' ' | '@' | '2' => Some(0x00),
+                        '[' | '3' => Some(0x1b),
+                        '\\' | '4' => Some(0x1c),
+                        ']' | '5' => Some(0x1d),
+                        '^' | '6' => Some(0x1e),
+                        '/' | '_' | '7' => Some(0x1f),
+                        '8' | '?' => Some(0x7f),
+                        _ => None,
+                    }
+                };
+                // Ctrl+Alt+letter is ESC then the control byte.
+                byte.map_or_else(Vec::new, |b| esc_if_alt(vec![b]))
             } else {
                 let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
+                esc_if_alt(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
         }
         _ => Vec::new(),
@@ -53528,10 +54178,19 @@ pub fn run(
     // Restore the tabs / layout carried across a self-update re-exec, then
     // delete the handoff file so a later normal launch starts clean.
     if let Some(session_path) = restore_session.as_ref() {
-        if let Ok(state) = crate::session_state::SessionState::load(session_path) {
-            app.apply_session_state(&state);
+        match crate::session_state::SessionState::load(session_path) {
+            Ok(state) => {
+                app.apply_session_state(&state);
+                let _ = std::fs::remove_file(session_path);
+            }
+            // Kept: it may hold the only copy of unsaved text.
+            Err(e) => {
+                app.status = format!(
+                    "Could not restore the session ({e:#}); it is kept at {}",
+                    session_path.display()
+                );
+            }
         }
-        let _ = std::fs::remove_file(session_path);
     }
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
     // window. "Move/Copy into New Window" launches the new window this way so it
@@ -53691,6 +54350,8 @@ pub fn run(
     if app.pending_reexec {
         let state = app.capture_session_state();
         let session_path = crate::session_state::handoff_path();
+        // Saved once already when the relaunch was armed; this refresh is
+        // best-effort, and a failure leaves that copy in place.
         let _ = state.save(&session_path);
         use std::os::unix::process::CommandExt;
         // A staged release (#333) is swapped over the installed binary
@@ -53930,6 +54591,8 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
 /// Fingerprints of the text cells under each large post-frame image this
 /// frame (see [`overlay::ImageOverlay::needs_emit`]).
 struct ImageUnderlays {
+    /// Around each activity-bar and toolbar icon, for iTerm2's keepalive.
+    activity: Vec<u64>,
     editor: [u64; 2],
     terminal: u64,
     markdown: u64,
@@ -53959,6 +54622,28 @@ fn cells_fingerprint(buf: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u
 impl App {
     /// This frame's [`ImageUnderlays`], read from the buffer just drawn.
     fn image_underlays(&self, buf: &ratatui::buffer::Buffer) -> ImageUnderlays {
+        // A one-cell ring around each icon's block (the widest is 4x2).
+        let activity: Vec<u64> = self
+            .overlays
+            .activity
+            .last_positions()
+            .iter()
+            .map(|&(x, y)| cells_fingerprint(buf, x.saturating_sub(1), y.saturating_sub(1), 6, 4))
+            .collect();
+        // Kitty keeps pictures on their own layer: text written into the
+        // cells never deletes a placement (only a delete command or a screen
+        // clear does, and both forget what was sent). So on Kitty the cells
+        // beneath do not matter, and streaming output beside an image sends
+        // nothing.
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            return ImageUnderlays {
+                activity,
+                editor: [0, 0],
+                terminal: 0,
+                markdown: 0,
+                minimap: 0,
+            };
+        }
         let o = &self.overlays;
         let editor = |side: usize| {
             o.editor[side].layout().map_or(0, |l| {
@@ -53966,6 +54651,7 @@ impl App {
             })
         };
         ImageUnderlays {
+            activity,
             editor: [editor(0), editor(1)],
             terminal: o.terminal_image.layout().map_or(0, |l| {
                 cells_fingerprint(buf, l.cell_x, l.cell_y, l.cell_w, l.cell_h)
@@ -53979,9 +54665,46 @@ impl App {
         }
     }
 
+    /// Whether a small chrome image must be sent this frame (#682). These
+    /// used to go out after every redraw, so a keystroke re-sent each one
+    /// over SSH. Now one goes out when it is new, changed or moved, and on
+    /// iTerm2 and Sixel also when the cells around it were repainted (iTerm2
+    /// evicts an image under neighbouring traffic, and a cell-buffer picture
+    /// is erased by writes into it). Kitty keeps images on their own layer.
+    fn chrome_image_due(&mut self, key: &'static str, image: &str, at: Rect) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        image.hash(&mut h);
+        (at.x, at.y, at.width, at.height).hash(&mut h);
+        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
+            && let Some(buf) = &self.drawn_buffer
+        {
+            cells_fingerprint(
+                buf,
+                at.x.saturating_sub(1),
+                at.y.saturating_sub(1),
+                at.width.saturating_add(2),
+                at.height.saturating_add(2),
+            )
+            .hash(&mut h);
+        }
+        let sig = h.finish();
+        self.chrome_seen.insert(key);
+        self.chrome_sent.insert(key, sig) != Some(sig)
+    }
+
+    /// Drop the record of chrome images that were not on screen this frame,
+    /// so they are sent again when they come back.
+    fn end_chrome_flush(&mut self) {
+        let seen = std::mem::take(&mut self.chrome_seen);
+        self.chrome_sent.retain(|k, _| seen.contains(k));
+    }
+
     /// The screen was wiped or its images evicted: every large image is
     /// sent again on the next flush.
     fn forget_sent_images(&mut self) {
+        self.chrome_sent.clear();
+        self.overlays.activity.forget_sent();
         for side in 0..2 {
             self.overlays.editor[side].forget_sent();
         }
@@ -54122,7 +54845,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
-        let live_run_changed = app.tick_live_run() | app.sync_markdown_scroll();
+        let live_run_changed =
+            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.drain_lsp_code_lens()
             | app.drain_search_editor()
@@ -54138,7 +54862,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
-        let blame_changed = app.drain_blame();
+        let blame_changed = app.drain_blame() | app.drain_git_net();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
@@ -54348,6 +55072,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.render(f);
             })?;
             let mut underlays = app.image_underlays(drawn.buffer);
+            app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -54365,6 +55090,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     app.render(f);
                 })?;
                 underlays = app.image_underlays(drawn.buffer);
+                app.drawn_buffer = Some(drawn.buffer.clone());
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -54377,7 +55103,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // buffer in image-mode, ratatui's diff produces zero per-cell
             // writes here — re-emitting the pre-encoded OSC bytes every
             // frame is cheap and locks the images in.
-            app.flush_activity_image_overlays();
+            app.flush_activity_image_overlays(&underlays.activity);
             // Active editor image preview: baked once, and sent after
             // ratatui's diff only when it could be missing from the screen
             // (`ImageOverlay::needs_emit`), never on every frame: a picture
@@ -54511,6 +55237,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.flush_problems_badge_overlay();
             app.flush_no_repo_hero_overlay();
             app.flush_ssh_empty_state_overlay();
+            app.end_chrome_flush();
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
