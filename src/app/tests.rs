@@ -18853,6 +18853,35 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// A second click on the same forwarded loopback link reuses the tunnel
+/// instead of asking for another (each one was a new tunnel on a random port
+/// and a new browser tab, #648); a click while one is in flight asks nothing.
+#[test]
+fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
+    use crate::widgets::ports::PortOrigin;
+    let _guard = relay_test_lock().lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    let log = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.request_remote_forward(3000, true);
+        app.request_remote_forward(3000, true);
+        let first = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(first.matches("forward\t").count(), 1, "{first:?}");
+        // Once forwarded, a click opens the existing tunnel.
+        app.pending_remote_pulls.clear();
+        app.ports
+            .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+        app.ports.mark_forwarded(3000, 3001);
+        app.request_remote_forward(3000, true);
+        log
+    });
+    let all = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(all.matches("forward\t").count(), 1, "{all:?}");
+    assert!(all.contains("http://127.0.0.1:3001/"), "{all:?}");
+}
+
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
     let _guard = relay_test_lock().lock().unwrap();
@@ -56113,4 +56142,212 @@ esac
         );
         assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
     });
+}
+
+/// #694: a source build of croft on this host stops the language servers
+/// for its duration and restarts them after, since a compile next to
+/// rust-analyzer is what exhausted memory on small remotes.
+#[test]
+fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.lsp.is_some(), "precondition: a manager is running");
+
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none(), "the servers must stop for the build");
+    assert!(
+        !app.apply_source_build_state(true),
+        "a build still running changes nothing"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        app.lsp.is_some(),
+        "the servers must come back once the build ends"
+    );
+    assert!(!app.apply_source_build_state(false));
+
+    // Nothing running is nothing to pause, and nothing to start later: a
+    // manager that failed to start is not brought up by an unrelated build.
+    app.lsp = None;
+    assert!(!app.apply_source_build_state(true));
+    assert!(!app.apply_source_build_state(false));
+    assert!(app.lsp.is_none());
+}
+
+/// #694: re-rooting while a build has the language servers stopped must not
+/// start them beside the compile; the build's end starts them at the new
+/// root instead.
+#[test]
+fn a_reroot_during_a_source_build_leaves_the_servers_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none());
+
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(
+        app.lsp.is_none(),
+        "a re-root started the servers while the build still runs"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    let lsp = app
+        .lsp
+        .as_ref()
+        .expect("the build's end restarts the servers");
+    assert_eq!(
+        lsp.workspace_root(),
+        app.workspace_root(),
+        "the restarted servers must serve the NEW root"
+    );
+}
+
+/// #694 review: a resumed manager numbers semantic replies from 0 again, so
+/// the old manager's per-file high-water marks must go with it, or every
+/// reply for those files is rejected until the new count catches up.
+#[test]
+fn resuming_after_a_build_forgets_the_old_semantic_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let p = tmp.path().join("a.rs");
+    app.semantic_generation_seen.insert(p.clone(), 500);
+    assert!(app.apply_source_build_state(true));
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        "the restarted server's first reply must be accepted"
+    );
+}
+
+/// #694 review: diagnostics of a file with no open buffer do not outlive a
+/// pause; nothing else would ever drop them.
+#[test]
+fn resuming_after_a_build_drops_diagnostics_no_open_tab_owns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "open.rs", "fn main() {}");
+    let open = app.editor.path.clone().unwrap();
+    let closed = tmp.path().join("closed.rs");
+    app.lsp_diagnostics.insert(open.clone(), Default::default());
+    app.lsp_diagnostics
+        .insert(closed.clone(), Default::default());
+    assert!(app.apply_source_build_state(true));
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        !app.lsp_diagnostics.contains_key(&closed),
+        "a tab closed during the build kept its diagnostics"
+    );
+    assert!(
+        app.lsp_diagnostics.contains_key(&open),
+        "an open tab's diagnostics stay until the new servers publish"
+    );
+}
+
+/// #694 review: a format-on-save in flight when the servers stop is saved at
+/// once, unformatted, rather than left armed for an unrelated reply.
+#[test]
+fn pausing_for_a_build_completes_a_pending_format_on_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    let file = app.editor.path.clone().unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.format_request_id = Some(7);
+    app.save_after_format = Some(file.clone());
+    assert!(app.apply_source_build_state(true));
+    assert!(app.format_request_id.is_none());
+    assert!(app.save_after_format.is_none(), "the save was left armed");
+    assert!(
+        std::fs::read_to_string(&file).unwrap().starts_with('x'),
+        "the edit must reach disk"
+    );
+}
+
+/// A local croft (no update watcher) never pauses its servers, and the
+/// marker is read at most once a second.
+#[test]
+fn only_a_remote_launched_croft_polls_the_build_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.update_watch.is_none());
+    assert!(!app.poll_source_build_marker());
+    assert!(
+        app.build_marker_checked.is_none(),
+        "a local croft read the marker"
+    );
+    assert!(app.lsp.is_some());
+
+    app.update_watch = Some(crate::update_watch::UpdateWatch::start(
+        tmp.path().to_path_buf(),
+        String::new(),
+    ));
+    let just_now = std::time::Instant::now();
+    app.build_marker_checked = Some(just_now);
+    assert!(!app.poll_source_build_marker());
+    assert_eq!(
+        app.build_marker_checked,
+        Some(just_now),
+        "the marker was read again within the second"
+    );
+}
+
+/// #694: an "all clear" from the last server reporting on a path drops the
+/// path from the store instead of leaving an empty entry behind; another
+/// server's findings on it survive.
+#[test]
+fn an_all_clear_from_every_server_drops_the_path_from_the_store() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/gone.rs");
+    let update = |server: &str, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: server.to_string(),
+        diagnostics,
+    };
+    store_diagnostics_update(
+        &mut store,
+        update("ra", vec![diag(0, 1, DiagnosticSeverity::Error)]),
+    );
+    store_diagnostics_update(
+        &mut store,
+        update("clippy", vec![diag(2, 3, DiagnosticSeverity::Warning)]),
+    );
+    store_diagnostics_update(&mut store, update("ra", Vec::new()));
+    assert_eq!(store[&path].len(), 1, "clippy's findings stay");
+    store_diagnostics_update(&mut store, update("clippy", Vec::new()));
+    assert!(store.is_empty(), "{store:?}");
+    // An all-clear for a path never reported does not create one.
+    store_diagnostics_update(&mut store, update("ra", Vec::new()));
+    assert!(store.is_empty());
+}
+
+/// #262: a config file croft did not write itself (one that arrived by
+/// config sync) is applied within the watch interval, not on next launch;
+/// a macro croft records itself is not reloaded behind its back.
+#[test]
+fn a_macros_file_written_outside_croft_is_reloaded_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let store = tmp.path().join("macros.json");
+    app.macros_path = store.clone();
+    app.config_watch = crate::config_sync::ConfigWatch::new(vec![store.clone()]);
+    app.macro_registers.clear();
+    let mut mac = crate::macros::Macro::default();
+    mac.push_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    crate::macros::save_register(&store, "q", mac).unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(!app.tick_config_watch_at(t0), "not before the interval");
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert!(
+        app.macro_registers.contains_key("q"),
+        "{:?}",
+        app.macro_registers.keys()
+    );
+    assert!(app.status.starts_with("Macros reloaded"), "{}", app.status);
+    // Nothing more changed: the next check reloads nothing.
+    assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
 }
