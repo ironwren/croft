@@ -21236,8 +21236,10 @@ impl App {
         }
         // The tour (#377): with no picker or palette open, Enter moves on and
         // Esc leaves. Below the modal guards, so a picker a step opened keeps
-        // its own Enter and Esc.
+        // its own Enter and Esc; the context menu is checked here because its
+        // guard comes later, and the theme picker is one.
         if self.tour.is_some()
+            && self.context_menu.is_none()
             && key.kind == KeyEventKind::Press
             && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
@@ -32654,6 +32656,17 @@ impl App {
         // Finished or skipped, the welcome panel stops offering it.
         self.tour_done = true;
         let _ = crate::prefs::save_tour_done_in(&self.config_dir);
+        // The sample's tabs go with it, edited or not: left open they name
+        // deleted files, and saving one would write a scratch file back.
+        let mut sample: Vec<PathBuf> = self
+            .open_tab_paths()
+            .into_iter()
+            .filter(|p| p.starts_with(&run.scratch))
+            .collect();
+        sample.dedup();
+        for path in sample {
+            self.close_tabs_with_path_everywhere(&path);
+        }
         self.change_workspace_root(run.previous_root);
         self.status = match crate::tour::remove_scratch(&run.scratch) {
             Ok(()) => String::from("Tour finished"),
@@ -32673,6 +32686,12 @@ impl App {
                 }
             }
             A::QuickOpen => self.open_file_finder(),
+            A::FindFile(query) => {
+                self.open_file_finder();
+                if let Some(finder) = self.file_finder.as_mut() {
+                    finder.set_query(&query);
+                }
+            }
             A::SplitEditor => self.split_editor(),
             A::Terminal => {
                 if !self.show_terminal {
@@ -32711,6 +32730,12 @@ impl App {
                 }
             }
             A::CommandPalette => self.open_command_palette(),
+            A::Palette(query) => {
+                self.open_command_palette();
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.set_query(&query);
+                }
+            }
             A::ThemePicker => self.open_theme_picker(),
             A::Done => {}
         }
