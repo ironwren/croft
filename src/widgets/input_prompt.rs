@@ -42,6 +42,8 @@ pub enum InputPurpose {
     NewWorktreeLane,
     /// The command to run across the fleet (#363).
     FleetCommand,
+    /// The host to push the syncable config to now (#262).
+    SyncConfigHost,
     /// The pull request to review (#365): a number, `#n`, or its URL.
     PullRequestNumber,
     /// Where to add a CodeQL database from (#578).

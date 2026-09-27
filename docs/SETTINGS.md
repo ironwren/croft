@@ -139,6 +139,21 @@ which must be granted per machine. Two user-layer settings opt out:
 
 The connect output says what was pushed, what was skipped and why.
 
+A file edited on the remote since croft last pushed it is never overwritten.
+It is left alone, and the output names it along with the commands that settle it:
+
+```sh
+croft sync-config devbox --diff keybindings.json         # remote vs local, + is what a push brings
+croft sync-config devbox --take-local keybindings.json   # push yours over it
+croft sync-config devbox --keep-remote keybindings.json  # keep theirs until either side changes
+```
+
+`croft sync-config <host>` on its own pushes now, as a connect does. The
+**Remote: Sync Config Now** palette command runs it in a terminal pane. What
+was last pushed to each host is recorded in croft's cache dir. If that record
+is lost, the next push asks about any remote copy that differs rather than
+replacing it.
+
 ## Notification sinks
 
 A `notifications` list forwards events croft already notices to somewhere

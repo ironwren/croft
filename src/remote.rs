@@ -527,7 +527,9 @@ fn run_croft_session(
     // becoming the baseline with the remote holding the older copy.
     let repush_watch =
         crate::config_sync::ConfigWatch::new(crate::config_sync::watched_local_paths());
-    push_config_files(&ssh, &mut |msg| println!("{msg}"));
+    push_config_files(&ssh, &SyncResolution::default(), &mut |msg| {
+        println!("{msg}")
+    });
     // A file edited on this machine while the session runs follows it
     // (#262); the remote croft applies it on arrival. Stops with the session.
     let repush = ConfigRepush::start(&ssh, repush_watch);
@@ -2353,7 +2355,7 @@ fn sync_workspace_lock(source: &Path, log: impl Fn(String)) {
 /// behaviour — failing the connect over it would be a regression. Every
 /// outcome is reported so a silent no-op is distinguishable from a silent
 /// success.
-fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
+fn push_config_files(ssh: &SshControl, resolution: &SyncResolution, log: &mut dyn FnMut(String)) {
     // User layers only: a workspace must not decide what leaves the laptop.
     let prefs = crate::config_layers::load_merged(None).prefs;
     if crate::config_sync::host_excluded(&ssh.host, &prefs.config_sync_excluded_hosts) {
@@ -2389,16 +2391,88 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
         return;
     }
 
+    // What is there now, so a copy edited on the remote is never replaced
+    // (#262). Unreadable means unknown, and unknown is not permission.
+    let remote = match ssh
+        .background_shell(&crate::config_sync::remote_hash_script())
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => {
+            log(String::from(
+                "Config sync: could not read the remote's copies; pushing nothing rather than risk overwriting them",
+            ));
+            return;
+        }
+    };
+    let state_path = crate::config_sync::SyncState::path();
+    let mut state = crate::config_sync::SyncState::load(&state_path);
+
     let bulk = crate::remote_bulk::establish(&ssh.host, &ssh.socket_path, |_| {});
     let mut pushed = Vec::new();
     let mut failed = Vec::new();
+    let mut kept = Vec::new();
+    let mut conflicts = Vec::new();
     for (syncable, local) in &files {
-        let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
-        let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
-        match rsync.status() {
-            Ok(st) if st.success() => pushed.push(syncable),
-            _ => failed.push(syncable.name),
+        let Ok(bytes) = std::fs::read(local) else {
+            failed.push(syncable.name);
+            continue;
+        };
+        let local_hash = crate::config_sync::content_hash(&bytes);
+        let there = remote.get(syncable.name).map(String::as_str);
+        let chosen = |list: &[String]| list.iter().any(|n| n == syncable.name);
+        let plan = if chosen(&resolution.take_local) {
+            crate::config_sync::Plan::Push
+        } else if chosen(&resolution.keep_remote) && there.is_some_and(|r| r != local_hash) {
+            let entry = state.file_mut(&ssh.host, syncable.name);
+            entry.kept = there.map(|r| (r.to_string(), local_hash.clone()));
+            crate::config_sync::Plan::Kept
+        } else {
+            crate::config_sync::plan(&local_hash, there, state.file(&ssh.host, syncable.name))
+        };
+        match plan {
+            crate::config_sync::Plan::Push => {
+                let dest = crate::config_sync::remote_dest(&ssh.host, syncable.name);
+                let mut rsync = ship_file_rsync_command(&bulk.lane, &ssh.socket_path, local, &dest);
+                match rsync.status() {
+                    Ok(st) if st.success() => {
+                        let entry = state.file_mut(&ssh.host, syncable.name);
+                        entry.pushed = Some(local_hash);
+                        entry.kept = None;
+                        pushed.push(syncable);
+                    }
+                    _ => failed.push(syncable.name),
+                }
+            }
+            crate::config_sync::Plan::UpToDate => {
+                let entry = state.file_mut(&ssh.host, syncable.name);
+                entry.pushed = Some(local_hash);
+                entry.kept = None;
+            }
+            crate::config_sync::Plan::Kept => kept.push(syncable.name),
+            crate::config_sync::Plan::Conflict => conflicts.push(syncable.name),
         }
+    }
+    if let Err(e) = state.save(&state_path) {
+        log(format!(
+            "Config sync: could not record what was pushed ({e})"
+        ));
+    }
+    if !kept.is_empty() {
+        log(format!(
+            "Config sync: keeping the remote's own {} (as you chose)",
+            kept.join(", ")
+        ));
+    }
+    for name in &conflicts {
+        log(format!(
+            "Config sync: {name} was changed on {host} since croft last pushed it, so it was left alone. \
+             `croft sync-config {host} --diff {name}` compares the two; `--take-local {name}` pushes yours, \
+             `--keep-remote {name}` keeps theirs",
+            host = ssh.host
+        ));
     }
 
     if !pushed.is_empty() {
@@ -2419,6 +2493,43 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
             "Config sync: could not push {} (the remote keeps its own copy)",
             failed.join(", ")
         ));
+    }
+}
+
+/// How the user settled config files that differ on the remote (#262):
+/// push these anyway, or keep the remote's copy of these.
+#[derive(Debug, Default, Clone)]
+pub struct SyncResolution {
+    pub take_local: Vec<String>,
+    pub keep_remote: Vec<String>,
+}
+
+/// `croft sync-config <host>` (#262): push the syncable config now, the
+/// same way a connect does, or with `diff` set show how the remote's copy
+/// of that file differs from the local one.
+pub fn sync_config_now(host: &str, resolution: &SyncResolution, diff: Option<&str>) -> Result<()> {
+    for name in resolution
+        .take_local
+        .iter()
+        .chain(&resolution.keep_remote)
+        .map(String::as_str)
+        .chain(diff)
+    {
+        if !crate::config_sync::SYNCABLE.iter().any(|s| s.name == name) {
+            let names: Vec<&str> = crate::config_sync::SYNCABLE
+                .iter()
+                .map(|s| s.name)
+                .collect();
+            anyhow::bail!("{name} is not a synced file ({})", names.join(", "));
+        }
+    }
+    let ssh = SshControl::start(host)?;
+    match diff {
+        Some(name) => print_config_diff(&ssh, name),
+        None => {
+            push_config_files(&ssh, resolution, &mut |msg| println!("{msg}"));
+            Ok(())
+        }
     }
 }
 
@@ -2492,6 +2603,36 @@ impl ConfigRepush {
             *g = (ssh.host.clone(), ssh.socket_path.clone());
         }
     }
+}
+
+/// Print a unified diff of the remote's copy of `name` against the local
+/// one, remote first, so `+` lines are what a push would bring.
+fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
+    let local = crate::prefs::config_dir().join(name);
+    let out = ssh
+        .background_shell(&format!("cat ~/.config/croft/{name} 2>/dev/null"))
+        .output()?;
+    let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
+    std::fs::write(&tmp, &out.stdout)?;
+    let local_arg = if local.is_file() {
+        local
+    } else {
+        PathBuf::from("/dev/null")
+    };
+    let status = Command::new("diff")
+        .args(["-u", "--label"])
+        .arg(format!("{}:{name}", ssh.host))
+        .arg("--label")
+        .arg(format!("local:{name}"))
+        .arg(&tmp)
+        .arg(&local_arg)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    let status = status?;
+    if status.code() == Some(0) {
+        println!("{name} is the same on {} and here", ssh.host);
+    }
+    Ok(())
 }
 
 impl Drop for ConfigRepush {
@@ -2584,6 +2725,15 @@ impl RepushState {
 /// Config files to push, each with the local path it is read from.
 type Pushes = [(crate::config_sync::Syncable, PathBuf)];
 
+/// What a re-push did not send: files that failed to transfer (tried
+/// again), and files held because they were edited on the remote since
+/// croft last pushed them (#262), which wait for the user to settle.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PushResult {
+    failed: Vec<&'static str>,
+    held: Vec<&'static str>,
+}
+
 /// One poll of a live re-push: push the syncable files that changed and
 /// exist, and log what went and what did not. `push` returns the names it
 /// could not ship.
@@ -2592,7 +2742,7 @@ fn repush_tick(
     dir: &Path,
     now: std::time::Instant,
     exclusions: &mut dyn FnMut() -> RepushGate,
-    push: &mut dyn FnMut(&Pushes) -> Vec<&'static str>,
+    push: &mut dyn FnMut(&Pushes) -> PushResult,
     log: &mut dyn FnMut(String),
 ) {
     let changed = state.watch.poll(now);
@@ -2632,7 +2782,7 @@ fn repush_tick(
         state.pending.clear();
         return;
     }
-    let failed = push(&files);
+    let PushResult { failed, held } = push(&files);
     state.pending = files
         .iter()
         .filter(|(s, _)| failed.contains(&s.name))
@@ -2644,10 +2794,16 @@ fn repush_tick(
     let pushed: Vec<&str> = files
         .iter()
         .map(|(s, _)| s.name)
-        .filter(|n| !failed.contains(n))
+        .filter(|n| !failed.contains(n) && !held.contains(n))
         .collect();
     if !pushed.is_empty() {
         log(format!("Config sync: re-pushed {}", pushed.join(", ")));
+    }
+    for name in &held {
+        log(format!(
+            "Config sync: left {name} alone: it was changed on the remote since croft last pushed it \
+             (`croft sync-config <host> --diff {name}`)"
+        ));
     }
     if !failed.is_empty() {
         log(format!(
@@ -2663,27 +2819,68 @@ fn push_over_bulk_lane(
     host: &str,
     socket: &Path,
     files: &[(crate::config_sync::Syncable, PathBuf)],
-) -> Vec<&'static str> {
+) -> PushResult {
     // The connect-time push creates this only when it had files to send, so
     // a host that had none has no ~/.config/croft for the first file made
     // mid-session to land in.
     let mut mk = ssh_socket_command(socket, true);
     mk.arg(host).arg("mkdir -p ~/.config/croft");
+    let all_failed = || PushResult {
+        failed: files.iter().map(|(s, _)| s.name).collect(),
+        held: Vec::new(),
+    };
     if !matches!(mk.status(), Ok(st) if st.success()) {
-        return files.iter().map(|(s, _)| s.name).collect();
+        return all_failed();
     }
+    // The connect-time rule (#262): never over a copy edited there since.
+    let mut hashes = ssh_socket_command(socket, true);
+    hashes
+        .arg(host)
+        .arg(crate::config_sync::remote_hash_script());
+    let remote = match hashes.output() {
+        Ok(out) if out.status.success() => {
+            crate::config_sync::parse_remote_hashes(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => return all_failed(),
+    };
+    let state_path = crate::config_sync::SyncState::path();
+    let mut state = crate::config_sync::SyncState::load(&state_path);
     let bulk = crate::remote_bulk::establish(host, socket, |_| {});
-    files
-        .iter()
-        .filter_map(|(syncable, local)| {
-            let dest = crate::config_sync::remote_dest(host, syncable.name);
-            let ok = matches!(
-                ship_file_rsync_command(&bulk.lane, socket, local, &dest).status(),
-                Ok(st) if st.success()
-            );
-            (!ok).then_some(syncable.name)
-        })
-        .collect()
+    let mut result = PushResult::default();
+    for (syncable, local) in files {
+        let Ok(bytes) = std::fs::read(local) else {
+            result.failed.push(syncable.name);
+            continue;
+        };
+        let hash = crate::config_sync::content_hash(&bytes);
+        let there = remote.get(syncable.name).map(String::as_str);
+        match crate::config_sync::plan(&hash, there, state.file(host, syncable.name)) {
+            crate::config_sync::Plan::Push => {
+                let dest = crate::config_sync::remote_dest(host, syncable.name);
+                let ok = matches!(
+                    ship_file_rsync_command(&bulk.lane, socket, local, &dest).status(),
+                    Ok(st) if st.success()
+                );
+                if ok {
+                    let entry = state.file_mut(host, syncable.name);
+                    entry.pushed = Some(hash);
+                    entry.kept = None;
+                } else {
+                    result.failed.push(syncable.name);
+                }
+            }
+            crate::config_sync::Plan::UpToDate => {
+                let entry = state.file_mut(host, syncable.name);
+                entry.pushed = Some(hash);
+                entry.kept = None;
+            }
+            crate::config_sync::Plan::Kept | crate::config_sync::Plan::Conflict => {
+                result.held.push(syncable.name)
+            }
+        }
+    }
+    let _ = state.save(&state_path);
+    result
 }
 
 /// Appends timestamped lines to `~/.cache/croft/config-sync.log`.
@@ -4934,7 +5131,10 @@ Host !blocked *.internal
                 },
                 &mut |files| {
                     sent.push(files.iter().map(|(s, _)| s.name).collect());
-                    fail.to_vec()
+                    PushResult {
+                        failed: fail.to_vec(),
+                        held: Vec::new(),
+                    }
                 },
                 &mut |l| lines.push(l),
             );
@@ -5026,7 +5226,7 @@ Host !blocked *.internal
             &mut || RepushGate::Unknown,
             &mut |_| {
                 sent += 1;
-                Vec::new()
+                PushResult::default()
             },
             &mut |l| lines.push(l),
         );
@@ -5040,12 +5240,47 @@ Host !blocked *.internal
             &mut || RepushGate::Push(Vec::new()),
             &mut |_| {
                 sent += 1;
-                Vec::new()
+                PushResult::default()
             },
             &mut |l| lines.push(l),
         );
         assert_eq!(sent, 1, "it goes once they read cleanly");
         assert!(state.pending.is_empty());
+    }
+
+    /// #262: a live re-push that finds the remote copy edited since croft
+    /// last pushed it holds the file: not reported as re-pushed, not
+    /// retried, and the log names the command that compares the two.
+    #[test]
+    fn a_live_repush_holds_a_file_edited_on_the_remote() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut state = RepushState::new(ConfigWatch::new(vec![keys.clone()]));
+        let t0 = std::time::Instant::now();
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        let mut lines = Vec::new();
+        repush_tick(
+            &mut state,
+            dir.path(),
+            t0 + ConfigWatch::INTERVAL * 2,
+            &mut || RepushGate::Push(Vec::new()),
+            &mut |_| PushResult {
+                failed: Vec::new(),
+                held: vec!["keybindings.json"],
+            },
+            &mut |l| lines.push(l),
+        );
+        assert!(state.pending.is_empty(), "a held file is not retried");
+        assert!(state.retry_at.is_none());
+        assert!(!lines.iter().any(|l| l.contains("re-pushed")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("left keybindings.json alone") && l.contains("--diff")),
+            "{lines:?}"
+        );
     }
 
     /// #694: the build, and every rustc under it, is the kernel's first
