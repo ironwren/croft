@@ -57252,6 +57252,17 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
         "{crumbs:?}"
     );
 
+    // Switching to a file that did not exist at this commit: its outline
+    // is its own (none), never the previous file's history under its name.
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&other, "fn zeta() {}\n").unwrap();
+    app.editor.open(&other).unwrap();
+    app.sync_outline();
+    assert!(names(&app).is_empty(), "{:?}", names(&app));
+    app.editor.open(&file).unwrap();
+    app.sync_outline();
+    assert_eq!(names(&app), ["alpha"]);
+
     assert!(
         app.handle_scrubber_key(KeyCode::Home),
         "back to the working tree"

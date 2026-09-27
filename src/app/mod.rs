@@ -10067,6 +10067,12 @@ impl App {
             self.outline_synced = None;
             return false;
         };
+        // A tab switch while scrubbing is noticed by render, which runs
+        // after this: rebuild here first, or the new file's key would be
+        // paired with the previous file's historical text.
+        if self.scrubber.is_some() && self.scrub_for.as_ref() != Some(&path) {
+            self.rebuild_scrub_view();
+        }
         // Scrubbing (#371): the outline is the file as it was at the commit
         // on screen, from its own syntax tree; no language server knows that
         // text. Leaving drops the key, so the live outline is recomputed.
