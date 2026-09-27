@@ -22981,6 +22981,28 @@ impl App {
                 title: String::from("CALL STACK"),
             },
         });
+        // With more than one thread (goroutines, under delve), each gets a
+        // row and the selected one's frames sit under it, as in VS Code
+        // (#264). A single thread keeps the plain frame list.
+        let threaded = session.threads.len() > 1;
+        let mut frames_at = rows.len();
+        if threaded {
+            for (id, name) in &session.threads {
+                let selected = session.stopped_thread == Some(*id);
+                rows.push(DebugRow {
+                    indent: 1,
+                    kind: DebugRowKind::Thread {
+                        id: *id,
+                        name: name.clone(),
+                        selected,
+                    },
+                });
+                if selected {
+                    frames_at = rows.len();
+                }
+            }
+        }
+        let mut frame_rows = Vec::new();
         for f in &session.stack_frames {
             let loc = f
                 .path
@@ -22988,8 +23010,8 @@ impl App {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            rows.push(DebugRow {
-                indent: 1,
+            frame_rows.push(DebugRow {
+                indent: if threaded { 2 } else { 1 },
                 kind: DebugRowKind::Frame {
                     id: f.id,
                     selected: Some(f.id) == session.selected_frame,
@@ -22998,6 +23020,7 @@ impl App {
                 },
             });
         }
+        rows.splice(frames_at..frames_at, frame_rows);
         rows.push(DebugRow {
             indent: 0,
             kind: DebugRowKind::Header {
@@ -23165,6 +23188,12 @@ impl App {
             return;
         };
         match row.kind.clone() {
+            DebugRowKind::Thread { id, .. } => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.select_thread(id);
+                }
+                self.debug_expanded.clear();
+            }
             DebugRowKind::Frame { id, .. } => {
                 if let Some(session) = self.debug_sessions.focused_mut() {
                     session.load_frame(id);
