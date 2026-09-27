@@ -70,6 +70,8 @@ pub enum SidebarView {
     RunDebug,
     Extensions,
     Testing,
+    /// CodeQL (#578): databases, queries, query history, AST viewer.
+    CodeQL,
 }
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
@@ -168,6 +170,7 @@ pub enum ActivityIcon {
     RunDebug,
     Extensions,
     Testing,
+    CodeQL,
     Settings,
 }
 
@@ -637,6 +640,21 @@ fn activity_testing_block(bar: Rect) -> Rect {
     }
 }
 
+/// The QL icon (#578), last of the view icons so disabling CodeQL moves no
+/// other icon.
+fn activity_codeql_y(bar: Rect) -> u16 {
+    activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
+}
+
+fn activity_codeql_block(bar: Rect) -> Rect {
+    Rect {
+        x: bar.x,
+        y: activity_codeql_y(bar),
+        width: bar.width,
+        height: ACTIVITY_ICON_HEIGHT,
+    }
+}
+
 /// The settings gear, anchored to the BOTTOM of the activity bar (VS Code's
 /// "Manage" gear), asymmetric to the view icons stacked from the top. Returns
 /// an empty rect when the bar is too short to fit the gear below the last view
@@ -654,7 +672,7 @@ fn activity_settings_block(bar: Rect) -> Rect {
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    let last_view_bottom = activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT;
+    let last_view_bottom = activity_codeql_y(bar) + ACTIVITY_ICON_HEIGHT;
     if y < last_view_bottom {
         return Rect::default();
     }
@@ -684,6 +702,9 @@ struct SidebarAreas {
     extensions_icon: Rect,
     /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
     testing_icon: Rect,
+    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
+    /// built-in CodeQL extension is disabled.
+    codeql_icon: Rect,
     /// Block occupied by the settings gear, bottom-anchored on the activity
     /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
     /// clicking it opens the settings menu (Color Theme picker).
@@ -717,6 +738,9 @@ pub struct ActivityBarImages {
     testing_active: String,
     testing_inactive: String,
     testing_hovered: String,
+    codeql_active: String,
+    codeql_inactive: String,
+    codeql_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
     /// button reads as pressed, mirroring the view icons' selected state;
     /// `hovered` brightens it while the pointer rests on it.
@@ -1554,6 +1578,41 @@ enum PrGhJob {
 /// What a network git operation's worker hands back: the UI-thread half
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
+
+/// The BREAKPOINTS section of the debug tree (#250): a header and one row per
+/// breakpoint, or nothing when there are none.
+fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut rows = vec![DebugRow {
+        indent: 0,
+        kind: DebugRowKind::Header {
+            title: String::from("BREAKPOINTS"),
+        },
+    }];
+    rows.extend((0..count).map(|index| DebugRow {
+        indent: 1,
+        kind: DebugRowKind::Breakpoint { index },
+    }));
+    rows
+}
+
+/// The current user's processes, croft's own excluded, for the attach
+/// picker (#250). Empty when `ps` is unavailable.
+fn list_user_processes() -> Vec<(i64, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-x", "-o", "pid=,comm="])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => crate::dap::configs::parse_ps_processes(
+            &String::from_utf8_lossy(&o.stdout),
+            i64::from(std::process::id()),
+        ),
+        _ => Vec::new(),
+    }
+}
 
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
@@ -2617,6 +2676,8 @@ pub struct App {
     pub run_debug: RunDebugPanel,
     /// The Testing side panel: the suite tree with live pass/fail status.
     pub testing: crate::widgets::testing::TestingPanel,
+    /// The CodeQL side bar (#578).
+    pub codeql: crate::widgets::codeql::CodeqlPanel,
     /// Background `cargo test` worker feeding the Testing panel.
     test_worker: crate::testing::worker::TestWorker,
     /// The Extensions side panel: bundled + installed extensions with toggles.
@@ -2985,6 +3046,14 @@ pub struct App {
     /// main loop; rebuilds the Extensions panel once if the verified cache
     /// changed. `None` once consumed (or on a disarmed build, immediately).
     ext_index_refresh: Option<std::sync::mpsc::Receiver<bool>>,
+    /// The `codeql` executable; tests point it at a stand-in (#578).
+    codeql_program: PathBuf,
+    /// The query run in flight: its outcome arrives here, and when it
+    /// started (#578).
+    codeql_run: Option<(
+        std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
+        std::time::Instant,
+    )>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -4053,6 +4122,10 @@ pub struct App {
     /// single-config launch (one session, no siblings) never reads a stale
     /// value in a way that matters.
     debug_stop_all: bool,
+    /// The `postDebugTask`s of the configurations launched into the current
+    /// run (#250), run once each when the run ends: the user stops it, or
+    /// the last session terminates. A new launch starts a fresh list.
+    debug_post_tasks: Vec<String>,
     /// The running compound's name, kept past launch so the report rebuilt
     /// when one member ends can still say which compound is live (#567).
     debug_compound: Option<String>,
@@ -4061,6 +4134,9 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// An attach launch waiting for the user to pick its process (#250):
+    /// the resolved config and where it launches once `processId` is known.
+    pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
     /// In-flight background `cargo test --no-run` for debug-a-test: the
     /// receiver yields the picked binary (or the build error) and the test
     /// name rides along for the launch. Drained per tick; a second request
@@ -4960,6 +5036,7 @@ impl App {
             graph_refetch_queued: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
+            codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             extensions,
             vscode_listed: Vec::new(),
@@ -5119,6 +5196,8 @@ impl App {
             graph_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
+            codeql_program: PathBuf::from("codeql"),
+            codeql_run: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -5397,8 +5476,10 @@ impl App {
             selected_debug_config: None,
             selected_debug_compound: None,
             debug_stop_all: false,
+            debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
+            pending_attach: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
@@ -5776,6 +5857,7 @@ impl App {
             Some((rda, rdi, rdh)),
             Some((exta, exti, exth)),
             Some((tsta, tsti, tsth)),
+            Some((cqa, cqi, cqh)),
             Some((gea, gei, geh)),
             Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
         ) = (
@@ -5786,6 +5868,7 @@ impl App {
             bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
             bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
             bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
+            bake(ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
             bake(
                 ki::SETTINGS_GEAR_SRC_SVG,
                 gear_off_y_bias,
@@ -5815,6 +5898,9 @@ impl App {
                 testing_active: tsta,
                 testing_inactive: tsti,
                 testing_hovered: tsth,
+                codeql_active: cqa,
+                codeql_inactive: cqi,
+                codeql_hovered: cqh,
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
@@ -6340,6 +6426,9 @@ impl App {
         let rdb_block = self.sidebar_areas.run_debug_icon;
         let ext_block = self.sidebar_areas.extensions_icon;
         let tst_block = self.sidebar_areas.testing_icon;
+        // Optional: absent while CodeQL is disabled, so not part of the
+        // all-or-nothing readiness below.
+        let cql_block = self.sidebar_areas.codeql_icon;
         // The activity bar is all-or-nothing: emit its icons only when every
         // block is laid out (a partial bar would look broken). When it's hidden
         // (Customize Layout / Zen) the blocks are zero-width and skipped, but
@@ -6404,6 +6493,13 @@ impl App {
         } else {
             &images.testing_inactive
         };
+        let cql_state = if self.sidebar_view == SidebarView::CodeQL {
+            &images.codeql_active
+        } else if hov == Some(ActivityIcon::CodeQL) {
+            &images.codeql_hovered
+        } else {
+            &images.codeql_inactive
+        };
         // The gear is bottom-anchored and may be absent on a short bar
         // (empty block). It reads "active" while its menu/picker is open.
         let set_block = self.sidebar_areas.settings_icon;
@@ -6446,6 +6542,9 @@ impl App {
                 (ext_block, ext_state.as_str()),
                 (tst_block, tst_state.as_str()),
             ]);
+            if cql_block.width > 0 {
+                blocks.push((cql_block, cql_state.as_str()));
+            }
             if set_block.width > 0 {
                 blocks.push((set_block, set_state.as_str()));
             }
@@ -8164,6 +8263,8 @@ impl App {
             Some(ActivityIcon::Extensions)
         } else if rect_contains(a.testing_icon, col, row) {
             Some(ActivityIcon::Testing)
+        } else if rect_contains(a.codeql_icon, col, row) {
+            Some(ActivityIcon::CodeQL)
         } else if rect_contains(a.settings_icon, col, row) {
             Some(ActivityIcon::Settings)
         } else {
@@ -8199,6 +8300,7 @@ impl App {
                 ActivityIcon::RunDebug => "Run and Debug",
                 ActivityIcon::Extensions => "Extensions",
                 ActivityIcon::Testing => "Testing",
+                ActivityIcon::CodeQL => "CodeQL",
                 ActivityIcon::Settings => "Manage",
             });
         }
@@ -8249,7 +8351,7 @@ impl App {
                     return Some(label);
                 }
             }
-            SidebarView::Testing => {}
+            SidebarView::Testing | SidebarView::CodeQL => {}
         }
         None
     }
@@ -13837,6 +13939,11 @@ impl App {
         let run_debug_block = activity_run_debug_block(area);
         let extensions_block = activity_extensions_block(area);
         let testing_block = activity_testing_block(area);
+        let codeql_block = if self.is_extension_enabled("codeql") {
+            activity_codeql_block(area)
+        } else {
+            Rect::default()
+        };
         let settings_block = activity_settings_block(area);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
@@ -13845,6 +13952,7 @@ impl App {
         let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
         let extensions_active = self.sidebar_view == SidebarView::Extensions;
         let testing_active = self.sidebar_view == SidebarView::Testing;
+        let codeql_active = self.sidebar_view == SidebarView::CodeQL;
         let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
@@ -13856,6 +13964,7 @@ impl App {
         let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
         let extensions_hovered = hov == Some(ActivityIcon::Extensions);
         let testing_hovered = hov == Some(ActivityIcon::Testing);
+        let codeql_hovered = hov == Some(ActivityIcon::CodeQL);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         // Same palette the baked icons use, so an image-less terminal renders
@@ -13996,6 +14105,15 @@ impl App {
                 testing_hovered,
             );
             render_count_badge(frame, testing_block, self.testing.failed_count());
+            if codeql_block.width > 0 {
+                render_glyph(
+                    frame,
+                    codeql_block,
+                    crate::icons::ACTIVITY_CODEQL,
+                    codeql_active,
+                    codeql_hovered,
+                );
+            }
             if settings_block.width > 0 {
                 render_glyph(
                     frame,
@@ -14014,6 +14132,7 @@ impl App {
         self.sidebar_areas.run_debug_icon = run_debug_block;
         self.sidebar_areas.extensions_icon = extensions_block;
         self.sidebar_areas.testing_icon = testing_block;
+        self.sidebar_areas.codeql_icon = codeql_block;
         self.sidebar_areas.settings_icon = settings_block;
     }
 
@@ -14089,6 +14208,10 @@ impl App {
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Testing => self.focus_pane(Pane::Tree),
+            SidebarView::CodeQL => {
+                self.codeql.theme = self.theme;
+                self.focus_pane(Pane::Tree);
+            }
         }
     }
 
@@ -16745,9 +16868,19 @@ impl App {
                     }
                 }
                 SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
-                SidebarView::RunDebug => frame.render_widget(&mut self.run_debug, usable_area),
+                SidebarView::RunDebug => {
+                    // Breakpoints change from many places (F9, the gutter,
+                    // the condition and logpoint editors); syncing here keeps
+                    // the list current without a refresh at each of them.
+                    self.sync_breakpoint_list();
+                    frame.render_widget(&mut self.run_debug, usable_area)
+                }
                 SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
                 SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
+                SidebarView::CodeQL => {
+                    self.codeql.focused = self.focus == Pane::Tree;
+                    frame.render_widget(&mut self.codeql, usable_area)
+                }
             }
         }
         if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
@@ -20234,7 +20367,7 @@ impl App {
             {
                 self.open_attach_python_picker();
             } else if shift {
-                self.debug_stop();
+                self.debug_stop_by_user();
             } else {
                 self.debug_start_or_continue();
             }
@@ -20536,6 +20669,7 @@ impl App {
                 SidebarView::RunDebug => self.handle_run_debug_key(key),
                 SidebarView::Extensions => self.handle_extensions_key(key),
                 SidebarView::Testing => self.handle_testing_key(key),
+                SidebarView::CodeQL => self.handle_codeql_key(key),
             },
             Pane::Editor => {
                 // A shared file is read-only until its bootstrap snapshot
@@ -21036,20 +21170,7 @@ impl App {
             return;
         }
         let now_enabled = self.disabled_extensions.contains(&id);
-        if now_enabled {
-            self.disabled_extensions.remove(&id);
-        } else {
-            self.disabled_extensions.insert(id.clone());
-        }
-        let _ =
-            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
-        // Turning an extension off forgets its tools' fingerprints, so
-        // turning it back on re-approves a tool whose definition changed.
-        if !now_enabled {
-            let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, &id);
-            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
-        }
-        self.refresh_extensions();
+        self.set_extension_enabled(&id, now_enabled);
         self.status = format!(
             "{} extension '{id}'",
             if now_enabled { "Enabled" } else { "Disabled" }
@@ -21671,6 +21792,502 @@ impl App {
         self.test_worker.discover();
     }
 
+    /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
+    /// with the reason, while the built-in CodeQL extension is disabled.
+    fn open_codeql_view(&mut self) {
+        if !self.is_extension_enabled("codeql") {
+            self.status = String::from(
+                "CodeQL is disabled - enable it in the Extensions view to show its side bar",
+            );
+            return;
+        }
+        self.show_tree = true;
+        self.refresh_codeql_databases();
+        self.refresh_codeql_history();
+        self.set_sidebar_view(SidebarView::CodeQL);
+    }
+
+    /// CodeQL view keys: arrows move between headers and actions, Enter or
+    /// Space folds a section or runs an action, Esc returns to the Explorer.
+    fn handle_codeql_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
+            KeyCode::Up => self.codeql.move_selection(false),
+            KeyCode::Down => self.codeql.move_selection(true),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(hit) = self.codeql.selected_hit() {
+                    self.activate_codeql(hit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run what a CodeQL side-bar row offers. Sections fold; the language
+    /// list selects; the database, query and variant-analysis actions are
+    /// the parts of #578 that follow, and say so rather than do nothing.
+    fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
+        use crate::widgets::codeql::{Action, Hit, LANGUAGES};
+        match hit {
+            Hit::Header(section) => self.codeql.toggle(section),
+            Hit::Action(Action::SelectLanguage(i)) => {
+                self.codeql.language = if self.codeql.language == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+                self.status = match self.codeql.language {
+                    Some(i) => format!("CodeQL language: {}", LANGUAGES[i]),
+                    None => String::from("CodeQL language: all"),
+                };
+            }
+            Hit::Action(Action::SelectDatabase(i)) => {
+                let path = Self::codeql_db_store_path();
+                let mut store = crate::codeql_db::DatabaseStore::load(&path);
+                if i < store.databases.len() {
+                    store.current = Some(i);
+                    let _ = store.save(&path);
+                    self.status = format!("Current CodeQL database: {}", store.databases[i].name);
+                }
+                self.refresh_codeql_databases();
+            }
+            Hit::Action(
+                action @ (Action::AddDatabaseFromFolder
+                | Action::AddDatabaseFromArchive
+                | Action::AddDatabaseFromUrl
+                | Action::AddDatabaseFromGithub),
+            ) => {
+                use crate::widgets::input_prompt::{CodeqlDbSource, InputPrompt, InputPurpose};
+                let (source, title, hint) = match action {
+                    Action::AddDatabaseFromFolder => (
+                        CodeqlDbSource::Folder,
+                        "Add CodeQL Database from Folder",
+                        "path to the database folder",
+                    ),
+                    Action::AddDatabaseFromArchive => (
+                        CodeqlDbSource::Archive,
+                        "Add CodeQL Database from Archive",
+                        "path to a .zip",
+                    ),
+                    Action::AddDatabaseFromUrl => (
+                        CodeqlDbSource::Url,
+                        "Add CodeQL Database from URL",
+                        "https://… .zip",
+                    ),
+                    _ => (
+                        CodeqlDbSource::Github,
+                        "Add CodeQL Database from GitHub",
+                        "owner/repo [language]",
+                    ),
+                };
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::CodeqlDatabase { source },
+                    String::from(title),
+                    String::from(hint),
+                ));
+            }
+            Hit::Action(Action::OpenHistory(i)) => {
+                let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+                let Some(entry) = history.entries.get(i) else {
+                    return;
+                };
+                match &entry.status {
+                    crate::codeql_query::RunStatus::Succeeded => {
+                        let output = entry.output.clone();
+                        match self.editor.open(&output) {
+                            Ok(()) => self.sync_open_file_poll_mtime(),
+                            Err(e) => self.status = format!("{}: {e}", output.display()),
+                        }
+                    }
+                    crate::codeql_query::RunStatus::Failed(why) => {
+                        self.status = format!("That run failed: {why}");
+                    }
+                    crate::codeql_query::RunStatus::Running => {
+                        self.status = String::from("That query is still running");
+                    }
+                }
+            }
+            Hit::Action(action) => {
+                let what = match action {
+                    Action::CreateQuery => "Creating CodeQL queries",
+                    Action::SetUpControllerRepository => "Variant analysis",
+                    Action::ViewAst => "The AST viewer",
+                    _ => unreachable!("handled above"),
+                };
+                self.status = format!("{what} is not available yet (#578)");
+            }
+        }
+    }
+
+    fn codeql_db_store_path() -> PathBuf {
+        croft_cache_dir().join("codeql-databases.json")
+    }
+
+    /// Where fetched or extracted databases live: croft's cache, never
+    /// beside the archive the user pointed at.
+    fn codeql_db_cache_dir() -> PathBuf {
+        croft_cache_dir().join("codeql").join("databases")
+    }
+
+    fn codeql_history_path() -> PathBuf {
+        croft_cache_dir().join("codeql-history.json")
+    }
+
+    /// Mirror the saved query history into the side bar.
+    fn refresh_codeql_history(&mut self) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
+    }
+
+    /// Run the open `.ql` file on the current database (#578): alerts
+    /// through `database analyze` into SARIF, anything else through
+    /// `query run` into a table decoded as CSV. The run happens on a worker
+    /// thread; [`Self::drain_codeql_run`] collects it.
+    fn run_codeql_query(&mut self) {
+        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                self.status = String::from("Open a .ql query to run it");
+                return;
+            }
+        };
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        };
+        // The buffer, not the disk: an unsaved edit is what the user means.
+        let source = self.editor.lines.join("\n");
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = query
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("results")
+            .join(format!("{started}-{stem}"));
+        let kind = cq::output_for(&source);
+        let output = dir.join(match kind {
+            Output::Sarif => "results.sarif",
+            Output::Table => "results.csv",
+        });
+        let mut history = History::load(&Self::codeql_history_path());
+        history.push(HistoryEntry {
+            query: query.clone(),
+            database: db.name.clone(),
+            started,
+            seconds: 0,
+            status: RunStatus::Running,
+            output: output.clone(),
+        });
+        let _ = history.save(&Self::codeql_history_path());
+        self.refresh_codeql_history();
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let run = |args: Vec<String>| -> Result<(), String> {
+                let out = std::process::Command::new(&program)
+                    .args(&args)
+                    .output()
+                    .map_err(|e| format!("could not run codeql: {e}"))?;
+                if out.status.success() {
+                    return Ok(());
+                }
+                let err = String::from_utf8_lossy(&out.stderr);
+                Err(err
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("codeql failed")
+                    .to_string())
+            };
+            let outcome = std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))
+                .and_then(|()| match kind {
+                    Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
+                    Output::Table => {
+                        let bqrs = dir.join("results.bqrs");
+                        run(cq::run_args(&query, &db.path, &bqrs))
+                            .and_then(|()| run(cq::decode_args(&bqrs, &output)))
+                    }
+                });
+            let _ = tx.send(match outcome {
+                Ok(()) => RunStatus::Succeeded,
+                Err(e) => RunStatus::Failed(e),
+            });
+        });
+        self.codeql_run = Some((rx, std::time::Instant::now()));
+        self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Collect a finished query run (#578): record how it went in the
+    /// history, and open its results when it succeeded.
+    pub fn drain_codeql_run(&mut self) -> bool {
+        use crate::codeql_query::{History, RunStatus};
+        let Some((rx, since)) = self.codeql_run.as_ref() else {
+            return false;
+        };
+        let status = match rx.try_recv() {
+            Ok(s) => s,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                RunStatus::Failed(String::from("the query run stopped unexpectedly"))
+            }
+        };
+        let seconds = since.elapsed().as_secs();
+        self.codeql_run = None;
+        let mut history = History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.first_mut() else {
+            return true;
+        };
+        entry.status = status.clone();
+        entry.seconds = seconds;
+        let output = entry.output.clone();
+        let name = entry
+            .query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = history.save(&Self::codeql_history_path());
+        self.refresh_codeql_history();
+        match status {
+            RunStatus::Failed(why) => self.status = format!("{name} failed: {why}"),
+            _ => match self.editor.open(&output) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    self.status = format!("{name} finished in {seconds}s");
+                }
+                Err(e) => self.status = format!("{}: {e}", output.display()),
+            },
+        }
+        true
+    }
+
+    /// Mirror the saved database list into the side bar.
+    fn refresh_codeql_databases(&mut self) {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        self.codeql.databases = store.databases;
+        self.codeql.current_db = store.current;
+    }
+
+    /// A path as typed: `~` expanded, relative to the workspace root.
+    fn typed_path(&self, value: &str) -> PathBuf {
+        let v = value.trim();
+        let p = match v.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(rest),
+            None => PathBuf::from(v),
+        };
+        if p.is_absolute() {
+            p
+        } else {
+            self.workspace_root().join(p)
+        }
+    }
+
+    /// Add a CodeQL database from `value` (#578): a folder, an archive, a
+    /// URL to a zip, or `owner/repo [language]` on GitHub.
+    pub fn submit_codeql_database(
+        &mut self,
+        source: crate::widgets::input_prompt::CodeqlDbSource,
+        value: &str,
+    ) {
+        use crate::widgets::input_prompt::CodeqlDbSource;
+        let found: Result<PathBuf, String> = match source {
+            CodeqlDbSource::Folder => {
+                let dir = self.typed_path(value);
+                crate::codeql_db::find_database_in(&dir).ok_or_else(|| {
+                    format!(
+                        "{} is not a CodeQL database (no codeql-database.yml)",
+                        dir.display()
+                    )
+                })
+            }
+            CodeqlDbSource::Archive => {
+                let zip = self.typed_path(value);
+                let stem = zip
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| String::from("database"));
+                self.extract_codeql_zip(&zip, &stem)
+            }
+            CodeqlDbSource::Url => self.download_codeql_zip_from_url(value.trim()),
+            CodeqlDbSource::Github => self.download_codeql_db_from_github(value.trim()),
+        };
+        let dir = match found {
+            Ok(d) => d,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&path);
+        match store.add(&dir) {
+            Ok(i) => {
+                if let Err(e) = store.save(&path) {
+                    self.status = format!("Could not save the database list: {e}");
+                    return;
+                }
+                let db = &store.databases[i];
+                self.status = format!(
+                    "Added CodeQL database {}{}",
+                    db.name,
+                    db.language
+                        .as_deref()
+                        .map(|l| format!(" ({l})"))
+                        .unwrap_or_default()
+                );
+                self.refresh_codeql_databases();
+            }
+            Err(why) => self.status = why,
+        }
+    }
+
+    fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+        let dest = Self::codeql_db_cache_dir().join(name);
+        crate::codeql_db::extract_zip(zip, &dest)?;
+        crate::codeql_db::find_database_in(&dest)
+            .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
+    }
+
+    fn download_codeql_zip_from_url(&self, url: &str) -> Result<PathBuf, String> {
+        if !url.starts_with("https://") {
+            return Err(String::from("A database URL must be https://"));
+        }
+        let resp = ureq::get(url)
+            .timeout(std::time::Duration::from_secs(300))
+            .call()
+            .map_err(|e| format!("Download failed: {e}"))?;
+        let name = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("database")
+            .trim_end_matches(".zip")
+            .to_string();
+        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
+        if let Some(dir) = tmp.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
+        let out = self.extract_codeql_zip(&tmp, &name);
+        let _ = std::fs::remove_file(&tmp);
+        out
+    }
+
+    /// `owner/repo` or `owner/repo language`. With no language, the one
+    /// database GitHub has is used; several need the language named.
+    fn download_codeql_db_from_github(&self, value: &str) -> Result<PathBuf, String> {
+        let mut parts = value.split_whitespace();
+        let repo = parts
+            .next()
+            .map(|r| {
+                r.trim_start_matches("https://github.com/")
+                    .trim_end_matches('/')
+            })
+            .filter(|r| r.split('/').count() == 2)
+            .ok_or_else(|| {
+                String::from("Give the repository as owner/repo (and optionally a language)")
+            })?
+            .to_string();
+        let language = match parts.next() {
+            Some(l) => l.to_string(),
+            None => {
+                let out = std::process::Command::new("gh")
+                    .args([
+                        "api",
+                        &format!("/repos/{repo}/code-scanning/codeql/databases"),
+                        "--jq",
+                        ".[].language",
+                    ])
+                    .output()
+                    .map_err(|e| format!("could not run gh: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "{repo} has no CodeQL databases on GitHub: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                let langs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                match langs.as_slice() {
+                    [one] => one.clone(),
+                    [] => return Err(format!("{repo} has no CodeQL databases on GitHub")),
+                    many => {
+                        return Err(format!(
+                            "{repo} has databases for {}; add one with '{repo} <language>'",
+                            many.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+        let out = std::process::Command::new("gh")
+            .args(crate::codeql_db::github_database_args(&repo, &language))
+            .output()
+            .map_err(|e| format!("could not run gh: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Download failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let name = format!("{}-{language}", repo.replace('/', "-"));
+        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
+        if let Some(dir) = tmp.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&tmp, &out.stdout).map_err(|e| e.to_string())?;
+        let result = self.extract_codeql_zip(&tmp, &name);
+        let _ = std::fs::remove_file(&tmp);
+        result
+    }
+
+    /// Enable or disable an extension by id, persist the choice, and keep the
+    /// UI consistent with it: a disabled CodeQL takes its activity-bar icon
+    /// and its open side bar with it.
+    fn set_extension_enabled(&mut self, id: &str, enabled: bool) {
+        if enabled {
+            self.disabled_extensions.remove(id);
+        } else {
+            self.disabled_extensions.insert(id.to_string());
+        }
+        let _ =
+            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
+        // Turning an extension off forgets its tools' fingerprints, so
+        // turning it back on re-approves a tool whose definition changed.
+        if !enabled {
+            let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
+            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
+        }
+        self.refresh_extensions();
+        if id == "codeql" {
+            if !enabled && self.sidebar_view == SidebarView::CodeQL {
+                self.set_sidebar_view(SidebarView::Explorer);
+            }
+            // The icon appears or disappears, so the baked bar redraws.
+            self.overlays.activity.mark_dirty();
+        }
+    }
+
     /// Reveal the Testing view (the user-open gesture: activity icon, Cmd+K B,
     /// palette). Auto-discovers once when the tree is still empty so it
     /// populates like VS Code, without recompiling on every subsequent open.
@@ -21911,6 +22528,7 @@ impl App {
                 "{} ended — stopAll stopped the rest of the compound",
                 ended_names.join(", ")
             );
+            self.run_post_debug_tasks();
             return true;
         }
         if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
@@ -22091,6 +22709,7 @@ impl App {
                 // Keep `debug_console` so its output stays visible after the run;
                 // the panel renders it until the next session starts.
                 self.run_debug.session_ended = true;
+                self.run_post_debug_tasks();
                 changed = true;
             }
             _ => {
@@ -22159,7 +22778,11 @@ impl App {
                 .feedback
                 .clone()
                 .unwrap_or_else(|| String::from("Running"));
-            return (true, status, Vec::new());
+            return (
+                true,
+                status,
+                breakpoint_section_rows(self.breakpoint_items().len()),
+            );
         }
         let mut rows = Vec::new();
         rows.push(DebugRow {
@@ -22232,6 +22855,8 @@ impl App {
             indent: 1,
             kind: DebugRowKind::WatchAdd,
         });
+        // Last, so `sync_breakpoint_list` can swap it without a rebuild.
+        rows.extend(breakpoint_section_rows(self.breakpoint_items().len()));
         let status = self
             .run_debug
             .feedback
@@ -22722,6 +23347,7 @@ impl App {
                 return MemberOutcome::Failed;
             }
         };
+        self.record_post_debug_task(&rc);
         if rc.pre_launch_task.is_some() {
             // NOT launched. Running it anyway would debug whatever the last
             // build left behind, which is exactly what the single-member path
@@ -22809,6 +23435,7 @@ impl App {
         stop_all: bool,
     ) {
         self.debug_stop();
+        self.debug_post_tasks.clear();
         // Set only here, once the old set is gone: a compound refused before
         // this point leaves the running set untouched, and must leave its
         // `stopAll` out of it too (#567).
@@ -22979,6 +23606,8 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        // A new run: the previous run's cleanup is not this one's.
+        self.debug_post_tasks.clear();
         let root = self.active_workspace_root();
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
@@ -22991,6 +23620,7 @@ impl App {
                 return;
             }
         };
+        self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
             let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
@@ -23145,6 +23775,23 @@ impl App {
     ) {
         use crate::dap::configs::{self, RequestKind};
         use crate::dap::session::AdapterKind;
+        // The picker attaches by pid, which is lldb's attach; debugpy and
+        // js-debug attach by other means, and dropping the key silently would
+        // launch something the config did not ask for.
+        if rc.pick_process && rc.kind != AdapterKind::LldbDap {
+            self.debug_error(format!(
+                "config \"{}\": ${{command:pickProcess}} is supported for lldb attach only",
+                rc.name
+            ));
+            return;
+        }
+        // `${command:pickProcess}`: ask first, then come back here with the
+        // pid filled in (#250). Asked before the adapter lookup so the choice
+        // does not depend on it; a missing lldb-dap is reported on resume.
+        if rc.pick_process && rc.process_id.is_none() {
+            self.open_attach_process_picker(rc, slot);
+            return;
+        }
         let breakpoints = self.collect_editor_breakpoints();
         let cwd = rc
             .cwd
@@ -23308,6 +23955,8 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567).
         self.pending_debug_launch = None;
+        // Zero-config "Debug active file" declares no postDebugTask.
+        self.debug_post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;
@@ -24110,6 +24759,199 @@ impl App {
         let running = self.debug_sessions.names().join(", ");
         self.status = format!("Debugging {name} · running: {running}");
         self.refresh_debug_panel();
+    }
+
+    /// Every breakpoint for the BREAKPOINTS list (#250), by file then line,
+    /// with its condition or log message.
+    fn breakpoint_items(&self) -> Vec<crate::widgets::run_debug::BreakpointItem> {
+        let mut paths: Vec<&PathBuf> = self.editor.breakpoints.keys().collect();
+        paths.sort();
+        let mut items = Vec::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            for &line in &self.editor.breakpoints[path] {
+                let condition = self
+                    .editor
+                    .breakpoint_conditions
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let log = self
+                    .editor
+                    .breakpoint_logs
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let detail = match (log, condition) {
+                    (Some(msg), _) => Some(format!("log {msg}")),
+                    (None, Some(cond)) => Some(format!("if {cond}")),
+                    (None, None) => None,
+                };
+                items.push(crate::widgets::run_debug::BreakpointItem {
+                    path: path.clone(),
+                    line,
+                    label: format!("{name}:{line}"),
+                    detail,
+                });
+            }
+        }
+        items
+    }
+
+    /// Bring the panel's BREAKPOINTS list up to date, and the tree's section
+    /// with it while a session is shown. A no-op when nothing changed.
+    fn sync_breakpoint_list(&mut self) {
+        use crate::widgets::run_debug::DebugRowKind;
+        let items = self.breakpoint_items();
+        if items == self.run_debug.breakpoints {
+            return;
+        }
+        let n = items.len();
+        self.run_debug.breakpoints = items;
+        if self.run_debug.debug_active {
+            let rows = &mut self.run_debug.debug_rows;
+            if let Some(pos) = rows.iter().position(
+                |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
+            ) {
+                rows.truncate(pos);
+            }
+            rows.extend(breakpoint_section_rows(n));
+        }
+    }
+
+    /// A click in the BREAKPOINTS list: jump to the breakpoint, or remove it
+    /// when the click landed on its `✕`.
+    fn breakpoint_list_click(&mut self, index: usize, remove: bool) {
+        let Some(bp) = self.run_debug.breakpoints.get(index).cloned() else {
+            return;
+        };
+        if remove {
+            self.remove_breakpoint_at(&bp.path, bp.line);
+        } else if let Err(e) = self.open_at(&bp.path, bp.line.saturating_sub(1), 0) {
+            self.status = format!("Could not open {}: {e}", bp.path.display());
+        }
+        self.sync_breakpoint_list();
+    }
+
+    /// Remove the breakpoint at `path:line` (1-based) with its condition or
+    /// log message, and push the file's breakpoints to every live session so
+    /// it stops binding mid-run too, as F9 does.
+    fn remove_breakpoint_at(&mut self, path: &Path, line: usize) {
+        if let Some(lines) = self.editor.breakpoints.get_mut(path) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(path);
+            }
+        }
+        if let Some(m) = self.editor.breakpoint_conditions.get_mut(path) {
+            m.remove(&line);
+        }
+        if let Some(m) = self.editor.breakpoint_logs.get_mut(path) {
+            m.remove(&line);
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        let owned = path.to_path_buf();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&owned, &specs);
+        }
+        self.status = format!(
+            "Breakpoint removed from {}:{line}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+    }
+
+    /// Open the process picker for a `${command:pickProcess}` attach (#250),
+    /// parking the resolved config until a process is chosen.
+    fn open_attach_process_picker(
+        &mut self,
+        rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+    ) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let processes = list_user_processes();
+        if processes.is_empty() {
+            self.debug_error(format!(
+                "config \"{}\": no processes found to attach to",
+                rc.name
+            ));
+            return;
+        }
+        let rows = processes
+            .into_iter()
+            .map(|(pid, comm)| ListRow {
+                id: pid.to_string(),
+                label: format!("{pid:>7}  {comm}"),
+            })
+            .collect();
+        let title = format!("Attach \"{}\" to process", rc.name);
+        self.pending_attach = Some((rc, slot));
+        self.list_picker = Some(ListPicker::new(ListPurpose::AttachProcess, title, rows));
+    }
+
+    /// The parked attach with its `processId` set to the chosen `pid`, taken
+    /// out so a second confirm cannot launch it twice.
+    fn take_pending_attach(
+        &mut self,
+        pid: i64,
+    ) -> Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)> {
+        let (mut rc, slot) = self.pending_attach.take()?;
+        rc.process_id = Some(pid);
+        Some((rc, slot))
+    }
+
+    /// Remember a launched configuration's `postDebugTask` for the end of
+    /// this run (#250). A compound's members may name the same one; it runs
+    /// once.
+    fn record_post_debug_task(&mut self, rc: &crate::dap::configs::ResolvedConfig) {
+        if let Some(task) = &rc.post_debug_task
+            && !self.debug_post_tasks.contains(task)
+        {
+            self.debug_post_tasks.push(task.clone());
+        }
+    }
+
+    /// Run the finished run's `postDebugTask`s, each once, in launch order.
+    /// A label no tasks.json declares is reported rather than skipped, the
+    /// same contract `preLaunchTask` has.
+    fn run_post_debug_tasks(&mut self) {
+        let labels = std::mem::take(&mut self.debug_post_tasks);
+        if labels.is_empty() {
+            return;
+        }
+        let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
+        for label in labels {
+            match tasks.iter().find(|t| t.label == label) {
+                Some(task) => {
+                    self.run_project_task(task.clone());
+                }
+                None => {
+                    self.status = format!(
+                        "postDebugTask \"{label}\" not found — Tasks: Run Task lists what the workspace declares"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Shift+F5 and Debug: Stop Debugging. The user ending the run is when a
+    /// `postDebugTask` runs (#250); the internal `debug_stop` a relaunch uses
+    /// to replace the set is not, so it lives here rather than in there.
+    fn debug_stop_by_user(&mut self) {
+        let was_running = !self.debug_sessions.is_empty();
+        self.debug_stop();
+        if was_running {
+            self.run_post_debug_tasks();
+        } else {
+            self.debug_post_tasks.clear();
+        }
     }
 
     /// Shift+F5: stop debugging and tear the session down.
@@ -25168,6 +26010,10 @@ impl App {
             InputPurpose::PullRequestNumber => {
                 self.close_input_prompt();
                 self.submit_pr_number(&value);
+            }
+            InputPurpose::CodeqlDatabase { source } => {
+                self.close_input_prompt();
+                self.submit_codeql_database(source, &value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -27464,6 +28310,16 @@ impl App {
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
                     self.run_project_task(task);
+                }
+            }
+            ListPurpose::AttachProcess => {
+                if let Some((rc, slot)) = row
+                    .id
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|pid| self.take_pending_attach(pid))
+                {
+                    self.launch_resolved_in(rc, slot);
                 }
             }
             ListPurpose::DebugConfig => {
@@ -31301,7 +32157,11 @@ impl App {
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
         }
-        if let Some(view) = sidebar_view_from_label(&state.sidebar_view) {
+        if let Some(view) = sidebar_view_from_label(&state.sidebar_view)
+            // A CodeQL view saved before the extension was disabled restores
+            // to the Explorer rather than to a side bar with no icon.
+            && (view != SidebarView::CodeQL || self.is_extension_enabled("codeql"))
+        {
             self.set_sidebar_view(view);
         }
         self.sidebar_width = state.sidebar_width;
@@ -32353,6 +33213,10 @@ impl App {
         }
         if self.editor.pr_review.is_some() {
             self.handle_pr_review_key(key);
+            return;
+        }
+        if self.editor.sarif.is_some() {
+            self.handle_sarif_key(key);
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -39733,6 +40597,8 @@ impl App {
             Cmd::ShowExtensions => self.set_sidebar_view(SidebarView::Extensions),
             Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
+            Cmd::CodeqlRunQuery => self.run_codeql_query(),
+            Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
             Cmd::ToggleSideBar => self.toggle_side_bar(),
@@ -39855,7 +40721,7 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
-            Cmd::StopDebugging => self.debug_stop(),
+            Cmd::StopDebugging => self.debug_stop_by_user(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::SwitchDebugSession => self.switch_debug_session(),
             Cmd::RestartDebugging => self.debug_restart(),
@@ -42519,6 +43385,7 @@ impl App {
             SidebarView::RunDebug => self.run_debug.last_area,
             SidebarView::Extensions => self.extensions.last_area,
             SidebarView::Testing => self.testing.last_area,
+            SidebarView::CodeQL => self.codeql.last_area,
         };
         // The COMMITS graph docks BELOW the change list in its own strip, so
         // `source_control.last_area` alone misses it; without this union the
@@ -43882,6 +44749,10 @@ impl App {
                     self.open_testing_view();
                     return;
                 }
+                if rect_contains(self.sidebar_areas.codeql_icon, m.column, m.row) {
+                    self.open_codeql_view();
+                    return;
+                }
                 if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
                     self.open_settings_menu();
                     return;
@@ -44102,6 +44973,10 @@ impl App {
                 }
                 if in_tree && self.sidebar_view == SidebarView::RunDebug {
                     self.focus_pane(Pane::Tree);
+                    if let Some((index, remove)) = self.run_debug.breakpoint_at(m.column, m.row) {
+                        self.breakpoint_list_click(index, remove);
+                        return;
+                    }
                     if self.run_debug.debug_active {
                         if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
                             self.remove_watch_expression(widx);
@@ -44141,6 +45016,14 @@ impl App {
                         } else if on_switch {
                             self.toggle_selected_extension();
                         }
+                    }
+                    return;
+                }
+                if in_tree && self.sidebar_view == SidebarView::CodeQL {
+                    self.focus_pane(Pane::Tree);
+                    if let Some((row, hit)) = self.codeql.hit_at(m.column, m.row) {
+                        self.codeql.selected = row;
+                        self.activate_codeql(hit);
                     }
                     return;
                 }
@@ -44463,6 +45346,32 @@ impl App {
                             if idx < view.entries.len() {
                                 if view.selected == idx {
                                     self.open_selected_archive_member();
+                                } else {
+                                    view.selected = idx;
+                                }
+                            }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
+                    // SARIF viewer (#577): click selects a row; a second
+                    // click on the selected row opens it (a result) or
+                    // folds it (a group).
+                    if let Some(view) = self.editor.sarif.as_mut() {
+                        if view.rows_visible > 0
+                            && m.row >= view.rows_top
+                            && m.row < view.rows_top + view.rows_visible
+                            && m.column >= view.list_x
+                            && m.column < view.list_x + view.list_width
+                        {
+                            let idx = view.scroll + (m.row - view.rows_top) as usize;
+                            if idx < view.rows().len() {
+                                if view.selected == idx {
+                                    if view.selected_entry().is_some() {
+                                        self.open_selected_sarif_result();
+                                    } else {
+                                        view.toggle_fold();
+                                    }
                                 } else {
                                     view.selected = idx;
                                 }
@@ -44806,6 +45715,7 @@ impl App {
                             SidebarView::RunDebug => {}
                             SidebarView::Extensions => {}
                             SidebarView::Testing => {}
+                            SidebarView::CodeQL => {}
                         },
                         Pane::Editor => {
                             self.editor.scroll_to_bar_y(m.row);
@@ -44965,7 +45875,8 @@ impl App {
                         | SidebarView::SourceControl
                         | SidebarView::RunDebug
                         | SidebarView::Extensions
-                        | SidebarView::Testing => {}
+                        | SidebarView::Testing
+                        | SidebarView::CodeQL => {}
                     }
                 } else if in_terminal {
                     self.terminal_mut().extend_selection_to(m.column, m.row);
@@ -45205,6 +46116,7 @@ impl App {
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_down(3),
                         SidebarView::Testing => self.testing.scroll_down(3),
+                        SidebarView::CodeQL => self.codeql.scroll_down(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -45277,6 +46189,7 @@ impl App {
                         SidebarView::RunDebug => {}
                         SidebarView::Extensions => self.extensions.scroll_up(3),
                         SidebarView::Testing => self.testing.scroll_up(3),
+                        SidebarView::CodeQL => self.codeql.scroll_up(3),
                     }
                 } else if in_editor {
                     if let Some(diff) = self.editor.diff.as_mut() {
@@ -46049,6 +46962,7 @@ impl App {
                     SidebarView::RunDebug => (tr("Run and Debug"), None),
                     SidebarView::Extensions => (tr("Extensions"), None),
                     SidebarView::Testing => (tr("Testing"), None),
+                    SidebarView::CodeQL => (tr("CodeQL"), None),
                 };
                 Snapshot {
                     focus,
@@ -50457,6 +51371,106 @@ impl App {
         }
     }
 
+    /// SARIF viewer keys (#577). While the filter box has focus, printable
+    /// keys edit the query; otherwise they drive the list.
+    fn handle_sarif_key(&mut self, key: KeyEvent) {
+        use crate::sarif::semantics::{BaselineState, Level, SuppressionState};
+        use crate::sarif::view::{Column, Tab};
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        if view.editing_query {
+            match key.code {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let mut q = view.query_text.clone();
+                    q.push(c);
+                    view.set_query(&q);
+                }
+                KeyCode::Backspace => {
+                    let mut q = view.query_text.clone();
+                    q.pop();
+                    view.set_query(&q);
+                }
+                KeyCode::Enter => view.editing_query = false,
+                KeyCode::Esc => {
+                    view.set_query("");
+                    view.editing_query = false;
+                }
+                KeyCode::Up => view.move_selection(-1),
+                KeyCode::Down => view.move_selection(1),
+                _ => {}
+            }
+            return;
+        }
+        let page = (view.rows_visible as isize).max(1);
+        let toggle = |set: &mut std::collections::HashSet<Level>, l: Level| {
+            if !set.remove(&l) {
+                set.insert(l);
+            }
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
+            KeyCode::PageDown => view.move_selection(page),
+            KeyCode::PageUp => view.move_selection(-page),
+            KeyCode::Home => view.select_first(),
+            KeyCode::End => view.select_last(),
+            KeyCode::Left | KeyCode::Char('h') => view.set_fold(true),
+            KeyCode::Right | KeyCode::Char('l') => view.set_fold(false),
+            KeyCode::Char('/') => view.editing_query = true,
+            KeyCode::Esc => view.set_query(""),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let order = [Tab::Locations, Tab::Rules, Tab::Logs];
+                let i = order.iter().position(|t| *t == view.tab).unwrap_or(0);
+                let step = if key.code == KeyCode::BackTab { 2 } else { 1 };
+                view.set_tab(order[(i + step) % order.len()]);
+            }
+            KeyCode::Char('s') => {
+                let order = [
+                    Column::Line,
+                    Column::Level,
+                    Column::Rule,
+                    Column::File,
+                    Column::Message,
+                ];
+                let i = order.iter().position(|c| *c == view.sort.0).unwrap_or(0);
+                view.sort_by(order[(i + 1) % order.len()]);
+                view.sort.1 = true;
+            }
+            KeyCode::Char('S') => {
+                let col = view.sort.0;
+                view.sort_by(col);
+            }
+            KeyCode::Char('c') => view.fold_all(true),
+            KeyCode::Char('e') => view.fold_all(false),
+            KeyCode::Char('1') => toggle(&mut view.filters.hidden_levels, Level::Error),
+            KeyCode::Char('2') => toggle(&mut view.filters.hidden_levels, Level::Warning),
+            KeyCode::Char('3') => toggle(&mut view.filters.hidden_levels, Level::Note),
+            KeyCode::Char('4') => toggle(&mut view.filters.hidden_levels, Level::None),
+            KeyCode::Char('u') => {
+                let set = &mut view.filters.hidden_suppressions;
+                if !set.remove(&SuppressionState::Suppressed) {
+                    set.insert(SuppressionState::Suppressed);
+                }
+            }
+            KeyCode::Char('a') => {
+                let set = &mut view.filters.hidden_baselines;
+                if !set.remove(&BaselineState::Absent) {
+                    set.insert(BaselineState::Absent);
+                }
+            }
+            KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Enter => {
+                if view.selected_entry().is_some() {
+                    self.open_selected_sarif_result();
+                } else {
+                    view.toggle_fold();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The selected file's section of the PR's patch, side by side. The
     /// patch is fetched once per tab with `gh pr diff`, off the UI thread.
     fn open_pr_file_diff(&mut self) {
@@ -50528,6 +51542,51 @@ impl App {
             PrGhJob::Log { name: check.name },
             crate::pr_review::log_args(run, job),
         );
+    }
+
+    /// Open the selected SARIF result's primary location, keeping the viewer
+    /// tab: it is pinned first, so the preview open lands in a new tab
+    /// instead of replacing the list the user is working through.
+    fn open_selected_sarif_result(&mut self) {
+        use crate::sarif::region::{ColumnKind, column_kind};
+        let root = self.workspace_root().to_path_buf();
+        let Some((path, line, column, kind, uri)) = self.editor.sarif.as_ref().and_then(|v| {
+            let e = v.selected_entry()?;
+            let loaded = v.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let result = run.results.as_ref()?.get(e.result)?;
+            let physical = result.locations.first()?.physical_location.as_ref()?;
+            let artifact = physical.artifact_location.as_ref()?;
+            let mut roots = vec![root.clone()];
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            let resolver = crate::sarif::resolve::Resolver {
+                roots,
+                ..Default::default()
+            };
+            let found = resolver.resolve(run, artifact, &|p| p.is_file());
+            let region = physical.region.as_ref();
+            let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
+            let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
+            Some((found, line, column, column_kind(run), e.uri.clone()))
+        }) else {
+            self.status = String::from("This result has no location to open");
+            return;
+        };
+        let Some(path) = path else {
+            self.status = format!("Cannot find {uri} on this machine");
+            return;
+        };
+        self.editor.pin_active();
+        let opened = match kind {
+            ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
+            ColumnKind::UnicodeCodePoints => self.open_at(&path, line as usize, column as usize),
+        };
+        self.status = match opened {
+            Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
+            Err(e) => format!("Open failed: {e}"),
+        };
     }
 
     /// Archive browser keys (#179): selection movement, Enter extracts
@@ -55181,6 +56240,7 @@ fn sidebar_view_label(view: SidebarView) -> &'static str {
         SidebarView::RunDebug => "RunDebug",
         SidebarView::Extensions => "Extensions",
         SidebarView::Testing => "Testing",
+        SidebarView::CodeQL => "CodeQL",
     }
 }
 
@@ -55193,6 +56253,7 @@ fn sidebar_view_from_label(label: &str) -> Option<SidebarView> {
         "RunDebug" => Some(SidebarView::RunDebug),
         "Extensions" => Some(SidebarView::Extensions),
         "Testing" => Some(SidebarView::Testing),
+        "CodeQL" => Some(SidebarView::CodeQL),
         _ => None,
     }
 }
@@ -56541,6 +57602,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
+        let codeql_changed = app.drain_codeql_run();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -56683,6 +57745,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || blink_changed
             || spinner_changed
             || ext_index_changed
+            || codeql_changed
             || search_changed
             || log_index_changed
             || remote_changed
