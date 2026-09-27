@@ -143,6 +143,34 @@ mod tests {
         assert_eq!(resolve(&s, &disabled, "ts"), Some(AdapterKind::JsDebug));
     }
 
+    /// #264: the Go adapter toggles off from the Extensions panel like the
+    /// others: disabled, `.go` resolves to nothing and the disabled
+    /// extension is the one named, and nothing else changes.
+    #[test]
+    fn disabling_the_go_adapter_releases_go_files_and_nothing_else() {
+        let s = bundled();
+        let mut disabled = BTreeSet::new();
+        disabled.insert("dap-go".to_string());
+        assert_eq!(resolve(&s, &disabled, "go"), None);
+        let claims: Vec<String> = matches(&s, "go")
+            .into_iter()
+            .map(|m| m.extension_id)
+            .collect();
+        assert_eq!(claims, ["dap-go"], "the one to name in the message");
+        for (ext, kind) in [
+            ("py", AdapterKind::Debugpy),
+            ("rs", AdapterKind::LldbDap),
+            ("ts", AdapterKind::JsDebug),
+        ] {
+            assert_eq!(resolve(&s, &disabled, ext), Some(kind), "{ext}");
+        }
+        assert_eq!(
+            resolve(&s, &BTreeSet::new(), "go"),
+            Some(AdapterKind::Delve),
+            "enabling it again restores it"
+        );
+    }
+
     #[test]
     fn a_user_manifest_can_retarget_a_built_in_mechanism_to_a_new_extension() {
         let mut s = bundled();
