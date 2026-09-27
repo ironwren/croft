@@ -67,6 +67,18 @@ pub enum DapEvent {
     },
 }
 
+/// Why an adapter refused `launch`/`attach`: DAP puts the full text in
+/// `body.error.format` (delve's "Failed to launch …: Go version … is too old
+/// for this version of Delve"), the short form in `message`.
+fn launch_failure_reason(msg: &Value) -> String {
+    msg.pointer("/body/error/format")
+        .and_then(Value::as_str)
+        .or_else(|| msg.get("message").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("the debug adapter refused to start the program")
+        .to_string()
+}
+
 /// One breakpoint's binding status as reported by the adapter: the source file,
 /// the (possibly adjusted) 1-based line, and whether the adapter could actually
 /// place it. An unverified breakpoint never pauses execution, so surfacing it is
@@ -956,6 +968,11 @@ pub struct DapSession {
     /// connection can be opened on demand. `None` for stdio adapters.
     js_server: Option<(String, u16)>,
     pub phase: SessionPhase,
+    /// Why the adapter refused the `launch` or `attach` request, when it
+    /// did (#264): delve rejecting a Go too old for it, say. The session
+    /// ends with it rather than waiting in Initializing for an
+    /// `initialized` that will never come.
+    pub launch_error: Option<String>,
     /// Breakpoints to push once the adapter is `initialized`, keyed by absolute
     /// file path (with optional per-breakpoint conditions).
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
@@ -1143,6 +1160,7 @@ impl DapSession {
             child: None,
             js_server,
             phase: SessionPhase::Initializing,
+            launch_error: None,
             breakpoints,
             stopped_thread: None,
             threads: Vec::new(),
@@ -1392,6 +1410,19 @@ impl DapSession {
                     if let Some(body) = msg.get("body") {
                         self.capabilities = body.clone();
                     }
+                }
+                Some("launch" | "attach")
+                    if msg.get("success").and_then(Value::as_bool) == Some(false) =>
+                {
+                    let reason = launch_failure_reason(&msg);
+                    out.push(DapEvent::Output {
+                        category: String::from("stderr"),
+                        text: format!("{reason}\n"),
+                    });
+                    self.launch_error = Some(reason);
+                    self.phase = SessionPhase::Terminated;
+                    self.current_location = None;
+                    out.push(DapEvent::Terminated);
                 }
                 Some("dataBreakpointInfo") => {
                     let req_seq = msg.get("request_seq").and_then(Value::as_i64);
@@ -1859,6 +1890,82 @@ fn with_run_to(
 mod tests {
     /// #264: zero-config Go debugging runs the file's package; a `_test.go`
     /// file runs the package's tests instead.
+    /// #264: an adapter that refuses `launch` (delve rejecting a Go too old
+    /// for it, with its real payload) ends the session with the reason, on
+    /// the console and in `launch_error`, instead of leaving it Initializing.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_launch_ends_the_session_with_the_adapters_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = tmp.path().join("adapter.py");
+        std::fs::write(
+            &adapter,
+            r#"import sys, json
+def read():
+    n = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line.strip() == b"":
+            break
+        if line.lower().startswith(b"content-length:"):
+            n = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(n))
+def send(m):
+    b = json.dumps(m).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+    sys.stdout.buffer.flush()
+seq = 0
+while True:
+    req = read()
+    seq += 1
+    if req["command"] == "initialize":
+        send({"seq": seq, "type": "response", "request_seq": req["seq"], "success": True, "command": "initialize", "body": {}})
+    elif req["command"] == "launch":
+        send({"seq": seq, "type": "response", "request_seq": req["seq"], "success": False, "command": "launch",
+              "message": "Failed to launch /w",
+              "body": {"error": {"id": 3000, "showUser": True,
+                                 "format": "Failed to launch /w: Go version go1.24.7 is too old for this version of Delve (minimum supported version 1.25, suppress this error with --check-go-version=false)"}}})
+    else:
+        send({"seq": seq, "type": "response", "request_seq": req["seq"], "success": True, "command": req["command"]})
+"#,
+        )
+        .unwrap();
+        let launch =
+            json!({"type": "request", "command": "launch", "arguments": {"request": "launch"}});
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[adapter.to_string_lossy().into_owned()],
+            tmp.path(),
+            launch,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "the adapter's launch response",
+            || {
+                events.extend(session.poll());
+                session.phase == SessionPhase::Terminated
+            },
+        );
+        let reason = session.launch_error.clone().expect("the reason is kept");
+        assert!(reason.contains("go1.24.7 is too old"), "{reason}");
+        assert!(events.iter().any(|e| matches!(e, DapEvent::Terminated)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DapEvent::Output { category, text }
+                if category == "stderr" && text.contains("minimum supported version 1.25"))),
+            "{events:?}"
+        );
+        // The short `message` is the fallback when there is no `format`.
+        let bare = json!({"type": "response", "command": "attach", "success": false, "message": "no such process"});
+        assert_eq!(launch_failure_reason(&bare), "no such process");
+    }
+
     #[test]
     fn delve_zero_config_runs_the_package_or_its_tests() {
         let main = delve_zero_config_request(Path::new("/w/cmd/app/main.go"));
@@ -1911,6 +2018,54 @@ mod tests {
         let (file, line) = s.current_location.clone().expect("a stop location");
         assert_eq!(line, 7);
         assert_eq!(file.canonicalize().unwrap(), main);
+        s.disconnect();
+    }
+
+    /// #264, against a real delve: whatever Go is installed, a launch never
+    /// sits in Initializing. A Go that delve supports stops at the
+    /// breakpoint; one too old for it (delve 1.27 wants 1.25+) ends the
+    /// session at once with delve's own reason. Needs Go and `dlv`.
+    #[test]
+    #[ignore]
+    fn delve_either_stops_or_says_why_it_cannot_start() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tx := 41\n\tx++\n\tfmt.Println(x)\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let mut bps = BTreeMap::new();
+        bps.insert(main.clone(), vec![SourceBreakpoint::plain(7)]);
+        let mut s = DapSession::launch_delve(
+            &dlv,
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !matches!(s.phase, SessionPhase::Stopped | SessionPhase::Terminated)
+            && std::time::Instant::now() < deadline
+        {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match s.phase {
+            SessionPhase::Stopped => {}
+            SessionPhase::Terminated => {
+                let why = s.launch_error.clone().expect("a refused launch says why");
+                assert!(why.contains("too old"), "{why}");
+                eprintln!("delve refused, as expected for this Go: {why}");
+            }
+            other => panic!("still {other:?} after 90 s"),
+        }
         s.disconnect();
     }
 
