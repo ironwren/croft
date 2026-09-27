@@ -8747,6 +8747,16 @@ impl Editor {
         self.undo_stack.drain(..drop);
     }
 
+    /// Undo and redo steps held, and the bytes of text they hold, for the
+    /// memory report (#694).
+    pub fn undo_history_size(&self) -> (usize, usize) {
+        let steps = self.undo_stack.iter().chain(&self.redo_stack);
+        (
+            self.undo_stack.len() + self.redo_stack.len(),
+            steps.map(|s| s.bytes).sum(),
+        )
+    }
+
     /// Push an undo entry tagged with the kind of edit about to happen.
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.

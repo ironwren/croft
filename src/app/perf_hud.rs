@@ -34,10 +34,7 @@ impl MemorySample {
     fn take() -> Self {
         let budget = crate::rewind::budget();
         Self {
-            rss_kb: std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .as_deref()
-                .and_then(parse_vm_rss_kb),
+            rss_kb: read_rss_kb(),
             rewind_held: budget.held_bytes(),
             rewind_total: budget.total(),
             rewind_panes: budget.pane_count(),
@@ -68,6 +65,14 @@ fn parse_vm_rss_kb(status: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// croft's own resident set in KiB, or `None` off Linux (no `/proc`).
+pub(super) fn read_rss_kb() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .as_deref()
+        .and_then(parse_vm_rss_kb)
 }
 
 impl PerfHud {
