@@ -161,22 +161,16 @@ pub fn database_source(dir: &Path) -> Option<DbSource> {
 /// The folder name a database's extracted `src.zip` gets in croft's cache:
 /// its folder name, a short hash of its canonical path (so two databases
 /// with the same name never share one) and a short hash of the archive's
-/// size and modification time (so a database replaced at the same path is
-/// extracted afresh rather than showing the old source). The first two
-/// parts, from [`source_cache_prefix`], name every extraction of it.
+/// contents (so a database replaced at the same path is extracted afresh,
+/// even when the new archive has the same size and timestamp). The first
+/// two parts, from [`source_cache_prefix`], name every extraction of it.
 pub fn source_cache_name(db: &Path, zip: &Path) -> String {
     use sha2::Digest;
-    let stamp = std::fs::metadata(zip)
-        .map(|m| {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            format!("{}:{mtime}", m.len())
-        })
-        .unwrap_or_default();
-    let digest = format!("{:x}", sha2::Sha256::digest(stamp.as_bytes()));
+    let mut hasher = sha2::Sha256::new();
+    if let Ok(mut f) = std::fs::File::open(zip) {
+        let _ = std::io::copy(&mut f, &mut hasher);
+    }
+    let digest = format!("{:x}", hasher.finalize());
     format!("{}{}", source_cache_prefix(db), &digest[..12])
 }
 
@@ -618,10 +612,20 @@ mod tests {
             "same name, other path"
         );
         assert_eq!(name, source_cache_name(&db, &zip), "stable");
-        std::fs::write(&zip, b"a different archive").unwrap();
-        let replaced = source_cache_name(&db, &zip);
-        assert_ne!(name, replaced, "a changed archive gets a new folder");
-        assert!(replaced.starts_with(&source_cache_prefix(&db)));
+        std::fs::write(&zip, b"archive one").unwrap();
+        let one = source_cache_name(&db, &zip);
+        let mtime = std::fs::metadata(&zip).unwrap().modified().unwrap();
+        // Same size and timestamp, other contents: still a new folder.
+        std::fs::write(&zip, b"archive two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&zip)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let two = source_cache_name(&db, &zip);
+        assert_ne!(one, two, "a changed archive gets a new folder");
+        assert!(two.starts_with(&source_cache_prefix(&db)));
     }
 
     #[test]
