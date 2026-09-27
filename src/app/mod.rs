@@ -22192,9 +22192,36 @@ impl App {
             .run_coverage_scoped(crate::testing::worker::CoverageScope {
                 name: run.clone(),
                 exact,
+                suite: false,
             });
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run} with coverage");
+    }
+
+    /// A Testing-tree row's coverage glyph (#263): that test, or that whole
+    /// suite, under the coverage tool, marked in the tree as a plain run of
+    /// it would be. The report replaces the last one.
+    fn run_scope_with_coverage(&mut self, name: String, suite: bool) {
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        if suite {
+            self.testing
+                .start_filter(&crate::testing::suite_pattern(&name));
+        } else {
+            self.testing.start_single(&name);
+        }
+        self.test_worker
+            .run_coverage_scoped(crate::testing::worker::CoverageScope {
+                name: name.clone(),
+                exact: !suite,
+                suite,
+            });
+        self.status = if suite {
+            format!("Running suite {name} with coverage")
+        } else {
+            format!("Running test {name} with coverage")
+        };
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
@@ -46168,6 +46195,8 @@ impl App {
                         self.testing_scrollbar_drag = true;
                     } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
                         self.toggle_test_watch(crate::testing::watch::WatchScope::All);
+                    } else if rect_contains(self.testing.last_cover_all, m.column, m.row) {
+                        self.run_all_tests_with_coverage();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
@@ -46181,6 +46210,12 @@ impl App {
                             }
                             Some(crate::widgets::testing::RowHit::RunSuite(suite)) => {
                                 self.run_suite(suite)
+                            }
+                            Some(crate::widgets::testing::RowHit::CoverCase(name)) => {
+                                self.run_scope_with_coverage(name, false)
+                            }
+                            Some(crate::widgets::testing::RowHit::CoverSuite(suite)) => {
+                                self.run_scope_with_coverage(suite, true)
                             }
                             None => {}
                         }

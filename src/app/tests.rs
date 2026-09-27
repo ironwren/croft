@@ -54451,6 +54451,65 @@ fn a_real_pytest_cov_run_marks_the_covered_file() {
     );
 }
 
+/// #263: the Testing tree's coverage glyphs run their row with coverage,
+/// marking just that scope as running, as a plain run of it would.
+#[test]
+fn a_rows_coverage_glyph_runs_that_scope_with_coverage() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::widgets::testing::RowHit;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::a", "parse::b", "other::c"] {
+        app.testing.apply_case(TestCase {
+            name: n.into(),
+            status: TestStatus::Passed,
+        });
+    }
+    app.set_sidebar_view(SidebarView::Testing);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.testing.last_area;
+    let x = area.x + area.width - 5;
+    let click = |app: &mut App, want: RowHit| {
+        let y = (area.y..area.y + area.height)
+            .find(|&y| app.testing.hit_at(x, y) == Some(want.clone()))
+            .unwrap_or_else(|| panic!("no {want:?} glyph"));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    click(&mut app, RowHit::CoverSuite("parse".into()));
+    assert_eq!(app.status, "Running suite parse with coverage");
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("parse::b"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("other::c"), Some(TestStatus::Passed));
+    app.testing.on_finished(Some(true));
+
+    click(&mut app, RowHit::CoverCase("other::c".into()));
+    assert_eq!(app.status, "Running test other::c with coverage");
+    assert_eq!(app.testing.status_of("other::c"), Some(TestStatus::Running));
+    app.testing.on_finished(Some(true));
+
+    // The header's glyph runs everything with coverage.
+    let all = app.testing.last_cover_all;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: all.x,
+        row: all.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.status, "Running tests with coverage");
+}
+
 /// Watch mode (#263) end to end through the App: the eye on a test's row
 /// watches it, a save anywhere under the runner's root reruns exactly that
 /// test once the debounce passes, without moving the sidebar, and a rerun
