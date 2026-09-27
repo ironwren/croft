@@ -56748,3 +56748,74 @@ fn saving_macros_json_reloads_the_registers() {
         app.status
     );
 }
+
+/// #363 end to end: a fleet run's results open as tiles in the Fleet tab,
+/// `s` saves the whole run to a file, `d` switches to full output, Enter
+/// opens a shell pane on the selected host, and Esc closes the tab.
+#[test]
+fn a_fleet_run_opens_tiles_that_save_and_open_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_fleet_command("localhost: echo fleet-ok");
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(10), "the fleet run", || {
+        app.drain_fleet_results();
+        app.editor.fleet.is_some()
+    });
+    let view = app.editor.fleet.as_ref().unwrap();
+    assert_eq!(view.command, "echo fleet-ok");
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(view.results[0].output, "fleet-ok");
+    assert_eq!(app.editor.path.as_deref(), Some(Path::new("Fleet")));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen: String = (0..30)
+        .map(|y| {
+            (0..120)
+                .map(|x| term.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("localhost"), "{screen}");
+
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.fleet.as_ref().unwrap().diff_mode);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    let saved = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("fleet-"))
+        })
+        .expect("a capture file");
+    let text = std::fs::read_to_string(saved).unwrap();
+    assert!(text.starts_with("$ echo fleet-ok\n"), "{text}");
+    assert!(text.contains("== localhost (exit 0,"), "{text}");
+
+    let panes = app.terminals.len();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        panes + 1,
+        "a shell pane opened: {}",
+        app.status
+    );
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.fleet.is_none());
+}
+
+#[test]
+fn fleet_shell_commands_quote_the_target() {
+    assert_eq!(fleet_shell_command("localhost"), None);
+    assert_eq!(fleet_shell_command("db-1").as_deref(), Some("ssh 'db-1'"));
+    assert_eq!(
+        fleet_shell_command("docker:web").as_deref(),
+        Some("docker exec -it 'web' sh")
+    );
+}

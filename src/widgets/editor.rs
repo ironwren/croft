@@ -2997,6 +2997,8 @@ pub struct Editor {
     /// A pull request under review (#365): its files, checks and viewed
     /// marks. Read-only; the tab has no file behind it.
     pub pr_review: Option<crate::widgets::pr_review::PrReviewView>,
+    /// A fleet run's results as tiles (#363).
+    pub fleet: Option<crate::widgets::fleet::FleetView>,
     /// SARIF results viewer (#577): every result of a `.sarif` log, grouped
     /// and filterable; Enter opens a result's location. Read-only; "Reopen
     /// as Text" shows the JSON.
@@ -3205,6 +3207,7 @@ impl Editor {
             log: None,
             archive: None,
             pr_review: None,
+            fleet: None,
             sarif: None,
             merge: None,
             merge_edit_row: 0,
@@ -4899,6 +4902,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
@@ -5011,6 +5015,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
@@ -5067,6 +5072,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
@@ -5145,6 +5151,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
@@ -5265,6 +5272,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
@@ -5324,6 +5332,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
@@ -5403,6 +5412,7 @@ impl Editor {
         self.log = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
@@ -5420,6 +5430,7 @@ impl Editor {
             || self.hex.is_some()
             || self.archive.is_some()
             || self.pr_review.is_some()
+            || self.fleet.is_some()
             || self.sarif.is_some()
             // A rendered log's text side is an empty stub, so a save would
             // write one blank line over the file — the #185 truncation class.
@@ -5513,6 +5524,7 @@ impl Editor {
         self.markdown_preview = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         self.hex = None;
         self.log = Some(view);
@@ -5677,6 +5689,7 @@ impl Editor {
         self.markdown_preview = None;
         self.archive = None;
         self.pr_review = None;
+        self.fleet = None;
         self.sarif = None;
         // The render dispatch checks `log` BEFORE `hex`, so a stale log would
         // keep painting after "Reopen as Hex" reported success.
@@ -12971,6 +12984,10 @@ impl Widget for &mut Editor {
             crate::widgets::pr_review::render(view, inner, buf, cbg, self.theme);
             return;
         }
+        if let Some(view) = self.fleet.as_mut() {
+            crate::widgets::fleet::render(view, inner, buf, cbg, self.theme);
+            return;
+        }
         if let Some(view) = self.sarif.as_mut() {
             crate::sarif::render::render(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
@@ -16162,6 +16179,30 @@ impl EditorTabs {
         self.editors[self.active].focused = false;
         self.active = pos;
         Ok(())
+    }
+
+    /// Show a fleet run's results in the `Fleet` tab (#363), replacing the
+    /// previous run's, so one tab always holds the latest comparison.
+    pub fn open_fleet(&mut self, view: crate::widgets::fleet::FleetView) {
+        let label = PathBuf::from("Fleet");
+        if let Some(idx) = self.find_tab_with_path(&label) {
+            self.editors[idx].fleet = Some(view);
+            self.select(idx);
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label);
+        e.fleet = Some(view);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return;
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
     }
 
     /// Open a pull request for review in a fresh tab labelled `PR #n`

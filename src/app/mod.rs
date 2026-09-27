@@ -1565,6 +1565,20 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What "open shell here" types for a fleet target (#363): nothing for
+/// localhost (the pane is already a shell there), `docker exec -it` for a
+/// container, `ssh` for a host. Names are quoted for the pane's shell.
+fn fleet_shell_command(host: &str) -> Option<String> {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    if host == "localhost" {
+        return None;
+    }
+    Some(match host.strip_prefix("docker:") {
+        Some(name) => format!("docker exec -it {} sh", quote(name)),
+        None => format!("ssh {}", quote(host)),
+    })
+}
+
 /// What an Agent Lane row's `+n −m` was counted from (#345): the reviewed
 /// snapshot, the agent's last write, and the file's mtime on disk.
 type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
@@ -3481,6 +3495,8 @@ pub struct App {
     /// True while a run is in flight, so a second invocation says so rather
     /// than starting a competing fleet against the same hosts.
     fleet_running: bool,
+    /// The command the fleet run in flight is running, for its tab (#363).
+    fleet_command: String,
     port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
@@ -5342,6 +5358,7 @@ impl App {
             fleet_rx,
             fleet_tx,
             fleet_running: false,
+            fleet_command: String::new(),
             port_poll_tx,
             port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_label_refresh: std::time::Instant::now(),
@@ -31364,6 +31381,7 @@ impl App {
         let host_count = hosts.len();
         let tx = self.fleet_tx.clone();
         let command = command.to_string();
+        self.fleet_command = command.clone();
         self.fleet_running = true;
         std::thread::spawn(move || {
             let _ = tx.send(crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT));
@@ -31430,8 +31448,90 @@ impl App {
                 &summary.line(),
             );
             self.status = format!("Fleet: {}", summary.line());
+            // The tiles (#363); OUTPUT keeps the text record above.
+            self.editor
+                .open_fleet(crate::widgets::fleet::FleetView::new(
+                    self.fleet_command.clone(),
+                    results,
+                ));
+            self.focus_pane(Pane::Editor);
         }
         true
+    }
+
+    /// FLEET tab keys (#363).
+    fn handle_fleet_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.editor.fleet.as_mut() else {
+            return;
+        };
+        let cols = view.columns.max(1) as isize;
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => view.move_selection(-1),
+            KeyCode::Right | KeyCode::Char('l') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-cols),
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(cols),
+            KeyCode::Char('d') => view.diff_mode = !view.diff_mode,
+            KeyCode::Char('r') => {
+                view.toggle_reference();
+                self.status = match &view.reference_host {
+                    Some(h) => format!("Fleet: comparing with {h}"),
+                    None => String::from("Fleet: comparing with the most common output"),
+                };
+            }
+            KeyCode::Char('s') => self.save_fleet_capture(),
+            KeyCode::Enter => self.open_fleet_shell(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.editor.close_active();
+                self.status = String::from("Closed the fleet results");
+            }
+            _ => {}
+        }
+    }
+
+    /// Save the fleet tab's run to `fleet-<time>.txt` in the workspace
+    /// (#363): the command, the summary and every host's full output.
+    fn save_fleet_capture(&mut self) {
+        let Some(view) = self.editor.fleet.as_ref() else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = self.workspace_root().join(format!("fleet-{stamp}.txt"));
+        self.status = match std::fs::write(&path, view.capture()) {
+            Ok(()) => format!("Fleet run saved to {}", path.display()),
+            Err(e) => format!("Could not save the fleet run: {e}"),
+        };
+    }
+
+    /// "Open shell here" (#363): a terminal pane on the selected tile's
+    /// host: `ssh` for a host, a shell for localhost, `docker exec` for a
+    /// container. Typed into a fresh pane so the user sees what runs.
+    fn open_fleet_shell(&mut self) {
+        let Some(host) = self
+            .editor
+            .fleet
+            .as_ref()
+            .and_then(|v| v.selected_result())
+            .map(|r| r.host.clone())
+        else {
+            return;
+        };
+        let command = fleet_shell_command(&host);
+        match crate::widgets::terminal::PtyTerminal::new(self.workspace_root()) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(host.clone()));
+                if let Some(cmd) = command {
+                    term.write_input(format!("{cmd}\r").as_bytes());
+                }
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Shell on {host}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
     }
 
     /// Ask for a new lane's name (#348); the palette command and `Cmd+K
@@ -33821,6 +33921,10 @@ impl App {
         }
         if self.editor.pr_review.is_some() {
             self.handle_pr_review_key(key);
+            return;
+        }
+        if self.editor.fleet.is_some() {
+            self.handle_fleet_key(key);
             return;
         }
         if self.editor.sarif.is_some() {
@@ -45957,6 +46061,14 @@ impl App {
                                 let cursor = value.len();
                                 view.editing = Some(crate::sheet::CellEdit { value, cursor });
                             }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
+                    // Fleet tiles (#363): a click selects a tile.
+                    if let Some(view) = self.editor.fleet.as_mut() {
+                        if let Some(i) = view.tile_at(m.column, m.row) {
+                            view.selected = i;
                         }
                         self.poke_cursor();
                         return;
