@@ -3266,6 +3266,10 @@ pub struct App {
     /// proposals waiting on the user in arrival order, and the popup's
     /// state for the one at the head (`Some` exactly while one waits).
     hook_listener: Option<std::os::unix::net::UnixListener>,
+    /// The workspace the hook socket was bound for: an approval
+    /// notification's links name it, so `croft decide` finds this croft
+    /// (#359).
+    hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
@@ -5266,6 +5270,7 @@ impl App {
             pending_remote_pulls: Vec::new(),
             view_listener,
             hook_listener,
+            hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
             notebook_kernels: std::collections::HashMap::new(),
@@ -15614,6 +15619,7 @@ impl App {
             Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
             None => false,
         };
+        self.notify_new_approvals();
         let now = std::time::Instant::now();
         let before = self.approvals.len();
         self.approvals.retain(|p| !p.expired(now));
@@ -15628,6 +15634,31 @@ impl App {
             changed = true;
         }
         changed
+    }
+
+    /// Tell the notification sinks about each proposal that arrived since
+    /// the last pass, once, with its Approve and Deny links (#359).
+    fn notify_new_approvals(&mut self) {
+        for i in 0..self.approvals.len() {
+            if self.approvals[i].notified {
+                continue;
+            }
+            self.approvals[i].notified = true;
+            let pending = &self.approvals[i];
+            let path = &pending.proposal.path;
+            let file = path
+                .strip_prefix(&self.hook_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let event = crate::notifications::Event::ApprovalPending {
+                agent: pending.request.agent.clone(),
+                file,
+                token: pending.token.clone(),
+            };
+            self.notifier
+                .emit(event, &self.hook_root, &remote_host_label());
+        }
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
@@ -57009,6 +57040,15 @@ pub fn run(
     match std::env::var("CROFT_FOCUS").as_deref() {
         Ok("terminal") => app.focus_pane(Pane::Terminal),
         Ok("editor") => app.focus_pane(Pane::Editor),
+        // The approval popup is modal and opens by itself for a waiting
+        // edit, so landing on it needs no focus change; say so when there
+        // is nothing to land on (answered or expired on the way here).
+        Ok("approval") => {
+            app.drain_hook_requests();
+            if app.approvals.is_empty() {
+                app.status = String::from("No agent edit is waiting for approval");
+            }
+        }
         _ => {}
     }
     app.start_update_watch_if_remote();

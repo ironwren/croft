@@ -1,8 +1,12 @@
 //! `croft://` links (#359): tap a notification, land in the session.
 //!
-//! `croft://attach?host=<ssh alias>&path=<workspace>&focus=<terminal|editor>`
+//! `croft://attach?host=<ssh alias>&path=<workspace>&focus=<terminal|editor|approval>`
 //! opens `croft remote <host> <path>`, or `croft attach <path>` without a
-//! host. Any web page can hand the OS a link, so a link can only do what the
+//! host. `croft://decide?host=…&path=…&token=…&decision=<allow|deny>`
+//! answers an agent's pending edit without attaching: it runs `croft
+//! decide` there, over ssh for a remote host. The token is the one-time
+//! secret the approval notification carried, so a link some page made up
+//! answers nothing. Any web page can hand the OS a link, so a link can only do what the
 //! user could already do by name: the host must be an alias in their
 //! `~/.ssh/config`, and nothing may start with `-` (it would read as a flag).
 //! `croft install-link-handler` registers the scheme with the desktop
@@ -14,6 +18,8 @@ use anyhow::{Result, bail};
 pub enum Focus {
     Terminal,
     Editor,
+    /// The agent edit waiting for approval (#359).
+    Approval,
 }
 
 impl Focus {
@@ -21,6 +27,7 @@ impl Focus {
         match self {
             Self::Terminal => "terminal",
             Self::Editor => "editor",
+            Self::Approval => "approval",
         }
     }
 }
@@ -30,6 +37,21 @@ pub struct Link {
     pub host: Option<String>,
     pub path: Option<String>,
     pub focus: Option<Focus>,
+    /// Set for a `croft://decide` link: answer, don't attach.
+    pub decide: Option<Decide>,
+}
+
+/// A `croft://decide` link's answer to a pending agent edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decide {
+    pub token: String,
+    pub allow: bool,
+}
+
+/// A token as croft issues them: 32 lowercase hex digits. Anything else
+/// is refused before it reaches a shell or a socket.
+fn valid_token(t: &str) -> bool {
+    t.len() == 32 && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Decode `%XX` and `+` in a query value.
@@ -69,20 +91,24 @@ fn safe_host(h: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-@".contains(c))
 }
 
-/// Parse and check a `croft://attach?…` link.
+/// Parse and check a `croft://attach?…` or `croft://decide?…` link.
 pub fn parse(url: &str) -> Result<Link> {
     let Some(rest) = url.strip_prefix("croft://") else {
         bail!("not a croft:// link");
     };
     let (action, query) = rest.split_once('?').unwrap_or((rest, ""));
-    if action.trim_end_matches('/') != "attach" {
-        bail!("croft:// links support only `attach`");
-    }
+    let deciding = match action.trim_end_matches('/') {
+        "attach" => false,
+        "decide" => true,
+        _ => bail!("croft:// links support only `attach` and `decide`"),
+    };
     let mut link = Link {
         host: None,
         path: None,
         focus: None,
+        decide: None,
     };
+    let (mut token, mut allow) = (None, None);
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let v = percent_decode(v)?;
@@ -103,13 +129,38 @@ pub fn parse(url: &str) -> Result<Link> {
                 link.focus = Some(match v.as_str() {
                     "terminal" | "pane" => Focus::Terminal,
                     "editor" => Focus::Editor,
+                    "approval" => Focus::Approval,
                     other => bail!("unknown focus {other:?}"),
+                });
+            }
+            "token" if deciding => {
+                if !valid_token(&v) {
+                    bail!("refusing token");
+                }
+                token = Some(v);
+            }
+            "decision" if deciding => {
+                allow = Some(match v.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    other => bail!("unknown decision {other:?}"),
                 });
             }
             // Unknown keys are ignored, so a link from a newer croft still
             // opens the session in an older one.
             _ => {}
         }
+    }
+    if deciding {
+        let (Some(token), Some(allow)) = (token, allow) else {
+            bail!("a decide link needs a token and a decision");
+        };
+        // Which croft to answer is found from the workspace, so a decide
+        // link without one could only guess.
+        if link.path.is_none() {
+            bail!("a decide link needs the workspace path");
+        }
+        link.decide = Some(Decide { token, allow });
     }
     Ok(link)
 }
@@ -151,22 +202,56 @@ pub fn argv(link: &Link, home: Option<&str>) -> Vec<String> {
         }
         None => out.push(String::from("attach")),
     }
-    if let Some(p) = &link.path {
-        out.push(match (&link.host, p.strip_prefix('~')) {
-            // The remote croft quotes its path, so `~` is never expanded
-            // there either; the login shell starts in home, so a path
-            // relative to it is the same directory.
-            (Some(_), Some("")) => String::from("."),
-            // `./` keeps `~/-x` from reading as a flag once the `~` is gone.
-            (Some(_), Some(rest)) if rest.starts_with('/') => format!(".{rest}"),
-            (None, Some(rest)) if rest.is_empty() || rest.starts_with('/') => match home {
-                Some(h) => format!("{}{rest}", h.trim_end_matches('/')),
-                None => p.clone(),
-            },
-            _ => p.clone(),
-        });
-    }
+    out.extend(path_arg(link, home));
     out
+}
+
+/// The `croft decide` arguments a decide link stands for, to run here or,
+/// for a link with a host, on that host (see [`remote_shell_command`]).
+pub fn decide_argv(link: &Link, home: Option<&str>) -> Option<Vec<String>> {
+    let d = link.decide.as_ref()?;
+    let mut out = vec![
+        String::from("decide"),
+        d.token.clone(),
+        String::from(if d.allow { "allow" } else { "deny" }),
+    ];
+    if let Some(p) = path_arg(link, home) {
+        out.push(String::from("--path"));
+        out.push(p);
+    }
+    Some(out)
+}
+
+/// `croft <args>` as the one command string ssh hands the remote login
+/// shell, every argument single-quoted. The PATH line matches `croft
+/// remote`'s, so a croft installed by cargo is found.
+pub fn remote_shell_command(args: &[String]) -> String {
+    let mut s = String::from("export PATH=\"$HOME/.cargo/bin:$PATH\"; croft");
+    for a in args {
+        s.push_str(" '");
+        s.push_str(&a.replace('\'', "'\\''"));
+        s.push('\'');
+    }
+    s
+}
+
+/// The link's path as croft's argument: `~` expanded locally, relative to
+/// the login directory remotely.
+fn path_arg(link: &Link, home: Option<&str>) -> Option<String> {
+    let p = link.path.as_ref()?;
+    Some(match (&link.host, p.strip_prefix('~')) {
+        // The remote croft quotes its path, so `~` is never expanded
+        // there either; the login shell starts in home, so a path
+        // relative to it is the same directory.
+        (Some(_), Some("")) => String::from("."),
+        // `./` keeps `~/-x` from reading as a flag once the `~` is gone.
+        (Some(_), Some(rest)) if rest.starts_with('/') => format!(".{rest}"),
+        (None, Some(rest)) if rest.is_empty() || rest.starts_with('/') => match home {
+            Some(h) => format!("{}{rest}", h.trim_end_matches('/')),
+            None => p.clone(),
+        },
+        _ => p.clone(),
+    })
 }
 
 /// The xdg desktop entry that routes `croft://` to `croft open-link`.
@@ -272,5 +357,69 @@ mod tests {
         let t = termux_url_opener("/b/croft");
         assert!(t.contains("croft://*) exec \"/b/croft\" open-link \"$1\""));
         assert!(t.contains("termux-open-url"));
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_decide_link_answers_here_or_over_ssh_without_attaching() {
+        let l = parse(&format!(
+            "croft://decide?path=~/proj&token={TOKEN}&decision=allow"
+        ))
+        .unwrap();
+        assert_eq!(
+            l.decide,
+            Some(Decide {
+                token: TOKEN.into(),
+                allow: true
+            })
+        );
+        assert_eq!(
+            decide_argv(&l, Some("/home/ada")).unwrap(),
+            ["decide", TOKEN, "allow", "--path", "/home/ada/proj"]
+        );
+        let mut remote = parse(&format!(
+            "croft://decide?host=box&path=%2Fsrv%2Fit%27s&token={TOKEN}&decision=deny"
+        ))
+        .unwrap();
+        remote.host = Some(String::from("box"));
+        let args = decide_argv(&remote, None).unwrap();
+        assert_eq!(args, ["decide", TOKEN, "deny", "--path", "/srv/it's"]);
+        assert_eq!(
+            remote_shell_command(&args),
+            format!(
+                "export PATH=\"$HOME/.cargo/bin:$PATH\"; croft 'decide' '{TOKEN}' 'deny' '--path' '/srv/it'\\''s'"
+            )
+        );
+        // An attach link is not a decision.
+        assert_eq!(decide_argv(&parse("croft://attach").unwrap(), None), None);
+        assert_eq!(
+            parse("croft://attach?focus=approval").unwrap().focus,
+            Some(Focus::Approval)
+        );
+    }
+
+    #[test]
+    fn a_decide_link_without_a_well_formed_token_decision_and_path_is_refused() {
+        for bad in [
+            String::from("croft://decide?path=/w&decision=allow"),
+            format!("croft://decide?path=/w&token={TOKEN}"),
+            format!("croft://decide?token={TOKEN}&decision=allow"),
+            format!("croft://decide?path=/w&token={TOKEN}&decision=maybe"),
+            format!(
+                "croft://decide?path=/w&token={}&decision=allow",
+                &TOKEN[1..]
+            ),
+            format!(
+                "croft://decide?path=/w&token={}&decision=allow",
+                TOKEN.to_uppercase()
+            ),
+            String::from("croft://decide?path=/w&token=%27%3Brm%20-rf%20~%27&decision=allow"),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
+        // On an attach link, token and decision mean nothing.
+        let l = parse(&format!("croft://attach?token={TOKEN}&decision=allow")).unwrap();
+        assert_eq!(l.decide, None);
     }
 }

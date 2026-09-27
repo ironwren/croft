@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_hook::{ANSWER_WINDOW, Decision, EditRequest};
@@ -107,6 +108,12 @@ pub struct Pending {
     pub request: EditRequest,
     pub proposal: Proposal,
     pub arrived: Instant,
+    /// The one-time token a notification's Approve and Deny carry (#359).
+    /// It answers this proposal once, from outside the popup, and dies
+    /// with it: answered either way, or expired.
+    pub token: String,
+    /// Whether the notification for this proposal has gone out.
+    pub notified: bool,
 }
 
 impl Pending {
@@ -143,6 +150,12 @@ pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bo
         let Ok(line) = crate::view_ipc::read_line_by_deadline(&stream, deadline, "the hook") else {
             continue;
         };
+        if let Ok(DecideLine { decide }) = serde_json::from_str::<DecideLine>(line.trim()) {
+            let reply = decide_by_token(queue, &decide, Instant::now());
+            changed |= reply.ok;
+            reply.send(stream);
+            continue;
+        }
         let Ok(request) = serde_json::from_str::<EditRequest>(line.trim()) else {
             continue;
         };
@@ -154,6 +167,8 @@ pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bo
                     request,
                     proposal,
                     arrived: Instant::now(),
+                    token: new_token(),
+                    notified: false,
                 });
                 changed = true;
             }
@@ -170,6 +185,8 @@ pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bo
                     },
                     request,
                     arrived: Instant::now(),
+                    token: String::new(),
+                    notified: true,
                 }
                 .answer(&reply);
             }
@@ -177,6 +194,129 @@ pub fn accept_into(listener: &UnixListener, queue: &mut VecDeque<Pending>) -> bo
     }
     changed
 }
+
+/// A fresh one-time token: 128 random bits as hex. Empty only if the
+/// system RNG fails, and an empty token never matches anything, so such a
+/// proposal is answered in the popup alone.
+fn new_token() -> String {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    match ring::rand::SystemRandom::new().fill(&mut bytes) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => String::new(),
+    }
+}
+
+/// An answer given outside the popup (#359): `croft decide`, which a
+/// notification's Approve or Deny runs, sends this line on the hook socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDecision {
+    pub token: String,
+    pub allow: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DecideLine {
+    decide: RemoteDecision,
+}
+
+/// What `croft decide` hears back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+impl DecideReply {
+    fn send(&self, mut stream: UnixStream) {
+        use std::io::Write;
+        if let Ok(mut line) = serde_json::to_string(self) {
+            line.push('\n');
+            let _ = stream.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// The reason a deny from a notification carries to the agent.
+pub const NOTIFICATION_DENY: &str = "denied from a croft notification";
+
+/// Equal without an early exit, so the time a wrong guess takes says
+/// nothing about how much of it was right.
+fn same_token(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+/// Answer the live proposal `decision.token` names, and take it off the
+/// queue so the token cannot answer twice. A token that matches nothing
+/// (already answered, expired, or never issued) answers nothing.
+fn decide_by_token(
+    queue: &mut VecDeque<Pending>,
+    decision: &RemoteDecision,
+    now: Instant,
+) -> DecideReply {
+    let found = queue.iter().position(|p| {
+        !decision.token.is_empty() && same_token(&p.token, &decision.token) && !p.expired(now)
+    });
+    let Some(index) = found else {
+        return DecideReply {
+            ok: false,
+            message: String::from(
+                "no edit is waiting on that token: it was already answered, or it expired",
+            ),
+        };
+    };
+    let pending = queue.remove(index).expect("index from position");
+    let file = pending.proposal.path.display().to_string();
+    if decision.allow {
+        pending.answer(&Decision::Allow);
+    } else {
+        pending.answer(&Decision::Deny {
+            reason: NOTIFICATION_DENY.into(),
+        });
+    }
+    DecideReply {
+        ok: true,
+        message: format!(
+            "{} the edit to {file}",
+            if decision.allow { "approved" } else { "denied" }
+        ),
+    }
+}
+
+/// `croft decide` (#359): answer the proposal `token` names, through the
+/// croft serving `cwd`, without attaching to it.
+pub fn send_decision(cwd: &Path, decision: &RemoteDecision) -> Result<String, String> {
+    use std::io::Write;
+    let mut stream = crate::agent_hook::connect_croft(cwd)
+        .ok_or_else(|| format!("no croft is open for {}", cwd.display()))?;
+    let mut line = serde_json::to_string(&DecideLine {
+        decide: decision.clone(),
+    })
+    .map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("could not reach croft: {e}"))?;
+    let deadline = Instant::now() + DECIDE_DEADLINE;
+    let reply = crate::view_ipc::read_line_by_deadline(&stream, deadline, "croft")
+        .map_err(|e| format!("croft did not answer: {e}"))?;
+    let reply: DecideReply = serde_json::from_str(reply.trim())
+        .map_err(|_| String::from("croft's answer was garbled"))?;
+    if reply.ok {
+        Ok(reply.message)
+    } else {
+        Err(reply.message)
+    }
+}
+
+/// How long `croft decide` waits for the running croft, which reads the
+/// hook socket once a frame.
+const DECIDE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Keys that arrive this soon after the popup appears are ignored, so an
 /// Enter meant for the pane being typed in cannot approve an edit nobody
@@ -520,5 +660,138 @@ mod tests {
             serde_json::from_str(line.trim()).unwrap(),
             Decision::Ask { .. }
         ));
+    }
+
+    /// Queue one proposal for `file` through `listener`, as a hook would,
+    /// and return the hook's end of the connection.
+    fn queue_one(
+        listener: &UnixListener,
+        sock: &Path,
+        dir: &Path,
+        queue: &mut VecDeque<Pending>,
+    ) -> UnixStream {
+        use std::io::Write;
+        let file = dir.join(format!("f{}.rs", queue.len()));
+        std::fs::write(&file, "let x = 1;\n").unwrap();
+        let mut hook = UnixStream::connect(sock).unwrap();
+        let req = EditRequest {
+            agent: "claude-code".into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({"file_path": file, "old_string": "1", "new_string": "2"}),
+            cwd: dir.into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(accept_into(listener, queue));
+        hook
+    }
+
+    /// Send `decide` on the socket as `croft decide` does, let the app's
+    /// pass pick it up, and return the reply `croft decide` would print.
+    fn decide(
+        listener: &UnixListener,
+        sock: &Path,
+        queue: &mut VecDeque<Pending>,
+        token: &str,
+        allow: bool,
+    ) -> DecideReply {
+        use std::io::{BufRead, Write};
+        let mut client = UnixStream::connect(sock).unwrap();
+        let line = serde_json::to_string(&DecideLine {
+            decide: RemoteDecision {
+                token: token.into(),
+                allow,
+            },
+        })
+        .unwrap();
+        writeln!(client, "{line}").unwrap();
+        accept_into(listener, queue);
+        let mut reply = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut reply)
+            .unwrap();
+        serde_json::from_str(reply.trim()).unwrap()
+    }
+
+    fn hook_answer(hook: UnixStream) -> Decision {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[test]
+    fn each_proposal_gets_its_own_token_and_starts_unnotified() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut queue = VecDeque::new();
+        let _a = queue_one(&listener, &sock, dir.path(), &mut queue);
+        let _b = queue_one(&listener, &sock, dir.path(), &mut queue);
+        assert_eq!(queue[0].token.len(), 32);
+        assert!(queue[0].token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(queue[0].token, queue[1].token);
+        assert!(!queue[0].notified && !queue[1].notified);
+    }
+
+    #[test]
+    fn a_token_answers_its_own_proposal_once_from_outside_the_popup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut queue = VecDeque::new();
+        let first = queue_one(&listener, &sock, dir.path(), &mut queue);
+        let second = queue_one(&listener, &sock, dir.path(), &mut queue);
+        let (t1, t2) = (queue[0].token.clone(), queue[1].token.clone());
+
+        // The second proposal, not the head: a token names its own.
+        let reply = decide(&listener, &sock, &mut queue, &t2, true);
+        assert!(reply.ok, "{reply:?}");
+        assert!(reply.message.starts_with("approved the edit to "));
+        assert_eq!(hook_answer(second), Decision::Allow);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].token, t1);
+
+        // Single use: the same token again answers nothing.
+        let again = decide(&listener, &sock, &mut queue, &t2, false);
+        assert!(!again.ok);
+        assert!(again.message.contains("already answered, or it expired"));
+        assert_eq!(queue.len(), 1);
+
+        let deny = decide(&listener, &sock, &mut queue, &t1, false);
+        assert!(deny.ok);
+        assert_eq!(
+            hook_answer(first),
+            Decision::Deny {
+                reason: NOTIFICATION_DENY.into()
+            }
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_empty_or_expired_token_answers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut queue = VecDeque::new();
+        let _hook = queue_one(&listener, &sock, dir.path(), &mut queue);
+        let token = queue[0].token.clone();
+        let mut wrong = token.clone();
+        wrong.replace_range(..1, if token.starts_with('0') { "1" } else { "0" });
+        assert!(!decide(&listener, &sock, &mut queue, &wrong, true).ok);
+        assert!(!decide(&listener, &sock, &mut queue, "", true).ok);
+        // A proposal with no token (the RNG failed) is not matched by an
+        // empty one either.
+        queue[0].token.clear();
+        assert!(!decide(&listener, &sock, &mut queue, "", true).ok);
+        queue[0].token = token.clone();
+        // It expires with the proposal: past the hook's window, the hook
+        // has answered by itself.
+        queue[0].arrived = Instant::now() - ANSWER_WINDOW;
+        assert!(!decide(&listener, &sock, &mut queue, &token, true).ok);
+        assert_eq!(queue.len(), 1, "the app's own pass drops the expired one");
     }
 }
