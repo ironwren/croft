@@ -297,11 +297,6 @@ pub fn dlv_program() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A login shell with a chatty rc (a `fastfetch` banner, `set -x`
-    /// tracing) can emit more than the OS pipe buffer. The child then blocks
-    /// in write() and never exits, so waiting for exit before reading
-    /// deadlocks until the timeout and reports node as missing. Output must
-    /// be drained while the child runs.
     /// #264: the install picks the delve that debugs with this machine's
     /// Go: 1.25.2 for Go 1.24 and older (delve 1.27 refuses them), latest
     /// otherwise. Run as the pane would, through `sh`, against a stub `go`.
@@ -350,6 +345,11 @@ mod tests {
         }
     }
 
+    /// A login shell with a chatty rc (a `fastfetch` banner, `set -x`
+    /// tracing) can emit more than the OS pipe buffer. The child then blocks
+    /// in write() and never exits, so waiting for exit before reading
+    /// deadlocks until the timeout and reports node as missing. Output must
+    /// be drained while the child runs.
     #[test]
     fn run_bounded_survives_output_larger_than_the_pipe_buffer() {
         let out = run_bounded(

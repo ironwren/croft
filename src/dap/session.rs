@@ -1888,8 +1888,6 @@ fn with_run_to(
 
 #[cfg(test)]
 mod tests {
-    /// #264: zero-config Go debugging runs the file's package; a `_test.go`
-    /// file runs the package's tests instead.
     /// #264: an adapter that refuses `launch` (delve rejecting a Go too old
     /// for it, with its real payload) ends the session with the reason, on
     /// the console and in `launch_error`, instead of leaving it Initializing.
@@ -1966,6 +1964,8 @@ while True:
         assert_eq!(launch_failure_reason(&bare), "no such process");
     }
 
+    /// #264: zero-config Go debugging runs the file's package; a `_test.go`
+    /// file runs the package's tests instead.
     #[test]
     fn delve_zero_config_runs_the_package_or_its_tests() {
         let main = delve_zero_config_request(Path::new("/w/cmd/app/main.go"));
