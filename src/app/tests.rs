@@ -57208,6 +57208,7 @@ fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
     assert_eq!(app.status, "Syncing config to user@dev-box.lan");
 }
 
+#[test]
 fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     // #365: `c` fetches the PR head into a sibling worktree added to the
     // workspace, and Esc takes it away again when nothing was changed.
