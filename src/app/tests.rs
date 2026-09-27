@@ -57187,6 +57187,12 @@ fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
     // tool at the nearest scanned commit, and again after a checkout of
     // another branch; `prompt` names them and waits; `off` never asks.
     use std::os::unix::fs::PermissionsExt;
+}
+
+#[test]
+fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
+    // #365: `c` fetches the PR head into a sibling worktree added to the
+    // workspace, and Esc takes it away again when nothing was changed.
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
@@ -57195,6 +57201,12 @@ fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(tmp.path())
+}
+
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
                 .args(args)
                 .output()
                 .unwrap();
@@ -57290,6 +57302,103 @@ esac
             !calls.contains("sarif+json"),
             "prompt downloads nothing: {calls}"
         );
+}
+
+        // The "GitHub" repository, at a path ending in the PR's `o/r`, so
+        // the remote naming it is found without a network.
+        let up = tmp.path().join("o").join("r");
+        std::fs::create_dir_all(&up).unwrap();
+        git(&up, &["init", "-q", "-b", "main"]);
+        git(&up, &["config", "user.email", "a@b"]);
+        git(&up, &["config", "user.name", "a"]);
+        std::fs::write(up.join("a.txt"), "base").unwrap();
+        git(&up, &["add", "."]);
+        git(&up, &["commit", "-q", "-m", "base"]);
+        std::fs::write(up.join("a.txt"), "pr").unwrap();
+        git(&up, &["commit", "-q", "-am", "pr"]);
+        let head = git(&up, &["rev-parse", "HEAD"]);
+        git(&up, &["update-ref", "refs/pull/579/head", &head]);
+        git(&up, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(tmp.path(), &["clone", "-q", up.to_str().unwrap(), "app"]);
+        let root = tmp.path().join("app").canonicalize().unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.status.contains("Fetching PR #579"), "{}", app.status);
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "PR checkout",
+            || {
+                app.poll_pr_checkout();
+                app.pr_checkout_rx.is_none()
+            },
+        );
+        let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
+        assert!(app.status.contains("checked out"), "{}", app.status);
+        assert!(
+            app.roots.iter().any(|r| r == checkout),
+            "added to the workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "pr"
+        );
+
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.status.contains("removed its checkout"),
+            "{}",
+            app.status
+        );
+        assert!(!checkout.exists(), "the worktree is gone");
+        assert!(!app.roots.iter().any(|r| r == checkout));
+        assert!(app.pr_checkout.is_none());
+
+        // Leaving before the fetch lands: nobody owns the result, so it is
+        // settled on arrival, never adopted.
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "PR checkout",
+            || {
+                app.poll_pr_checkout();
+                app.pr_checkout_rx.is_none()
+            },
+        );
+        assert!(
+            app.status
+                .contains("after its review closed; removed its checkout"),
+            "{}",
+            app.status
+        );
+        assert!(app.pr_checkout.is_none() && !checkout.exists());
+        assert!(!app.roots.iter().any(|r| r == checkout));
+
+        // An unsaved tab under the checkout keeps it.
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(10),
+            "PR checkout",
+            || {
+                app.poll_pr_checkout();
+                app.pr_checkout_rx.is_none()
+            },
+        );
+        let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
+        app.editor.open(&checkout.join("a.txt")).unwrap();
+        app.editor.dirty = true;
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.status.contains("a.txt has unsaved changes"),
+            "{}",
+            app.status
+        );
+        assert!(checkout.exists(), "kept");
     });
 }
 

@@ -1596,6 +1596,21 @@ struct CodeScanList {
     rx: std::sync::mpsc::Receiver<Result<Vec<crate::sarif::github::Analysis>, String>>,
 }
 
+/// Where a pull request checkout's worktree path and commit, or git's
+/// refusal, arrive (#365).
+type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, crate::git::PrWorktree), String>>;
+
+/// A pull request head checked out into a sibling worktree (#365).
+struct PrCheckout {
+    number: u64,
+    path: PathBuf,
+    /// The commit checked out: a HEAD anywhere else means new commits.
+    oid: String,
+    /// Whether review mode created the worktree; one that was already there
+    /// is never removed by leaving.
+    created: bool,
+}
+
 /// What a pull request review tab's `gh` call is fetching (#365).
 enum PrGhJob {
     /// The PR itself (`gh pr view`), by number or URL.
@@ -3860,6 +3875,12 @@ pub struct App {
     pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// When the open review tab's checks were last re-read (#365).
     pr_checks_polled: Option<std::time::Instant>,
+    /// The pull request head review mode checked out (#365), removed again
+    /// when review is left with nothing in it worth keeping.
+    pr_checkout: Option<PrCheckout>,
+    /// A checkout still fetching: the PR number, and where the worktree
+    /// path and commit (or git's refusal) arrive.
+    pr_checkout_rx: Option<(u64, PrCheckoutRx)>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -5678,6 +5699,8 @@ impl App {
             review_gh: String::from("gh"),
             pr_gh: None,
             pr_checks_polled: None,
+            pr_checkout: None,
+            pr_checkout_rx: None,
             review_tx,
             review_rx,
             recording: None,
@@ -52559,6 +52582,7 @@ impl App {
                 }
             }
             KeyCode::Char('l') => self.show_pr_check_log(),
+            KeyCode::Char('c') => self.checkout_pr_head(),
             KeyCode::Char('r') => {
                 // By URL, so a PR opened from another repository refreshes
                 // as itself.
@@ -52573,9 +52597,172 @@ impl App {
                 let n = view.pr.number;
                 self.editor.close_active();
                 self.status = format!("Left review of PR #{n}");
+                self.leave_pr_checkout();
             }
             _ => {}
         }
+    }
+
+    /// Check the reviewed pull request's head out into a sibling worktree
+    /// and add it to the workspace (#365), so its code has the language
+    /// server, go-to-definition and tests. Fetching runs off the UI thread.
+    fn checkout_pr_head(&mut self) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        if self.pr_checkout_rx.is_some() {
+            self.status = String::from("A pull request checkout is already fetching");
+            return;
+        }
+        let number = view.pr.number;
+        let slug = view.key.split('#').next().unwrap_or_default().to_string();
+        // What review mode last checked out there, the one HEAD a refresh
+        // may move away from without stranding commits.
+        let previous = self
+            .pr_checkout
+            .as_ref()
+            .filter(|c| c.number == number)
+            .map(|c| c.oid.clone());
+        let repo = self.workspace_root().to_path_buf();
+        let Some(path) = crate::git::pr_worktree_path(&repo, number) else {
+            self.status = format!(
+                "No place beside {} to check PR #{number} out",
+                repo.display()
+            );
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let remote = crate::git::remote_for_slug(&repo, &slug);
+            // Canonical, like the workspace roots it is added to and later
+            // removed from.
+            let result = crate::git::checkout_pr_worktree(
+                &repo,
+                &remote,
+                number,
+                &path,
+                previous.as_deref(),
+            )
+            .map(|wt| (path.canonicalize().unwrap_or(path), wt));
+            let _ = tx.send(result);
+        });
+        self.pr_checkout_rx = Some((number, rx));
+        self.status = format!("Fetching PR #{number}…");
+    }
+
+    /// Apply a finished pull request checkout. Returns true when it changed
+    /// what is on screen.
+    fn poll_pr_checkout(&mut self) -> bool {
+        let Some((number, rx)) = self.pr_checkout_rx.as_ref() else {
+            return false;
+        };
+        let number = *number;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the checkout stopped without answering"))
+            }
+        };
+        self.pr_checkout_rx = None;
+        match result {
+            Ok((path, wt)) => {
+                let mut fresh = PrCheckout {
+                    number,
+                    path,
+                    oid: wt.oid,
+                    created: wt.created,
+                };
+                // Review closed, or another PR opened, while this fetched:
+                // no review owns it, so it is settled like a left one.
+                if self.editor.pr_review.as_ref().map(|v| v.pr.number) != Some(number) {
+                    let outcome = self.settle_pr_checkout(fresh);
+                    self.status = format!(
+                        "PR #{number}'s checkout finished after its review closed; {outcome}"
+                    );
+                    return true;
+                }
+                match self.pr_checkout.take() {
+                    // A refresh of the same checkout: still review mode's
+                    // if review mode made it.
+                    Some(old) if old.number == number => fresh.created |= old.created,
+                    // Another PR's: settled before this one replaces it.
+                    Some(old) => {
+                        let _ = self.settle_pr_checkout(old);
+                    }
+                    None => {}
+                }
+                if !self.roots.iter().any(|r| r == fresh.path) {
+                    self.add_workspace_folder(fresh.path.clone());
+                }
+                let short: String = fresh.oid.chars().take(8).collect();
+                self.status = if fresh.created {
+                    format!(
+                        "PR #{number} checked out at {short} in {} — leaving review removes it if nothing changed",
+                        fresh.path.display()
+                    )
+                } else {
+                    format!(
+                        "PR #{number} checked out at {short} in the existing {}, which leaving review keeps",
+                        fresh.path.display()
+                    )
+                };
+                self.pr_checkout = Some(fresh);
+            }
+            Err(why) => self.status = format!("Could not check out PR #{number}: {why}"),
+        }
+        true
+    }
+
+    /// Remove a pull request checkout review mode no longer needs, with its
+    /// workspace folder and panes, unless something in it is worth keeping:
+    /// a worktree that existed before review, an unsaved editor tab under
+    /// it, edits or build output on disk, or new commits. Says which.
+    fn settle_pr_checkout(&mut self, checkout: PrCheckout) -> String {
+        let PrCheckout {
+            path, oid, created, ..
+        } = checkout;
+        if !path.exists() {
+            return String::from("its checkout is already gone");
+        }
+        let kept = |why: &str| format!("kept its checkout at {}: {why}", path.display());
+        if !created {
+            return kept("it existed before review");
+        }
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let unsaved = groups
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.dirty)
+            .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(&path)))
+            .map(|p| p.strip_prefix(&path).unwrap_or(p).display().to_string());
+        if let Some(file) = unsaved {
+            return kept(&format!("{file} has unsaved changes"));
+        }
+        if let Some(why) = crate::git::pr_worktree_keep_reason(&path, &oid) {
+            return kept(&why);
+        }
+        match crate::git::remove_worktree_lane(&path) {
+            Ok(()) => {
+                self.close_lane_panes(&path);
+                if self.roots.iter().any(|r| r == path) {
+                    self.remove_workspace_folder(path);
+                }
+                String::from("removed its checkout")
+            }
+            Err(why) => format!("could not remove {}: {why}", path.display()),
+        }
+    }
+
+    /// Leaving review mode (#365): remove the pull request's checkout and
+    /// its workspace folder, unless it holds work — edits, build output or
+    /// new commits — which stay, with the reason in the status.
+    fn leave_pr_checkout(&mut self) {
+        let Some(checkout) = self.pr_checkout.take() else {
+            return;
+        };
+        let number = checkout.number;
+        let outcome = self.settle_pr_checkout(checkout);
+        self.status = format!("Left review of PR #{number}; {outcome}");
     }
 
     /// SARIF viewer keys (#577). While the filter box has focus, printable
@@ -59688,7 +59875,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_code_scanning();
+        let hook_changed = app.drain_hook_requests()
+            | app.poll_pr_gh()
+            | app.poll_pr_checkout()
+            | app.poll_code_scanning();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
