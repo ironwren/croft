@@ -19,6 +19,9 @@ use ratatui::{
 /// Why the picker is open, so the App dispatches the right git op on Enter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListPurpose {
+    /// Source Control: Review Pull Request (#365): the open PRs, `id` the
+    /// PR's URL, or [`PR_BY_NUMBER`] for the typed-number prompt.
+    ReviewPullRequest,
     StashApply,
     StashPop,
     StashDrop,
@@ -79,6 +82,9 @@ pub enum ListPurpose {
     /// the reason an index into `DismissReason::ALL`.
     DismissAlert,
 }
+
+/// The Review Pull Request row that asks for a number or URL instead.
+pub const PR_BY_NUMBER: &str = "#by-number";
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a
 /// remote/tag name) and the `label` shown.

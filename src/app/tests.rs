@@ -56109,3 +56109,81 @@ fn show_coverage_report_opens_the_last_run_as_a_tab() {
         app.editor.lines
     );
 }
+
+/// #365: Review Pull Request lists the open PRs to pick from (off the UI
+/// thread), picking one opens it by URL, and the last row asks for a
+/// number instead. When gh cannot list, the prompt opens directly.
+#[test]
+fn review_pull_request_picks_from_the_open_prs() {
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{}'
+case "$2" in
+  list) echo '[{{"number": 9, "title": "Add it", "author": {{"login": "ada"}}, "url": "https://github.com/o/r/pull/9", "isDraft": false}}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        app.run_command(Command::ReviewPullRequest);
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr list", || {
+            app.poll_pr_gh();
+            app.list_picker.is_some()
+        });
+        let picker = app.list_picker.as_ref().unwrap();
+        assert_eq!(picker.rows.len(), 2);
+        assert!(picker.rows[0].label.contains("#9") && picker.rows[0].label.contains("Add it"));
+        assert_eq!(picker.rows[1].id, crate::widgets::list_picker::PR_BY_NUMBER);
+        app.confirm_list_picker();
+        assert!(
+            app.status
+                .contains("Loading PR https://github.com/o/r/pull/9"),
+            "{}",
+            app.status
+        );
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+            app.poll_pr_gh();
+            app.pr_gh.is_none()
+        });
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("pr view https://github.com/o/r/pull/9"),
+            "{args}"
+        );
+
+        // gh unable to list: straight to the prompt, with the reason.
+        app.review_gh = String::from("/nonexistent/gh");
+        app.run_command(Command::ReviewPullRequest);
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the fallback",
+            || {
+                app.poll_pr_gh();
+                app.input_prompt.is_some()
+            },
+        );
+        assert!(
+            app.status.contains("Could not list pull requests"),
+            "{}",
+            app.status
+        );
+    });
+}

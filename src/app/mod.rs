@@ -1580,6 +1580,8 @@ enum PrGhJob {
     Diff { path: String },
     /// A failing check's log, for OUTPUT > PR Checks.
     Log { name: String },
+    /// The open PRs, for the Review Pull Request picker.
+    List,
     /// A background re-read of the PR while its checks run: only the
     /// checks of the open tab for `url` are replaced.
     Checks { url: String },
@@ -28435,6 +28437,13 @@ impl App {
                     self.run_project_task(task);
                 }
             }
+            ListPurpose::ReviewPullRequest => {
+                if row.id == crate::widgets::list_picker::PR_BY_NUMBER {
+                    self.open_pr_number_prompt();
+                } else {
+                    self.start_pr_review(row.id.clone());
+                }
+            }
             ListPurpose::AttachProcess => {
                 if let Some((rc, slot)) = row
                     .id
@@ -40828,12 +40837,11 @@ impl App {
             }
             Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
             Cmd::ReviewPullRequest => {
-                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                self.open_input_prompt(InputPrompt::new(
-                    InputPurpose::PullRequestNumber,
-                    String::from("Review Pull Request"),
-                    String::from("number, #number, or the PR's URL"),
-                ));
+                // The open PRs first, fetched off the UI thread; the typed
+                // prompt stays one row away (and is the fallback when gh
+                // cannot list).
+                self.status = String::from("Listing open pull requests…");
+                self.spawn_pr_gh(PrGhJob::List, crate::pr_review::list_args());
             }
             Cmd::DiffWorktreeLane => self.diff_worktree_lane(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
@@ -51223,6 +51231,16 @@ impl App {
         self.status = format!("Reviewing PR #{n}");
     }
 
+    /// Ask for a pull request by number or URL (#365).
+    fn open_pr_number_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::PullRequestNumber,
+            String::from("Review Pull Request"),
+            String::from("number, #number, or the PR's URL"),
+        ));
+    }
+
     /// The Review Pull Request prompt's answer.
     fn submit_pr_number(&mut self, input: &str) {
         match crate::pr_review::parse_pr_selector(input) {
@@ -51327,6 +51345,43 @@ impl App {
                 }
                 Err(why) => self.status = format!("gh pr diff failed: {why}"),
             },
+            PrGhJob::List => {
+                use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow, PR_BY_NUMBER};
+                let items = result.and_then(|json| crate::pr_review::parse_pr_list(&json));
+                let items = match items {
+                    Ok(items) if !items.is_empty() => items,
+                    other => {
+                        self.open_pr_number_prompt();
+                        if let Err(why) = other {
+                            self.status = format!("Could not list pull requests: {why}");
+                        }
+                        return true;
+                    }
+                };
+                let mut rows: Vec<ListRow> = items
+                    .into_iter()
+                    .map(|p| ListRow {
+                        id: p.url,
+                        label: format!(
+                            "#{:<5} {}{}  ({})",
+                            p.number,
+                            if p.draft { "[draft] " } else { "" },
+                            p.title,
+                            p.author
+                        ),
+                    })
+                    .collect();
+                rows.push(ListRow {
+                    id: PR_BY_NUMBER.to_string(),
+                    label: String::from("Another pull request by number or URL…"),
+                });
+                self.status.clear();
+                self.list_picker = Some(ListPicker::new(
+                    ListPurpose::ReviewPullRequest,
+                    String::from("Review Pull Request"),
+                    rows,
+                ));
+            }
             PrGhJob::Checks { url } => {
                 // A failed re-read changes nothing: the next one retries.
                 let Ok(pr) = result.and_then(|json| crate::pr_review::parse_pr(&json)) else {
