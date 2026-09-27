@@ -1284,8 +1284,22 @@ fn parse_env_pairs(line: &str) -> Result<Vec<(String, String)>, String> {
 /// as plain JSON: a file with comments or trailing commas would lose them,
 /// so it is left alone and the entry is handed back to add by hand. A name
 /// the file already uses is refused, since the picker lists by name.
+///
+/// The new file is written aside and renamed into place, so a kill or a full
+/// disk mid-write leaves the old one whole. The workspace controls `.croft`,
+/// so a symlink there (or at the file) is refused rather than followed: the
+/// rewrite must not land somewhere else.
 pub fn add_to_croft_launch_json(root: &Path, draft: &ConfigDraft) -> Result<PathBuf, String> {
-    let path = root.join(".croft/launch.json");
+    let dir = root.join(".croft");
+    let path = dir.join("launch.json");
+    for p in [&dir, &path] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{} is a symlink; not rewriting it",
+                p.strip_prefix(root).unwrap_or(p).display()
+            ));
+        }
+    }
     let entry = draft.to_json();
     let mut doc = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str::<Value>(&text).map_err(|_| {
@@ -1327,12 +1341,15 @@ pub fn add_to_croft_launch_json(root: &Path, draft: &ConfigDraft) -> Result<Path
         ));
     }
     list.push(entry);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Could not create .croft: {e}"))?;
-    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create .croft: {e}"))?;
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text + "\n")
-        .map_err(|e| format!("Could not write .croft/launch.json: {e}"))?;
+    let tmp = dir.join(format!("launch.json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text + "\n")
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Could not write .croft/launch.json: {e}")
+        })?;
     Ok(path)
 }
 
@@ -2650,9 +2667,38 @@ mod tests {
         std::fs::write(jsonc.path().join(".croft/launch.json"), text).unwrap();
         let err = add_to_croft_launch_json(jsonc.path(), &d).unwrap_err();
         assert!(err.contains("by hand") && err.contains("\"Web\""), "{err}");
+        // Written aside and renamed: nothing is left beside the file.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join(".croft"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("launch.json")]);
         assert_eq!(
             std::fs::read_to_string(jsonc.path().join(".croft/launch.json")).unwrap(),
             text
         );
+    }
+
+    /// #250: `.croft` is workspace content, so a symlink there or at the
+    /// file is refused rather than followed, and its target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn adding_a_configuration_refuses_a_symlinked_croft_launch_json() {
+        let mut d = ConfigDraft::new("node", RequestKind::Launch);
+        d.set(DraftField::Name, "Web").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("victim.json");
+        std::fs::write(&target, "[]").unwrap();
+        let file_link = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(file_link.path().join(".croft")).unwrap();
+        std::os::unix::fs::symlink(&target, file_link.path().join(".croft/launch.json")).unwrap();
+        let err = add_to_croft_launch_json(file_link.path(), &d).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        let dir_link = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir_link.path().join(".croft")).unwrap();
+        let err = add_to_croft_launch_json(dir_link.path(), &d).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "[]");
+        assert!(!elsewhere.path().join("launch.json").exists());
     }
 }
