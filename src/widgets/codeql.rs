@@ -62,6 +62,8 @@ pub enum Action {
     SetUpControllerRepository,
     ViewAst,
     SelectLanguage(usize),
+    /// Make the listed database at this index the current one.
+    SelectDatabase(usize),
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -105,6 +107,9 @@ pub struct CodeqlPanel {
     pub theme: crate::theme::Theme,
     /// Frame truth for mouse routing.
     pub last_area: Rect,
+    /// The databases the user added, and which one queries run against.
+    pub databases: Vec<crate::codeql_db::DbEntry>,
+    pub current_db: Option<usize>,
 }
 
 impl CodeqlPanel {
@@ -140,6 +145,22 @@ impl CodeqlPanel {
                     }
                 }
                 Section::Databases => {
+                    for (i, db) in self.databases.iter().enumerate() {
+                        let mark = if self.current_db == Some(i) {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        let lang = db
+                            .language
+                            .as_deref()
+                            .map(|l| format!(" ({l})"))
+                            .unwrap_or_default();
+                        out.push(Line::Action(
+                            Action::SelectDatabase(i),
+                            format!("{mark} {}{lang}", db.name),
+                        ));
+                    }
                     out.push(Line::Text("Add a CodeQL database:"));
                     for (a, label) in [
                         (Action::AddDatabaseFromFolder, "From a folder"),
@@ -371,6 +392,40 @@ mod tests {
             p.selected_hit(),
             Some(Hit::Header(Section::Language)),
             "clamps at the top"
+        );
+    }
+
+    #[test]
+    fn databases_list_with_the_current_one_marked() {
+        let mut p = CodeqlPanel::new();
+        p.databases = vec![
+            crate::codeql_db::DbEntry {
+                name: "a-db".into(),
+                path: "/x/a-db".into(),
+                language: Some("python".into()),
+            },
+            crate::codeql_db::DbEntry {
+                name: "b-db".into(),
+                path: "/x/b-db".into(),
+                language: Some("go".into()),
+            },
+        ];
+        p.current_db = Some(1);
+        let lines = p.lines();
+        assert!(lines.contains(&Line::Action(
+            Action::SelectDatabase(0),
+            "○ a-db (python)".into()
+        )));
+        assert!(lines.contains(&Line::Action(
+            Action::SelectDatabase(1),
+            "● b-db (go)".into()
+        )));
+        assert!(
+            lines.contains(&Line::Action(
+                Action::AddDatabaseFromGithub,
+                "From GitHub".into()
+            )),
+            "adding more stays on offer"
         );
     }
 
