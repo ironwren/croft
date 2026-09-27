@@ -58637,7 +58637,6 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
 }
 
-<<<<<<< HEAD
 /// #371's criterion, measured: after a warm-up pass, holding an arrow key
 /// back across up to 200 commits of this repository's own
 /// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
@@ -58685,7 +58684,8 @@ fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
     let max = *times.last().unwrap();
     eprintln!("{steps} steps: p50 {p50:?} p95 {p95:?} max {max:?}");
     assert!(p95 < std::time::Duration::from_millis(16), "p95 {p95:?}");
-=======
+}
+
 #[test]
 fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette() {
     // The cache-dir override is process-global; serialize with the
@@ -58858,5 +58858,4 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
             Some(Command::CodeqlSetUpController)
         );
     });
->>>>>>> origin/main
 }
