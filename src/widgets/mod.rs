@@ -1,4 +1,5 @@
 pub mod approval_popup;
+pub mod agent_lane;
 pub mod branch_picker;
 pub mod captures;
 pub mod command_palette;
