@@ -480,6 +480,23 @@ pub enum CliCommand {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Push your keybindings, snippets, triggers, matchers and macros to a
+    /// remote now, as connecting does (#262). A file edited on the remote
+    /// since the last push is left alone: --diff compares it, and
+    /// --take-local or --keep-remote settles it.
+    SyncConfig {
+        /// Host alias from ~/.ssh/config.
+        host: String,
+        /// Show how the remote's copy of this file differs from yours.
+        #[arg(long, value_name = "FILE")]
+        diff: Option<String>,
+        /// Push this file even though the remote's copy was edited.
+        #[arg(long, value_name = "FILE")]
+        take_local: Vec<String>,
+        /// Keep the remote's copy of this file until either side changes.
+        #[arg(long, value_name = "FILE")]
+        keep_remote: Vec<String>,
+    },
     /// Make `croft://` links open croft: an xdg handler on Linux, Termux's
     /// URL opener on Android. On macOS the launcher (install-launcher)
     /// registers the scheme.
@@ -906,6 +923,23 @@ impl Cli {
                         std::process::exit(1);
                     }
                 }
+            }
+            Some(CliCommand::SyncConfig {
+                host,
+                diff,
+                take_local,
+                keep_remote,
+            }) => {
+                let resolution = crate::remote::SyncResolution {
+                    take_local,
+                    keep_remote,
+                };
+                if let Err(e) = crate::remote::sync_config_now(&host, &resolution, diff.as_deref())
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Ok(())
             }
             Some(CliCommand::InstallLinkHandler) => install_link_handler(),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
