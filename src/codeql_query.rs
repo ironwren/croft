@@ -83,6 +83,12 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments upgrading `db` to the CLI's current schema (VS Code's
+/// "CodeQL: Upgrade Database").
+pub fn upgrade_args(db: &Path) -> Vec<String> {
+    vec![String::from("database"), String::from("upgrade"), path(db)]
+}
+
 /// The queries in one CodeQL pack, as the side bar's Queries section groups
 /// them (#578).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +356,11 @@ pub enum RunStatus {
 pub struct HistoryEntry {
     pub query: PathBuf,
     pub database: String,
+    /// The database's folder, so "Delete Unused Databases" can tell which
+    /// ones a run refers to after a rename. History saved before this
+    /// field existed reads as `None` and falls back to the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<PathBuf>,
     /// Seconds since the Unix epoch.
     pub started: u64,
     pub seconds: u64,
@@ -370,6 +381,19 @@ impl HistoryEntry {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// Whether this run was on the database at `path` that goes, or went,
+    /// by one of `names`: by canonical path when the entry recorded one,
+    /// else by name.
+    pub fn refers_to(&self, path: &Path, names: &[&str]) -> bool {
+        match &self.database_path {
+            Some(p) => {
+                let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(p) == canon(path)
+            }
+            None => names.contains(&self.database.as_str()),
+        }
     }
 
     /// What the entry is called: the user's label, else the query's file
@@ -465,6 +489,20 @@ impl History {
         }
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, text)
+    }
+
+    /// Pin older entries that only recorded the database's `name` to its
+    /// `path`, so renaming the database does not orphan them (#578).
+    /// Returns whether anything changed.
+    pub fn adopt_legacy(&mut self, name: &str, path: &Path) -> bool {
+        let mut changed = false;
+        for e in &mut self.entries {
+            if e.database_path.is_none() && e.database == name {
+                e.database_path = Some(path.to_path_buf());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Record a new run, dropping the oldest past the cap. It goes at the
@@ -605,6 +643,46 @@ mod tests {
                 "/out/r.bqrs"
             ]
         );
+        assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+    }
+
+    #[test]
+    fn a_run_refers_to_its_database_by_path_else_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("app");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::create_dir_all(tmp.path().join("x")).unwrap();
+        let mut e = entry(RunStatus::Succeeded);
+        assert!(e.refers_to(&db, &["app"]), "an old entry goes by name");
+        assert!(!e.refers_to(&db, &["renamed"]));
+        assert!(
+            e.refers_to(&db, &["renamed", "app"]),
+            "or by a name the database had before a rename"
+        );
+        e.database_path = Some(tmp.path().join("x/../app"));
+        assert!(e.refers_to(&db, &["renamed"]), "a path survives a rename");
+        assert!(!e.refers_to(&tmp.path().join("other"), &["app"]));
+    }
+
+    /// #578: runs that only named their database get its path before a
+    /// rename, and runs that already have a path are left alone.
+    #[test]
+    fn legacy_runs_are_pinned_to_a_database_path() {
+        let mut history = History::default();
+        let mut pinned = entry(RunStatus::Succeeded);
+        pinned.database_path = Some(PathBuf::from("/dbs/elsewhere"));
+        history.entries = vec![entry(RunStatus::Succeeded), pinned.clone()];
+        let name = history.entries[0].database.clone();
+        assert!(history.adopt_legacy(&name, Path::new("/dbs/app")));
+        assert_eq!(
+            history.entries[0].database_path.as_deref(),
+            Some(Path::new("/dbs/app"))
+        );
+        assert_eq!(history.entries[1], pinned);
+        assert!(
+            !history.adopt_legacy(&name, Path::new("/dbs/app")),
+            "idempotent"
+        );
     }
 
     #[test]
@@ -685,6 +763,7 @@ mod tests {
         HistoryEntry {
             query: PathBuf::from("/w/sql.ql"),
             database: String::from("app"),
+            database_path: None,
             started: 1,
             seconds: 12,
             status,
