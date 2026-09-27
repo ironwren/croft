@@ -333,7 +333,13 @@ pub struct ApprovalUi {
     /// `Some` while a deny reason is being typed.
     pub reason: Option<String>,
     pub shown_at: Instant,
+    /// Set by `a`: the approval also covers this agent's next proposals
+    /// for [`AUTO_APPROVE_FOR`].
+    pub approve_all: bool,
 }
+
+/// How long `a` in the popup keeps approving one agent's edits (#347).
+pub const AUTO_APPROVE_FOR: Duration = Duration::from_secs(10 * 60);
 
 impl ApprovalUi {
     pub fn new(now: Instant) -> Self {
@@ -341,6 +347,7 @@ impl ApprovalUi {
             scroll: 0,
             reason: None,
             shown_at: now,
+            approve_all: false,
         }
     }
 
@@ -380,6 +387,10 @@ impl ApprovalUi {
         let last = rows.saturating_sub(1);
         match key.code {
             KeyCode::Enter => return Some(Decision::Allow),
+            KeyCode::Char('a') => {
+                self.approve_all = true;
+                return Some(Decision::Allow);
+            }
             KeyCode::Esc => {
                 return Some(Decision::Deny {
                     reason: DEFAULT_DENY.into(),

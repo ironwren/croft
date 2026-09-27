@@ -56328,3 +56328,71 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
     assert!(!app.scrub_dragging);
     assert!(app.scrubber.is_some(), "the scrubber stays open");
 }
+
+/// #347: `a` in the approval popup approves this edit and the same agent's
+/// next ones for ten minutes, with a countdown chip; another agent still
+/// asks, and Agents: Stop Auto-Approving (or the time running out) ends it.
+#[test]
+fn approve_all_lets_one_agent_through_until_stopped() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = tmp.path().join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let propose = |app: &mut App, agent: &str| {
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: agent.into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({"file_path": tmp.path().join("a.rs"), "old_string": "1", "new_string": "2"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        app.drain_hook_requests();
+        hook
+    };
+    let answer = |hook: std::os::unix::net::UnixStream| {
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(hook).read_line(&mut line);
+        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).ok()
+    };
+
+    let first = propose(&mut app, "claude-code");
+    let other = propose(&mut app, "other-agent");
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(answer(first), Some(crate::agent_hook::Decision::Allow));
+    assert!(app.status.contains("for 10 minutes"), "{}", app.status);
+    assert_eq!(app.approvals.len(), 1, "the other agent still asks");
+    assert_eq!(app.approvals[0].request.agent, "other-agent");
+
+    // The same agent's next edit goes straight through.
+    let next = propose(&mut app, "claude-code");
+    assert_eq!(answer(next), Some(crate::agent_hook::Decision::Allow));
+    assert_eq!(app.approvals.len(), 1);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let bottom: String = (0..160).map(|x| buf[(x, 29)].symbol()).collect();
+    assert!(
+        bottom.contains("auto-approving claude-code 9:")
+            || bottom.contains("auto-approving claude-code 10:00"),
+        "{bottom}"
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::StopAutoApprove);
+    let after = propose(&mut app, "claude-code");
+    assert_eq!(app.approvals.len(), 2, "asks again once stopped");
+    drop((after, other));
+
+    // A window that has run out closes by itself.
+    app.auto_approve = Some((String::from("x"), std::time::Instant::now()));
+    app.drain_hook_requests();
+    assert!(app.auto_approve.is_none());
+}

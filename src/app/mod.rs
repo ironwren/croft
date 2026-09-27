@@ -3835,6 +3835,9 @@ pub struct App {
     /// rebuilds the view for the new file rather than showing the old one's
     /// history over it.
     scrub_for: Option<PathBuf>,
+    /// `a` in the approval popup (#347): the agent whose edits are
+    /// approved without asking, until when.
+    auto_approve: Option<(String, std::time::Instant)>,
     /// The scrubber slider's track, from the last frame, and whether a
     /// drag that started on it is under way (#371).
     scrub_slider: Rect,
@@ -5603,6 +5606,7 @@ impl App {
             scrubber: None,
             scrub_view: None,
             scrub_for: None,
+            auto_approve: None,
             scrub_slider: Rect::default(),
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
@@ -15699,6 +15703,8 @@ impl App {
             Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
             None => false,
         };
+        // Auto-approved edits are answered before anyone is notified.
+        changed |= self.apply_auto_approve();
         self.notify_new_approvals();
         let now = std::time::Instant::now();
         let before = self.approvals.len();
@@ -15741,6 +15747,48 @@ impl App {
         }
     }
 
+    /// Answer "allow" to every queued proposal from the auto-approved agent
+    /// while its window lasts (#347), and drop the window once it ends.
+    /// Returns true when anything was approved or the window closed.
+    fn apply_auto_approve(&mut self) -> bool {
+        let Some((agent, until)) = self.auto_approve.clone() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.auto_approve = None;
+            self.status = format!("Stopped auto-approving {agent}: its 10 minutes are up");
+            return true;
+        }
+        let mut approved = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for p in std::mem::take(&mut self.approvals) {
+            if p.request.agent == agent {
+                approved.push(p.proposal.path.display().to_string());
+                p.answer(&crate::agent_hook::Decision::Allow);
+            } else {
+                kept.push_back(p);
+            }
+        }
+        self.approvals = kept;
+        if approved.is_empty() {
+            return false;
+        }
+        if self.approvals.is_empty() {
+            self.approval_ui = None;
+        }
+        self.status = format!("Auto-approved {agent}'s edit to {}", approved.join(", "));
+        true
+    }
+
+    /// Agents: Stop Auto-Approving (#347).
+    fn stop_auto_approve(&mut self) {
+        self.status = match self.auto_approve.take() {
+            Some((agent, _)) => format!("Stopped auto-approving {agent}"),
+            None => String::from("No agent is being auto-approved"),
+        };
+    }
+
     fn handle_approval_key(&mut self, key: KeyEvent) {
         let rows = self
             .approvals
@@ -15753,8 +15801,23 @@ impl App {
         let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
             return;
         };
+        let approve_all = ui.approve_all;
         if let Some(head) = self.approvals.pop_front() {
+            if approve_all {
+                let agent = head.request.agent.clone();
+                self.auto_approve = Some((
+                    agent.clone(),
+                    std::time::Instant::now() + crate::agent_approval::AUTO_APPROVE_FOR,
+                ));
+                self.status = format!(
+                    "Approving every edit from {agent} for 10 minutes (Agents: Stop Auto-Approving ends it)"
+                );
+            }
             head.answer(&decision);
+        }
+        // What was already queued from that agent goes through too.
+        if approve_all {
+            self.apply_auto_approve();
         }
         self.approval_ui = (!self.approvals.is_empty())
             .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
@@ -17803,6 +17866,23 @@ impl App {
                     .fg(self.theme.ui(Color::Rgb(0x2d, 0xd4, 0xbf)))
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+        if let Some((agent, until)) = &self.auto_approve {
+            let left = until
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            spans.push(Span::styled(
+                format!(
+                    " \u{2713} auto-approving {agent} {}:{:02} ",
+                    left / 60,
+                    left % 60
+                ),
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
         }
         if let Some(chip) = self.notebook_kernel_chip() {
             spans.push(Span::styled(
@@ -40975,6 +41055,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::DebugInstallDelve => self.install_delve(),
+            Cmd::StopAutoApprove => self.stop_auto_approve(),
             Cmd::ScrubOpenHere => self.scrub_open_here(),
             Cmd::ScrubDiffToWorkingTree => self.scrub_diff_to_working_tree(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
