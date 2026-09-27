@@ -2111,6 +2111,161 @@ while True:
         s.disconnect();
     }
 
+    /// A Go program in its own module under a temp dir, for the delve
+    /// end-to-end tests: `(dir, canonical main.go)`.
+    fn go_program(src: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(&main, src).unwrap();
+        let main = main.canonicalize().unwrap();
+        (tmp, main)
+    }
+
+    fn test_dlv() -> PathBuf {
+        std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv")
+    }
+
+    /// Poll `s` until `done` holds or 90 s pass, keeping every output line.
+    fn poll_delve_until(
+        s: &mut DapSession,
+        output: &mut Vec<String>,
+        done: impl Fn(&DapSession) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !done(s) && std::time::Instant::now() < deadline {
+            for ev in s.poll() {
+                if let DapEvent::Output { text, .. } = ev {
+                    output.push(text);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// #264 against a real delve: a conditional breakpoint stops only when
+    /// its condition holds, and a logpoint prints its interpolated message
+    /// on every pass without stopping. Needs Go and `dlv`, so it is ignored
+    /// by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_honours_conditions_and_logpoints() {
+        let (_tmp, main) = go_program(
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ttotal := 0\n\
+             \tfor i := 0; i < 10; i++ {\n\t\ttotal += i\n\t\tfmt.Println(total)\n\t}\n}\n",
+        );
+        let mut bps = BTreeMap::new();
+        bps.insert(
+            main.clone(),
+            vec![
+                SourceBreakpoint {
+                    line: 8,
+                    condition: None,
+                    log_message: Some(String::from("tick {i}")),
+                    hit_condition: None,
+                },
+                SourceBreakpoint {
+                    line: 9,
+                    condition: Some(String::from("i == 6")),
+                    log_message: None,
+                    hit_condition: None,
+                },
+            ],
+        );
+        let mut s = DapSession::launch_delve(
+            &test_dlv(),
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let mut output = Vec::new();
+        poll_delve_until(&mut s, &mut output, |s| s.lookup_local("i").is_some());
+        let (_, line) = s.current_location.clone().expect("a stop location");
+        assert_eq!(line, 9, "stopped on the conditional line, not the logpoint");
+        assert_eq!(
+            s.lookup_local("i").map(|v| v.value.clone()).as_deref(),
+            Some("6"),
+            "the condition held at the stop"
+        );
+        let text = output.concat();
+        for i in 0..=6 {
+            assert!(
+                text.contains(&format!("tick {i}")),
+                "logpoint {i}: {text:?}"
+            );
+        }
+        assert!(
+            !text.contains("tick 7"),
+            "nothing ran past the stop: {text:?}"
+        );
+        s.disconnect();
+    }
+
+    /// #264 against a real delve: at a stop the thread list is the program's
+    /// goroutines, and selecting a parked one loads its own stack. Needs Go
+    /// and `dlv`, so it is ignored by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_lists_goroutines_and_shows_one_s_stack() {
+        let (_tmp, main) = go_program(
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"time\"\n)\n\n\
+             func worker(c chan int) {\n\tv := <-c\n\tfmt.Println(v)\n}\n\n\
+             func main() {\n\tc := make(chan int)\n\tgo worker(c)\n\
+             \ttime.Sleep(200 * time.Millisecond)\n\tc <- 1\n\
+             \ttime.Sleep(100 * time.Millisecond)\n}\n",
+        );
+        let mut bps = BTreeMap::new();
+        bps.insert(main.clone(), vec![SourceBreakpoint::plain(17)]);
+        let mut s = DapSession::launch_delve(
+            &test_dlv(),
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let mut output = Vec::new();
+        poll_delve_until(&mut s, &mut output, |s| {
+            s.current_location.is_some() && s.threads.len() > 1
+        });
+        let (_, line) = s.current_location.clone().expect("a stop location");
+        assert_eq!(line, 17);
+        let worker = s
+            .threads
+            .iter()
+            .find(|(_, name)| name.contains("main.worker"))
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| panic!("the worker goroutine is listed: {:?}", s.threads));
+        assert!(
+            s.threads.iter().any(|(_, name)| name.contains("main.main")),
+            "{:?}",
+            s.threads
+        );
+        s.select_thread(worker);
+        poll_delve_until(&mut s, &mut output, |s| {
+            s.stack_frames
+                .iter()
+                .any(|f| f.name.contains("main.worker"))
+        });
+        let frame = s
+            .stack_frames
+            .iter()
+            .find(|f| f.name.contains("main.worker"))
+            .unwrap_or_else(|| panic!("the worker's own stack: {:?}", s.stack_frames));
+        assert_eq!(frame.line, 9, "parked on its channel receive");
+        assert!(
+            // `main.main.gowrap1` is the `go` statement's wrapper, part of the
+            // worker's stack; `main.main` itself is the other goroutine's.
+            s.stack_frames.iter().all(|f| f.name != "main.main"),
+            "the stack is the worker's, not main's: {:?}",
+            s.stack_frames
+        );
+        s.disconnect();
+    }
+
     #[test]
     fn run_to_cursor_stops_even_on_a_logpoint_line() {
         let src = PathBuf::from("/w/app.py");
