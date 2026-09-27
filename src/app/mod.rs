@@ -32639,7 +32639,8 @@ impl App {
         self.build_marker_checked = Some(now);
         let building = crate::update_watch::source_build_running(
             &croft_cache_dir(),
-            crate::update_watch::boot_time(),
+            crate::update_watch::boot_id,
+            crate::update_watch::boot_time,
             process_is_alive,
         );
         self.apply_source_build_state(building)

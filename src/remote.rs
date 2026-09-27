@@ -3503,20 +3503,33 @@ if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
 # cargo itself): a shell killed mid-build leaves cargo running as an orphan,
 # and the marker must keep naming it. Markers whose pid is gone are stale;
 # they are swept here, and croft ignores them and any from before a reboot.
+#
+# Which boot a marker belongs to is `building.<pid>.boot`, the kernel's
+# boot_id (#736): unlike boot time it does not move when the wall clock is
+# stepped. A sidecar rather than a second field, so a croft from before it,
+# which reads the marker as one pid, still pauses for this build.
 mkdir -p "$HOME/.cache/croft"
+CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
   [ -f "$CROFT_OLD" ] || continue
+  case "$CROFT_OLD" in
+    # Its marker sorts first, so a sidecar whose marker is gone is orphaned.
+    *.boot) [ -e "${{CROFT_OLD%.boot}}" ] || rm -f "$CROFT_OLD"; continue ;;
+  esac
   CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
-  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null; then
-    rm -f "$CROFT_OLD"
+  CROFT_OLD_BOOT=$(cat "$CROFT_OLD.boot" 2>/dev/null || true)
+  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null \
+    || {{ [ -n "$CROFT_OLD_BOOT" ] && [ -n "$CROFT_BOOT" ] && [ "$CROFT_OLD_BOOT" != "$CROFT_BOOT" ]; }}; then
+    rm -f "$CROFT_OLD" "$CROFT_OLD.boot"
   fi
 done
 CROFT_MARK="$HOME/.cache/croft/building.$$"
 CROFT_BUILD_PID=""
+if [ -n "$CROFT_BOOT" ]; then printf %s "$CROFT_BOOT" > "$CROFT_MARK.boot"; fi
 printf %s "$$" > "$CROFT_MARK"
 # Keep the marker while the compile outlives this shell; croft sees it go
 # stale the moment the compile ends.
-trap 'if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK"; fi' EXIT
+trap 'if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK" "$CROFT_MARK.boot"; fi' EXIT
 if [ -n "$CROFT_LIVE" ]; then
   # croft polls the marker once a second, and a server gets up to three
   # seconds to shut down cleanly: let both finish before the first rustc.
@@ -3536,7 +3549,7 @@ fi
 CROFT_BUILD_PID=$!
 printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
 wait "$CROFT_BUILD_PID"
-rm -f "$CROFT_MARK"
+rm -f "$CROFT_MARK" "$CROFT_MARK.boot"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
 "#,
@@ -5119,7 +5132,9 @@ Host !blocked *.internal
         );
         // The marker goes as soon as the compile does, so language servers
         // are not held back through the rest of the install.
-        let cleared = command.rfind("rm -f \"$CROFT_MARK\"").unwrap();
+        let cleared = command
+            .rfind("rm -f \"$CROFT_MARK\" \"$CROFT_MARK.boot\"")
+            .unwrap();
         assert!(cleared > install);
     }
 
@@ -5152,7 +5167,8 @@ Host !blocked *.internal
             "cargo",
             &format!(
                 "sleep 0.5\n\
-                 printf '%s %s' \"$$\" \"$(cat \"$HOME\"/.cache/croft/building.* 2>/dev/null)\" > \"{}\"\n\
+                 for f in \"$HOME\"/.cache/croft/building.*; do case \"$f\" in *.boot) b=$(cat \"$f\");; *) m=$(cat \"$f\");; esac; done\n\
+                 printf '%s %s %s' \"$$\" \"$m\" \"$b\" > \"{}\"\n\
                  exit {cargo_exit}",
                 dir.join("seen").display()
             ),
@@ -5191,7 +5207,18 @@ Host !blocked *.internal
         let tmp = tempfile::tempdir().unwrap();
         let (ok, seen) = run_install_script(tmp.path(), 0);
         assert!(ok, "the stubbed install must succeed");
-        let (own, marked) = seen.split_once(' ').expect("cargo ran and reported");
+        let mut fields = seen.splitn(3, ' ');
+        let (own, marked, boot) = (
+            fields.next().unwrap(),
+            fields.next().expect("cargo ran and reported"),
+            fields.next().unwrap_or_default(),
+        );
+        // #736: the marker carries the boot it was written in, where the
+        // host has one.
+        let host_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(boot.trim(), host_boot, "the marker's boot sidecar");
         assert_eq!(
             own, marked,
             "while cargo runs the marker must name cargo itself, so a killed \
@@ -5227,12 +5254,27 @@ Host !blocked *.internal
         // never alive.
         std::fs::write(cache.join("building.1"), std::process::id().to_string()).unwrap();
         std::fs::write(cache.join("building.2"), "2147483646").unwrap();
+        // #736: a live pid from another boot is someone else's process now,
+        // and an orphaned sidecar goes with nothing to describe.
+        let this_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+        if let Some(boot) = &this_boot {
+            std::fs::write(cache.join("building.1.boot"), boot.trim()).unwrap();
+            std::fs::write(cache.join("building.3"), std::process::id().to_string()).unwrap();
+            std::fs::write(cache.join("building.3.boot"), "another-boot").unwrap();
+        }
+        std::fs::write(cache.join("building.4.boot"), "orphan").unwrap();
         let (ok, _) = run_install_script(tmp.path(), 0);
         assert!(ok);
+        let mut left = leftover_markers(tmp.path());
+        left.sort();
+        let expect: Vec<String> = if this_boot.is_some() {
+            vec!["building.1".into(), "building.1.boot".into()]
+        } else {
+            vec!["building.1".into()]
+        };
         assert_eq!(
-            leftover_markers(tmp.path()),
-            vec![String::from("building.1")],
-            "only the live build's marker may survive another build"
+            left, expect,
+            "only the live build of this boot, and its sidecar, may survive another build"
         );
     }
 
