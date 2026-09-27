@@ -55060,6 +55060,102 @@ fn a_query_history_entry_reopens_its_results() {
     });
 }
 
+/// The phone loop (#359), end to end through the App: a proposal sends one
+/// notification whose Approve link carries the proposal's token, and that
+/// token, sent back the way `croft decide` sends it, answers the hook and
+/// closes the popup without a key pressed.
+#[test]
+fn an_approval_notifies_once_and_its_approve_token_answers_the_hook() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "let x = 1;\n").unwrap();
+    let out = tmp.path().join("notified");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.notifier = crate::notifications::Notifier::new(&[crate::prefs::NotificationSink {
+        kind: String::from("command"),
+        argv: vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            format!(
+                "printf '%s %s\\n' \"$CROFT_EVENT\" \"$CROFT_APPROVE_LINK\" >> '{}'",
+                out.display()
+            ),
+        ],
+        ..Default::default()
+    }]);
+    let sock = tmp.path().join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": "1", "new_string": "2"}),
+        cwd: tmp.path().into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    // Later passes do not notify it again.
+    app.drain_hook_requests();
+    app.drain_hook_requests();
+    let token = app.approvals[0].token.clone();
+    // One worker delivers in order, so once this sentinel lands, anything
+    // the passes above sent has landed too.
+    app.notifier.emit(
+        crate::notifications::Event::Osc9 {
+            pane: String::from("p"),
+            message: String::from("sentinel"),
+        },
+        tmp.path(),
+        "h",
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the notification",
+        || std::fs::read_to_string(&out).is_ok_and(|s| s.contains("osc9")),
+    );
+    let sent = std::fs::read_to_string(&out).unwrap();
+    let approvals: Vec<_> = sent
+        .lines()
+        .filter(|l| l.starts_with("approval_pending "))
+        .collect();
+    assert_eq!(approvals.len(), 1, "{sent}");
+    let (event, link) = approvals[0].split_once(' ').unwrap();
+    assert_eq!(event, "approval_pending");
+    let link = crate::deep_link::parse(link).unwrap();
+    assert_eq!(link.decide.as_ref().unwrap().token, token);
+    assert!(link.decide.as_ref().unwrap().allow);
+    assert_eq!(
+        link.path.as_deref(),
+        Some(tmp.path().to_str().unwrap()),
+        "the link names the workspace whose croft holds the edit"
+    );
+
+    let mut phone = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    writeln!(
+        phone,
+        "{}",
+        serde_json::json!({"decide": {"token": token, "allow": true}})
+    )
+    .unwrap();
+    assert!(app.drain_hook_requests());
+    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
+    let mut reply = String::new();
+    std::io::BufReader::new(phone)
+        .read_line(&mut reply)
+        .unwrap();
+    assert!(reply.contains("\"ok\":true"), "{reply}");
+    let mut line = String::new();
+    std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).unwrap(),
+        crate::agent_hook::Decision::Allow
+    );
+}
+
 /// Starting the tour while it runs keeps the first one: a second start
 /// would record the first tour's scratch project as the way home, and the
 /// user's own workspace would be lost when it ended.
