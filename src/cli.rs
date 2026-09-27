@@ -633,11 +633,11 @@ impl Cli {
                 crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
             }
             Some(CliCommand::Pr { number }) => {
-                let Some(n) = crate::pr_review::parse_pr_number(&number) else {
-                    eprintln!("croft pr: {number:?} is not a pull request number");
+                let Some(selector) = crate::pr_review::parse_pr_selector(&number) else {
+                    eprintln!("croft pr: {number:?} is not a pull request number or URL");
                     std::process::exit(2);
                 };
-                crate::pr_review::set_startup_pr(n);
+                crate::pr_review::set_startup_pr(selector);
                 let cwd = std::env::current_dir()?;
                 crate::app::run(cwd, None, None, false, Vec::new())
             }

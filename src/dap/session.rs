@@ -964,6 +964,9 @@ pub struct DapSession {
     /// value changes", and the `dataBreakpointInfo` requests in flight.
     pub data_breakpoints: Vec<(String, String)>,
     pending_data_info: std::collections::HashMap<i64, String>,
+    /// The session attached to a process croft did not start, so ending
+    /// it must leave that process running.
+    attached: bool,
 }
 
 impl DapSession {
@@ -1003,8 +1006,11 @@ impl DapSession {
     ) -> Result<DapSession> {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
         transport.send(initialize_request())?;
+        let attached = is_attach(&launch_request);
         transport.send(launch_request)?;
-        Ok(Self::new_with_transport(transport, breakpoints, None))
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = attached;
+        Ok(session)
     }
 
     /// Launch a vscode-js-debug session: spawn `node dapDebugServer.js <port>
@@ -1073,8 +1079,11 @@ impl DapSession {
         let transport =
             DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
         transport.send(initialize_request())?;
+        let attached = is_attach(&start_request);
         transport.send(start_request)?;
-        Ok(Self::new_with_transport(transport, breakpoints, None))
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = attached;
+        Ok(session)
     }
 
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
@@ -1107,6 +1116,7 @@ impl DapSession {
             run_to: None,
             data_breakpoints: Vec::new(),
             pending_data_info: std::collections::HashMap::new(),
+            attached: false,
         }
     }
 
@@ -1559,19 +1569,32 @@ impl DapSession {
 
     /// Ask the adapter to disconnect and terminate the debuggee. Sent to both the
     /// child (if any) and the parent so a js-debug server tears the whole tree
-    /// down, not just the target.
+    /// down, not just the target. An attached session leaves its process
+    /// running: croft did not start it, and delve and lldb-dap both honour
+    /// `terminateDebuggee` for an attach.
     pub fn disconnect(&mut self) {
-        let req = json!({
-            "type": "request",
-            "command": "disconnect",
-            "arguments": { "terminateDebuggee": true }
-        });
+        let req = disconnect_request(self.attached);
         if let Some(child) = self.child.as_ref() {
             let _ = child.send(req.clone());
         }
         let _ = self.transport.send(req);
         self.phase = SessionPhase::Terminated;
     }
+}
+
+/// Whether a start request attaches to a running process rather than
+/// launching one.
+fn is_attach(request: &Value) -> bool {
+    request["command"] == "attach"
+}
+
+/// `disconnect`, ending the debuggee only when the session launched it.
+fn disconnect_request(attached: bool) -> Value {
+    json!({
+        "type": "request",
+        "command": "disconnect",
+        "arguments": { "terminateDebuggee": !attached }
+    })
 }
 
 /// The `(name, value)` pairs inline values draw from (#135): every variable
@@ -1851,6 +1874,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn stopping_an_attached_session_leaves_its_process_running() {
+        let attach = json!({"type": "request", "command": "attach", "arguments": {"processId": 7}});
+        let launch = json!({"type": "request", "command": "launch", "arguments": {}});
+        assert!(is_attach(&attach));
+        assert!(!is_attach(&launch));
+        assert_eq!(
+            disconnect_request(is_attach(&attach))["arguments"]["terminateDebuggee"],
+            false
+        );
+        assert_eq!(
+            disconnect_request(is_attach(&launch))["arguments"]["terminateDebuggee"],
+            true
+        );
+    }
 
     #[test]
     fn inline_locals_prefer_local_scopes_and_fall_back_to_the_first() {

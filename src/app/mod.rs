@@ -1565,6 +1565,16 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What a pull request review tab's `gh` call is fetching (#365).
+enum PrGhJob {
+    /// The PR itself (`gh pr view`), by number or URL.
+    View { selector: String },
+    /// The whole patch, then the section for `path` opens.
+    Diff { path: String },
+    /// A failing check's log, for OUTPUT > PR Checks.
+    Log { name: String },
+}
+
 /// What a network git operation's worker hands back: the UI-thread half
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
@@ -3779,6 +3789,9 @@ pub struct App {
     review_nodes: std::collections::HashMap<u64, String>,
     review_verdict: Option<crate::review_threads::ReviewEvent>,
     review_gh: String,
+    /// The review tab's `gh` call in flight (#365): what it is for, and
+    /// where its answer arrives.
+    pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -3801,6 +3814,10 @@ pub struct App {
     /// read-only editor painted in place of the live one, which is never
     /// touched. `None` at the working tree.
     pub scrub_view: Option<crate::widgets::editor::Editor>,
+    /// The file `scrub_view` was built for. Switching tabs while scrubbing
+    /// rebuilds the view for the new file rather than showing the old one's
+    /// history over it.
+    scrub_for: Option<PathBuf>,
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
     scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
@@ -5555,12 +5572,14 @@ impl App {
             review_nodes: std::collections::HashMap::new(),
             review_verdict: None,
             review_gh: String::from("gh"),
+            pr_gh: None,
             review_tx,
             review_rx,
             recording: None,
             recorded_size: (0, 0),
             scrubber: None,
             scrub_view: None,
+            scrub_for: None,
             scrub_cache: std::collections::HashMap::new(),
             tour: None,
             tour_done: loaded_prefs.tour_done,
@@ -17094,6 +17113,9 @@ impl App {
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            if self.scrubber.is_some() && self.scrub_for != self.editor.path {
+                self.rebuild_scrub_view();
+            }
             let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
@@ -29779,6 +29801,12 @@ impl App {
     /// Start the guided tour (#377) in a fresh scratch project, never the
     /// user's workspace, and perform its first step.
     pub fn start_demo(&mut self) {
+        // A second start would record the first tour's scratch project as
+        // the workspace to return to, and the user's own would be lost.
+        if self.tour.is_some() {
+            self.status = String::from("The tour is already running (Esc leaves it)");
+            return;
+        }
         let tour = match crate::tour::Tour::parse(crate::tour::TOUR_JSON) {
             Ok(t) => t,
             Err(e) => {
@@ -30705,7 +30733,7 @@ impl App {
         let no_ssh_hosts = known.is_empty();
         // `localhost` and running containers can be named explicitly; `*`
         // still means the ssh hosts only (see `parse_request_with_groups`).
-        known.extend(crate::fleet::local_targets());
+        known.extend(crate::fleet::local_targets_in(command, &self.fleet_groups));
         if no_ssh_hosts
             && !crate::fleet::split_request(command).is_some_and(|(spec, _)| {
                 spec.split(',')
@@ -30800,12 +30828,11 @@ impl App {
                 if mark == "DIFFERS"
                     && let Some(reference) = reference.as_deref()
                 {
-                    let changed = crate::fleet::changed_lines(reference, &r.output);
-                    for (line, _) in r.output.lines().zip(changed).filter(|(_, c)| *c) {
+                    for line in crate::fleet::differing_lines(reference, &r.output) {
                         crate::output::push(
                             crate::output::CHANNEL_FLEET,
                             crate::output::OutputLevel::Info,
-                            &format!("    ≠ {line}"),
+                            &format!("    {line}"),
                         );
                     }
                 }
@@ -31284,6 +31311,7 @@ impl App {
     /// (commit, path), so stepping back and forth after the first visit
     /// costs no git process.
     fn rebuild_scrub_view(&mut self) {
+        self.scrub_for = self.editor.path.clone();
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.scrub_view = None;
             return;
@@ -50931,35 +50959,89 @@ impl App {
 
     /// The Review Pull Request prompt's answer.
     fn submit_pr_number(&mut self, input: &str) {
-        match crate::pr_review::parse_pr_number(input) {
-            Some(n) => self.start_pr_review(n),
+        match crate::pr_review::parse_pr_selector(input) {
+            Some(selector) => self.start_pr_review(selector),
             None => {
                 self.status = format!("{:?} is not a pull request number", input.trim());
             }
         }
     }
 
-    /// Fetch pull request `number` with `gh` and open it for review.
-    fn start_pr_review(&mut self, number: u64) {
+    /// Fetch the pull request `selector` names (a number, or its URL) with
+    /// `gh` and open it for review once it arrives.
+    fn start_pr_review(&mut self, selector: String) {
+        self.status = format!("Loading PR {selector}…");
+        let args = crate::pr_review::view_args(&selector);
+        self.spawn_pr_gh(PrGhJob::View { selector }, args);
+    }
+
+    /// Run one `gh` call for the review tab on a worker (#365): a slow
+    /// network or a large log never stalls input or redraws, and the call
+    /// is killed at [`crate::pr_review::GH_TIMEOUT`]. A newer call replaces
+    /// one still running, whose answer is then dropped.
+    fn spawn_pr_gh(&mut self, job: PrGhJob, args: Vec<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gh = self.review_gh.clone();
         let root = self.workspace_root().to_path_buf();
-        let out = std::process::Command::new("gh")
-            .args(crate::pr_review::view_args(number))
-            .current_dir(&root)
-            .output();
-        let pr = match out {
-            Ok(o) if o.status.success() => {
-                crate::pr_review::parse_pr(&String::from_utf8_lossy(&o.stdout))
-            }
-            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => Err(format!("could not run gh: {e}")),
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::pr_review::run_gh(
+                &gh,
+                &args,
+                &root,
+                crate::pr_review::GH_TIMEOUT,
+            ));
+        });
+        self.pr_gh = Some((job, rx));
+    }
+
+    /// Apply a finished review `gh` call. Returns true when it changed what
+    /// is on screen.
+    fn poll_pr_gh(&mut self) -> bool {
+        let Some((_, rx)) = self.pr_gh.as_ref() else {
+            return false;
         };
-        match pr {
-            Ok(pr) => {
-                let key = crate::pr_review::review_key(&pr);
-                self.open_pr_review(pr, key);
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("gh stopped without answering"))
             }
-            Err(why) => self.status = format!("Could not load PR #{number}: {why}"),
+        };
+        let Some((job, _)) = self.pr_gh.take() else {
+            return false;
+        };
+        match job {
+            PrGhJob::View { selector } => {
+                match result.and_then(|json| crate::pr_review::parse_pr(&json)) {
+                    Ok(pr) => {
+                        let key = crate::pr_review::review_key(&pr);
+                        self.open_pr_review(pr, key);
+                    }
+                    Err(why) => self.status = format!("Could not load PR {selector}: {why}"),
+                }
+            }
+            PrGhJob::Diff { path } => match result {
+                Ok(patch) => {
+                    let Some(view) = self.editor.pr_review.as_mut() else {
+                        return true;
+                    };
+                    view.diff = Some(crate::pr_review::split_diff_by_file(&patch));
+                    self.open_pr_diff_section(&path);
+                }
+                Err(why) => self.status = format!("gh pr diff failed: {why}"),
+            },
+            PrGhJob::Log { name } => {
+                let channel = "PR Checks";
+                crate::output::clear(channel);
+                // A failed fetch's reason goes where the log would have.
+                let text = result.unwrap_or_else(|why| why);
+                for line in text.lines() {
+                    crate::output::push(channel, crate::output::OutputLevel::Info, line);
+                }
+                self.status = format!("{name}: log in OUTPUT > {channel}");
+            }
         }
+        true
     }
 
     /// PULL REQUEST tab keys (#365).
@@ -51001,8 +51083,14 @@ impl App {
             }
             KeyCode::Char('l') => self.show_pr_check_log(),
             KeyCode::Char('r') => {
-                let n = view.pr.number;
-                self.start_pr_review(n);
+                // By URL, so a PR opened from another repository refreshes
+                // as itself.
+                let selector = if view.pr.url.is_empty() {
+                    view.pr.number.to_string()
+                } else {
+                    view.pr.url.clone()
+                };
+                self.start_pr_review(selector);
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 let n = view.pr.number;
@@ -51177,41 +51265,37 @@ impl App {
     }
 
     /// The selected file's section of the PR's patch, side by side. The
-    /// patch is fetched once per tab with `gh pr diff`.
+    /// patch is fetched once per tab with `gh pr diff`, off the UI thread.
     fn open_pr_file_diff(&mut self) {
-        let root = self.workspace_root().to_path_buf();
-        let Some(view) = self.editor.pr_review.as_mut() else {
+        let Some(view) = self.editor.pr_review.as_ref() else {
             return;
         };
         let Some(path) = view.selected_file().map(|f| f.path.clone()) else {
             return;
         };
-        if view.diff.is_none() {
-            let out = std::process::Command::new("gh")
-                .args(["pr", "diff", &view.pr.number.to_string()])
-                .current_dir(&root)
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {
-                    view.diff = Some(crate::pr_review::split_diff_by_file(
-                        &String::from_utf8_lossy(&o.stdout),
-                    ));
-                }
-                Ok(o) => {
-                    self.status = format!(
-                        "gh pr diff failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                    return;
-                }
-                Err(e) => {
-                    self.status = format!("could not run gh: {e}");
-                    return;
-                }
-            }
+        if view.diff.is_some() {
+            self.open_pr_diff_section(&path);
+            return;
         }
+        let selector = if view.pr.url.is_empty() {
+            view.pr.number.to_string()
+        } else {
+            view.pr.url.clone()
+        };
+        self.status = format!("Fetching the diff of PR #{}…", view.pr.number);
+        self.spawn_pr_gh(
+            PrGhJob::Diff { path },
+            vec![String::from("pr"), String::from("diff"), selector],
+        );
+    }
+
+    /// Open `path`'s section of the fetched patch in a diff tab.
+    fn open_pr_diff_section(&mut self, path: &str) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
         let n = view.pr.number;
-        let Some(section) = view.diff.as_ref().and_then(|d| d.get(&path)).cloned() else {
+        let Some(section) = view.diff.as_ref().and_then(|d| d.get(path)).cloned() else {
             self.status = format!("{path} has no textual diff (binary or too large)");
             return;
         };
@@ -51225,7 +51309,6 @@ impl App {
     /// Put the selected (or first failing) check's failing-step log in
     /// OUTPUT > PR Checks.
     fn show_pr_check_log(&mut self) {
-        let root = self.workspace_root().to_path_buf();
         let Some(view) = self.editor.pr_review.as_ref() else {
             return;
         };
@@ -51247,27 +51330,11 @@ impl App {
             );
             return;
         };
-        let out = std::process::Command::new("gh")
-            .args(crate::pr_review::log_args(run, job))
-            .current_dir(&root)
-            .output();
-        let channel = "PR Checks";
-        match out {
-            Ok(o) => {
-                crate::output::clear(channel);
-                let text = String::from_utf8_lossy(if o.status.success() {
-                    &o.stdout
-                } else {
-                    &o.stderr
-                })
-                .into_owned();
-                for line in text.lines() {
-                    crate::output::push(channel, crate::output::OutputLevel::Info, line);
-                }
-                self.status = format!("{}: log in OUTPUT > {channel}", check.name);
-            }
-            Err(e) => self.status = format!("could not run gh: {e}"),
-        }
+        self.status = format!("Fetching the log of {}…", check.name);
+        self.spawn_pr_gh(
+            PrGhJob::Log { name: check.name },
+            crate::pr_review::log_args(run, job),
+        );
     }
 
     /// Open the selected SARIF result's primary location, keeping the viewer
@@ -57263,8 +57330,8 @@ pub fn run(
     app.start_drift_probe_if_local();
     app.start_update_check_if_local();
     // `croft pr <n>` (#365): open the review once the app is up.
-    if let Some(n) = crate::pr_review::take_startup_pr() {
-        app.start_pr_review(n);
+    if let Some(selector) = crate::pr_review::take_startup_pr() {
+        app.start_pr_review(selector);
     }
     // `croft demo` (#377): start the tour once the app is up.
     if crate::tour::take_startup_demo() {
@@ -57888,7 +57955,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests();
+        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();

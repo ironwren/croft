@@ -263,6 +263,13 @@ impl NotebookRun {
         for event in std::mem::take(&mut self.backlog) {
             let (id, edit) = match event {
                 Event::Ready { display, .. } => {
+                    // A second Ready is a restart: the old kernel will never
+                    // finish what it had, so nothing still pending can
+                    // complete. The bridge settles those cells first; this
+                    // is the backstop if it could not.
+                    if self.kernel.is_some() {
+                        self.pending.clear();
+                    }
                     notes.push(format!("Kernel ready: {display}"));
                     self.kernel = Some(display);
                     continue;
@@ -645,5 +652,31 @@ mod tests {
         assert!(text.is_none());
         assert_eq!(notes, vec!["Kernel: no Python".to_string()]);
         assert!(run.running_indices().is_empty());
+    }
+
+    #[test]
+    fn a_restart_settles_cells_the_old_kernel_was_running() {
+        let mut run = run_without_kernel();
+        let ready = || Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3".into(),
+        };
+        run.backlog = vec![ready()];
+        run.fold(NB);
+        run.execute(code_cell(NB, 1).unwrap());
+        assert_eq!(run.running_indices(), vec![1]);
+        // The restarted kernel announces itself; the old one never answers.
+        run.backlog = vec![ready()];
+        run.fold(NB);
+        assert!(
+            run.running_indices().is_empty(),
+            "no cell stays at In [*] across a restart"
+        );
+        // The first Ready of a run is not a restart: it clears nothing.
+        let mut fresh = run_without_kernel();
+        fresh.execute(code_cell(NB, 1).unwrap());
+        fresh.backlog = vec![ready()];
+        fresh.fold(NB);
+        assert_eq!(fresh.running_indices(), vec![1]);
     }
 }
