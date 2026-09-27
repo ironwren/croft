@@ -101,11 +101,16 @@ arrival order, and the title counts the ones waiting (`· 2 pending`).
 | `Enter` | approve |
 | `Esc` | deny |
 | `r` | deny with a reason: type it, `Enter` sends it to the agent, `Esc` goes back |
+| `e` | edit, then approve: the proposed file opens as a scratch tab; saving it approves your version, closing it unsaved returns to the popup |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | scroll the diff |
 
 For its first 400 ms the popup ignores keys, so an `Enter` meant for the pane
 you were typing in cannot approve an edit you have not seen. Approving only
 answers the agent, which then makes the edit itself; croft writes nothing.
+An edited approval goes back as Claude Code's `updatedInput`, in the shape the
+tool already takes. A `Write` carries your text as its content. An `Edit` becomes
+one replacement of the file's current text with yours. An `Edit` of an empty
+file cannot carry an edited version, so `e` refuses it.
 If an edit can't be worked out against the file on disk (its text is missing,
 or ambiguous without `replace_all`), croft answers `ask` without showing the
 popup. A proposal still waiting when the hook's 120 s run out leaves the
