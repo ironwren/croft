@@ -57093,3 +57093,87 @@ fn sarif_export_writes_the_visible_results_as_sarif_or_csv() {
     let csv = std::fs::read_to_string(tmp.path().join("out.csv")).unwrap();
     assert!(csv.starts_with("rule,level,file"), "{csv}");
 }
+
+#[test]
+fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
+    // #371: while scrubbing, the Outline lists the file as it was at the
+    // commit on screen, the breadcrumbs follow the historical caret, a
+    // symbol jump lands in the history, and leaving brings the live
+    // outline back.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    let file = tmp.path().join("lib.rs");
+    std::fs::write(&file, "fn alpha() {\n    let a = 1;\n}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "alpha"]);
+    std::fs::write(
+        &file,
+        "fn beta() {\n}\n\nfn alpha() {\n    let a = 1;\n}\n\nfn gamma() {\n}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "beta and gamma"]);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    let names = |app: &App| -> Vec<String> {
+        app.outline
+            .symbols()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    };
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "control: live outline"
+    );
+
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "HEAD");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    app.sync_outline();
+    assert_eq!(names(&app), ["alpha"], "the commit's outline");
+
+    // A jump to `alpha` lands in the historical view, where it is line 0,
+    // and the breadcrumbs name it from there.
+    let target = app.outline.jump_target(0).unwrap().1;
+    assert!(app.jump_in_scrub_view(target));
+    assert_eq!(app.scrub_view.as_ref().unwrap().cursor_row, 0);
+    app.editor.cursor_row = 7; // the live caret, inside `gamma`
+    let crumbs: Vec<String> = app
+        .build_breadcrumbs()
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert_eq!(
+        crumbs.last().map(String::as_str),
+        Some("alpha"),
+        "{crumbs:?}"
+    );
+
+    assert!(
+        app.handle_scrubber_key(KeyCode::Home),
+        "back to the working tree"
+    );
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "the live outline is back"
+    );
+    assert!(!app.jump_in_scrub_view(0), "no history on screen");
+}

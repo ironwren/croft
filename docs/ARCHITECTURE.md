@@ -572,6 +572,8 @@ Moves through a branch's history. This is the cursor behind "Source Control: Scr
 
 **`Position::Working` is a variant, not `Option::None`.** An `Option` over a commit index invites "nothing selected" and "back at the working tree" to be the same value, and the second is where the user started.
 
+**The Outline and breadcrumbs follow the commit.** While a commit is on screen, `sync_outline` fills the Outline from that version's own syntax tree, recomputed once per step (keyed by file and commit). No language server has seen that text. The breadcrumbs read the historical view's caret, and an Outline or breadcrumb jump lands in the historical view through `jump_in_scrub_view` rather than moving the hidden live buffer. Leaving drops the key, and the live outline is recomputed.
+
 **The key hook sits below every modal guard in `handle_key_inner`.** A palette, prompt or picker opened while scrubbing keeps its own arrows. This holds by construction: each of those returns unconditionally, so a key only reaches the scrubber when none of them wanted it.
 
 **Fed by `git::branch_history` (`--first-parent HEAD`), not `commit_graph`.** The commit graph's `--branches --tags` ref set exists to draw the repo-wide graph. With any other branch present, index 0 there is whatever topological order put first rather than HEAD.
