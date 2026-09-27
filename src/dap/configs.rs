@@ -687,9 +687,15 @@ pub struct ResolvedConfig {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub pre_launch_task: Option<String>,
+    /// The task to run when this configuration's debug run ends (#250),
+    /// by the user stopping it or the debuggee finishing, not on relaunch.
+    pub post_debug_task: Option<String>,
     pub stop_on_entry: bool,
     pub port: Option<u16>,
     pub process_id: Option<i64>,
+    /// `"processId": "${command:pickProcess}"` (#250): the user chooses the
+    /// process at launch, so `process_id` is `None` until they have.
+    pub pick_process: bool,
     pub extra: Map<String, Value>,
 }
 
@@ -705,6 +711,7 @@ const MAPPED_KEYS: &[&str] = &[
     "envFile",
     "cwd",
     "preLaunchTask",
+    "postDebugTask",
     "stopOnEntry",
     "port",
     "processId",
@@ -724,7 +731,19 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
             cfg.name, cfg.type_name
         )
     })?;
-    let raw = Value::Object(cfg.raw.clone());
+    // `${command:pickProcess}` is not a substitution but a request for a
+    // picker at launch (#250), so it is taken out before substitution would
+    // reject it as an unknown variable.
+    let mut raw_obj = cfg.raw.clone();
+    let pick_process = raw_obj
+        .get("processId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some("${command:pickProcess}");
+    if pick_process {
+        raw_obj.remove("processId");
+    }
+    let raw = Value::Object(raw_obj);
     let raw = substitute_value(&raw, ctx).map_err(|e| format!("config \"{}\": {e}", cfg.name))?;
     let obj = raw.as_object().expect("substitution preserves the object");
 
@@ -782,14 +801,33 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         env,
         cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
         pre_launch_task: get_str("preLaunchTask"),
+        post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         port,
         process_id,
+        pick_process,
         extra,
     })
+}
+
+/// The current user's processes as `(pid, command name)` from
+/// `ps -x -o pid=,comm=` output (BSD-style flags, which both macOS and
+/// procps accept), for the attach picker (#250). `skip` (croft's own pid) is
+/// left out: attaching a debugger to the editor running it would freeze it.
+pub fn parse_ps_processes(output: &str, skip: i64) -> Vec<(i64, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (pid, comm) = line.split_once(char::is_whitespace)?;
+            let pid: i64 = pid.parse().ok()?;
+            let comm = comm.trim();
+            (pid != skip && !comm.is_empty()).then(|| (pid, comm.to_string()))
+        })
+        .collect()
 }
 
 /// Resolve a possibly-relative path against the workspace folder (VS Code
@@ -1108,6 +1146,39 @@ mod tests {
         assert!(err.contains("go"), "the supported list names go: {err}");
     }
 
+    /// `${command:pickProcess}` asks for a picker at launch (#250) rather
+    /// than failing as an unknown variable; a literal pid is unchanged.
+    #[test]
+    fn pick_process_resolves_to_a_picker_request_not_an_error() {
+        let cfg = config(
+            r#"[{ "name": "Attach", "type": "lldb", "request": "attach",
+                 "processId": "${command:pickProcess}" }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).expect("pickProcess resolves");
+        assert!(rc.pick_process);
+        assert_eq!(rc.process_id, None);
+        assert!(!rc.extra.contains_key("processId"));
+
+        let cfg = config(
+            r#"[{ "name": "Attach", "type": "lldb", "request": "attach", "processId": 4242 }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(!rc.pick_process);
+        assert_eq!(rc.process_id, Some(4242));
+    }
+
+    #[test]
+    fn ps_output_parses_to_pids_and_names_without_our_own() {
+        let out = "  101 /usr/bin/zsh\n  202 server\n\n  303 croft\n bad line\n  404 \n";
+        assert_eq!(
+            parse_ps_processes(out, 303),
+            vec![
+                (101, String::from("/usr/bin/zsh")),
+                (202, String::from("server"))
+            ]
+        );
+    }
+
     #[test]
     fn substitutes_workspace_and_file_variables() {
         let c = ctx();
@@ -1169,6 +1240,7 @@ mod tests {
                 "env": { "MODE": "dev", "RETRIES": 3 },
                 "cwd": "${workspaceFolder}",
                 "preLaunchTask": "build",
+                "postDebugTask": "cleanup",
                 "stopOnEntry": true,
                 "justMyCode": true,
                 "subProcess": "${workspaceFolderBasename}"
@@ -1181,6 +1253,9 @@ mod tests {
         assert_eq!(rc.env["RETRIES"], "3");
         assert_eq!(rc.cwd.as_deref(), Some(Path::new("/work/proj")));
         assert_eq!(rc.pre_launch_task.as_deref(), Some("build"));
+        // A mapped key, so croft runs it rather than handing it to the adapter.
+        assert_eq!(rc.post_debug_task.as_deref(), Some("cleanup"));
+        assert!(!rc.extra.contains_key("postDebugTask"));
         assert!(rc.stop_on_entry);
         // Unmapped fields survive, substituted, for verbatim passthrough.
         assert_eq!(rc.extra["justMyCode"], json!(true));
