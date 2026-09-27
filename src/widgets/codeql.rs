@@ -231,6 +231,15 @@ impl CodeqlPanel {
         }
     }
 
+    /// The index into `queries` of the pack whose line, or one of whose
+    /// query rows, is selected.
+    pub fn selected_pack(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::TogglePack(p) | Action::RunQuery(p, _))) => Some(p),
+            _ => None,
+        }
+    }
+
     /// Every line the panel paints, top to bottom.
     pub fn lines(&self) -> Vec<Line> {
         let mut out = Vec::new();
@@ -766,7 +775,11 @@ mod tests {
                 .any(|l| matches!(l, Line::Action(Action::RunQuery(..), _)))
         );
         p.toggle_pack(0);
+        assert_eq!(p.selected_pack(), Some(0));
         p.move_selection(true);
         assert_eq!(p.selected_hit(), Some(Hit::Action(Action::RunQuery(0, 0))));
+        assert_eq!(p.selected_pack(), Some(0), "a query row is in its pack");
+        p.toggle(Section::Queries);
+        assert_eq!(p.selected_pack(), None);
     }
 }
