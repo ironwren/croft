@@ -77,6 +77,27 @@ impl Tour {
     }
 }
 
+static CUSTOM_TOUR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `croft demo --tour <file>`: run this tour instead of the built-in one,
+/// in the same sample project. Checked with [`Tour::parse`] before the app
+/// starts, so a bad file is refused at the command line.
+pub fn set_custom_tour(json: String) {
+    if let Ok(mut slot) = CUSTOM_TOUR.lock() {
+        *slot = Some(json);
+    }
+}
+
+/// The tour to run: the one `--tour` named for this session, else the
+/// built-in one.
+pub fn tour_source() -> String {
+    CUSTOM_TOUR
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| TOUR_JSON.to_string())
+}
+
 static STARTUP_DEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `croft demo` asks for the tour here before the app starts.

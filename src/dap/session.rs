@@ -493,6 +493,31 @@ pub fn thread_request(command: &str, thread_id: i64) -> Value {
     })
 }
 
+/// Build a `threads` request: every thread the debuggee has.
+pub fn threads_request() -> Value {
+    json!({ "type": "request", "command": "threads" })
+}
+
+/// The `(id, name)` pairs of a `threads` response.
+pub fn parse_threads(msg: &Value) -> Vec<(i64, String)> {
+    msg.pointer("/body/threads")
+        .and_then(Value::as_array)
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("id")?.as_i64()?,
+                        t.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build a `stackTrace` request for the full call stack of `thread_id`. Omitting
 /// `levels` asks the adapter for every frame (debugpy returns the whole stack),
 /// which powers the Call Stack panel; the top frame still drives the stop-line.
@@ -920,6 +945,9 @@ pub struct DapSession {
     breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     /// Thread id reported by the most recent `stopped` event.
     pub stopped_thread: Option<i64>,
+    /// Every thread (goroutine, under delve) at the last stop, as `(id,
+    /// name)` in the adapter's order (#264). Refreshed at each stop.
+    pub threads: Vec<(i64, String)>,
     /// File + 1-based line the debugger is paused on, resolved from the
     /// `stackTrace` response that follows each `stopped` event. Cleared on
     /// resume/terminate.
@@ -1101,6 +1129,7 @@ impl DapSession {
             phase: SessionPhase::Initializing,
             breakpoints,
             stopped_thread: None,
+            threads: Vec::new(),
             current_location: None,
             unverified_breakpoints: BTreeMap::new(),
             stack_frames: Vec::new(),
@@ -1171,6 +1200,19 @@ impl DapSession {
         self.variables.clear();
         self.selected_frame = None;
         self.pending_var_refs.clear();
+    }
+
+    /// Show another thread's stack (#264): a goroutine other than the one
+    /// that hit the breakpoint. Stepping then applies to it, as in VS Code.
+    /// Only while stopped: a running thread has no stack to show.
+    pub fn select_thread(&mut self, thread_id: i64) {
+        if self.phase != SessionPhase::Stopped || self.stopped_thread == Some(thread_id) {
+            return;
+        }
+        self.stopped_thread = Some(thread_id);
+        self.known_thread = Some(thread_id);
+        self.clear_inspection();
+        let _ = self.active().send(stack_trace_request(thread_id));
     }
 
     /// Load scopes for `frame_id` and fetch each scope's variables. Called when a
@@ -1282,6 +1324,10 @@ impl DapSession {
                         let top_id = top.id;
                         self.load_frame(top_id);
                     }
+                    out.push(DapEvent::InspectionUpdated);
+                }
+                Some("threads") => {
+                    self.threads = parse_threads(&msg);
                     out.push(DapEvent::InspectionUpdated);
                 }
                 Some("scopes") => {
@@ -1412,6 +1458,7 @@ impl DapSession {
                 self.phase = SessionPhase::Stopped;
                 self.clear_inspection();
                 let _ = self.active().send(stack_trace_request(*thread_id));
+                let _ = self.active().send(threads_request());
             }
             DapEvent::Continued => {
                 self.phase = SessionPhase::Running;
@@ -2355,6 +2402,79 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("timed out; requests so far: {:?}", requests(log));
+    }
+
+    /// #264 against a fake adapter with two goroutines: a stop lists both,
+    /// selecting the other shows its own stack, and an attached session's
+    /// disconnect leaves the process running.
+    #[test]
+    fn goroutines_list_and_select_and_an_attach_disconnects_softly() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let script = FAKE_DAP.replace(
+            "    elif c == \"disconnect\":",
+            r#"    elif c == "threads":
+        reply(req, {"threads": [{"id": 1, "name": "main"}, {"id": 7, "name": "worker"}]})
+    elif c == "stackTrace":
+        tid = req["arguments"]["threadId"]
+        name = "main.run" if tid == 1 else "main.work"
+        reply(req, {"stackFrames": [{"id": tid * 100, "name": name, "line": tid,
+                    "source": {"path": "/w/main.go"}}]})
+    elif c == "disconnect":"#,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "attach", "arguments": {"processId": 77}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (session.threads.len() < 2 || session.stack_frames.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            session.threads,
+            vec![(1, String::from("main")), (7, String::from("worker"))]
+        );
+        assert_eq!(session.stack_frames[0].name, "main.run");
+
+        session.select_thread(7);
+        assert_eq!(session.stopped_thread, Some(7));
+        while session.stack_frames.is_empty() && std::time::Instant::now() < deadline {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            session.stack_frames[0].name, "main.work",
+            "the goroutine's own stack"
+        );
+
+        session.disconnect();
+        poll_until(&mut session, &log, |r| {
+            r.iter().any(|q| q["command"] == "disconnect")
+        });
+        let disc = requests(&log)
+            .into_iter()
+            .find(|q| q["command"] == "disconnect")
+            .unwrap();
+        assert_eq!(
+            disc["arguments"]["terminateDebuggee"], false,
+            "croft did not start it"
+        );
     }
 
     /// #611 end to end against a fake adapter: function breakpoints and hit

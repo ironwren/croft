@@ -128,6 +128,62 @@ pub fn parse_pr_selector(input: &str) -> Option<String> {
     }
 }
 
+/// `gh pr list` for the Review Pull Request picker: the open PRs, newest
+/// first, with what a row shows.
+pub fn list_args() -> Vec<String> {
+    [
+        "pr",
+        "list",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,author,url,isDraft",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// One open pull request as the picker lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrListItem {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub url: String,
+    pub draft: bool,
+}
+
+/// Parse `gh pr list --json number,title,author,url,isDraft`.
+pub fn parse_pr_list(json: &str) -> Result<Vec<PrListItem>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let items = v.as_array().ok_or("gh pr list did not return a list")?;
+    Ok(items
+        .iter()
+        .filter_map(|it| {
+            Some(PrListItem {
+                number: it.get("number")?.as_u64()?,
+                title: it
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                author: it
+                    .pointer("/author/login")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                url: it
+                    .get("url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                draft: it.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
 /// How long one `gh` call may take before it is killed and reported: a
 /// slow network or a large log must not hang the review for good.
 pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -619,6 +675,27 @@ mod tests {
         assert_eq!(sel("abc"), None);
         assert_eq!(sel(""), None);
         assert_eq!(sel("#0"), None, "no PR zero");
+    }
+
+    #[test]
+    fn open_prs_parse_for_the_picker() {
+        let items = parse_pr_list(
+            r#"[{"number": 7, "title": "Fix it", "author": {"login": "ada"}, "url": "https://github.com/o/r/pull/7", "isDraft": true},
+                {"title": "no number"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            items,
+            vec![PrListItem {
+                number: 7,
+                title: "Fix it".into(),
+                author: "ada".into(),
+                url: "https://github.com/o/r/pull/7".into(),
+                draft: true,
+            }]
+        );
+        assert!(parse_pr_list("{}").is_err());
+        assert!(list_args().contains(&String::from("number,title,author,url,isDraft")));
     }
 
     #[test]

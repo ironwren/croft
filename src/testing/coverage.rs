@@ -124,6 +124,38 @@ impl Coverage {
         let total = self.files.values().map(|f| f.hits.len()).sum();
         percent(covered, total)
     }
+
+    /// The run as text, one file per line, least covered first (the files
+    /// that need tests lead), paths relative to `root` where they can be.
+    /// Files with no executable lines are left out.
+    pub fn report(&self, root: &Path) -> String {
+        let mut rows: Vec<(f64, usize, usize, String)> = self
+            .files
+            .iter()
+            .filter_map(|(path, f)| {
+                let pct = f.percent()?;
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                Some((pct, f.covered(), f.hits.len(), name))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.3.cmp(&b.3)));
+        let total: usize = rows.iter().map(|r| r.2).sum();
+        let mut out = match self.percent() {
+            Some(pct) => format!("Coverage: {pct:.1}% of {total} lines\n\n"),
+            None => String::from("Coverage: no executable lines reported\n"),
+        };
+        for (pct, covered, lines, name) in rows {
+            out.push_str(&format!(
+                "{pct:>6.1}%  {:>11}  {name}\n",
+                format!("{covered}/{lines}")
+            ));
+        }
+        out
+    }
 }
 
 /// One file's coverage as the editor paints it: 0-based logical lines,
@@ -155,6 +187,25 @@ impl Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_report_lists_files_least_covered_first() {
+        let lcov = "SF:src/a.rs\nDA:1,1\nDA:2,1\nend_of_record\nSF:src/b.rs\nDA:1,0\nDA:2,1\nDA:3,0\nDA:4,0\nend_of_record\n";
+        let cov = Coverage::from_lcov(lcov, Path::new("/w"));
+        let report = cov.report(Path::new("/w"));
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "Coverage: 50.0% of 6 lines");
+        assert!(
+            lines[2].ends_with("src/b.rs")
+                && lines[2].contains("25.0%")
+                && lines[2].contains("1/4"),
+            "{report}"
+        );
+        assert!(
+            lines[3].ends_with("src/a.rs") && lines[3].contains("100.0%"),
+            "{report}"
+        );
+    }
 
     const LCOV: &str = "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nDA:3,4\nBRDA:3,0,0,2\nBRDA:3,0,1,0\nDA:5,1\nBRDA:5,0,0,1\nBRDA:5,0,1,-\nLF:4\nLH:3\nend_of_record\nSF:/abs/b.rs\nDA:10,0\nDA:11,0\nend_of_record\n";
 
