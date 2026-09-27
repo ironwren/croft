@@ -53786,6 +53786,48 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// Wait for the history scrubber's finished view of where it stands to
+/// replace the plain stand-in (#371); the builder runs on its own thread.
+fn settle_scrub_view(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !matches!(app.scrub_view_key, Some((_, true))) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubber's view was never built"
+        );
+        app.drain_scrub_views();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stepping_back_to_a_finished_scrub_view_reuses_it() {
+    // #371: a step never waits on highlighting, and a commit whose view was
+    // already built shows it at once rather than building it again.
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Right), "back to HEAD");
+    assert!(
+        matches!(app.scrub_view_key, Some((_, true))),
+        "HEAD's finished view was kept"
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1", "v2", "v3"]
+    );
+    // Home drops the view; Esc drops the kept ones with the builder.
+    assert!(app.handle_scrubber_key(KeyCode::Home));
+    assert!(app.scrub_view.is_none() && app.scrub_view_key.is_none());
+    assert!(app.handle_scrubber_key(KeyCode::Esc));
+    assert!(app.scrub_views.is_empty() && app.scrub_builder.is_none());
+}
+
 #[test]
 fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     // #371: at each position the editor shows the file at that commit, and
@@ -53795,6 +53837,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     app.editor.open(&repo.path().join("a.txt")).unwrap();
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
     assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
     assert_eq!(
@@ -53803,6 +53846,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     );
     assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
     assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1", "v2"]);
     assert_eq!(
@@ -53810,6 +53854,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         Some(crate::widgets::editor::GitMark::Added)
     );
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1"]);
     assert_eq!(
@@ -57709,4 +57754,49 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
         assert!(text.contains(section), "{text}");
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+}
+
+/// #371's criterion, measured: after a warm-up pass, holding an arrow key
+/// back across up to 200 commits of this repository's own
+/// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
+/// frame it paints. Highlighting that file takes over half a second, so a
+/// step shows the plain text the builder already split and swaps the
+/// finished view in behind it. Needs this checkout's history, so it is
+/// ignored by default.
+#[test]
+#[ignore]
+fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/app/mod.rs")).unwrap();
+    app.scrub_history();
+    let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
+    assert!(steps > 20, "only {steps} commits to scrub");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // A held arrow key repeats about 30 times a second; between repeats the
+    // main loop takes in what the builder produced.
+    let repeat = std::time::Duration::from_millis(33);
+    // Warm-up, as the criterion allows: one pass reads every version.
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        app.handle_scrubber_key(KeyCode::Left);
+    }
+    app.handle_scrubber_key(KeyCode::Home);
+    let mut times = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        let t = std::time::Instant::now();
+        app.handle_scrubber_key(KeyCode::Left);
+        term.draw(|f| app.render(f)).unwrap();
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let p95 = times[times.len() * 95 / 100];
+    let max = *times.last().unwrap();
+    eprintln!("{steps} steps: p50 {p50:?} p95 {p95:?} max {max:?}");
+    assert!(p95 < std::time::Duration::from_millis(16), "p95 {p95:?}");
 }

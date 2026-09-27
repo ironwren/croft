@@ -4080,7 +4080,33 @@ impl Editor {
         e.set_git_head_lines(path.to_path_buf(), Some(baseline));
         // Never edited, so the marks are computed once, here.
         e.refresh_git_marks();
+        e.warm_render_caches();
         e
+    }
+
+    /// [`Self::historical`] without the expensive parts: the text alone, no
+    /// highlighting and no gutter marks. What the history scrubber shows for
+    /// the frame or two until the full view is built off the UI thread
+    /// (#371); cheap enough for every step of a held arrow key.
+    pub fn historical_plain(path: &Path, text: &str) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.highlights = vec![Vec::new(); e.lines.len()];
+        e.warm_render_caches();
+        e
+    }
+
+    /// Fill the whole-buffer caches a first paint would otherwise compute
+    /// (fold tables, conflict markers, the widest line), so a view built on
+    /// another thread (#371) costs the UI thread only its visible rows.
+    fn warm_render_caches(&mut self) {
+        self.refresh_fold_tables();
+        self.conflicts();
+        self.content_cols();
     }
 
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
@@ -12805,6 +12831,11 @@ fn follow_moved_bookmark_lines(
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
 pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
+    // Most text has no `\r` at all; skip the two whole-text copies that
+    // normalising would make (#371 splits a 35k-line file per scrub step).
+    if !text.contains('\r') {
+        return text.lines().map(str::to_string).collect();
+    }
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())
