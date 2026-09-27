@@ -66,12 +66,26 @@ pub enum Action {
     SelectDatabase(usize),
     /// Step the Databases list to its next sort order.
     SortDatabases,
+    /// Step the Query History list to its next sort order.
+    SortHistory,
     /// Open the results of the query history entry at this index.
     OpenHistory(usize),
     /// Fold or unfold the query pack at this index of `queries`.
     TogglePack(usize),
     /// Run query `.1` of pack `.0` on the current database.
     RunQuery(usize, usize),
+    /// Variant analysis list `.0`: select it, or fold it once selected.
+    VariantList(usize),
+    /// Select repository `.1` of variant analysis list `.0`, or of the
+    /// single repositories.
+    VariantRepo(Option<usize>, usize),
+    /// Select the variant analysis owner at this index.
+    VariantOwner(usize),
+    AddVariantRepo,
+    AddVariantList,
+    AddVariantOwner,
+    /// Open the variant analysis config file in an editor tab.
+    OpenVariantConfig,
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -135,12 +149,22 @@ pub struct CodeqlPanel {
     pub current_db: Option<usize>,
     /// The order the store keeps the databases in, shown on the sort row.
     pub db_sort: Option<crate::codeql_db::DbSort>,
-    /// Query history labels, newest first (#578).
+    /// Query history labels, in the store's order (#578).
     pub history: Vec<String>,
+    /// The order the store keeps the history in, shown on the sort row.
+    pub history_sort: crate::codeql_query::HistSort,
     /// The workspace's queries by pack, from the last discovery.
     pub queries: Vec<crate::codeql_query::QueryPack>,
     /// Folded packs, by folder, so a fold survives rediscovery.
     pub folded_packs: std::collections::HashSet<std::path::PathBuf>,
+    /// The controller repository and the repositories variant analysis
+    /// runs against, from the last load of their config.
+    pub variant: crate::codeql_variant::VariantConfig,
+    /// The variant analysis config file could not be read; the section
+    /// says so instead of showing an empty config.
+    pub variant_error: bool,
+    /// Folded variant analysis lists, by name.
+    pub folded_lists: std::collections::HashSet<String>,
 }
 
 impl CodeqlPanel {
@@ -191,6 +215,25 @@ impl CodeqlPanel {
         }
     }
 
+    /// The store index of the query history entry whose row is selected.
+    pub fn selected_history(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::OpenHistory(i))) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on history entry `index`'s row, when it shows.
+    pub fn select_history(&mut self, index: usize) {
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::OpenHistory(i), _) if *i == index))
+        {
+            self.selected = n;
+        }
+    }
+
     /// Fold or unfold a query pack, keeping the selection on its line.
     pub fn toggle_pack(&mut self, pack: usize) {
         let Some(dir) = self.queries.get(pack).map(|p| p.dir.clone()) else {
@@ -205,6 +248,157 @@ impl CodeqlPanel {
             .position(|l| matches!(l, Line::Action(Action::TogglePack(p), _) if *p == pack))
         {
             self.selected = n;
+        }
+    }
+
+    /// The index into `queries` of the pack whose line, or one of whose
+    /// query rows, is selected.
+    pub fn selected_pack(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::TogglePack(p) | Action::RunQuery(p, _))) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The variant analysis entry whose row is selected.
+    pub fn selected_variant_item(&self) -> Option<crate::codeql_variant::Item> {
+        use crate::codeql_variant::Item;
+        match self.selected_hit() {
+            Some(Hit::Action(Action::VariantList(i))) => Some(Item::List(i)),
+            Some(Hit::Action(Action::VariantRepo(l, j))) => Some(Item::Repo(l, j)),
+            Some(Hit::Action(Action::VariantOwner(i))) => Some(Item::Owner(i)),
+            _ => None,
+        }
+    }
+
+    /// The list whose line, or one of whose repositories, is selected: where
+    /// an added repository goes.
+    pub fn selected_variant_list(&self) -> Option<usize> {
+        use crate::codeql_variant::Item;
+        match self.selected_variant_item() {
+            Some(Item::List(i) | Item::Repo(Some(i), _)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on `item`'s row, when it shows.
+    pub fn select_variant_item(&mut self, item: crate::codeql_variant::Item) {
+        use crate::codeql_variant::Item;
+        let action = match item {
+            Item::List(i) => Action::VariantList(i),
+            Item::Repo(l, j) => Action::VariantRepo(l, j),
+            Item::Owner(i) => Action::VariantOwner(i),
+        };
+        self.select_action(action);
+    }
+
+    /// Put the selection on `action`'s row, when it shows.
+    pub fn select_action(&mut self, action: Action) {
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(a, _) if *a == action))
+        {
+            self.selected = n;
+        }
+    }
+
+    /// Fold or unfold variant analysis list `list`, keeping the selection
+    /// on its line.
+    pub fn toggle_variant_list(&mut self, list: usize) {
+        let Some(name) = self.variant.lists.get(list).map(|l| l.name.clone()) else {
+            return;
+        };
+        if !self.folded_lists.remove(&name) {
+            self.folded_lists.insert(name);
+        }
+        self.select_variant_item(crate::codeql_variant::Item::List(list));
+    }
+
+    /// The section the selected row is in.
+    pub fn selected_section(&self) -> Option<Section> {
+        let lines = self.lines();
+        let end = self.selected.min(lines.len().saturating_sub(1));
+        lines[..=end].iter().rev().find_map(|l| match l {
+            Line::Header(s) => Some(*s),
+            _ => None,
+        })
+    }
+
+    /// The Variant Analysis Repositories section's lines under its header.
+    fn variant_lines(&self, out: &mut Vec<Line>) {
+        use crate::codeql_variant::Item;
+        if self.variant_error {
+            out.push(Line::Text("The variant analysis config file could"));
+            out.push(Line::Text("not be read. Fix or remove it to go on."));
+            out.push(Line::Action(
+                Action::OpenVariantConfig,
+                "Open config file".to_string(),
+            ));
+            return;
+        }
+        let v = &self.variant;
+        match &v.controller_repo {
+            None => {
+                out.push(Line::Text("Set up a controller repository to start"));
+                out.push(Line::Text("using variant analysis."));
+                out.push(Line::Action(
+                    Action::SetUpControllerRepository,
+                    "Set up controller repository".to_string(),
+                ));
+            }
+            Some(c) => out.push(Line::Action(
+                Action::SetUpControllerRepository,
+                format!("Controller: {c}"),
+            )),
+        }
+        let mark = |item| if v.is_selected(item) { "●" } else { "○" };
+        for (i, list) in v.lists.iter().enumerate() {
+            let folded = self.folded_lists.contains(&list.name);
+            let chevron = if folded {
+                crate::icons::CHEVRON_CLOSED
+            } else {
+                crate::icons::CHEVRON_OPEN
+            };
+            out.push(Line::Action(
+                Action::VariantList(i),
+                format!(
+                    "{chevron} {} {} ({})",
+                    mark(Item::List(i)),
+                    list.name,
+                    list.repos.len()
+                ),
+            ));
+            if folded {
+                continue;
+            }
+            for (j, nwo) in list.repos.iter().enumerate() {
+                out.push(Line::Action(
+                    Action::VariantRepo(Some(i), j),
+                    format!("    {} {nwo}", mark(Item::Repo(Some(i), j))),
+                ));
+            }
+        }
+        for (j, nwo) in v.repos.iter().enumerate() {
+            out.push(Line::Action(
+                Action::VariantRepo(None, j),
+                format!("{} {nwo}", mark(Item::Repo(None, j))),
+            ));
+        }
+        for (i, owner) in v.owners.iter().enumerate() {
+            out.push(Line::Action(
+                Action::VariantOwner(i),
+                format!("{} {owner} (owner)", mark(Item::Owner(i))),
+            ));
+        }
+        if v.controller_repo.is_some() {
+            for (a, label) in [
+                (Action::AddVariantRepo, "Add repository"),
+                (Action::AddVariantList, "Add repository list"),
+                (Action::AddVariantOwner, "Add owner"),
+            ] {
+                out.push(Line::Action(a, label.to_string()));
+            }
         }
     }
 
@@ -312,15 +506,12 @@ impl CodeqlPanel {
                         "Create one to get started".to_string(),
                     ));
                 }
-                Section::VariantAnalysis => {
-                    out.push(Line::Text("Set up a controller repository to start"));
-                    out.push(Line::Text("using variant analysis."));
-                    out.push(Line::Action(
-                        Action::SetUpControllerRepository,
-                        "Set up controller repository".to_string(),
-                    ));
-                }
+                Section::VariantAnalysis => self.variant_lines(&mut out),
                 Section::QueryHistory if !self.history.is_empty() => {
+                    out.push(Line::Action(
+                        Action::SortHistory,
+                        format!("Sort by: {}", self.history_sort.label()),
+                    ));
                     for (i, label) in self.history.iter().enumerate() {
                         out.push(Line::Action(Action::OpenHistory(i), label.clone()));
                     }
@@ -542,12 +733,14 @@ mod tests {
                 path: "/x/a-db".into(),
                 language: Some("python".into()),
                 added: 0,
+                former_names: Vec::new(),
             },
             crate::codeql_db::DbEntry {
                 name: "b-db".into(),
                 path: "/x/b-db".into(),
                 language: Some("go".into()),
                 added: 0,
+                former_names: Vec::new(),
             },
         ];
         p.current_db = Some(1);
@@ -576,6 +769,7 @@ mod tests {
             path: format!("/x/{name}").into(),
             language: lang.map(Into::into),
             added: 0,
+            former_names: Vec::new(),
         };
         let mut p = CodeqlPanel::new();
         p.databases = vec![
@@ -653,6 +847,17 @@ mod tests {
             Action::OpenHistory(1),
             "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
         )));
+        assert!(
+            lines.contains(&Line::Action(Action::SortHistory, "Sort by: date".into())),
+            "the list offers its order"
+        );
+        p.history_sort = crate::codeql_query::HistSort::Name;
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::SortHistory, "Sort by: name".into()))
+        );
+        p.select_history(1);
+        assert_eq!(p.selected_history(), Some(1));
     }
 
     fn pack(
@@ -728,7 +933,88 @@ mod tests {
                 .any(|l| matches!(l, Line::Action(Action::RunQuery(..), _)))
         );
         p.toggle_pack(0);
+        assert_eq!(p.selected_pack(), Some(0));
         p.move_selection(true);
         assert_eq!(p.selected_hit(), Some(Hit::Action(Action::RunQuery(0, 0))));
+        assert_eq!(p.selected_pack(), Some(0), "a query row is in its pack");
+        p.toggle(Section::Queries);
+        assert_eq!(p.selected_pack(), None);
+    }
+
+    #[test]
+    fn variant_analysis_lists_the_controller_lists_repos_and_owners() {
+        use crate::codeql_variant::Item;
+        let mut p = CodeqlPanel::new();
+        p.variant.lists.push(crate::codeql_variant::RepoList {
+            name: "top".into(),
+            repos: vec!["a/b".into(), "c/d".into()],
+        });
+        p.variant.repos.push("e/f".into());
+        p.variant.owners.push("octo".into());
+        // Without a controller the welcome stays, and there is no adding.
+        let lines = p.lines();
+        assert!(lines.contains(&Line::Action(
+            Action::SetUpControllerRepository,
+            "Set up controller repository".into()
+        )));
+        assert!(!lines.contains(&Line::Action(
+            Action::AddVariantRepo,
+            "Add repository".into()
+        )));
+
+        p.variant.controller_repo = Some("me/ctl".into());
+        p.variant.select(Item::Repo(Some(0), 1)).unwrap();
+        let open = crate::icons::CHEVRON_OPEN;
+        let va: Vec<Line> = p
+            .lines()
+            .into_iter()
+            .skip_while(|l| *l != Line::Header(Section::VariantAnalysis))
+            .skip(1)
+            .take_while(|l| !matches!(l, Line::Header(_)))
+            .collect();
+        assert_eq!(
+            va,
+            [
+                Line::Action(
+                    Action::SetUpControllerRepository,
+                    "Controller: me/ctl".into()
+                ),
+                Line::Action(Action::VariantList(0), format!("{open} ○ top (2)")),
+                Line::Action(Action::VariantRepo(Some(0), 0), "    ○ a/b".into()),
+                Line::Action(Action::VariantRepo(Some(0), 1), "    ● c/d".into()),
+                Line::Action(Action::VariantRepo(None, 0), "○ e/f".into()),
+                Line::Action(Action::VariantOwner(0), "○ octo (owner)".into()),
+                Line::Action(Action::AddVariantRepo, "Add repository".into()),
+                Line::Action(Action::AddVariantList, "Add repository list".into()),
+                Line::Action(Action::AddVariantOwner, "Add owner".into()),
+            ]
+        );
+
+        // A repository row is in its list; folding hides the rows.
+        p.select_variant_item(Item::Repo(Some(0), 1));
+        assert_eq!(p.selected_variant_list(), Some(0));
+        assert_eq!(p.selected_section(), Some(Section::VariantAnalysis));
+        p.toggle_variant_list(0);
+        assert_eq!(p.selected_variant_item(), Some(Item::List(0)));
+        assert!(
+            !p.lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::VariantRepo(Some(_), _), _)))
+        );
+        p.select_variant_item(Item::Owner(0));
+        assert_eq!(p.selected_variant_list(), None);
+
+        // An unreadable config says so instead of looking empty.
+        p.variant_error = true;
+        let lines = p.lines();
+        assert!(lines.contains(&Line::Action(
+            Action::OpenVariantConfig,
+            "Open config file".into()
+        )));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::VariantOwner(_), _)))
+        );
     }
 }

@@ -37038,8 +37038,8 @@ fn the_picker_lists_compounds_and_selecting_one_reports_why_it_cannot_launch() {
     let picker = app.list_picker.as_ref().expect("picker open");
     assert_eq!(
         picker.rows.len(),
-        5,
-        "zero-config entry + two configurations + two compounds"
+        6,
+        "zero-config entry + two configurations + two compounds + Add Configuration"
     );
     let compound_row = picker
         .rows
@@ -37118,7 +37118,11 @@ fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("picker open");
-    assert_eq!(picker.rows.len(), 3, "zero-config entry + the two configs");
+    assert_eq!(
+        picker.rows.len(),
+        4,
+        "zero-config entry + the two configs + Add Configuration"
+    );
     assert!(picker.rows[0].label.contains("active file"));
     assert!(picker.rows[1].label.contains("API"));
 
@@ -46433,7 +46437,8 @@ fn the_config_row_does_not_count_a_hidden_compound() {
         "the visible configuration counts; the hidden compound does not"
     );
 
-    // And the picker agrees: nothing but the always-present active-file row.
+    // And the picker agrees: nothing but the always-present rows (the active
+    // file, and Add Configuration).
     app.open_debug_config_picker();
     let picker = app.list_picker.as_ref().expect("the picker opened");
     assert!(
@@ -46560,7 +46565,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
     let configs = crate::dap::configs::discover_configs(tmp.path());
     let ordered: Vec<&str> = rows
         .iter()
-        .filter(|(id, _)| id != "active")
+        .filter(|(id, _)| id != "active" && id != "add")
         .map(|(_, label)| label.split(' ').next().unwrap_or_default())
         .collect();
     assert_eq!(
@@ -46569,7 +46574,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
         "precondition: the presentation actually moved a row"
     );
     // The claim: every id still indexes the entry whose name the row shows.
-    for (id, label) in rows.iter().filter(|(id, _)| id != "active") {
+    for (id, label) in rows.iter().filter(|(id, _)| id != "active" && id != "add") {
         let idx: usize = id.parse().expect("a configuration row's id is its index");
         assert!(
             label.starts_with(&configs[idx].name),
@@ -51110,6 +51115,99 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
     }
 }
 
+/// Pick the row of the open list picker whose id is `id`.
+fn pick_row_id(app: &mut App, id: &str) {
+    let picker = app.list_picker.as_mut().expect("a picker is open");
+    picker.selected = picker
+        .rows
+        .iter()
+        .position(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no row {id}"));
+    app.confirm_list_picker();
+}
+
+/// Type `value` over whatever the open prompt holds and press Enter.
+fn answer_prompt(app: &mut App, value: &str) {
+    app.input_prompt.as_mut().expect("a prompt is open").value = value.to_string();
+    app.submit_input_prompt();
+}
+
+/// #250: Debug: Add Configuration… walks the fields a launch needs, refuses
+/// a value that does not fit without losing the rest, and writes the entry
+/// to `.croft/launch.json`, selected for F5 and listed in the picker.
+#[test]
+fn add_debug_configuration_writes_a_launch_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Reachable from the picker, not only the palette.
+    app.open_debug_config_picker();
+    pick_row_id(&mut app, "add");
+    pick_row_id(&mut app, "python");
+    pick_row_id(&mut app, "launch");
+    let prompt = app.input_prompt.as_ref().expect("the name is asked");
+    assert_eq!(prompt.value, "Launch Python", "seeded with a name");
+    answer_prompt(&mut app, "Serve");
+    assert_eq!(app.input_prompt.as_ref().unwrap().value, "${file}");
+    answer_prompt(&mut app, "${workspaceFolder}/api.py");
+    answer_prompt(&mut app, "--port \"80 00");
+    assert!(app.status.contains("quote"), "{}", app.status);
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "--port \"80 00",
+        "the refused value is offered back to fix"
+    );
+    answer_prompt(&mut app, "--port 8000");
+    // Optional fields take a blank Enter.
+    answer_prompt(&mut app, "");
+    answer_prompt(&mut app, "DEBUG=1");
+    answer_prompt(&mut app, "");
+    assert!(app.input_prompt.is_none(), "the draft is complete");
+    assert!(app.status.contains("Added \"Serve\""), "{}", app.status);
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Serve"));
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(cfgs.len(), 1);
+    assert_eq!(cfgs[0].source, ".croft/launch.json");
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/launch.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &written["configurations"][0];
+    assert_eq!(entry["program"], "${workspaceFolder}/api.py");
+    assert_eq!(entry["args"], serde_json::json!(["--port", "8000"]));
+    assert_eq!(entry["env"]["DEBUG"], "1");
+    assert!(entry.get("cwd").is_none() && entry.get("preLaunchTask").is_none());
+    app.open_debug_config_picker();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.label.starts_with("Serve")),
+        "and the picker lists it"
+    );
+}
+
+/// #250: an attach asks only where to attach, and the palette starts it.
+#[test]
+fn add_debug_configuration_attaches_by_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::AddDebugConfig);
+    pick_row_id(&mut app, "node");
+    pick_row_id(&mut app, "attach");
+    answer_prompt(&mut app, "Web");
+    answer_prompt(&mut app, "nope");
+    assert!(app.status.contains("Not a port"), "{}", app.status);
+    answer_prompt(&mut app, "9229");
+    assert!(app.input_prompt.is_none());
+    let cfgs = crate::dap::configs::discover_configs(tmp.path());
+    assert_eq!(
+        (cfgs.len(), cfgs[0].request),
+        (1, crate::dap::configs::RequestKind::Attach)
+    );
+}
+
 /// Open the debug picker and confirm the row whose label starts with `label`.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
@@ -53584,6 +53682,155 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
+/// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
+/// socket, as Claude Code's hook would; the returned stream is the hook's
+/// end, kept open for the answer.
+fn queue_edit_proposal(
+    app: &mut App,
+    dir: &Path,
+    file: &Path,
+    old: &str,
+    new: &str,
+) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    let sock = dir.join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": old, "new_string": new}),
+        cwd: dir.into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    hook
+}
+
+fn popup_screen(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut screen = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            screen.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// #347: what the language server says about a proposal's file while it is
+/// checked goes to the popup, against the proposed row it names, and not to
+/// the buffer's diagnostics; answering the proposal ends the check.
+#[test]
+fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.lsp = None;
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    app.sync_approval_check();
+    assert!(
+        app.approval_check.is_none(),
+        "no server, nothing to check with"
+    );
+    // As a server would once the proposal's text was sent as the file's.
+    app.approval_check = Some(crate::agent_approval::ProposalCheck {
+        arrived: app.approvals[0].arrived,
+        started: std::time::Instant::now(),
+        path: file.clone(),
+        opened: true,
+        by_server: Default::default(),
+    });
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(screen.contains("Checking the proposed file"), "{screen}");
+    app.apply_diagnostics_updates(vec![crate::lsp::manager::DiagnosticsUpdate {
+        path: file.clone(),
+        server: "ruff".into(),
+        diagnostics: vec![crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 18,
+            severity: crate::lsp::manager::DiagnosticSeverity::Error,
+            message: "Undefined name `nope_undefined`".into(),
+        }],
+    }]);
+    assert!(
+        !app.lsp_diagnostics.contains_key(&file),
+        "the buffer's diagnostics are the buffer's"
+    );
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(
+        screen.contains("1 error, 0 warnings in the proposed file"),
+        "{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("+ x = nope_undefined") && l.contains("\u{25c0} Undefined name")),
+        "the proposed row carries it: {screen}"
+    );
+    // Answered: the check ends with the proposal.
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approvals.is_empty());
+    app.sync_approval_check();
+    assert!(app.approval_check.is_none());
+}
+
+/// #347's criterion against a real server: a proposal that uses an
+/// undefined name shows the server's diagnostic in the popup before it is
+/// approved. Ignored by default: it needs a Python language server that
+/// publishes diagnostics for an open buffer (run it with `--ignored` where
+/// one does); `a_proposals_diagnostics_show_in_the_popup_not_the_buffer`
+/// covers the routing and rendering without one.
+#[test]
+#[ignore]
+fn a_real_server_flags_the_proposal_before_approval() {
+    if !["ruff", "pyright-langserver", "basedpyright-langserver"]
+        .iter()
+        .any(|b| crate::lsp::manager::is_on_path(b))
+    {
+        eprintln!("SKIPPED: no Python language server on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    if app.lsp.is_none() {
+        eprintln!("SKIPPED: no language server manager");
+        return;
+    }
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        app.sync_approval_check();
+        app.drain_lsp_diagnostics();
+        let found = app.approval_check.as_ref().is_some_and(|c| {
+            c.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("nope_undefined"))
+        });
+        if found {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no server flagged the proposal: {:?}",
+            app.approval_check
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!app.lsp_diagnostics.contains_key(&file));
+}
+
 /// An agent's edit proposal, end to end through the App: the hook's
 /// request opens the popup over everything, keys go to the popup and not
 /// to the editor under it, and the answer reaches the hook's connection.
@@ -53786,6 +54033,71 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// Wait for the OUTLINE to show the scrubbed commit's own symbols (#371),
+/// which the builder parses on its own thread with the finished view.
+fn settle_scrub_outline(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.drain_scrub_views();
+        app.sync_outline();
+        let commit = app
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if commit.is_some() && app.outline_scrub_key.as_ref().map(|(_, c)| c.clone()) == commit {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubbed commit's outline was never built"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait for the history scrubber's finished view of where it stands to
+/// replace the plain stand-in (#371); the builder runs on its own thread.
+fn settle_scrub_view(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !matches!(app.scrub_view_key, Some((_, true))) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubber's view was never built"
+        );
+        app.drain_scrub_views();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stepping_back_to_a_finished_scrub_view_reuses_it() {
+    // #371: a step never waits on highlighting, and a commit whose view was
+    // already built shows it at once rather than building it again.
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Right), "back to HEAD");
+    assert!(
+        matches!(app.scrub_view_key, Some((_, true))),
+        "HEAD's finished view was kept"
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1", "v2", "v3"]
+    );
+    // Home drops the view; Esc drops the kept ones with the builder.
+    assert!(app.handle_scrubber_key(KeyCode::Home));
+    assert!(app.scrub_view.is_none() && app.scrub_view_key.is_none());
+    assert!(app.handle_scrubber_key(KeyCode::Esc));
+    assert!(app.scrub_views.is_empty() && app.scrub_builder.is_none());
+}
+
 #[test]
 fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     // #371: at each position the editor shows the file at that commit, and
@@ -53795,6 +54107,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     app.editor.open(&repo.path().join("a.txt")).unwrap();
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
     assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
     assert_eq!(
@@ -53803,6 +54116,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     );
     assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
     assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1", "v2"]);
     assert_eq!(
@@ -53810,6 +54124,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         Some(crate::widgets::editor::GitMark::Added)
     );
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1"]);
     assert_eq!(
@@ -55033,6 +55348,222 @@ fn codeql_database_palette_commands_act_on_the_current_database() {
     });
 }
 
+/// Save a query history of `(query, started, status, output)` runs, with
+/// each output file written, for the history management tests.
+fn seed_codeql_history(
+    tmp: &std::path::Path,
+    runs: &[(&str, u64, crate::codeql_query::RunStatus, PathBuf)],
+) {
+    let mut history = crate::codeql_query::History::default();
+    for (query, started, status, output) in runs {
+        std::fs::write(tmp.join(query), "select 1").unwrap();
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, "col0\n1\n").unwrap();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.join(query),
+            database: String::from("app"),
+            database_path: None,
+            started: *started,
+            seconds: 3,
+            status: status.clone(),
+            output: output.clone(),
+            name: None,
+        });
+    }
+    history.save(&App::codeql_history_path()).unwrap();
+}
+
+#[test]
+fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Query History view renames, sorts, views the query
+    // of, opens the results directory of and removes a run; removing
+    // deletes only results in croft's own cache.
+    use crate::codeql_query::RunStatus;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = App::codeql_results_dir().join("200-a");
+        let elsewhere = tmp.path().join("elsewhere");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                (
+                    "c.ql",
+                    50,
+                    RunStatus::Running,
+                    App::codeql_results_dir().join("50-c/results.csv"),
+                ),
+                (
+                    "b.ql",
+                    100,
+                    RunStatus::Succeeded,
+                    elsewhere.join("results.csv"),
+                ),
+                (
+                    "a.ql",
+                    200,
+                    RunStatus::Succeeded,
+                    cached.join("results.csv"),
+                ),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        assert_eq!(app.codeql.history.len(), 3);
+        assert!(app.codeql.history[0].contains("a.ql"), "newest first");
+
+        // F2 renames, starting from the query's name.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "a.ql");
+        for _ in 0.."a.ql".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "zeta".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history[0], "\u{2713} zeta", "{}", app.status);
+
+        // `s` on a history row sorts the history, not the databases.
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        assert_eq!(app.codeql.db_sort, None, "databases untouched");
+        assert!(app.codeql.history[0].contains("b.ql"));
+        assert_eq!(app.codeql.selected_history(), Some(2), "still on zeta");
+        assert_eq!(
+            crate::codeql_query::History::load(&App::codeql_history_path()).sort_by,
+            crate::codeql_query::HistSort::Name,
+            "the order is saved"
+        );
+
+        // `v` opens the query; `o` the results in their cache folder.
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a.ql").as_path())
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(cached.join("results.csv").as_path())
+        );
+        assert!(app.status.contains("Results directory"), "{}", app.status);
+
+        // A run in flight is not removed.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(app.input_prompt.is_none());
+        assert!(app.status.contains("still running"), "{}", app.status);
+
+        // Delete asks first; Esc keeps it; results outside the cache stay.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("stay on disk"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.codeql.history.len(), 3, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 2, "{}", app.status);
+        assert!(
+            elsewhere.join("results.csv").is_file(),
+            "not croft's to delete"
+        );
+        assert_eq!(app.codeql.selected_history(), Some(0), "stays in the list");
+
+        // Croft's own results folder goes with its entry.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("results are deleted"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 1, "{}", app.status);
+        assert!(!cached.exists(), "the run's folder is gone");
+        assert!(
+            App::codeql_results_dir().join("50-c").is_dir(),
+            "only that run's folder"
+        );
+    });
+}
+
+#[test]
+fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlRemoveHistory);
+        assert!(
+            app.status.contains("no CodeQL query history"),
+            "{}",
+            app.status
+        );
+        assert!(app.input_prompt.is_none());
+        let out = |n: &str| App::codeql_results_dir().join(n).join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("a-old.ql", 1, RunStatus::Succeeded, out("1-old")),
+                ("b-new.ql", 2, RunStatus::Succeeded, out("2-new")),
+            ],
+        );
+        // Sorted by name, the newest run is no longer on top; it is still
+        // the one the commands pick.
+        app.run_command(Command::CodeqlSortHistory);
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        app.run_command(Command::CodeqlRenameHistory);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&InputPurpose::CodeqlRenameHistory {
+                output: out("2-new")
+            })
+        );
+        app.close_input_prompt();
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("b-new.ql").as_path())
+        );
+        // A selected row wins over the newest.
+        app.open_codeql_view();
+        app.codeql.select_history(0);
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a-old.ql").as_path())
+        );
+        assert_eq!(
+            Command::from_id("codeql_remove_history"),
+            Some(Command::CodeqlRemoveHistory)
+        );
+        assert_eq!(Command::CodeqlViewQuery.title(), "CodeQL: View Query");
+    });
+}
+
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
 /// `--output=` names, and exits with `code` (printing `err` on stderr).
 #[cfg(unix)]
@@ -55074,6 +55605,7 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
             path: db,
             language: Some(String::from("rust")),
             added: 0,
+            former_names: Vec::new(),
         }],
         current: Some(0),
         sort_by: None,
@@ -55260,6 +55792,665 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
             calls.starts_with("database analyze ") && calls.contains("pack/r.ql"),
             "the saved file's @kind picks SARIF: {calls}"
         );
+    });
+}
+
+/// A workspace whose pack `acme/rust` holds `a.ql`, `b.ql` and `c.ql`,
+/// database "app" current, the CodeQL view open on the pack's line, and a
+/// stand-in `codeql` in `bin` that fails whatever runs `b.ql`.
+#[cfg(unix)]
+fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
+    use std::os::unix::fs::PermissionsExt;
+    let pack = tmp.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        "name: acme/rust\nextractor: rust\n",
+    )
+    .unwrap();
+    for q in ["a", "b", "c"] {
+        std::fs::write(pack.join(format!("{q}.ql")), "select 1").unwrap();
+    }
+    let mut app = codeql_query_fixture(tmp, "select 1");
+    let reply = bin.join("codeql-reply");
+    std::fs::write(&reply, "col0\n1\n").unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in *b.ql*) echo 'ERROR: b is broken' >&2; exit 1 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; esac; done\nexit 0\n",
+        log = bin.join("codeql-calls.log").display(),
+        reply = reply.display(),
+    );
+    let program = bin.join("codeql");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    app.codeql_program = program;
+    app.open_codeql_view();
+    app.focus = Pane::Tree;
+    let row = app
+        .codeql
+        .lines()
+        .iter()
+        .position(|l| {
+            matches!(
+                l,
+                crate::widgets::codeql::Line::Action(
+                    crate::widgets::codeql::Action::TogglePack(0),
+                    _
+                )
+            )
+        })
+        .expect("the pack is listed");
+    app.codeql.selected = row;
+    app
+}
+
+/// Drain until one query run lands (the next of a pack run may start).
+fn drain_one_codeql_run(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_run() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query run never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
+    // #578: `r` on a pack line queues every query in it; each run lands in
+    // the query history in order and a failing one doesn't stop the rest.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        let pack = tmp.path().join("pack");
+        assert_eq!(
+            app.codeql.queries[0].queries,
+            vec![pack.join("a.ql"), pack.join("b.ql"), pack.join("c.ql")]
+        );
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/3: a.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/3: b.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 3/3: c.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(app.status, "Ran 3 CodeQL queries, 1 failed");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        // Newest first: one entry per query, in the order they ran.
+        assert_eq!(app.codeql.history.len(), 3, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[2].starts_with("\u{2713} a.ql \u{b7} app"));
+        assert_eq!(
+            app.codeql.history[1],
+            "\u{2717} b.ql \u{b7} app \u{b7} failed: ERROR: b is broken"
+        );
+        assert!(app.codeql.history[0].starts_with("\u{2713} c.ql \u{b7} app"));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let at = |q: &str| calls.find(&format!("pack/{q}.ql")).unwrap();
+        assert!(at("a") < at("b") && at("b") < at("c"), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_codeql_queries_are_cancelled_from_the_palette_or_with_esc() {
+    // #578: cancelling drops the queries still waiting; the one running
+    // finishes and is recorded.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("1/3"), "{}", app.status);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[0].starts_with("\u{2713} a.ql"));
+
+        // Esc in the side bar cancels first and leaves the view only after.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        assert!(app.sidebar_view == SidebarView::CodeQL);
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 2, "{:?}", app.codeql.history);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "No CodeQL queries are queued");
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.sidebar_view == SidebarView::Explorer);
+        assert_eq!(
+            Command::from_id("codeql_run_pack"),
+            Some(Command::CodeqlRunPack)
+        );
+        assert_eq!(
+            Command::CodeqlRunPack.title(),
+            "CodeQL: Run Queries in Pack"
+        );
+        assert_eq!(
+            Command::CodeqlCancelQueue.title(),
+            "CodeQL: Cancel Queued Queries"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        // A single query is running: the pack run is refused, not mixed in.
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(app.codeql_run.is_some());
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.status, "A CodeQL query is already running");
+        assert!(app.codeql_run_queue.is_empty());
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1);
+
+        // Nothing selected in the Queries section.
+        app.codeql.selected = 0;
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("Select a query pack"), "{}", app.status);
+
+        // No current database: nothing is queued or recorded.
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.current = None;
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.open_codeql_view();
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(
+                        crate::widgets::codeql::Action::RunQuery(0, 1),
+                        _
+                    )
+                )
+            })
+            .expect("b.ql is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlRunPack);
+        assert_eq!(app.status, "Add a CodeQL database and select it first");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        assert_eq!(app.codeql.history.len(), 1);
+    });
+}
+
+/// Drain the database upgrade until it lands, or fail after a few seconds.
+fn wait_for_codeql_upgrade(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_upgrade() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upgrade never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrading_a_codeql_database_runs_the_cli_off_the_ui_thread() {
+    // #578: VS Code's "CodeQL: Upgrade Database". `u` on a database row
+    // runs `codeql database upgrade` on a worker; the status line says how
+    // it went, with the CLI's first error line when it failed. An upgrade
+    // and a query run never overlap.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_database(0);
+        let u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        app.handle_codeql_key(u);
+        assert_eq!(app.status, "Upgrading CodeQL database app\u{2026}");
+        app.handle_codeql_key(u);
+        assert_eq!(app.status, "A CodeQL database upgrade is already running");
+        app.run_command(Command::CodeqlRunQuery);
+        assert_eq!(app.status, "Wait for the CodeQL database upgrade to finish");
+        assert!(app.codeql_run.is_none());
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Upgraded CodeQL database app");
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!("database upgrade {}", tmp.path().join("dbs/app").display())
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: the database is too new");
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not upgrade CodeQL database app: ERROR: the database is too new"
+        );
+
+        // A query is running: the upgrade waits its turn.
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(app.codeql_run.is_some());
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL query run to finish before upgrading"
+        );
+        assert!(app.codeql_upgrade.is_none());
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_upgrade_database"),
+            Some(Command::CodeqlUpgradeDatabase)
+        );
+        assert_eq!(
+            Command::CodeqlUpgradeDatabase.title(),
+            "CodeQL: Upgrade Database"
+        );
+    });
+}
+
+#[test]
+fn a_codeql_databases_source_is_added_to_the_workspace() {
+    // #578: VS Code's "CodeQL: Add Database Source to Workspace". A `src`
+    // folder is added as it is; a `src.zip` is extracted once into croft's
+    // cache and that folder added.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder_db = make_codeql_db(&tmp.path().join("dbs"), "folder", "go");
+        std::fs::create_dir_all(folder_db.join("src/proj")).unwrap();
+        std::fs::write(folder_db.join("src/proj/main.go"), "package main\n").unwrap();
+        let zip_db = make_codeql_db(&tmp.path().join("dbs"), "zipped", "go");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("proj/main.go", opts).unwrap();
+        z.write_all(b"package main\n").unwrap();
+        z.finish().unwrap();
+        let bare_db = make_codeql_db(&tmp.path().join("dbs"), "bare", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&folder_db, &zip_db, &bare_db] {
+            store.add(db).unwrap();
+        }
+        store.current = Some(0);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut app = App::new(ws).unwrap();
+        app.workspace_folders_path = tmp.path().join("folders.json");
+        let has_root = |app: &App, p: &std::path::Path| {
+            app.roots.iter().any(|r| r == p.canonicalize().unwrap())
+        };
+
+        app.run_command(Command::CodeqlAddDatabaseSource);
+        assert_eq!(
+            app.status,
+            "Added the source of CodeQL database folder to the workspace"
+        );
+        assert!(has_root(&app, &folder_db.join("src")));
+        app.run_command(Command::CodeqlAddDatabaseSource);
+        assert_eq!(
+            app.status,
+            "The source of CodeQL database folder is already in the workspace"
+        );
+
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        let w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_codeql_key(w);
+        assert_eq!(
+            app.status,
+            "Added the source of CodeQL database zipped to the workspace"
+        );
+        let extracted = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("proj/main.go")).unwrap(),
+            "package main\n"
+        );
+        assert!(has_root(&app, &extracted));
+
+        // Extracted once: adding it again reuses the folder as it is.
+        std::fs::write(extracted.join("mine.txt"), "kept").unwrap();
+        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        assert!(!has_root(&app, &extracted));
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        app.handle_codeql_key(w);
+        assert!(has_root(&app, &extracted));
+        assert!(extracted.join("mine.txt").exists());
+
+        // A database replaced at the same path has a new src.zip: it is
+        // extracted afresh and the out-of-date copy dropped.
+        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
+        z.start_file("proj/main.go", opts).unwrap();
+        z.write_all(b"package main // v2\n").unwrap();
+        z.finish().unwrap();
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        app.handle_codeql_key(w);
+        let fresh = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
+        assert_ne!(fresh, extracted);
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("proj/main.go")).unwrap(),
+            "package main // v2\n"
+        );
+        assert!(has_root(&app, &fresh));
+        assert!(!extracted.exists(), "the stale extraction is removed");
+
+        app.codeql.select_database(2);
+        app.handle_codeql_key(w);
+        assert_eq!(
+            app.status,
+            "CodeQL database bare has no src folder or src.zip"
+        );
+        assert_eq!(
+            Command::CodeqlAddDatabaseSource.title(),
+            "CodeQL: Add Database Source to Workspace"
+        );
+    });
+}
+
+#[test]
+fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
+    // #578: VS Code's "CodeQL: Delete Unused Databases". Only copies in
+    // croft's cache that no query history entry ran on go, after a
+    // confirmation; the current database and ones elsewhere stay.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = App::codeql_db_cache_dir();
+        // An archive's extraction keeps the database one level down.
+        let cached = |name: &str| make_codeql_db(&cache.join(name), name, "go");
+        let used = cached("used");
+        let legacy = cached("legacy");
+        let current = cached("current");
+        let stale_a = cached("stale-a");
+        let stale_b = cached("stale-b");
+        let outside = make_codeql_db(tmp.path(), "outside", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&used, &legacy, &current, &stale_a, &stale_b, &outside] {
+            store.add(db).unwrap();
+        }
+        // Renamed since its run: the history still finds it by path.
+        store.rename(0, "used, renamed").unwrap();
+        store.current = Some(2);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let mut history = crate::codeql_query::History::default();
+        for (db, name, path) in [
+            (&used, "used", Some(used.clone())),
+            // Saved before runs recorded a path: matched by name.
+            (&legacy, "legacy", None),
+        ] {
+            history.push(crate::codeql_query::HistoryEntry {
+                query: tmp.path().join("q.ql"),
+                database: name.to_string(),
+                database_path: path,
+                started: 1,
+                seconds: 1,
+                status: crate::codeql_query::RunStatus::Succeeded,
+                output: db.join("unused-output.csv"),
+                name: None,
+            });
+        }
+        history.save(&App::codeql_history_path()).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Renaming the database a pre-path run named pins that run to its
+        // path first, so the rename does not make it look unused.
+        app.submit_rename_codeql_database(&legacy, "legacy, renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert!(history.entries.iter().any(
+            |e| e.database == "legacy" && e.database_path.as_deref() == Some(legacy.as_path())
+        ));
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        let prompt = app.input_prompt.as_ref().expect("asks first");
+        assert_eq!(prompt.title, "Delete 2 unused CodeQL databases?");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlDeleteUnusedDatabases {
+                paths: vec![stale_a.clone(), stale_b.clone()]
+            }
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.status, "Deleted 2 unused CodeQL databases");
+        let store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        let names: Vec<&str> = store.databases.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["used, renamed", "legacy, renamed", "current", "outside"]
+        );
+        assert_eq!(store.current, Some(2), "still the current one");
+        assert!(!cache.join("stale-a").exists() && !cache.join("stale-b").exists());
+        for kept in [&used, &legacy, &current, &outside] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        assert!(app.input_prompt.is_none());
+        assert_eq!(app.status, "There are no unused CodeQL databases to delete");
+        assert_eq!(
+            Command::from_id("codeql_delete_unused_databases"),
+            Some(Command::CodeqlDeleteUnusedDatabases)
+        );
+    });
+}
+
+#[test]
+fn renaming_one_of_two_same_named_databases_keeps_both_protected() {
+    // #578: an old run that names "dup" could have been on either of two
+    // databases called that. After one is renamed, Delete Unused must
+    // still leave both alone: the renamed one remembers its former name.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = App::codeql_db_cache_dir();
+        let first = make_codeql_db(&cache.join("one"), "dup", "go");
+        let second = make_codeql_db(&cache.join("two"), "dup", "go");
+        let current = make_codeql_db(&cache.join("cur"), "current", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&first, &second, &current] {
+            store.add(db).unwrap();
+        }
+        store.current = Some(2);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let mut history = crate::codeql_query::History::default();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.path().join("q.ql"),
+            database: String::from("dup"),
+            database_path: None,
+            started: 1,
+            seconds: 1,
+            status: crate::codeql_query::RunStatus::Succeeded,
+            output: tmp.path().join("r.csv"),
+            name: None,
+        });
+        history.save(&App::codeql_history_path()).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_rename_codeql_database(&first, "renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(
+            history.entries[0].database_path, None,
+            "ambiguous: not pinned to either"
+        );
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        assert!(app.input_prompt.is_none());
+        assert_eq!(app.status, "There are no unused CodeQL databases to delete");
+        assert!(first.exists() && second.exists());
+    });
+}
+
+#[test]
+fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
+    // #578: "CodeQL: Create Query" asks for a name and writes a starter
+    // query into the selected pack, in its language; from the empty
+    // Queries section it goes to the workspace root, with a pack file in
+    // the Language section's language.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::codeql::{Action, Hit, Section};
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_str = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, KeyCode::Char(c));
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::TogglePack(0), _)
+                )
+            })
+            .expect("the pack is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlCreateQuery);
+        let prompt = app.input_prompt.as_ref().expect("a name is asked for");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlCreateQuery {
+                dir: pack.clone(),
+                language: Some(String::from("go")),
+            }
+        );
+        assert!(prompt.title.contains("acme/go"), "{}", prompt.title);
+        type_str(&mut app, "find-calls");
+        press(&mut app, KeyCode::Enter);
+        let created = pack.join("find-calls.ql");
+        let text = std::fs::read_to_string(&created).expect("written");
+        assert!(text.contains("\nimport go\n"), "{text}");
+        assert!(text.contains("@id go/find-calls"), "{text}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(app.focus == Pane::Editor);
+        assert!(app.codeql.queries[0].queries.contains(&created), "listed");
+        assert!(app.status.contains("pack/find-calls.ql"), "{}", app.status);
+        assert!(!pack.join("sub").exists());
+
+        // The same name again is refused on the status line.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "find-calls.ql");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.contains("already exists"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), text);
+
+        // An empty workspace: the welcome row, in the chosen language.
+        let empty = tempfile::tempdir().unwrap();
+        let mut app = App::new(empty.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.language = Some(6);
+        app.codeql.collapsed.insert(Section::Databases);
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::CreateQuery, _)
+                )
+            })
+            .expect("the welcome offers to create one");
+        app.codeql.selected = row;
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::CreateQuery))
+        );
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "hello");
+        press(&mut app, KeyCode::Enter);
+        let created = empty.path().join("hello.ql");
+        assert!(
+            std::fs::read_to_string(&created)
+                .unwrap()
+                .contains("import python"),
+            "{}",
+            app.status
+        );
+        let qlpack = std::fs::read_to_string(empty.path().join("qlpack.yml")).unwrap();
+        assert!(qlpack.contains("codeql/python-all"), "{qlpack}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(
+            app.codeql
+                .queries
+                .iter()
+                .any(|p| p.queries.contains(&created)),
+            "{:?}",
+            app.codeql.queries
+        );
+        assert_eq!(
+            Command::from_id("codeql_create_query"),
+            Some(Command::CodeqlCreateQuery)
+        );
+        assert_eq!(Command::CodeqlCreateQuery.title(), "CodeQL: Create Query");
     });
 }
 
@@ -56629,8 +57820,12 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         app.poll_pr_gh();
         assert!(app.pr_gh.is_none());
         app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        // A due refresh runs gh. Not asserted through `pr_gh` straight after
+        // the poll: that poll also reads the answer, and under load the stub
+        // can answer before it does, leaving `pr_gh` already empty again.
+        // The checks turning from running to passed, below, is what only a
+        // gh run can do.
         app.poll_pr_gh();
-        assert!(app.pr_gh.is_some(), "a due refresh runs gh");
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the refresh", || {
             app.poll_pr_gh();
             !app.editor.pr_review.as_ref().unwrap().has_pending_checks()
@@ -57354,6 +58549,101 @@ fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
 }
 
 #[test]
+fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
+    // #371: while scrubbing, the Outline lists the file as it was at the
+    // commit on screen, the breadcrumbs follow the historical caret, a
+    // symbol jump lands in the history, and leaving brings the live
+    // outline back.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    let file = tmp.path().join("lib.rs");
+    std::fs::write(&file, "fn alpha() {\n    let a = 1;\n}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "alpha"]);
+    std::fs::write(
+        &file,
+        "fn beta() {\n}\n\nfn alpha() {\n    let a = 1;\n}\n\nfn gamma() {\n}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "beta and gamma"]);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    let names = |app: &App| -> Vec<String> {
+        app.outline
+            .symbols()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    };
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "control: live outline"
+    );
+
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "HEAD");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_outline(&mut app);
+    assert_eq!(names(&app), ["alpha"], "the commit's outline");
+
+    // A jump to `alpha` lands in the historical view, where it is line 0,
+    // and the breadcrumbs name it from there.
+    let target = app.outline.jump_target(0).unwrap().1;
+    assert!(app.jump_in_scrub_view(target));
+    assert_eq!(app.scrub_view.as_ref().unwrap().cursor_row, 0);
+    app.editor.cursor_row = 7; // the live caret, inside `gamma`
+    let crumbs: Vec<String> = app
+        .build_breadcrumbs()
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert_eq!(
+        crumbs.last().map(String::as_str),
+        Some("alpha"),
+        "{crumbs:?}"
+    );
+
+    // Switching to a file that did not exist at this commit: its outline
+    // is its own (none), never the previous file's history under its name.
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&other, "fn zeta() {}\n").unwrap();
+    app.editor.open(&other).unwrap();
+    app.sync_outline();
+    assert!(names(&app).is_empty(), "{:?}", names(&app));
+    app.editor.open(&file).unwrap();
+    app.sync_outline();
+    assert_eq!(names(&app), ["alpha"]);
+
+    assert!(
+        app.handle_scrubber_key(KeyCode::Home),
+        "back to the working tree"
+    );
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "the live outline is back"
+    );
+    assert!(!app.jump_in_scrub_view(0), "no history on screen");
+}
+
+#[test]
 fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     // #365: `c` fetches the PR head into a sibling worktree added to the
     // workspace, and Esc takes it away again when nothing was changed.
@@ -57469,6 +58759,118 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     });
 }
 
+#[test]
+fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
+    // #577: `code_scanning = on` loads the branch's newest analysis per
+    // tool at the nearest scanned commit, and again after a checkout of
+    // another branch; `prompt` names them and waits; `off` never asks.
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "scanned"]);
+        let scanned = git(&["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), "b").unwrap();
+        git(&["commit", "-q", "-am", "not scanned yet"]);
+
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *sarif+json*) echo '{{"version": "2.1.0", "runs": []}}' ;;
+  *) echo '[{{"id": 7, "ref": "refs/heads/main", "commit_sha": "{scanned}", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-01T00:00:00Z", "results_count": 0}}, {{"id": 6, "ref": "refs/heads/main", "commit_sha": "0000", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-02T00:00:00Z", "results_count": 0}}]' ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh.clone();
+        app.source_control.status.in_repo = true;
+        app.source_control.status.branch = Some(String::from("main"));
+
+        // Off: nothing is asked.
+        app.poll_code_scanning();
+        assert!(
+            app.code_scan_list.is_none() && !log.exists(),
+            "off never calls gh"
+        );
+
+        app.code_scanning = crate::sarif::github::CodeScanningMode::On;
+        let settle = |app: &mut App| {
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_secs(10),
+                "code scanning",
+                || {
+                    app.poll_code_scanning();
+                    app.code_scan_list.is_none() && app.code_scan_fetch.is_none()
+                },
+            );
+        };
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert_eq!(app.status, "Loaded 1 code scanning analysis");
+        assert!(
+            app.editor.sarif.is_some(),
+            "the analysis opened in the viewer"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("ref=refs%2Fheads%2Fmain") || calls.contains("ref=refs/heads/main"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("analyses/7"),
+            "the one at the nearest scanned commit: {calls}"
+        );
+        assert!(!calls.contains("analyses/6"), "{calls}");
+
+        // The same branch is not looked up again; another one is.
+        std::fs::remove_file(&log).unwrap();
+        app.poll_code_scanning();
+        assert!(app.code_scan_list.is_none() && !log.exists());
+        app.code_scanning = crate::sarif::github::CodeScanningMode::Prompt;
+        app.source_control.status.branch = None;
+        app.source_control.status.detached_hash = Some(scanned.clone());
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert!(
+            app.status
+                .starts_with("Code scanning has 1 analysis for detached HEAD"),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("sarif+json"),
+            "prompt downloads nothing: {calls}"
+        );
+    });
+}
+
 /// #694: Developer: Show Memory Usage opens a tab attributing memory to
 /// each subsystem, with the stored diagnostics counted per server.
 #[test]
@@ -57494,4 +58896,403 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
         assert!(text.contains(section), "{text}");
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+}
+
+#[test]
+fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
+    // #347: `e` opens the proposal as a scratch file with the popup put
+    // away; closing it unsaved brings the popup back; saving it approves
+    // with input that makes the agent's own tool write the edited text.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "let x = 1;\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let input = serde_json::json!({"file_path": target, "old_string": "1", "new_string": "2"});
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Edit".into(),
+            input,
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // A tab with unsaved work, which opening the proposal must not
+        // replace.
+        let other = tmp.path().join("b.rs");
+        std::fs::write(&other, "fn b() {}\n").unwrap();
+        app.editor.open_pinned(&other).unwrap();
+        app.editor.lines[0] = String::from("fn b() { unsaved }");
+        app.editor.dirty = true;
+        app.drain_hook_requests();
+        let arm = |app: &mut App| {
+            app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        };
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.approval_ui.is_none(), "the popup is put away");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        assert_eq!(app.editor.lines[0], "let x = 2;", "the proposal's text");
+        app.drain_hook_requests();
+        assert!(app.approval_ui.is_none(), "and stays away while editing");
+
+        // Closed unsaved: back to the popup, nothing answered.
+        app.editor.close_active();
+        app.drain_hook_requests();
+        assert!(app.approval_edit.is_none() && app.approval_ui.is_some());
+        assert_eq!(app.approvals.len(), 1);
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.editor.lines[0] = String::from("let x = 3;");
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("as you changed it"), "{}", app.status);
+        assert!(app.approvals.is_empty() && app.approval_edit.is_none());
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p);
+        let replay =
+            crate::agent_approval::proposal_for("Edit", &input, tmp.path(), &read).unwrap();
+        assert_eq!(
+            replay.after, "let x = 3;\n",
+            "the agent's Edit writes what was saved"
+        );
+        app.editor.open_pinned(&other).unwrap();
+        assert!(app.editor.dirty, "the other tab kept its unsaved work");
+        assert_eq!(app.editor.lines[0], "fn b() { unsaved }");
+    });
+}
+
+#[test]
+fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
+    // #347: the proposal is computed from disk, so approving it over a tab
+    // with unsaved edits would put the agent's write under them. Enter
+    // opens a merge (disk, yours, the agent's) instead; auto-approve never
+    // lets it through; saving with conflicts left approves nothing; the
+    // resolved result is what the agent writes, and the tab holds it too.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&target).unwrap();
+        app.editor.lines[0] = String::from("ONE"); // yours: line 1
+        app.editor.lines[2] = String::from("mine"); // yours: line 3, in conflict
+        app.editor.dirty = true;
+        app.editor.pin_active(); // as any real edit does
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        // The agent's: lines 3 and 5 (Write, so the whole text).
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Write".into(),
+            input: serde_json::json!({"file_path": target, "content": "one\ntwo\ntheirs\nfour\nFIVE\n"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // Auto-approving this agent does not approve an edit under unsaved text.
+        app.auto_approve = Some((
+            String::from("claude-code"),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        app.drain_hook_requests();
+        assert_eq!(app.approvals.len(), 1, "auto-approved over unsaved edits");
+        app.auto_approve = None;
+        assert!(app.approval_ui.as_ref().unwrap().target_dirty);
+
+        app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.approvals.len(), 1, "Enter approved over unsaved edits");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        let mv = app.editor.merge.as_ref().expect("a merge view");
+        assert_eq!(mv.conflicts.len(), 1, "line 3 changed on both sides");
+        let conflict_row = mv.conflicts[0].result_start;
+        assert_eq!(
+            app.editor.lines,
+            ["ONE", "two", "three", "four", "FIVE"],
+            "each side's own change applied, the conflict holding the base"
+        );
+
+        // Saving with the conflict open approves nothing.
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("1 conflict left"), "{}", app.status);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.editor.cursor_row = conflict_row;
+        app.merge_apply(crate::merge_editor::ConflictState::Incoming);
+        app.write_current_to_disk();
+        assert!(app.approvals.is_empty(), "{}", app.status);
+        assert!(
+            app.status.contains("your tab holds the same text"),
+            "{}",
+            app.status
+        );
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        assert_eq!(input["content"], "ONE\ntwo\ntheirs\nfour\nFIVE\n");
+        // The user's tab is still there, and holds what the agent is about
+        // to write.
+        app.editor.open_pinned(&target).unwrap();
+        assert_eq!(app.editor.lines, ["ONE", "two", "theirs", "four", "FIVE"]);
+    });
+}
+
+/// #371's criterion, measured: after a warm-up pass, holding an arrow key
+/// back across up to 200 commits of this repository's own
+/// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
+/// frame it paints. Highlighting that file takes over half a second, so a
+/// step shows the plain text the builder already split and swaps the
+/// finished view in behind it. Needs this checkout's history, so it is
+/// ignored by default.
+#[test]
+#[ignore]
+fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/app/mod.rs")).unwrap();
+    app.scrub_history();
+    let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
+    assert!(steps > 20, "only {steps} commits to scrub");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // A held arrow key repeats about 30 times a second; between repeats the
+    // main loop takes in what the builder produced.
+    let repeat = std::time::Duration::from_millis(33);
+    // Warm-up, as the criterion allows: one pass reads every version.
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        app.handle_scrubber_key(KeyCode::Left);
+        app.sync_outline();
+    }
+    app.handle_scrubber_key(KeyCode::Home);
+    let mut times = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        let t = std::time::Instant::now();
+        app.handle_scrubber_key(KeyCode::Left);
+        // What the main loop runs between the key and the frame: the
+        // Outline follows the commit on screen.
+        app.sync_outline();
+        term.draw(|f| app.render(f)).unwrap();
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let p95 = times[times.len() * 95 / 100];
+    let max = *times.last().unwrap();
+    eprintln!("{steps} steps: p50 {p50:?} p95 {p95:?} max {max:?}");
+    assert!(p95 < std::time::Duration::from_millis(16), "p95 {p95:?}");
+}
+
+#[test]
+fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Variant Analysis Repositories view: a controller
+    // repository, then lists, repositories and owners to run against.
+    use crate::codeql_variant::{Item, Selection, VariantConfig};
+    use crate::widgets::codeql::{Action, Line};
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
+
+        // The welcome row asks for the controller and refuses a bad one.
+        app.codeql.select_action(Action::SetUpControllerRepository);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&crate::widgets::input_prompt::InputPurpose::CodeqlControllerRepository)
+        );
+        type_in(&mut app, "not a repo");
+        assert!(
+            app.status.contains("is not a GitHub repository"),
+            "{}",
+            app.status
+        );
+        assert!(!App::codeql_variant_path().exists(), "nothing saved");
+        press(&mut app, KeyCode::Enter);
+        type_in(&mut app, "https://github.com/me/ctl.git");
+        assert_eq!(saved().controller_repo.as_deref(), Some("me/ctl"));
+        assert!(app.codeql.lines().contains(&Line::Action(
+            Action::SetUpControllerRepository,
+            "Controller: me/ctl".into()
+        )));
+
+        // `l` adds a list, `a` a repository into the selected list.
+        press(&mut app, KeyCode::Char('l'));
+        type_in(&mut app, "top");
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().title,
+            "Add Repository to top"
+        );
+        type_in(&mut app, "github/codeql");
+        assert_eq!(saved().lists[0].repos, ["github/codeql"]);
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(Some(0), 0))
+        );
+        press(&mut app, KeyCode::Char('a'));
+        type_in(&mut app, "GitHub/CodeQL");
+        assert!(app.status.contains("already in list top"), "{}", app.status);
+
+        // `o` adds an owner; the palette adds a single repository.
+        press(&mut app, KeyCode::Char('o'));
+        type_in(&mut app, "octo-org");
+        assert_eq!(saved().owners, ["octo-org"]);
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::Owner(0)));
+        app.run_command(Command::CodeqlAddVariantRepo);
+        type_in(&mut app, "https://github.com/e/f/tree/main");
+        assert_eq!(saved().repos, ["e/f"]);
+
+        // Enter selects what a run targets, marked in the side bar.
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(None, 0))
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            saved().selected,
+            Some(Selection::Repo {
+                nwo: "e/f".into(),
+                list: None
+            })
+        );
+        assert!(
+            app.codeql
+                .lines()
+                .contains(&Line::Action(Action::VariantRepo(None, 0), "● e/f".into()))
+        );
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.status, "Open https://github.com/e/f");
+
+        // It persists for the next session.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.variant, saved());
+
+        // F2 renames a list; Space folds it.
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "top");
+        for _ in 0.."top".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_in(&mut app, "best");
+        assert_eq!(saved().lists[0].name, "best", "{}", app.status);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            !app.codeql
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::VariantRepo(Some(_), _), _)))
+        );
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+
+        // Delete removes an owner at once and asks before a list.
+        app.codeql.select_variant_item(Item::Owner(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(saved().owners.is_empty(), "{}", app.status);
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("and its 1 repository"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(saved().lists.len(), 1, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert!(saved().lists.is_empty(), "{}", app.status);
+        assert!(app.codeql.selected_hit().is_some(), "still on a row");
+
+        // Submission is still to come.
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(app.status.contains("not available yet"), "{}", app.status);
+
+        // The config file opens in a tab.
+        app.run_command(Command::CodeqlOpenVariantConfig);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(App::codeql_variant_path().as_path())
+        );
+
+        // A corrupt file is reported and never saved over.
+        std::fs::write(App::codeql_variant_path(), "{ broken").unwrap();
+        app.run_command(Command::CodeqlAddVariantList);
+        type_in(&mut app, "x");
+        assert!(app.status.contains("unchanged"), "{}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(App::codeql_variant_path()).unwrap(),
+            "{ broken"
+        );
+        app.open_codeql_view();
+        assert!(app.codeql.variant_error);
+        assert_eq!(
+            Command::from_id("codeql_set_up_controller_repository"),
+            Some(Command::CodeqlSetUpController)
+        );
+    });
 }
