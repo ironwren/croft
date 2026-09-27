@@ -523,6 +523,9 @@ fn run_croft_session(
     // hook does not, since an already-installed remote installs on a
     // detached thread and never waits.
     push_config_files(&ssh, &mut |msg| println!("{msg}"));
+    // A file edited on this machine while the session runs follows it
+    // (#262); the remote croft applies it on arrival. Stops with the session.
+    let repush = ConfigRepush::start(&ssh);
     let mut bootstrapped = false;
     // The relay rendezvous is keyed on the launch identity — the very same
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
@@ -577,7 +580,10 @@ fn run_croft_session(
             RemoteStatusClass::Failed if persistent && is_transport_failure(status.code()) => {
                 drop(pump);
                 match reconnect_master(host) {
-                    Some(new_ssh) => ssh = new_ssh,
+                    Some(new_ssh) => {
+                        ssh = new_ssh;
+                        repush.retarget(&ssh);
+                    }
                     None => return Ok(RemoteOutcome::Exited),
                 }
             }
@@ -2408,6 +2414,162 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
             "Config sync: could not push {} (the remote keeps its own copy)",
             failed.join(", ")
         ));
+    }
+}
+
+/// Re-pushes a config file edited on this machine while a remote session
+/// runs (#262), so a keybinding changed mid-session reaches the remote
+/// croft, which applies it on arrival, instead of waiting for the next
+/// connect. A thread polls the files with [`crate::config_sync::ConfigWatch`]
+/// and ships each change over the bulk lane; it logs to
+/// `~/.cache/croft/config-sync.log`, never to the terminal, which belongs to
+/// the remote croft. Dropping it stops the thread.
+struct ConfigRepush {
+    /// Host and control socket to push through; swapped on a reconnect.
+    target: std::sync::Arc<std::sync::Mutex<(String, PathBuf)>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConfigRepush {
+    fn start(ssh: &SshControl) -> Self {
+        let target = std::sync::Arc::new(std::sync::Mutex::new((
+            ssh.host.clone(),
+            ssh.socket_path.clone(),
+        )));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (t, s) = (target.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let dir = crate::prefs::config_dir();
+            let mut watch =
+                crate::config_sync::ConfigWatch::new(crate::config_sync::watched_local_paths());
+            let mut log = config_sync_log();
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let (host, socket) = match t.lock() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return,
+                };
+                repush_tick(
+                    &mut watch,
+                    &dir,
+                    std::time::Instant::now(),
+                    &mut || {
+                        // User layers only, as at connect: a workspace must
+                        // not decide what leaves the laptop.
+                        let prefs = crate::config_layers::load_merged(None).prefs;
+                        (!crate::config_sync::host_excluded(
+                            &host,
+                            &prefs.config_sync_excluded_hosts,
+                        ))
+                        .then_some(prefs.config_sync_excluded_files)
+                    },
+                    &mut |files| push_over_bulk_lane(&host, &socket, files),
+                    &mut log,
+                );
+            }
+        });
+        ConfigRepush { target, stop }
+    }
+
+    /// Push through the connection a reconnect just opened.
+    fn retarget(&self, ssh: &SshControl) {
+        if let Ok(mut g) = self.target.lock() {
+            *g = (ssh.host.clone(), ssh.socket_path.clone());
+        }
+    }
+}
+
+impl Drop for ConfigRepush {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Config files to push, each with the local path it is read from.
+type Pushes = [(crate::config_sync::Syncable, PathBuf)];
+
+/// One poll of a live re-push: push the syncable files that changed and
+/// exist, and log what went and what did not. `push` returns the names it
+/// could not ship.
+fn repush_tick(
+    watch: &mut crate::config_sync::ConfigWatch,
+    dir: &Path,
+    now: std::time::Instant,
+    exclusions: &mut dyn FnMut() -> Option<Vec<String>>,
+    push: &mut dyn FnMut(&Pushes) -> Vec<&'static str>,
+    log: &mut dyn FnMut(String),
+) {
+    let files = crate::config_sync::repush_targets(&watch.poll(now), dir);
+    if files.is_empty() {
+        return;
+    }
+    // The same rules as the push at connect (#603), read when a file
+    // changes so an edited exclusion applies without a reconnect: `None`
+    // is a host config sync never pushes to.
+    let Some(excluded) = exclusions() else {
+        return;
+    };
+    let (files, _) = crate::config_sync::apply_exclusions(files, &excluded);
+    if files.is_empty() {
+        return;
+    }
+    let failed = push(&files);
+    let pushed: Vec<&str> = files
+        .iter()
+        .map(|(s, _)| s.name)
+        .filter(|n| !failed.contains(n))
+        .collect();
+    if !pushed.is_empty() {
+        log(format!("Config sync: re-pushed {}", pushed.join(", ")));
+    }
+    if !failed.is_empty() {
+        log(format!(
+            "Config sync: could not re-push {} (the remote keeps its copy)",
+            failed.join(", ")
+        ));
+    }
+}
+
+/// Ship `files` over a bulk lane opened for this batch; the names that
+/// failed.
+fn push_over_bulk_lane(
+    host: &str,
+    socket: &Path,
+    files: &[(crate::config_sync::Syncable, PathBuf)],
+) -> Vec<&'static str> {
+    let bulk = crate::remote_bulk::establish(host, socket, |_| {});
+    files
+        .iter()
+        .filter_map(|(syncable, local)| {
+            let dest = crate::config_sync::remote_dest(host, syncable.name);
+            let ok = matches!(
+                ship_file_rsync_command(&bulk.lane, socket, local, &dest).status(),
+                Ok(st) if st.success()
+            );
+            (!ok).then_some(syncable.name)
+        })
+        .collect()
+}
+
+/// Appends timestamped lines to `~/.cache/croft/config-sync.log`.
+fn config_sync_log() -> impl FnMut(String) {
+    let path = install_log_path().with_file_name("config-sync.log");
+    move |line: String| {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{secs} {line}");
+        }
     }
 }
 
@@ -4556,6 +4718,71 @@ Host !blocked *.internal
     // box, and even niced, a rustc compile on a small VPS wrecks the live
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
+    /// #262: a config file edited during the session is pushed once, on the
+    /// next check; a failed push is logged; nothing changed pushes nothing.
+    #[test]
+    fn a_live_repush_ships_each_local_edit_once_and_logs_failures() {
+        use crate::config_sync::ConfigWatch;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keybindings.json");
+        let snips = dir.path().join("snippets.json");
+        let macros = dir.path().join("macros.json");
+        std::fs::write(&keys, "[]").unwrap();
+        let mut watch = ConfigWatch::new(vec![keys.clone(), snips.clone(), macros.clone()]);
+        let t0 = std::time::Instant::now();
+        let at = |n: u32| t0 + ConfigWatch::INTERVAL * n;
+        let mut sent: Vec<Vec<&'static str>> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        // `excluded`: None is an excluded host, else the excluded files.
+        let tick = |watch: &mut ConfigWatch,
+                    n: u32,
+                    excluded: Option<Vec<String>>,
+                    fail: &'static [&'static str],
+                    sent: &mut Vec<Vec<&'static str>>,
+                    lines: &mut Vec<String>| {
+            repush_tick(
+                watch,
+                dir.path(),
+                at(n),
+                &mut || excluded.clone(),
+                &mut |files| {
+                    sent.push(files.iter().map(|(s, _)| s.name).collect());
+                    fail.to_vec()
+                },
+                &mut |l| lines.push(l),
+            );
+        };
+        tick(&mut watch, 1, Some(vec![]), &[], &mut sent, &mut lines);
+        assert!(sent.is_empty(), "nothing edited yet");
+        std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        std::fs::write(&snips, "{}").unwrap();
+        std::fs::write(&macros, "{}").unwrap();
+        // macros.json is in config_sync_excluded_files: it stays home.
+        tick(
+            &mut watch,
+            2,
+            Some(vec![String::from("macros.json")]),
+            &["snippets.json"],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent, vec![vec!["keybindings.json", "snippets.json"]]);
+        assert_eq!(
+            lines,
+            vec![
+                "Config sync: re-pushed keybindings.json".to_string(),
+                "Config sync: could not re-push snippets.json (the remote keeps its copy)"
+                    .to_string(),
+            ]
+        );
+        tick(&mut watch, 3, Some(vec![]), &[], &mut sent, &mut lines);
+        assert_eq!(sent.len(), 1, "each edit is pushed once");
+        // A host in config_sync_excluded_hosts gets nothing.
+        std::fs::write(&keys, "[ ]").unwrap();
+        tick(&mut watch, 4, None, &[], &mut sent, &mut lines);
+        assert_eq!(sent.len(), 1, "an excluded host is never pushed to");
+    }
+
     /// #694: the build, and every rustc under it, is the kernel's first
     /// choice when memory runs out, and the script still parses as sh.
     #[test]
