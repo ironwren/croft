@@ -27,6 +27,7 @@ pub enum Runner {
     Pytest,
     Vitest,
     Jest,
+    Go,
 }
 
 /// Detect the workspace's test runner from the enabled extensions'
@@ -318,6 +319,44 @@ fn pytest_cmd(root: &Path, args: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+/// Absolute path to `go`: `PATH`, then where the official installer and
+/// Homebrew put it — absolute for the same GUI-stripped-PATH reason as
+/// [`cargo_cmd`].
+fn go_binary() -> PathBuf {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    path_dirs
+        .into_iter()
+        .chain(["/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .map(|d| d.join("go"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("go"))
+}
+
+/// `go test -json <args>` in `root` (#264).
+fn go_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, args: &[S]) -> Command {
+    let mut cmd = Command::new(go_binary());
+    cmd.args(["test", "-json"])
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Run `go test -json` and stream its finished tests, showing the text the
+/// tests printed (not the JSON events) in the OUTPUT channel.
+fn run_go<S: AsRef<std::ffi::OsStr>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
+    let module = super::gotest::module_path(root);
+    run_streaming_shown(tx, go_cmd(root, args), super::gotest::shown, |line| {
+        super::gotest::parse_event(module.as_deref(), line)
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Absolute path to a JS test runner binary for a workspace: the project's own
@@ -682,7 +721,19 @@ fn one(parse: fn(&str) -> Option<TestCase>) -> impl Fn(&str) -> Vec<TestCase> {
 /// it arrives. Returns the child's exit success, or `None` if it never spawned.
 fn run_streaming(
     tx: &EpochTx,
+    cmd: Command,
+    parse: impl Fn(&str) -> Vec<TestCase>,
+) -> Option<bool> {
+    run_streaming_shown(tx, cmd, |line| Some(line.to_string()), parse)
+}
+
+/// [`run_streaming`], with `show` choosing what of each stdout line the
+/// OUTPUT channel gets (`None` hides it): `go test -json` wraps the tests'
+/// own text in events.
+fn run_streaming_shown(
+    tx: &EpochTx,
     mut cmd: Command,
+    show: impl Fn(&str) -> Option<String>,
     parse: impl Fn(&str) -> Vec<TestCase>,
 ) -> Option<bool> {
     let mut child = match cmd.spawn() {
@@ -709,7 +760,9 @@ fn run_streaming(
     });
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
-            output::push(output::CHANNEL_TESTS, OutputLevel::Info, &line);
+            if let Some(text) = show(&line) {
+                output::push(output::CHANNEL_TESTS, OutputLevel::Info, &text);
+            }
             for case in parse(&line) {
                 tx.send(TestResponse::Case(case));
             }
@@ -773,6 +826,7 @@ fn run_all(root: &Path, tx: &EpochTx) {
             let cmd = cargo_cmd(root, &["test", "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
+        Runner::Go => run_go(tx, root, &[String::from("./...")]),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -835,6 +889,13 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
             }
             a
         }
+        Runner::Go => {
+            if scope.exact {
+                super::gotest::one_args(name)
+            } else {
+                super::gotest::filter_args(name, false)
+            }
+        }
     }
 }
 
@@ -877,7 +938,14 @@ fn coverage_args(runner: Runner, dir: &Path) -> Vec<String> {
             a.push(report);
             a
         }
+        // A Go cover profile, turned into `report` once the run ends.
+        Runner::Go => vec![format!("-coverprofile={}", go_cover_profile(dir).display())],
     }
+}
+
+/// Where a Go coverage run writes its native profile.
+fn go_cover_profile(dir: &Path) -> PathBuf {
+    dir.join("cover.out")
 }
 
 /// What installs a runner's coverage tool, picked from the project's own
@@ -909,7 +977,8 @@ fn coverage_install(runner: Runner, root: &Path) -> Option<(&'static str, String
                 String::from("npm install -D @vitest/coverage-v8")
             },
         )),
-        Runner::Jest => None,
+        // Coverage is built into `go test`.
+        Runner::Jest | Runner::Go => None,
     }
 }
 
@@ -925,7 +994,7 @@ fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
         Runner::Vitest => ["coverage-v8", "coverage-istanbul"]
             .iter()
             .any(|p| root.join("node_modules/@vitest").join(p).is_dir()),
-        Runner::Jest => true,
+        Runner::Jest | Runner::Go => true,
     }
 }
 
@@ -958,9 +1027,14 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
         tx.send(TestResponse::Started(Activity::Running));
     }
     let mut args = coverage_args(runner, &dir);
-    if let Some(scope) = scope {
-        args.extend(coverage_scope_args(runner, scope));
+    match scope {
+        Some(scope) => args.extend(coverage_scope_args(runner, scope)),
+        // The other runners run everything by default; `go test` only the
+        // package in the current directory.
+        None if runner == Runner::Go => args.push(String::from("./...")),
+        None => {}
     }
+
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ok = match runner {
         Runner::Pytest => run_streaming(tx, pytest_cmd(root, &args), one(parse_pytest_line)),
@@ -973,9 +1047,18 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
             parse_jest_json(root, line)
         }),
         Runner::Cargo => run_streaming(tx, cargo_cmd(root, &args), one(parse_test_line)),
+        Runner::Go => run_go(tx, root, &args),
     }
     .unwrap_or(false);
-    let report = std::fs::read_to_string(coverage_report(&dir))
+    let lcov = if runner == Runner::Go {
+        std::fs::read_to_string(go_cover_profile(&dir)).map(|profile| {
+            let module = super::gotest::module_path(root);
+            super::gotest::cover_profile_to_lcov(&profile, module.as_deref())
+        })
+    } else {
+        std::fs::read_to_string(coverage_report(&dir))
+    };
+    let report = lcov
         .map(|text| super::coverage::Coverage::from_lcov(&text, root))
         .map_err(|_| CoverageError::NoReport);
     tx.send(TestResponse::Coverage(report));
@@ -1011,6 +1094,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
             let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
+        Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1063,6 +1147,7 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
+        Runner::Go => run_go(tx, root, &super::gotest::filter_args(pattern, suite)),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1121,6 +1206,17 @@ fn discover(root: &Path, tx: &EpochTx) {
                 parse_list_line(line).map(not_run).into_iter().collect()
             });
         }
+        // `go test -list` compiles each package's tests but runs none.
+        Runner::Go => {
+            let module = super::gotest::module_path(root);
+            let cmd = go_cmd(root, &["-list", ".", "./..."]);
+            run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
+                super::gotest::parse_list_event(module.as_deref(), line)
+                    .map(not_run)
+                    .into_iter()
+                    .collect()
+            });
+        }
     }
     tx.send(TestResponse::Finished { ok: None });
 }
@@ -1162,6 +1258,100 @@ mod tests {
                 .any(|m| matches!(m, TestResponse::Finished { .. })),
             "a bare Finished after start_single/start_filter strands cases Running"
         );
+    }
+
+    /// End to end against a real `go` (#264): discovery lists each
+    /// package's tests, a run reports pass/fail/skip and subtests, one test
+    /// runs alone, and coverage paints the package's source. Needs Go, so it
+    /// is ignored by default; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn go_test_discovers_runs_and_covers_a_real_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module example.com/m\n\ngo 1.21\n").unwrap();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(
+            root.join("foo/foo.go"),
+            "package foo\n\nfunc Add(a, b int) int {\n\tif a > 100 {\n\t\treturn 0\n\t}\n\treturn a + b\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("foo/foo_test.go"),
+            "package foo\n\nimport \"testing\"\n\n\
+             func TestAdd(t *testing.T) {\n\tt.Run(\"small one\", func(t *testing.T) {\n\t\tif Add(1, 2) != 3 {\n\t\t\tt.Fatal(\"bad\")\n\t\t}\n\t})\n}\n\n\
+             func TestBad(t *testing.T) { t.Fatal(\"nope\") }\n\n\
+             func TestSkip(t *testing.T) { t.Skip(\"later\") }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("root_test.go"),
+            "package m\n\nimport \"testing\"\n\nfunc TestRoot(t *testing.T) {}\n",
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx { tx: &tx, epoch: 0 };
+        let cases = |rx: &Receiver<(u64, TestResponse)>| {
+            let mut v: Vec<(String, TestStatus)> = rx
+                .try_iter()
+                .filter_map(|(_, r)| match r {
+                    TestResponse::Case(c) => Some((c.name, c.status)),
+                    _ => None,
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        use TestStatus::*;
+        let s = String::from;
+
+        discover(root, &etx);
+        assert_eq!(
+            cases(&rx),
+            [
+                (s("./foo::TestAdd"), NotRun),
+                (s("./foo::TestBad"), NotRun),
+                (s("./foo::TestSkip"), NotRun),
+                (s(".::TestRoot"), NotRun),
+            ]
+        );
+        run_all(root, &etx);
+        assert_eq!(
+            cases(&rx),
+            [
+                (s("./foo::TestAdd"), Passed),
+                (s("./foo::TestAdd/small_one"), Passed),
+                (s("./foo::TestBad"), Failed),
+                (s("./foo::TestSkip"), Skipped),
+                (s(".::TestRoot"), Passed),
+            ]
+        );
+        run_one(root, &etx, "./foo::TestAdd/small_one");
+        assert_eq!(
+            cases(&rx),
+            [
+                (s("./foo::TestAdd"), Passed),
+                (s("./foo::TestAdd/small_one"), Passed),
+            ]
+        );
+        run_filter(root, &etx, "./foo", true);
+        assert_eq!(cases(&rx).len(), 4, "the whole package");
+
+        run_coverage(root, &etx, None);
+        let report = rx
+            .try_iter()
+            .find_map(|(_, r)| match r {
+                TestResponse::Coverage(c) => Some(c),
+                _ => None,
+            })
+            .expect("a coverage report")
+            .expect("go writes a profile");
+        let file = report
+            .files
+            .get(&root.join("foo/foo.go"))
+            .expect("foo.go is covered");
+        assert_eq!(file.hits.get(&7), Some(&1), "return a + b ran");
+        assert_eq!(file.hits.get(&5), Some(&0), "return 0 never ran");
     }
 
     #[test]

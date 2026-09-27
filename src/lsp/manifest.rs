@@ -55,6 +55,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/test-vitest/extension.toml"),
     include_str!("../../assets/extensions/test-jest/extension.toml"),
     include_str!("../../assets/extensions/test-pytest/extension.toml"),
+    include_str!("../../assets/extensions/test-go/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -257,6 +258,8 @@ pub enum RunnerKindDecl {
     Vitest,
     /// jest `--json` document output (JS/TS).
     Jest,
+    /// `go test -json` event stream (Go).
+    Go,
 }
 
 /// One `[[themes]]` entry: a complete IDE color palette. All colors are
@@ -983,6 +986,7 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             "test-pytest",
             "test-vitest",
             "test-jest",
+            "test-go",
         ] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }
