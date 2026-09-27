@@ -51115,7 +51115,6 @@ fn a_terminated_request_over_the_cap_is_refused_like_an_unterminated_one() {
     }
 }
 
-/// Open the debug picker and confirm the row whose label starts with `label`.
 /// Pick the row of the open list picker whose id is `id`.
 fn pick_row_id(app: &mut App, id: &str) {
     let picker = app.list_picker.as_mut().expect("a picker is open");
@@ -51209,6 +51208,7 @@ fn add_debug_configuration_attaches_by_port() {
     );
 }
 
+/// Open the debug picker and confirm the row whose label starts with `label`.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
     let idx = app
