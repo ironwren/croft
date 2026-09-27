@@ -38,6 +38,13 @@ pub struct FileTree {
     /// in the set — or under a dir in the set — render their name in the
     /// theme's dimmed foreground, VS Code's ignored-resource decoration.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// While the history scrubber sits on a commit (#371): the directory
+    /// the listing covers and every path in that commit's tree under it,
+    /// absolute, folders included. A row under that directory and absent
+    /// from it (submodule contents count as present) did not exist there,
+    /// and its name takes the same dimmed foreground as an ignored one.
+    /// `None` everywhere else, including at the working tree.
+    pub scrub_tree: Option<(PathBuf, Arc<crate::git::CommitTree>)>,
     /// Workspace files an agent changed and the user has not reviewed
     /// (#345), absolute. Rows in this set take a TRAILING dot in the theme's
     /// yellow; it clears when the file is marked reviewed.
@@ -117,6 +124,7 @@ impl FileTree {
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
+            scrub_tree: None,
             agent_touched: Arc::default(),
             note_counts: Arc::default(),
             root_badges: Arc::default(),
@@ -158,6 +166,7 @@ impl FileTree {
         // The old workspace's ignore set is meaningless under the new root;
         // the git worker re-queries after its SetRoot and repopulates.
         self.ignored = Arc::default();
+        self.scrub_tree = None;
         // Same reasoning for the lane badges (#348): keyed by absolute root
         // path, so a re-root would otherwise carry the old roots' entries
         // until the next sync rebuilt them.
@@ -274,6 +283,17 @@ impl FileTree {
                 None => return false,
             }
         }
+    }
+
+    /// True when the scrubber sits on a commit whose tree lacks `path`
+    /// (#371). Only paths strictly under the listed directory count: the
+    /// root row itself, and rows of another workspace root the listing
+    /// never covered, keep their colour.
+    pub fn is_absent_at_scrub(&self, path: &Path) -> bool {
+        let Some((base, present)) = self.scrub_tree.as_ref() else {
+            return false;
+        };
+        path != base && path.starts_with(base) && !present.contains(path)
     }
 
     /// Whether `path` is a file an agent changed that is still unreviewed.
@@ -1584,7 +1604,7 @@ impl Widget for &mut FileTree {
 
             // Git-ignored rows dim the *name* only — icons keep their color,
             // matching VS Code's ignored-resource decoration.
-            let name_fg = if self.is_ignored(&node.path) {
+            let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path) {
                 self.theme.ignored_fg()
             } else {
                 self.theme.ui(Color::White)
@@ -1791,7 +1811,8 @@ impl Widget for &mut FileTree {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| node.path.display().to_string());
-                let name_fg = if self.is_ignored(&node.path) {
+                let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path)
+                {
                     self.theme.ignored_fg()
                 } else {
                     self.theme.ui(Color::White)
@@ -2599,6 +2620,69 @@ mod tests {
             Color::White,
             "non-ignored names keep the normal foreground"
         );
+    }
+
+    /// #371: while scrubbing, a row absent from the commit's tree dims its
+    /// name; present files and folders, the root row, and another root the
+    /// listing never covered keep the normal foreground.
+    #[test]
+    fn rows_missing_from_the_scrubbed_commit_render_dimmed() {
+        let (_tmp, second, mut tree) = two_root_fixture();
+        let root = tree.root.clone();
+        tree.scrub_tree = Some((
+            root.clone(),
+            std::sync::Arc::new(crate::git::CommitTree {
+                paths: std::collections::HashSet::from([
+                    root.join("src"),
+                    root.join("src/lib.rs"),
+                    root.join("README.md"),
+                ]),
+                submodules: Vec::new(),
+            }),
+        ));
+        assert!(tree.is_absent_at_scrub(&root.join("main.rs")));
+        assert!(!tree.is_absent_at_scrub(&root.join("README.md")));
+        assert!(!tree.is_absent_at_scrub(&root), "the root row stays");
+        assert!(!tree.is_absent_at_scrub(&second.path().join("Cargo.toml")));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let dim = tree.theme.ignored_fg();
+        let row_fg = |needle: &str| {
+            for y in 0..area.height {
+                let cells: Vec<String> = (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                let joined = cells.concat();
+                let Some(target) = joined.find(needle) else {
+                    continue;
+                };
+                let mut acc = 0usize;
+                for (x, s) in cells.iter().enumerate() {
+                    if acc == target {
+                        return buf[(x as u16, y)].fg;
+                    }
+                    acc += s.len();
+                }
+            }
+            panic!("{needle} not on screen");
+        };
+        assert_eq!(row_fg("main.rs"), dim, "absent at the commit: dimmed");
+        assert_eq!(row_fg("README.md"), Color::White, "present: normal");
+        assert_eq!(row_fg("src"), Color::White, "a present folder: normal");
+        assert_eq!(
+            row_fg("Cargo.toml"),
+            Color::White,
+            "another root is outside the listing"
+        );
+        // The working tree: nothing dims.
+        tree.scrub_tree = None;
+        assert!(!tree.is_absent_at_scrub(&root.join("main.rs")));
     }
 
     #[test]
