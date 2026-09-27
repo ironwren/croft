@@ -53786,6 +53786,29 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// Wait for the OUTLINE to show the scrubbed commit's own symbols (#371),
+/// which the builder parses on its own thread with the finished view.
+fn settle_scrub_outline(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.drain_scrub_views();
+        app.sync_outline();
+        let commit = app
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if commit.is_some() && app.outline_scrub_key.as_ref().map(|(_, c)| c.clone()) == commit {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubbed commit's outline was never built"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Wait for the history scrubber's finished view of where it stands to
 /// replace the plain stand-in (#371); the builder runs on its own thread.
 fn settle_scrub_view(app: &mut App) {
@@ -57951,6 +57974,101 @@ fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
 }
 
 #[test]
+fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
+    // #371: while scrubbing, the Outline lists the file as it was at the
+    // commit on screen, the breadcrumbs follow the historical caret, a
+    // symbol jump lands in the history, and leaving brings the live
+    // outline back.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    let file = tmp.path().join("lib.rs");
+    std::fs::write(&file, "fn alpha() {\n    let a = 1;\n}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "alpha"]);
+    std::fs::write(
+        &file,
+        "fn beta() {\n}\n\nfn alpha() {\n    let a = 1;\n}\n\nfn gamma() {\n}\n",
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "beta and gamma"]);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    let names = |app: &App| -> Vec<String> {
+        app.outline
+            .symbols()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    };
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "control: live outline"
+    );
+
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "HEAD");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_outline(&mut app);
+    assert_eq!(names(&app), ["alpha"], "the commit's outline");
+
+    // A jump to `alpha` lands in the historical view, where it is line 0,
+    // and the breadcrumbs name it from there.
+    let target = app.outline.jump_target(0).unwrap().1;
+    assert!(app.jump_in_scrub_view(target));
+    assert_eq!(app.scrub_view.as_ref().unwrap().cursor_row, 0);
+    app.editor.cursor_row = 7; // the live caret, inside `gamma`
+    let crumbs: Vec<String> = app
+        .build_breadcrumbs()
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert_eq!(
+        crumbs.last().map(String::as_str),
+        Some("alpha"),
+        "{crumbs:?}"
+    );
+
+    // Switching to a file that did not exist at this commit: its outline
+    // is its own (none), never the previous file's history under its name.
+    let other = tmp.path().join("other.rs");
+    std::fs::write(&other, "fn zeta() {}\n").unwrap();
+    app.editor.open(&other).unwrap();
+    app.sync_outline();
+    assert!(names(&app).is_empty(), "{:?}", names(&app));
+    app.editor.open(&file).unwrap();
+    app.sync_outline();
+    assert_eq!(names(&app), ["alpha"]);
+
+    assert!(
+        app.handle_scrubber_key(KeyCode::Home),
+        "back to the working tree"
+    );
+    app.sync_outline();
+    assert_eq!(
+        names(&app),
+        ["beta", "alpha", "gamma"],
+        "the live outline is back"
+    );
+    assert!(!app.jump_in_scrub_view(0), "no history on screen");
+}
+
+#[test]
 fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     // #365: `c` fetches the PR head into a sibling worktree added to the
     // workspace, and Esc takes it away again when nothing was changed.
@@ -58119,6 +58237,7 @@ fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
         std::thread::sleep(repeat);
         app.drain_scrub_views();
         app.handle_scrubber_key(KeyCode::Left);
+        app.sync_outline();
     }
     app.handle_scrubber_key(KeyCode::Home);
     let mut times = Vec::with_capacity(steps);
@@ -58127,6 +58246,9 @@ fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
         app.drain_scrub_views();
         let t = std::time::Instant::now();
         app.handle_scrubber_key(KeyCode::Left);
+        // What the main loop runs between the key and the frame: the
+        // Outline follows the commit on screen.
+        app.sync_outline();
         term.draw(|f| app.render(f)).unwrap();
         times.push(t.elapsed());
     }

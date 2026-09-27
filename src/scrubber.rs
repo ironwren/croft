@@ -254,6 +254,10 @@ pub struct BuiltView {
     pub text: Option<std::sync::Arc<str>>,
     pub parent_text: Option<(String, Option<std::sync::Arc<str>>)>,
     pub view: crate::widgets::editor::Editor,
+    /// The file's outline at the commit, from its own syntax tree: built
+    /// with the finished view, since parsing a big file takes far longer
+    /// than a frame. `None` from the plain lane.
+    pub outline: Option<Vec<crate::lsp::manager::OutlineSymbol>>,
 }
 
 /// A queue a worker drains, most urgent first, which the app REPLACES on
@@ -349,12 +353,20 @@ impl ViewBuilder {
                     text.as_deref(),
                     baseline,
                 );
+                // A file the commit predates has no outline; its view is a
+                // note, not the file.
+                let outline = Some(if text.is_some() {
+                    crate::outline_syntax::symbols_for_lines(&job.path, &view.lines)
+                } else {
+                    Vec::new()
+                });
                 BuiltView {
                     key: job.key,
                     finished: true,
                     text,
                     parent_text,
                     view,
+                    outline,
                 }
             } else {
                 let view = plain_view(&job.path, &job.key.rel, &job.short, text.as_deref());
@@ -364,6 +376,7 @@ impl ViewBuilder {
                     text,
                     parent_text: None,
                     view,
+                    outline: None,
                 }
             };
             if tx.send(built).is_err() {
