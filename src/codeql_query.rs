@@ -239,19 +239,43 @@ pub struct HistoryEntry {
     pub started: u64,
     pub seconds: u64,
     pub status: RunStatus,
-    /// The SARIF or CSV the run wrote.
+    /// The SARIF or CSV the run wrote. Each run writes into its own
+    /// folder, so this also identifies the entry.
     pub output: PathBuf,
+    /// The label the user gave it, shown in place of the default one.
+    /// History saved before renaming existed reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl HistoryEntry {
-    /// A history line: "✓ query.ql · db · 12s", "✗ … · failed: why",
-    /// "… running".
-    pub fn label(&self) -> String {
-        let name = self
-            .query
+    /// The query's file name.
+    pub fn query_name(&self) -> String {
+        self.query
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// What the entry is called: the user's label, else the query's file
+    /// name. The name sort orders by this.
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.query_name())
+    }
+
+    /// A history line: "✓ query.ql · db · 12s", "✗ … · failed: why",
+    /// "… running". A renamed entry keeps only the status mark before the
+    /// user's label.
+    pub fn label(&self) -> String {
+        if let Some(custom) = &self.name {
+            let mark = match self.status {
+                RunStatus::Succeeded => '\u{2713}',
+                RunStatus::Failed(_) => '\u{2717}',
+                RunStatus::Running => '\u{2026}',
+            };
+            return format!("{mark} {custom}");
+        }
+        let name = self.query_name();
         match &self.status {
             RunStatus::Succeeded => format!(
                 "\u{2713} {name} \u{b7} {} \u{b7} {}s",
@@ -268,11 +292,46 @@ impl HistoryEntry {
     }
 }
 
-/// The query history, newest first, capped at [`History::CAP`] entries.
+/// The orders the Query History section sorts by. VS Code also sorts by
+/// result count; croft's history does not record counts, so the third
+/// order groups runs by how they ended instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HistSort {
+    /// Newest first.
+    #[default]
+    Date,
+    Name,
+    /// Succeeded, then failed, then running; newest first within each.
+    Status,
+}
+
+impl HistSort {
+    /// The next order in the cycle the side bar's sort row steps through.
+    pub fn next(self) -> HistSort {
+        match self {
+            HistSort::Date => HistSort::Name,
+            HistSort::Name => HistSort::Status,
+            HistSort::Status => HistSort::Date,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HistSort::Date => "date",
+            HistSort::Name => "name",
+            HistSort::Status => "status",
+        }
+    }
+}
+
+/// The query history in the order the user chose (newest first unless
+/// they sorted it otherwise), capped at [`History::CAP`] entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct History {
     #[serde(default)]
     pub entries: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub sort_by: HistSort,
 }
 
 impl History {
@@ -293,10 +352,80 @@ impl History {
         std::fs::write(path, text)
     }
 
-    /// Record a new run at the top, dropping the oldest past the cap.
+    /// Record a new run, dropping the oldest past the cap. It goes at the
+    /// top, then takes its place in the chosen order.
     pub fn push(&mut self, entry: HistoryEntry) {
         self.entries.insert(0, entry);
-        self.entries.truncate(Self::CAP);
+        if self.entries.len() > Self::CAP {
+            // The oldest run, wherever the order put it; among equals the
+            // one furthest down goes, never the new entry at the top.
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .min_by_key(|(_, e)| e.started)
+                .map_or(0, |(i, _)| i);
+            self.entries.remove(oldest);
+        }
+        if self.sort_by != HistSort::Date {
+            self.sort(self.sort_by);
+        }
+    }
+
+    /// Forget entry `index` (its results are the caller's business).
+    pub fn remove(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+
+    /// Give entry `index` a label of its own. A blank label is refused.
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(String::from("A query history label cannot be empty"));
+        }
+        let entry = self
+            .entries
+            .get_mut(index)
+            .ok_or_else(|| String::from("No such query history entry"))?;
+        entry.name = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Reorder the entries and remember the order.
+    pub fn sort(&mut self, by: HistSort) {
+        use std::cmp::Reverse;
+        match by {
+            HistSort::Date => self.entries.sort_by_key(|e| Reverse(e.started)),
+            HistSort::Name => self
+                .entries
+                .sort_by_key(|e| (e.display_name().to_lowercase(), Reverse(e.started))),
+            HistSort::Status => self.entries.sort_by_key(|e| {
+                let rank = match e.status {
+                    RunStatus::Succeeded => 0,
+                    RunStatus::Failed(_) => 1,
+                    RunStatus::Running => 2,
+                };
+                (rank, Reverse(e.started))
+            }),
+        }
+        self.sort_by = by;
+    }
+
+    /// The index of the entry whose run wrote `output`.
+    pub fn position(&self, output: &Path) -> Option<usize> {
+        self.entries.iter().position(|e| e.output == output)
+    }
+
+    /// The index of the most recent run, whatever the order.
+    pub fn newest(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
     }
 }
 
@@ -445,6 +574,7 @@ mod tests {
             seconds: 12,
             status,
             output: PathBuf::from("/out/r.sarif"),
+            name: None,
         }
     }
 
@@ -482,5 +612,106 @@ mod tests {
             History::load(&dir.path().join("missing.json")),
             History::default()
         );
+    }
+
+    fn run(query: &str, started: u64, status: RunStatus) -> HistoryEntry {
+        HistoryEntry {
+            query: PathBuf::from("/w").join(query),
+            started,
+            status,
+            output: PathBuf::from(format!("/out/{started}/r.sarif")),
+            ..entry(RunStatus::Succeeded)
+        }
+    }
+
+    fn started(h: &History) -> Vec<u64> {
+        h.entries.iter().map(|e| e.started).collect()
+    }
+
+    #[test]
+    fn a_history_entry_is_removed_by_index() {
+        let mut h = History::default();
+        for i in 1..=3 {
+            h.push(run("q.ql", i, RunStatus::Succeeded));
+        }
+        h.remove(1);
+        assert_eq!(started(&h), [3, 1]);
+        h.remove(7);
+        assert_eq!(started(&h), [3, 1], "out of range is a no-op");
+        assert_eq!(h.position(Path::new("/out/1/r.sarif")), Some(1));
+        assert_eq!(h.position(Path::new("/out/2/r.sarif")), None);
+    }
+
+    #[test]
+    fn a_renamed_entry_shows_its_label_but_never_a_blank_one() {
+        let mut h = History::default();
+        h.push(entry(RunStatus::Succeeded));
+        assert_eq!(h.rename(0, "  sqli on main  "), Ok(()));
+        assert_eq!(h.entries[0].label(), "\u{2713} sqli on main");
+        assert_eq!(h.entries[0].display_name(), "sqli on main");
+        assert!(h.rename(0, "  ").is_err());
+        assert_eq!(h.entries[0].name.as_deref(), Some("sqli on main"));
+        assert!(h.rename(4, "x").is_err());
+        h.entries[0].status = RunStatus::Failed(String::from("x"));
+        assert_eq!(h.entries[0].label(), "\u{2717} sqli on main");
+    }
+
+    #[test]
+    fn history_saved_before_labels_and_sorting_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"query":"/w/sql.ql","database":"app","started":1,"seconds":12,"status":"Succeeded","output":"/out/r.sarif"}]}"#,
+        )
+        .unwrap();
+        let h = History::load(&path);
+        assert_eq!(h.entries, vec![entry(RunStatus::Succeeded)]);
+        assert_eq!(h.sort_by, HistSort::Date);
+        // An unrenamed entry saves without the field.
+        h.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"name\""));
+    }
+
+    #[test]
+    fn history_sorts_by_date_name_or_status_and_keeps_the_order() {
+        let mut h = History::default();
+        h.push(run("b.ql", 1, RunStatus::Failed(String::from("x"))));
+        h.push(run("A.ql", 2, RunStatus::Succeeded));
+        h.push(run("c.ql", 3, RunStatus::Running));
+        h.push(run("b.ql", 4, RunStatus::Succeeded));
+        assert_eq!(started(&h), [4, 3, 2, 1], "newest first by default");
+        h.sort(HistSort::Name);
+        assert_eq!(started(&h), [2, 4, 1, 3], "case-insensitive, newest first");
+        h.rename(3, "0 first").unwrap();
+        h.sort(HistSort::Name);
+        assert_eq!(started(&h), [3, 2, 4, 1], "a label sorts as its name");
+        h.sort(HistSort::Status);
+        assert_eq!(started(&h), [4, 2, 1, 3]);
+        assert_eq!(h.newest(), Some(0));
+        // A new run takes its place in the chosen order.
+        h.push(run("z.ql", 5, RunStatus::Failed(String::from("y"))));
+        assert_eq!(started(&h), [4, 2, 5, 1, 3]);
+        assert_eq!(h.newest(), Some(2));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        h.save(&path).unwrap();
+        assert_eq!(History::load(&path).sort_by, HistSort::Status, "saved");
+        h.sort(HistSort::Date);
+        assert_eq!(started(&h), [5, 4, 3, 2, 1]);
+        assert_eq!(HistSort::Status.next(), HistSort::Date);
+    }
+
+    #[test]
+    fn the_cap_drops_the_oldest_run_in_any_order() {
+        let mut h = History::default();
+        for i in 0..History::CAP as u64 {
+            h.push(run("q.ql", i + 1, RunStatus::Succeeded));
+        }
+        h.sort(HistSort::Name);
+        h.push(run("q.ql", 1000, RunStatus::Succeeded));
+        assert_eq!(h.entries.len(), History::CAP);
+        assert!(h.entries.iter().all(|e| e.started != 1), "the oldest went");
+        assert_eq!(h.entries[0].started, 1000);
     }
 }
