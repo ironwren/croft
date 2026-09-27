@@ -395,11 +395,23 @@ fn merge_changed(
                 merge_changed(inner, b, value);
             }
             _ => {
+                // The old spelling goes with it: serde rejects an object
+                // holding both a field and its alias as a duplicate field,
+                // so the next load would fall back to defaults.
+                for (canonical, legacy) in SERDE_ALIASES {
+                    if key == canonical {
+                        doc.remove(*legacy);
+                    }
+                }
                 doc.insert(key.clone(), value.clone());
             }
         }
     }
 }
+
+/// Every `#[serde(alias)]` in the settings, as (field, old key), for
+/// [`merge_changed`].
+const SERDE_ALIASES: &[(&str, &str)] = &[("dependencies", "rust_dependencies")];
 
 /// The `config.json` that [`Prefs::load_or_default`] reads, or `None` in
 /// test builds: the user's real `config.json` must never steer a test
@@ -1089,6 +1101,17 @@ mod tests {
             .expect("write legacy config");
         let legacy = Prefs::load(&path).expect("load legacy").explorer_views;
         assert!(!legacy.dependencies, "old rust_dependencies key aliases in");
+        // Turning the view back on writes the new key and drops the old one:
+        // both in one object is a duplicate field, and the load after that
+        // would fall back to defaults.
+        let mut prefs = Prefs::load(&path).expect("load legacy");
+        prefs.explorer_views.dependencies = true;
+        prefs.explorer_views.timeline = false;
+        prefs.save(&path).expect("save over legacy");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("rust_dependencies"), "{text}");
+        let reloaded = Prefs::load(&path).expect("reload").explorer_views;
+        assert!(reloaded.dependencies && !reloaded.timeline, "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

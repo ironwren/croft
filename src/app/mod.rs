@@ -12857,17 +12857,27 @@ impl App {
 
     /// Accept a completion by the server's own edit and its additional edits
     /// (auto-imports), shifted by what was typed or deleted at the caret since
-    /// the request, as one generated edit and one undo step. False when the
-    /// item has no usable edit, for the prefix fallback.
+    /// the request, as one generated edit and one undo step. A snippet's
+    /// range is cleared by the same edit and its body then expanded at the
+    /// caret, tab stops and all: expanded over the typed prefix alone, a
+    /// range reaching further left the rest in the buffer, and the imports
+    /// never came. False when the item has no usable edit, for the prefix
+    /// fallback.
     fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
         use crate::widgets::editor::TextSpanEdit;
         let Some(te) = &item.text_edit else {
             return false;
         };
         let row = self.editor.cursor_row;
-        if te.start.0 != row || te.end.0 != row || te.new_text.contains('\n') {
+        if te.start.0 != row || te.end.0 != row || (!item.is_snippet && te.new_text.contains('\n'))
+        {
             return false;
         }
+        let inserted = if item.is_snippet {
+            String::new()
+        } else {
+            te.new_text.clone()
+        };
         let Some(line) = self.editor.lines.get(row) else {
             return false;
         };
@@ -12909,7 +12919,7 @@ impl App {
         let mut edits = vec![TextSpanEdit {
             start: (row, start),
             end: (row, end),
-            new_text: te.new_text.clone(),
+            new_text: inserted.clone(),
             utf16: false,
         }];
         for e in &item.additional_edits {
@@ -12928,7 +12938,7 @@ impl App {
         // The caret lands after the inserted text, moved by what the
         // additional edits before it added or removed.
         let mut caret_row = row as isize;
-        let mut caret_col = (start + te.new_text.chars().count()) as isize;
+        let mut caret_col = (start + inserted.chars().count()) as isize;
         for e in &edits[1..] {
             if e.end > (row, start) {
                 continue;
@@ -12950,6 +12960,9 @@ impl App {
         self.editor.cursor_row = caret_row.max(0) as usize;
         self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
+        if item.is_snippet {
+            self.editor.expand_snippet(&te.new_text, 0);
+        }
         true
     }
 
@@ -12996,7 +13009,7 @@ impl App {
                     .and_then(|p| p.selected_item().cloned());
                 self.completion_popup = None;
                 self.completion_request_id = None;
-                if let Some(item) = item.filter(|_| !is_snippet)
+                if let Some(item) = item
                     && self.accept_completion_edit(&item)
                 {
                     return true;

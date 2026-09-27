@@ -12627,6 +12627,35 @@ fn a_completion_applies_its_text_edit_and_additional_edits() {
     };
     assert!(app.accept_completion_edit(&item));
     assert_eq!(app.editor.lines, vec![String::from("baz")]);
+    // A snippet takes the same range and imports, and still expands: the
+    // `.` its range covers goes, and the caret sits on the first tab stop.
+    app.editor.lines = vec![String::from("a.f")];
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    let item = crate::lsp::CompletionItem {
+        label: String::from("foo"),
+        is_snippet: true,
+        text_edit: Some(TextSpanEdit {
+            start: (0, 1),
+            end: (0, 3),
+            new_text: String::from("?.foo(${1:x})$0"),
+            utf16: true,
+        }),
+        additional_edits: vec![TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: String::from("use x;\n"),
+            utf16: true,
+        }],
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    assert_eq!(
+        app.editor.lines,
+        vec![String::from("use x;"), String::from("a?.foo(x)")]
+    );
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(app.editor.snippet_active(), "tab stops are live");
 }
 
 /// Restoring a snapshot keeps the version it overwrites, even one never

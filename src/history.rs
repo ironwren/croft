@@ -172,6 +172,9 @@ fn record_impl(
     keep: bool,
 ) -> std::io::Result<()> {
     let dir = dir_for(root_dir, abs_path);
+    // First, so the merge path below and a directory an older build made
+    // (or a migrated legacy one) are owner-only too.
+    create_private_dir(&dir)?;
     if let Some(latest) = entries_in(root_dir, abs_path).first() {
         // Skip when the newest snapshot already holds this exact content;
         // a kept record marks it kept instead of adding a duplicate.
@@ -204,7 +207,19 @@ fn record_impl(
             return Ok(());
         }
     }
-    create_private_dir(&dir)?;
+    // Never over a snapshot already at this millisecond: a restore keeps the
+    // bytes on disk and then records the restored ones, often within one
+    // millisecond, and the second write renamed over the first. A later
+    // millisecond keeps the order (newest last). Leftover sidecars at the
+    // chosen timestamp would describe bytes that are not there.
+    let mut millis = millis;
+    while dir.join(format!("{millis}.{SNAP_EXT}")).exists() {
+        millis += 1;
+    }
+    let _ = std::fs::remove_file(seats_path(&dir, millis));
+    if !keep {
+        let _ = std::fs::remove_file(keep_path(&dir, millis));
+    }
     write_snapshot(&dir, millis, content)?;
     if keep {
         write_staged(&dir, millis, KEEP_EXT, b"")?;
@@ -215,7 +230,9 @@ fn record_impl(
 
 /// Create `dir` (and missing parents) owner-only: snapshots copy the files
 /// they record, a 0600 `.env` included, and the umask's 0755 let any local
-/// user list and read them.
+/// user list and read them. `DirBuilder::mode` only applies to directories
+/// it creates, so `dir` and the history root above it are tightened when an
+/// older build left them open, and so are the snapshots already inside.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -224,7 +241,37 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(dir)
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        if let Some(root) = dir.parent() {
+            make_owner_only(root, false);
+        }
+        make_owner_only(dir, true);
+    }
+    Ok(())
+}
+
+/// Set `dir` to 0700 when group or others can reach it, and with `files`
+/// its entries to 0600. Best-effort: history still records if it fails.
+#[cfg(unix)]
+fn make_owner_only(dir: &Path, files: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    if meta.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if !files {
+        return;
+    }
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 /// Put `content` at `<millis>.snap` under `dir` so that the entry is never
@@ -501,6 +548,57 @@ mod tests {
             std::fs::metadata(snap).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// A restore keeps the bytes on disk, then records the restored ones,
+    /// often in the same millisecond: the second must not replace the first.
+    #[test]
+    fn a_kept_record_in_the_same_millisecond_does_not_overwrite_the_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = Path::new("/work/a.rs");
+        record_kept_in(root, f, b"before restore", 5000).unwrap();
+        record_kept_in(root, f, b"restored", 5000).unwrap();
+        let held: Vec<(u64, Vec<u8>)> = entries_in(root, f)
+            .iter()
+            .map(|s| (s.millis, std::fs::read(&s.file).unwrap()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (5001, b"restored".to_vec()),
+                (5000, b"before restore".to_vec())
+            ]
+        );
+        assert!(is_kept(&dir_for(root, f), 5000) && is_kept(&dir_for(root, f), 5001));
+    }
+
+    /// History an older build left world-readable is tightened on the next
+    /// record, the snapshots already inside included.
+    #[test]
+    fn history_left_open_by_an_older_build_becomes_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("history");
+        let f = Path::new("/work/.env");
+        let dir = root.join(key_for(f));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1000.snap"), b"SECRET=1").unwrap();
+        for (p, mode) in [
+            (&root, 0o755),
+            (&dir, 0o755),
+            (&dir.join("1000.snap"), 0o644),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // Inside the merge window: the path that never created a directory.
+        record_in(&root, f, b"SECRET=2", 1500).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        for snap in entries_in(&root, f) {
+            assert_eq!(mode(&snap.file), 0o600, "{}", snap.file.display());
+        }
     }
 
     #[test]

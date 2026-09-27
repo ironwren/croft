@@ -927,10 +927,24 @@ pub fn replace_in_file(
                 if std::fs::rename(&tmp, path).is_ok() {
                     return Some(count);
                 }
+                // The directory took the temp file, so nothing is gained by
+                // writing in place, and a failure there truncates the file.
                 let _ = std::fs::remove_file(&tmp);
+                return None;
             }
-            Err(_) => {
-                let _ = std::fs::remove_file(&tmp);
+            // Only a temp file that cannot be created (a directory that
+            // refuses it, or a name already taken, which is never followed)
+            // falls through to an in-place write. A full disk would fail that
+            // write too, after it had already truncated the file.
+            Err(e) => {
+                use std::io::ErrorKind;
+                if !matches!(
+                    e.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::AlreadyExists
+                ) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return None;
+                }
             }
         }
     }
