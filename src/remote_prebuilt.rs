@@ -115,6 +115,7 @@ pub fn prepare(
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&binary, &bytes)?;
     std::fs::write(&recorded, sha256_hex(&bytes))?;
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
