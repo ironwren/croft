@@ -573,11 +573,15 @@ Moves through a branch's history. This is the cursor behind "Source Control: Scr
 
 **`Position::Working` is a variant, not `Option::None`.** An `Option` over a commit index invites "nothing selected" and "back at the working tree" to be the same value, and the second is where the user started.
 
+**The Outline and breadcrumbs follow the commit.** While a commit is on screen, `sync_outline` fills the Outline from that version's own syntax tree, recomputed once per step (keyed by file and commit). No language server has seen that text. The breadcrumbs read the historical view's caret, and an Outline or breadcrumb jump lands in the historical view through `jump_in_scrub_view` rather than moving the hidden live buffer. Leaving drops the key, and the live outline is recomputed.
+
 **The key hook sits below every modal guard in `handle_key_inner`.** A palette, prompt or picker opened while scrubbing keeps its own arrows. This holds by construction: each of those returns unconditionally, so a key only reaches the scrubber when none of them wanted it.
 
 **Fed by `git::branch_history` (`--first-parent HEAD`), not `commit_graph`.** The commit graph's `--branches --tags` ref set exists to draw the repo-wide graph. With any other branch present, index 0 there is whatever topological order put first rather than HEAD.
 
 **Two boundary decisions.** Stepping back from the tree lands on HEAD rather than skipping it — they are different views, since one has your unsaved edits. And the oldest commit is a wall rather than a wrap, because a drag that reappeared at the present would read as the slider slipping.
+
+**A step never builds a view on the UI thread.** Highlighting and diffing a big file takes far longer than a frame (the 35k-line `src/app/mod.rs` takes over half a second), and even splitting it into lines costs several milliseconds. So `ViewBuilder` runs two lanes on their own threads. The plain lane keeps the split text of the commits around the cursor ready; a step shows that at once. The finished lane builds the highlighted, gutter-marked view, which `App::drain_scrub_views` swaps in when it lands. Each step replaces both queues rather than adding to them, so a held arrow key leaves no backlog of commits already passed. The app keeps up to `SCRUB_VIEWS_KEPT` of each kind, so stepping back is free, and frees evicted views off the UI thread. The finished lane also parses the version's OUTLINE symbols, which `sync_outline` shows once they land (the previous outline of the same file stays until then; another file's is cleared), since parsing the whole file on each step cost about 400 ms. Both lanes also fill the whole-buffer caches a first paint would compute (fold tables, conflict markers, the widest line), so the UI thread paints only the visible rows. Measured on this repository's `src/app/mod.rs` (35k lines, 121 commits), a warm step is about 1 ms p50 and 2 ms p95, against the 16 ms budget.
 
 ### pair_host.rs
 
