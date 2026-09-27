@@ -2795,6 +2795,10 @@ pub struct App {
     /// The network git operation in flight (push, pull, fetch, clone...),
     /// named for the status line, and where its finisher arrives.
     git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
+    /// A read-only git view being computed off the UI thread (a TIMELINE
+    /// commit diff, a COMMITS patch): a large repo's `git show` or rename
+    /// walk froze the editor when run inline. A newer click replaces it.
+    git_view_job: Option<std::sync::mpsc::Receiver<GitNetDone>>,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -3618,6 +3622,10 @@ pub struct App {
     /// id are dropped so a slow earlier response cannot clobber a fresh
     /// one (e.g. user already moved past the original trigger).
     completion_request_id: Option<u64>,
+    /// Where the caret was (row, char column) when the pending completion was
+    /// requested: the server's edit ranges describe the line then, and the
+    /// accept shifts them by what was typed or deleted since.
+    completion_origin: Option<(usize, usize)>,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -3780,6 +3788,10 @@ pub struct App {
     review_export_pr: Option<(PathBuf, String)>,
     review_ai_prefix: String,
     review_pr: Option<(PathBuf, String)>,
+    /// The branch checked out when `review_pr` was recorded: the number is
+    /// reused only while it is still the branch, or a `gh pr checkout` of
+    /// another PR sent comments to the old one.
+    review_pr_branch: Option<String>,
     review_nodes: std::collections::HashMap<u64, String>,
     review_verdict: Option<crate::review_threads::ReviewEvent>,
     review_gh: String,
@@ -5079,6 +5091,7 @@ impl App {
             blame_tx,
             blame_fetched: None,
             git_net_job: None,
+            git_view_job: None,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -5521,6 +5534,7 @@ impl App {
             file_finder_index_rx: Some(file_finder_index_rx),
             file_finder_index_dirty: false,
             completion_request_id: None,
+            completion_origin: None,
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -5553,6 +5567,7 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| String::from(crate::review_threads::DEFAULT_AI_PREFIX)),
             review_pr: None,
+            review_pr_branch: None,
             review_nodes: std::collections::HashMap::new(),
             review_verdict: None,
             review_gh: String::from("gh"),
@@ -8128,6 +8143,7 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
+        self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -10093,20 +10109,22 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        match crate::git::show_commit_file_diff(&timeline_root, &hash, &rel) {
-            Ok(raw) => {
-                let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
-                if let Err(e) = self.editor.open_git_diff_side_by_side(&label, &raw) {
-                    self.status = format!("Could not open diff: {e}");
-                    return;
+        self.status = format!("Loading {rel} at {hash}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_commit_file_diff(&timeline_root, &hash, &rel);
+            Box::new(move |app: &mut App| match result {
+                Ok(raw) => {
+                    let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                    if let Err(e) = app.editor.open_git_diff_side_by_side(&label, &raw) {
+                        app.status = format!("Could not open diff: {e}");
+                        return;
+                    }
+                    app.focus_pane(Pane::Editor);
+                    app.status = format!("Showing {rel} at {hash}");
                 }
-                self.focus_pane(Pane::Editor);
-                self.status = format!("Showing {rel} at {hash}");
-            }
-            Err(e) => {
-                self.status = format!("git show failed: {e}");
-            }
-        }
+                Err(e) => app.status = format!("git show failed: {e}"),
+            })
+        });
     }
 
     /// Restore the local snapshot currently shown in a TIMELINE diff: write its
@@ -10117,6 +10135,16 @@ impl App {
             self.status = String::from("Open a local snapshot from the TIMELINE first");
             return;
         };
+        // What is on disk now is kept first: it may never have been
+        // snapshotted (an agent's write, a checkout), and the restore
+        // overwrites it. Refused if it cannot be kept.
+        if let Ok(current) = std::fs::read(&file)
+            && let Err(e) =
+                crate::history::record_kept_in(&self.history_root, &file, &current, now_millis())
+        {
+            self.status = format!("Restore cancelled: could not keep the current version ({e})");
+            return;
+        }
         if let Err(e) = std::fs::write(&file, &content) {
             self.status = format!("Restore failed: {e}");
             return;
@@ -10142,8 +10170,9 @@ impl App {
             onto_buffer.truncate(self.editor.lines.len());
             self.editor.provenance = onto_buffer;
         }
-        // The restore is itself a new version worth keeping.
-        self.record_history_snapshot(&file, seats);
+        // The restore is itself a new version worth keeping, kept like the
+        // version it replaced.
+        self.record_history_snapshot_of_kept(&file, seats);
         self.status = format!("Restored {}", self.status_path(&file));
     }
 
@@ -13075,6 +13104,117 @@ impl App {
         self.status = String::from("Resolving quick fix");
     }
 
+    /// Accept a completion by the server's own edit and its additional edits
+    /// (auto-imports), shifted by what was typed or deleted at the caret since
+    /// the request, as one generated edit and one undo step. A snippet's
+    /// range is cleared by the same edit and its body then expanded at the
+    /// caret, tab stops and all: expanded over the typed prefix alone, a
+    /// range reaching further left the rest in the buffer, and the imports
+    /// never came. False when the item has no usable edit, for the prefix
+    /// fallback.
+    fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
+        use crate::widgets::editor::TextSpanEdit;
+        let Some(te) = &item.text_edit else {
+            return false;
+        };
+        let row = self.editor.cursor_row;
+        if te.start.0 != row || te.end.0 != row || (!item.is_snippet && te.new_text.contains('\n'))
+        {
+            return false;
+        }
+        let inserted = if item.is_snippet {
+            String::new()
+        } else {
+            te.new_text.clone()
+        };
+        let Some(line) = self.editor.lines.get(row) else {
+            return false;
+        };
+        let to_char = |e: &TextSpanEdit, c: usize| {
+            if e.utf16 {
+                crate::widgets::editor::utf16_to_char_col(line, c as u32)
+            } else {
+                c
+            }
+        };
+        let caret = self.editor.cursor_col;
+        // The server's ranges describe the line when the completion was asked
+        // for; the caret has moved since by what was typed (or deleted) at it.
+        // Everything on this row from the request point on shifts with it,
+        // both ways: a Backspace after the request made the server's end
+        // reach past the word and swallow the `)` after it.
+        let shift: isize = match self.completion_origin {
+            Some((r, c)) if r == row => caret as isize - c as isize,
+            _ => 0,
+        };
+        let origin_col = self.completion_origin.map_or(caret, |(_, c)| c);
+        let moved = |c: usize| -> usize {
+            if c >= origin_col {
+                (c as isize + shift).max(0) as usize
+            } else {
+                c
+            }
+        };
+        let line_len = line.chars().count();
+        let start = to_char(te, te.start.1);
+        let end = moved(to_char(te, te.end.1)).max(caret).min(line_len);
+        if start > caret {
+            return false;
+        }
+        // The main edit and its additional edits (auto-imports) go in as ONE
+        // edit against the same text, as the spec defines them: applied one
+        // after the other, an import on this row landed in the edited line,
+        // and one accept took two undos.
+        let mut edits = vec![TextSpanEdit {
+            start: (row, start),
+            end: (row, end),
+            new_text: inserted.clone(),
+            utf16: false,
+        }];
+        for e in &item.additional_edits {
+            let mut e = e.clone();
+            if e.start.0 == row {
+                e.start.1 = moved(to_char(&e, e.start.1));
+                e.end.1 = if e.end.0 == row {
+                    moved(to_char(&e, e.end.1))
+                } else {
+                    e.end.1
+                };
+                e.utf16 = false;
+            }
+            edits.push(e);
+        }
+        // The caret lands after the inserted text, moved by what the
+        // additional edits before it added or removed.
+        let mut caret_row = row as isize;
+        let mut caret_col = (start + inserted.chars().count()) as isize;
+        for e in &edits[1..] {
+            if e.end > (row, start) {
+                continue;
+            }
+            let added_rows = e.new_text.matches('\n').count() as isize;
+            caret_row += added_rows - (e.end.0 - e.start.0) as isize;
+            if e.end.0 == row {
+                let tail = e.new_text.rsplit('\n').next().unwrap_or("").chars().count() as isize;
+                caret_col += if added_rows == 0 && e.start.0 == row {
+                    tail - (e.end.1 - e.start.1) as isize
+                } else {
+                    tail + e.start.1 as isize - e.end.1 as isize
+                };
+            }
+        }
+        // An accepted completion is the server's text, not the user's (#349).
+        self.editor
+            .apply_span_edits_as(&edits, crate::provenance::Seat::Generated);
+        self.editor.cursor_row = caret_row.max(0) as usize;
+        self.editor.cursor_col = caret_col.max(0) as usize;
+        self.editor.clamp_cursor();
+        if item.is_snippet {
+            self.editor.expand_snippet(&te.new_text, 0);
+        }
+        true
+    }
+
     /// Route the key through the completion popup when one is open.
     /// Up/Down navigate, Enter/Tab accept and replace the typed prefix
     /// with the chosen completion's full text, Esc dismisses. Printable
@@ -13112,8 +13252,17 @@ impl App {
                     .completion_popup
                     .as_ref()
                     .is_some_and(|p| p.selected_is_snippet());
+                let item = self
+                    .completion_popup
+                    .as_ref()
+                    .and_then(|p| p.selected_item().cloned());
                 self.completion_popup = None;
                 self.completion_request_id = None;
+                if let Some(item) = item
+                    && self.accept_completion_edit(&item)
+                {
+                    return true;
+                }
                 if let Some(t) = text {
                     if is_snippet {
                         // The body carries $1/$0 tab stops; expand_snippet
@@ -18116,6 +18265,9 @@ impl App {
         // selection. Croft Dark keeps the legacy bright-blue accent so the
         // menu stays coherent with that theme's blue focus border.
         let border_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        // Clipped to the frame (a submenu flipped at a narrow edge can still
+        // reach past it).
+        let rect = rect.intersection(frame.area());
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(border_blue))
@@ -18319,7 +18471,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -18329,6 +18481,9 @@ impl App {
             width,
             height,
         };
+        // Clipped to the frame: a terminal narrower or shorter than the
+        // dialog's minimum made a rect outside the buffer, which panics.
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18390,7 +18545,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -18400,6 +18555,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18456,7 +18612,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let prompt = format!(
             "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
             self.search.replace
@@ -18474,6 +18630,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18517,7 +18674,7 @@ impl App {
             return;
         }
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 7;
         let rect = Rect {
             x: (area.width.saturating_sub(width)) / 2 + area.x,
@@ -18525,6 +18682,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18577,7 +18735,7 @@ impl App {
             return;
         }
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 7;
         let rect = Rect {
             x: (area.width.saturating_sub(width)) / 2 + area.x,
@@ -18585,6 +18743,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -18647,7 +18806,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let inner_w = width.saturating_sub(4) as usize;
         let shown: Vec<String> = block
             .code
@@ -18674,6 +18833,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let (title, accent) = if block.destructive {
             (
                 " RUN THIS BLOCK? IT LOOKS DESTRUCTIVE ",
@@ -18757,6 +18917,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let warn = self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00));
         let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         let block = ratatui::widgets::Block::default()
@@ -18842,7 +19003,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96);
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -18852,6 +19013,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00))))
@@ -19143,7 +19305,7 @@ impl App {
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
         let Some(p) = &self.prompt else { return };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(40, 80);
+        let width = area.width.saturating_sub(8).clamp(40, 80).min(area.width);
         let height = if p.error.is_some() { 6 } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2 + area.x;
         let y = (area.height.saturating_sub(height)) / 2 + area.y;
@@ -19153,6 +19315,7 @@ impl App {
             width,
             height,
         };
+        let rect = rect.intersection(area);
         let grad = self.popup_gradient();
         let cursor_fg = if grad {
             rgb_color(GRAD_TL)
@@ -20937,20 +21100,27 @@ impl App {
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
-        match crate::git::show_commit(&self.scm_root(), hash) {
-            Ok(text) => {
-                let label = format!("commit {short_hash}");
-                match self.editor.open_text_buffer(Path::new(&label), &text) {
-                    Ok(()) => {
-                        self.focus_pane(Pane::Editor);
-                        self.sync_open_file_poll_mtime();
-                        self.status = format!("Opened commit {short_hash}");
+        let root = self.scm_root();
+        let hash = hash.to_string();
+        let short_hash = short_hash.to_string();
+        self.status = format!("Loading commit {short_hash}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_commit(&root, &hash);
+            Box::new(move |app: &mut App| match result {
+                Ok(text) => {
+                    let label = format!("commit {short_hash}");
+                    match app.editor.open_text_buffer(Path::new(&label), &text) {
+                        Ok(()) => {
+                            app.focus_pane(Pane::Editor);
+                            app.sync_open_file_poll_mtime();
+                            app.status = format!("Opened commit {short_hash}");
+                        }
+                        Err(e) => app.status = format!("Open commit failed: {e}"),
                     }
-                    Err(e) => self.status = format!("Open commit failed: {e}"),
                 }
-            }
-            Err(e) => self.status = format!("Show commit failed: {e}"),
-        }
+                Err(e) => app.status = format!("Show commit failed: {e}"),
+            })
+        });
     }
 
     fn handle_extensions_key(&mut self, key: KeyEvent) {
@@ -25058,6 +25228,9 @@ impl App {
     }
 
     pub fn stage_selected_source_control_entries(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
         let indices: Vec<usize> = if self.source_control.multi_selection.is_empty() {
             self.source_control
                 .selected_change
@@ -25257,6 +25430,9 @@ impl App {
     /// Unstage a single entry by index (the inline "−" icon on a staged
     /// row). Mirror of `stage_source_control_entry`.
     pub fn unstage_source_control_entry(&mut self, entry_idx: usize) {
+        if self.repo_git_busy() {
+            return;
+        }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
@@ -25337,6 +25513,50 @@ impl App {
         self.status = format!("Git: {what}\u{2026}");
     }
 
+    /// Run a read-only git view off the UI thread; its finisher is applied by
+    /// [`Self::drain_git_view`]. A newer request supersedes a pending one,
+    /// whose result is then dropped.
+    fn spawn_git_view(&mut self, job: impl FnOnce() -> GitNetDone + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_view_job = Some(rx);
+    }
+
+    /// Apply a finished git view. True when one landed.
+    fn drain_git_view(&mut self) -> bool {
+        let Some(rx) = &self.git_view_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_view_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.git_view_job = None;
+                false
+            }
+        }
+    }
+
+    /// Whether a network operation on THIS repository is still running,
+    /// saying so: what a commit, stage or branch switch must not overlap
+    /// (they fight over `index.lock`, and a pull would land on the switched
+    /// branch). A clone writes into another directory and blocks nothing here.
+    fn repo_git_busy(&mut self) -> bool {
+        match &self.git_net_job {
+            Some((running, _)) if running != "clone" => {
+                self.status = format!("Git: {running} is still running");
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a network git operation is still running, saying so.
     fn git_net_busy(&mut self) -> bool {
         let Some((running, _)) = &self.git_net_job else {
@@ -25361,12 +25581,17 @@ impl App {
         });
     }
 
-    fn finish_clone(&mut self, result: Result<PathBuf, String>) {
+    fn finish_clone(&mut self, result: Result<PathBuf, String>, origin: &Path) {
         match result {
             Ok(dest) => {
                 self.log_git("clone", &Ok(format!("into {}", dest.display())));
                 self.status = format!("Cloned into {}", self.status_path(&dest));
-                self.change_workspace_root(dest);
+                // Opened only if the user is still where the clone started:
+                // one who has moved to another folder meanwhile is not
+                // pulled out of it when the clone lands.
+                if self.tree.root == origin {
+                    self.change_workspace_root(dest);
+                }
             }
             Err(err) => {
                 self.log_git("clone", &Err(err.clone()));
@@ -25586,6 +25811,12 @@ impl App {
         use crate::widgets::list_picker::ListPurpose;
         use crate::widgets::scm_menu::ScmAction;
         self.scm_menu.close();
+        // Nothing else touches the repository while a push, pull or fetch
+        // runs in the background: a commit or branch switch under it fights
+        // over `index.lock`, and a pull would land on the switched branch.
+        if !matches!(action, ScmAction::ShowGitOutput) && self.repo_git_busy() {
+            return;
+        }
         match action {
             ScmAction::Pull => self.pull_source_control(),
             ScmAction::Push => self.push_source_control(),
@@ -25859,9 +26090,10 @@ impl App {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| self.tree.root.clone());
+                let origin = self.tree.root.clone();
                 self.spawn_git_net("clone", move || {
                     let r = crate::git::clone_into(&parent, &value);
-                    Box::new(move |app: &mut App| app.finish_clone(r))
+                    Box::new(move |app: &mut App| app.finish_clone(r, &origin))
                 });
             }
             InputPurpose::RenameBranch => {
@@ -28669,6 +28901,9 @@ impl App {
 
     /// Resolve the branch-picker selection per its open purpose.
     fn apply_branch_picker_selection(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
         let Some(picker) = self.branch_picker.as_ref() else {
             return;
         };
@@ -28879,6 +29114,9 @@ impl App {
     }
 
     pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        if self.repo_git_busy() {
+            return;
+        }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
@@ -29355,6 +29593,9 @@ impl App {
     }
 
     fn commit_source_control(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
         let message = self.source_control.message.trim().to_string();
         if message.is_empty() {
             self.source_control.commit_feedback = Some(String::from("Empty commit message"));
@@ -30274,21 +30515,42 @@ impl App {
         Some((root, path, rel))
     }
 
+    /// Remember the PR under review, with the branch it belongs to.
+    fn set_review_pr(&mut self, root: PathBuf, number: String) {
+        self.review_pr_branch = self.git_worker_for_root(&root).status().branch.clone();
+        self.review_pr = Some((root, number));
+    }
+
     /// The PR number for `root`'s branch, remembered for the write side, or
     /// `None` with the reason in the status bar.
     fn review_pr_number(&mut self, root: &Path) -> Option<String> {
-        let out = std::process::Command::new(&self.review_gh)
-            .args(["pr", "view", "--json", "number", "--jq", ".number"])
-            .current_dir(root)
-            .output();
+        // The PR already loaded for this root, when there is one: this runs
+        // on the UI thread for every comment and submit, and asking GitHub
+        // each time froze croft on a slow network or a gh auth prompt.
+        let branch = self.git_worker_for_root(root).status().branch.clone();
+        if let Some((r, number)) = &self.review_pr
+            && r == root
+            && branch.is_some()
+            && branch == self.review_pr_branch
+        {
+            return Some(number.clone());
+        }
+        let out = bounded_output(
+            std::process::Command::new(&self.review_gh)
+                .args(["pr", "view", "--json", "number", "--jq", ".number"])
+                .current_dir(root),
+            std::time::Duration::from_secs(5),
+        );
         let number = match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Some((status, stdout)) if status.success() => {
+                String::from_utf8_lossy(&stdout).trim().to_string()
+            }
             _ => {
                 self.status = String::from("No PR for this branch — check it out first");
                 return None;
             }
         };
-        self.review_pr = Some((root.to_path_buf(), number.clone()));
+        self.set_review_pr(root.to_path_buf(), number.clone());
         Some(number)
     }
 
@@ -30360,7 +30622,7 @@ impl App {
         notes: Vec<u64>,
         inline: usize,
     ) {
-        self.review_pr = Some((root.clone(), number.clone()));
+        self.set_review_pr(root.clone(), number.clone());
         self.review_export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
@@ -30473,7 +30735,7 @@ impl App {
         mut threads: Vec<crate::review_threads::Thread>,
         states: std::collections::HashMap<u64, (String, bool)>,
     ) {
-        self.review_pr = Some((root, number));
+        self.set_review_pr(root, number);
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
@@ -31719,6 +31981,38 @@ impl App {
                 dirty: ed.dirty,
                 unsaved_text,
             });
+        }
+        // The other editor groups too: their tabs are not in `self.editor`,
+        // and a relaunch dropped the unsaved text of every split but the
+        // focused one. Only dirty tabs are carried; a file already captured
+        // (the same file open in two splits) keeps the dirty copy.
+        for group in self.editor_layout.inactive_groups() {
+            for ed in &group.editors {
+                if ed.has_non_text_view() || !ed.dirty {
+                    continue;
+                }
+                let unsaved = Some(ed.lines.join("\n"));
+                if let Some(existing) = ed
+                    .path
+                    .as_ref()
+                    .and_then(|p| tabs.iter_mut().find(|t| t.path.as_ref() == Some(p)))
+                {
+                    if !existing.dirty {
+                        existing.dirty = true;
+                        existing.unsaved_text = unsaved;
+                    }
+                    continue;
+                }
+                tabs.push(crate::session_state::OpenTabState {
+                    path: ed.path.clone(),
+                    cursor_row: ed.cursor_row,
+                    cursor_col: ed.cursor_col,
+                    scroll: ed.scroll,
+                    scroll_col: ed.scroll_col,
+                    dirty: true,
+                    unsaved_text: unsaved,
+                });
+            }
         }
         if let Some(path) = active_path
             && let Some(i) = tabs.iter().position(|t| t.path.as_ref() == Some(&path))
@@ -37103,7 +37397,9 @@ impl App {
     /// it just cannot show a diff.
     fn record_review_baseline(history_root: &Path, path: &Path, bytes: &[u8]) -> Option<u64> {
         let millis = now_millis();
-        let _ = crate::history::record_in(history_root, path, bytes, millis);
+        // Kept: an autosave seconds later must not replace the baseline the
+        // review diff points at, nor may this replace the user's own save.
+        let _ = crate::history::record_kept_in(history_root, path, bytes, millis);
         crate::history::entries_in(history_root, path)
             .into_iter()
             .find(|s| std::fs::read(&s.file).is_ok_and(|held| held == bytes))
@@ -47880,11 +48176,8 @@ impl App {
     /// looked up by path here, since a split can hold the same file in a
     /// second buffer with a different map, and a snapshot restore records
     /// the restored snapshot's own seats, which no tab holds at that moment.
-    fn record_history_snapshot(&mut self, path: &Path, seats: crate::provenance::Provenance) {
-        self.record_history_snapshot_of(path, seats, None);
-    }
-
-    /// [`Self::record_history_snapshot`] with the bytes the map describes.
+    ///
+    /// Records the seats with the bytes the map describes.
     /// The worker re-reads the file, which is what makes the snapshot
     /// byte-exact, and between the save and that read another tab's save of
     /// the same path can land - so the map is recorded only while the bytes
@@ -47907,6 +48200,45 @@ impl App {
         self.testing
             .watch
             .on_saved(path, &self.active_test_root, std::time::Instant::now());
+        self.spawn_history_record(path, seats, described, false);
+        // Every save passes through here: breakpoints that followed edits in
+        // the buffer are handed to running sessions now that the file on disk
+        // has the same lines, or they stay bound to the old line numbers.
+        self.resend_breakpoints(path);
+    }
+
+    /// Send `path`'s current breakpoints to every debug session.
+    fn resend_breakpoints(&mut self, path: &Path) {
+        if self.debug_sessions.is_empty() {
+            return;
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(path, &specs);
+        }
+    }
+
+    /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
+    fn record_history_snapshot_of_kept(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+    ) {
+        self.spawn_history_record(path, seats, None, true);
+    }
+
+    fn spawn_history_record(
+        &mut self,
+        path: &Path,
+        seats: crate::provenance::Provenance,
+        described: Option<Vec<u8>>,
+        keep: bool,
+    ) {
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
@@ -47919,7 +48251,11 @@ impl App {
                     Some(want) if want != bytes => crate::provenance::Provenance::new(),
                     _ => seats,
                 };
-                let _ = crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats);
+                let _ = if keep {
+                    crate::history::record_kept_with_seats_in(&root, &path, &bytes, millis, &seats)
+                } else {
+                    crate::history::record_with_seats_in(&root, &path, &bytes, millis, &seats)
+                };
             }
             let _ = tx.send(path);
         });
@@ -48060,9 +48396,12 @@ impl App {
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
         let widest = menu.items.iter().map(menu_entry_width).max().unwrap_or(0);
-        let width = (widest + 4).max(18) as u16;
-        let height = (menu.items.len() + 2) as u16;
         let area = self.last_frame_area;
+        // Never past the frame: a long menu on a short terminal (or any menu
+        // under 18 columns) built a rect outside the buffer, which panics.
+        let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
+        let width = fit((widest + 4).max(18) as u16, area.width);
+        let height = fit((menu.items.len() + 2) as u16, area.height);
         // Clamp identically to `render_context_menu` so hit-testing maps
         // clicks to the same row the user actually sees. Without this, a
         // menu that has to shift up to fit (right-click low on screen)
@@ -48096,9 +48435,10 @@ impl App {
         };
         let main = self.menu_rect()?;
         let widest = items.iter().map(menu_entry_width).max().unwrap_or(0);
-        let width = (widest + 4).max(18) as u16;
-        let height = (items.len() + 2) as u16;
         let area = self.last_frame_area;
+        let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
+        let width = fit((widest + 4).max(18) as u16, area.width);
+        let height = fit((items.len() + 2) as u16, area.height);
         // Float right of the main panel; flip left if it would overflow.
         let mut x = main.x + main.width;
         if area.width > 0 && x + width > area.width {
@@ -51411,9 +51751,9 @@ impl App {
             return;
         }
         match crate::sqlite_view::table_page(&path, &table, next) {
-            Ok((headers, rows, total)) if !rows.is_empty() || next == 0 => {
+            Ok((headers, rows, more)) if !rows.is_empty() || next == 0 => {
                 let got = rows.len();
-                let label = crate::sqlite_view::page_label(&table, next, got, total);
+                let label = crate::sqlite_view::page_label(&table, next, got, more);
                 view.sheets[idx] = crate::sheet::sheet_data_from_parts(label, headers, rows);
                 if delta < 0 {
                     let last = view.sheets[idx].row_count().saturating_sub(1);
@@ -53109,8 +53449,28 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// through a quoted heredoc so the block runs whole. The terminator is
 /// chosen not to occur in the block, or a line inside it could close the
 /// heredoc early and hand the rest to the shell.
+///
+/// A block holding a tab or `!` goes as one single-quoted `printf '%b'`
+/// argument instead: typed into an interactive shell, a tab is completion
+/// (a python block lost its indentation) and bash expands `!` in a heredoc
+/// body as history, so what ran was not what the confirm popup showed.
+/// Inside single quotes neither happens, and the tab travels as `\t`.
 fn fence_command(interpreter: &str, code: &str) -> String {
     let code = code.trim_end_matches('\n');
+    if code.contains(['\t', '!']) {
+        let escaped = format!("{code}\n")
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\'', "'\\''");
+        // A shell block runs IN the pane's shell, as a typed one does (a
+        // `cd` or `export` persists, bash-isms still work): `eval` of the
+        // decoded text. Other interpreters read it on stdin.
+        if interpreter == "sh" {
+            return format!("eval \"$(printf '%b' '{escaped}')\"\r");
+        }
+        return format!("printf '%b' '{escaped}' | {interpreter}\r");
+    }
     match interpreter {
         "sh" => format!("{code}\r"),
         other => {
@@ -53752,6 +54112,7 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
         filter_text: Some(snip.prefix.clone()),
         kind: Some(lsp_types::CompletionItemKind::SNIPPET),
         is_snippet: true,
+        ..Default::default()
     }
 }
 
@@ -55432,6 +55793,44 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
 pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
 
+/// Run `cmd` for at most `budget`, collecting stdout; None when it could not
+/// start or ran out of time (it is then killed and reaped). For the few
+/// short commands that still run on the UI thread.
+fn bounded_output(
+    cmd: &mut std::process::Command,
+    budget: std::time::Duration,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + budget;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let bytes = rx.recv_timeout(budget).ok();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return bytes.map(|b| (status, b)),
+            Ok(None) if bytes.is_some() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// The user's `triggers.json`, with the built-in secret redactions in front
 /// of it when redaction is on (#360).
 fn load_trigger_set(redact_secrets: bool) -> std::sync::Arc<crate::triggers::TriggerSet> {
@@ -57109,7 +57508,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
-        let blame_changed = app.drain_blame() | app.drain_git_net();
+        let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
