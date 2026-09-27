@@ -3102,6 +3102,11 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
+    /// Queries "Run Queries in Pack" has yet to start, in order (#578).
+    codeql_run_queue: std::collections::VecDeque<PathBuf>,
+    /// How many queries the pack run holds and how many have failed so
+    /// far, for the status line; the total is 0 when no pack run is on.
+    codeql_batch: (usize, usize),
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5296,6 +5301,8 @@ impl App {
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
             codeql_run: None,
+            codeql_run_queue: std::collections::VecDeque::new(),
+            codeql_batch: (0, 0),
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -22466,12 +22473,14 @@ impl App {
     /// renames it, `v` opens its query and `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
-    /// when there is one.
+    /// when there is one. `r` on a pack or one of its queries runs every
+    /// query in the pack; Esc then first cancels the ones still queued.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
         use crate::widgets::codeql::{Action, Hit};
         let db = self.codeql.selected_database();
         let run = self.codeql.selected_history();
         match key.code {
+            KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
@@ -22517,6 +22526,11 @@ impl App {
             }
             KeyCode::Char('s') => self.sort_codeql_databases(),
             KeyCode::Char('n') => self.prompt_create_codeql_query(),
+            KeyCode::Char('r') => {
+                if let Some(p) = self.codeql.selected_pack() {
+                    self.run_codeql_pack(p);
+                }
+            }
             _ => {}
         }
     }
@@ -23126,7 +23140,15 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let dir = Self::codeql_results_dir().join(format!("{started}-{stem}"));
+        // Runs of a pack start back to back, so two queries of the same
+        // name can start within the same second; each keeps its own folder.
+        let base = Self::codeql_results_dir().join(format!("{started}-{stem}"));
+        let mut dir = base.clone();
+        let mut n = 1;
+        while dir.exists() {
+            n += 1;
+            dir = PathBuf::from(format!("{}-{n}", base.display()));
+        }
         let kind = cq::output_for(source);
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
@@ -23187,9 +23209,10 @@ impl App {
     }
 
     /// Collect a finished query run (#578): record how it went in the
-    /// history, and open its results when it succeeded.
+    /// history, open its results when it succeeded, and start a pack run's
+    /// next query.
     pub fn drain_codeql_run(&mut self) -> bool {
-        use crate::codeql_query::{History, RunStatus};
+        use crate::codeql_query::RunStatus;
         let Some((rx, since)) = self.codeql_run.as_ref() else {
             return false;
         };
@@ -23202,6 +23225,19 @@ impl App {
         };
         let seconds = since.elapsed().as_secs();
         self.codeql_run = None;
+        let failed = matches!(status, RunStatus::Failed(_));
+        self.record_codeql_run(status, seconds);
+        if self.codeql_batch.0 > 0 {
+            self.codeql_batch.1 += usize::from(failed);
+            self.start_next_queued_codeql();
+        }
+        true
+    }
+
+    /// Write a finished run's outcome into its history entry and open its
+    /// results when it succeeded.
+    fn record_codeql_run(&mut self, status: crate::codeql_query::RunStatus, seconds: u64) {
+        use crate::codeql_query::{History, RunStatus};
         let mut history = History::load(&Self::codeql_history_path());
         // The newest run still marked running is this one; a sorted history
         // need not have it on top, and it may have been removed meanwhile.
@@ -23211,7 +23247,7 @@ impl App {
             .filter(|e| e.status == RunStatus::Running)
             .max_by_key(|e| e.started)
         else {
-            return true;
+            return;
         };
         entry.status = status.clone();
         entry.seconds = seconds;
@@ -23233,7 +23269,85 @@ impl App {
                 Err(e) => self.status = format!("{}: {e}", output.display()),
             },
         }
-        true
+    }
+
+    /// Run every query in pack `pack` on the current database, one after
+    /// another (#578): the first starts now and [`Self::drain_codeql_run`]
+    /// starts each next one as the one before finishes, failed or not.
+    /// Each run keeps its own history entry. Refused while a query is
+    /// running, so two pack runs never interleave.
+    fn run_codeql_pack(&mut self, pack: usize) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let Some(queries) = self.codeql.queries.get(pack).map(|p| p.queries.clone()) else {
+            return;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        if store.current.and_then(|i| store.databases.get(i)).is_none() {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        }
+        if queries.is_empty() {
+            self.status = String::from("That pack has no queries");
+            return;
+        }
+        self.codeql_batch = (queries.len(), 0);
+        self.codeql_run_queue = queries.into();
+        self.start_next_queued_codeql();
+    }
+
+    /// Start the pack run's next query, read from disk as the side-bar rows
+    /// are; one that cannot be read counts as failed and the next is tried.
+    /// With the queue empty, the pack run is over and the status line sums
+    /// it up.
+    fn start_next_queued_codeql(&mut self) {
+        let (total, _) = self.codeql_batch;
+        while self.codeql_run.is_none() {
+            let Some(path) = self.codeql_run_queue.pop_front() else {
+                let failed = self.codeql_batch.1;
+                self.codeql_batch = (0, 0);
+                self.status = match failed {
+                    0 => format!("Ran {total} CodeQL queries"),
+                    n => format!("Ran {total} CodeQL queries, {n} failed"),
+                };
+                return;
+            };
+            let n = total - self.codeql_run_queue.len();
+            let source = match std::fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(e) => {
+                    self.codeql_batch.1 += 1;
+                    self.status = format!("{}: {e}", path.display());
+                    continue;
+                }
+            };
+            self.run_codeql_file(path, &source);
+            if self.codeql_run.is_none() {
+                // Refused (the database went away meanwhile): the rest
+                // would be refused too.
+                self.codeql_run_queue.clear();
+                self.codeql_batch = (0, 0);
+                return;
+            }
+            if let Some(rest) = self.status.strip_prefix("Running ") {
+                self.status = format!("Running CodeQL queries {n}/{total}: {rest}");
+            }
+        }
+    }
+
+    /// Drop the pack run's queries still waiting (#578); the one running
+    /// finishes and is recorded as usual.
+    fn cancel_codeql_queue(&mut self) {
+        let left = self.codeql_run_queue.len();
+        self.codeql_run_queue.clear();
+        self.codeql_batch = (0, 0);
+        self.status = match left {
+            0 => String::from("No CodeQL queries are queued"),
+            1 => String::from("Cancelled 1 queued CodeQL query"),
+            n => format!("Cancelled {n} queued CodeQL queries"),
+        };
     }
 
     /// Mirror the saved database list into the side bar.
@@ -42273,6 +42387,15 @@ impl App {
                 }
             }
             Cmd::CodeqlCreateQuery => self.prompt_create_codeql_query(),
+            Cmd::CodeqlRunPack => match self.codeql.selected_pack() {
+                Some(p) => self.run_codeql_pack(p),
+                None => {
+                    self.status = String::from(
+                        "Select a query pack or one of its queries in the CodeQL side bar first",
+                    );
+                }
+            },
+            Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
