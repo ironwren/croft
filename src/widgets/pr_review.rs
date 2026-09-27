@@ -195,7 +195,7 @@ pub fn render(
         };
         buf.set_stringn(area.x, y, format!("{line:<w$}"), w, style);
     }
-    let hint = " \u{2191}\u{2193} move \u{b7} Space viewed \u{b7} Enter diff (or a check's log) \u{b7} l failing log \u{b7} r refresh \u{b7} Esc leave review ";
+    let hint = " \u{2191}\u{2193} move \u{b7} Space viewed \u{b7} Enter diff (or a check's log) \u{b7} l failing log \u{b7} c check out \u{b7} r refresh \u{b7} Esc leave review ";
     buf.set_stringn(
         area.x,
         area.y + area.height - 1,
