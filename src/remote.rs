@@ -3504,6 +3504,12 @@ if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
 # and the marker must keep naming it. Markers whose pid is gone are stale;
 # they are swept here, and croft ignores them and any from before a reboot.
 mkdir -p "$HOME/.cache/croft"
+# The script runs under the login shell, and zsh aborts on a glob that
+# matches nothing (NOMATCH), which an empty cache always is (#734).
+# null_glob makes it expand to nothing, as the `[ -f ]` below expects of
+# every other shell. Not `emulate sh`: that also clears ERR_EXIT, and a
+# failed compile would then write the install stamp.
+[ -z "${{ZSH_VERSION:-}}" ] || setopt null_glob
 for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
   [ -f "$CROFT_OLD" ] || continue
   CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
@@ -5132,6 +5138,17 @@ Host !blocked *.internal
     /// `systemd-run` is absent (no cap to probe).
     #[cfg(unix)]
     fn run_install_script(dir: &std::path::Path, cargo_exit: u8) -> (bool, String) {
+        run_install_script_under("sh", dir, cargo_exit)
+    }
+
+    /// [`run_install_script`] under a given shell: the script runs under the
+    /// remote user's login shell, which is often zsh (#734).
+    #[cfg(unix)]
+    fn run_install_script_under(
+        shell: &str,
+        dir: &std::path::Path,
+        cargo_exit: u8,
+    ) -> (bool, String) {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("bin");
         let home = dir.join("home");
@@ -5158,7 +5175,7 @@ Host !blocked *.internal
             ),
         );
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let status = std::process::Command::new("sh")
+        let status = std::process::Command::new(shell)
             .arg("-c")
             .arg(remote_install_command("abc123"))
             .env_clear()
@@ -5211,6 +5228,37 @@ Host !blocked *.internal
         assert!(
             leftover_markers(tmp.path()).is_empty(),
             "a failed build left its marker behind"
+        );
+    }
+
+    /// #734: zsh aborts on a glob that matches nothing, and the marker
+    /// sweep's glob matches nothing on every host with an empty cache, so a
+    /// zsh login shell never reached cargo. It must reach it, and a failed
+    /// compile must still fail the install.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_reaches_cargo_under_zsh() {
+        if !crate::lsp::manager::is_on_path("zsh") {
+            eprintln!("SKIPPED: zsh not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, seen) = run_install_script_under("zsh", tmp.path(), 0);
+        assert!(ok, "an empty cache must not stop the install under zsh");
+        let (own, marked) = seen.split_once(' ').expect("cargo ran under zsh");
+        assert_eq!(own, marked);
+        assert!(leftover_markers(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
+            "abc123"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, _) = run_install_script_under("zsh", tmp.path(), 3);
+        assert!(!ok, "a failing compile must fail the install under zsh");
+        assert!(
+            !tmp.path().join("home/.cache/croft/install-stamp").exists(),
+            "a failed compile must not write the install stamp"
         );
     }
 
