@@ -2930,6 +2930,12 @@ impl WorkerState {
                 workspace_pull_targets(spawned.iter()),
                 self.diagnostics_tx.clone(),
             );
+            // An empty list that comes back is a restart as far as the app is
+            // concerned: it sent its tabs while the list was empty, so these
+            // servers have none of them (#694).
+            if !first_attempt && !spawned.is_empty() {
+                self.restarts.restarted.store(true, Ordering::Relaxed);
+            }
             self.clients.insert(key.clone(), spawned);
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
@@ -9342,6 +9348,19 @@ while True:
         handle.block_on(state.ensure_clients(key.0, &key.1));
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(started(2).len(), 2, "a given-up server must stay down");
+
+        // An empty list that comes back (a restart whose spawn failed, then a
+        // later re-probe that works) must tell the app too: it already sent
+        // its tabs into the empty list, so the new server never saw them.
+        state.restarts.gave_up.remove(&key);
+        restarted.store(false, Ordering::Relaxed);
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        assert_eq!(started(3).len(), 3, "the empty list must be re-probed");
+        assert!(
+            restarted.load(Ordering::Relaxed),
+            "a recovered empty list must make the app re-open its tabs"
+        );
+        handle.block_on(state.shutdown_all());
     }
 
     /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
