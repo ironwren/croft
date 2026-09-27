@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.1.1044"
+version = "0.1.1045"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -646,6 +646,7 @@ dependencies = [
  "resvg",
  "ring",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",

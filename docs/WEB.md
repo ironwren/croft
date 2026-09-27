@@ -1,8 +1,9 @@
 # croft web: a browser client for the session host
 
-Design RFC, now being built. The WebSocket transport (#341) has shipped; the
-page (#342) and TLS with remote access (#343) have not. What has shipped is
-described under [The transport](#the-transport), at the end.
+Design RFC, now being built. The WebSocket transport (#341) and its token,
+TLS and listener lifecycle (#343) have shipped; the page (#342) has not. What
+has shipped is described under [The transport](#the-transport) and
+[Threat model](#threat-model), at the end.
 
 The session host already fans one inner croft out to N clients, enforces write
 control server-side, sizes everyone to the smallest window, and survives
@@ -266,13 +267,75 @@ the host would not accept is dropped, as the host drops malformed control
 frames. Client frames must be masked; an unmasked frame, a message over 1 MiB,
 or non-UTF-8 text closes the connection.
 
-**Trust.** The session socket is owner-only (0600); a loopback port is open to
-every local user and to any page open in the user's browser, since WebSockets
-are not bound by CORS. So:
+**Connecting.** Every connection presents the per-run token printed at
+start-up, as a WebSocket subprotocol: the client offers two, `croft` and
+`croft.token.<token>`, and the server selects `croft`. From a browser:
 
-- only loopback addresses are served (`--bind` may change the port or pick
-  another loopback address, never a routable one);
-- every connection must present the per-run token printed at start-up
-  (`ws://127.0.0.1:7681/?token=...`);
-- a request that carries an `Origin` (every browser does) must come from
-  croft web's own address.
+```js
+new WebSocket("ws://127.0.0.1:7681/", ["croft", "croft.token." + token]);
+```
+
+A browser cannot set headers on a WebSocket, but subprotocols travel in the
+`Sec-WebSocket-Protocol` header, so the token never sits in a URL. The reply
+names only `croft`, never the token.
+
+**Options.**
+
+| | |
+|---|---|
+| `--bind ADDR` | Listen on `ADDR` instead of `127.0.0.1:7681`. A non-loopback address is served, with a warning on stderr naming the exposure (and, without `--tls`, that the token and the screen cross the network in plain text). |
+| `--tls CERT KEY` | Serve TLS (`wss://`) with a PEM certificate chain and private key. croft does not generate certificates. |
+| `--rotate-token` | Stop this workspace's listener and start one with a new token, on the same address unless `--bind` says otherwise. |
+| `--off` | Stop this workspace's listener. The session keeps running. |
+
+**Lifecycle.** A listener serves one workspace's session and exits when that
+session ends. It records its address beside the session socket
+(`<hash>.mux.sock.web`, mode 0600, never the token), so `croft ls` shows
+`web: ws://...` for an exposed session, and `--off` and `--rotate-token` find
+the listener to stop. A second `croft web` for the same workspace is refused
+while one is running. A record whose listener was killed is cleared the next
+time it is read.
+
+**Remote access.** The recommended way to reach a session from another
+machine is to leave `croft web` on loopback and put something in front of it:
+
+- Tailscale Serve, which terminates TLS with a real certificate and only
+  answers your tailnet: `tailscale serve --bg 7681`.
+- Caddy as a reverse proxy: `reverse_proxy 127.0.0.1:7681` in a site block.
+- A certificate from `mkcert` for `--tls`, when the browser is on the same
+  machine or you install mkcert's root on the other.
+
+## Threat model
+
+What croft web defends against:
+
+- **Other local users.** The loopback port is open to every account on the
+  machine. The token (128 bits from the system RNG, printed once) is the
+  credential; the session socket behind it stays 0600.
+- **Other web pages.** WebSockets are not bound by CORS, so any page the user
+  has open can try to connect. A request with an `Origin` must match the
+  scheme and `Host` it arrived on; on a loopback listener the `Host` must also
+  be a loopback name, which closes DNS rebinding (a hostile name resolved to
+  127.0.0.1 agrees with its own `Host`, but not with loopback). The page also
+  lacks the token.
+- **Token leakage.** The token is not in any URL, so it stays out of history,
+  `Referer` and proxy logs, and it is not in the listener record. It is
+  compared in constant time.
+- **The network, with `--tls`.** Everything, the token included, is inside
+  TLS.
+
+What it does not do, deliberately:
+
+- **No accounts or per-user tokens.** Anyone with the token is one more
+  participant. Write control is still the host's, per participant: a new
+  connection is read-only unless it is the first or is granted control in
+  `Session: Participants`.
+- **No certificate generation or ACME.** Bring a certificate, or front the
+  listener with Tailscale or Caddy.
+- **No protection on a routable `--bind` without `--tls`.** croft serves it,
+  and warns that anyone on the path sees the token and the screen.
+- **No rate limiting.** 128 bits of token make guessing pointless; a flood
+  of connections is a denial of service croft does not try to stop.
+- **Nothing against the local account itself.** Whoever can read the
+  terminal croft web was started in has the token, as whoever owns the
+  account already owns the session socket.
