@@ -58023,7 +58023,7 @@ fn a_toggle_before_github_answers_wins_and_is_sent() {
         );
         // A read in flight that has not answered yet.
         let (tx, rx) = std::sync::mpsc::channel();
-        app.pr_viewed_fetch = Some((String::from("x/y#42"), rx));
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
         app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         let mut states = std::collections::BTreeMap::new();
         states.insert(
@@ -58039,6 +58039,74 @@ fn a_toggle_before_github_answers_wins_and_is_sent() {
         assert!(
             args.contains(" markFileAsViewed(") && args.ends_with("-f id=PR_kw42 -f path=a.rs\n"),
             "{args}"
+        );
+    });
+}
+
+/// #365: a viewed-state read that began while a write was in flight may
+/// have seen GitHub before the write landed. Its answer must not undo the
+/// mark, even after the write finished and a refresh replaced the view.
+#[test]
+fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, _log) = viewed_sync_gh(tmp.path(), "  *FileAsViewed*) echo '{}' ;;");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        let pr = || {
+            crate::pr_review::parse_pr(
+                r#"{"number": 42, "url": "https://github.com/x/y/pull/42", "files": [{"path": "a.rs"}]}"#,
+            )
+            .unwrap()
+        };
+        app.open_pr_review(pr(), String::from("x/y#42"));
+        app.editor.pr_review.as_mut().unwrap().github_id = Some(String::from("PR_kw42"));
+        // Tick a.rs: its mutation is queued, then sent.
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.poll_pr_viewed();
+        assert!(app.pr_viewed_write.is_some(), "in flight");
+        // A refresh replaces the view and starts a read while it is.
+        app.open_pr_review(pr(), String::from("x/y#42"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        // The write lands and settles before the read answers ...
+        settle_viewed_writes(&mut app);
+        assert!(app.pr_viewed_queue.is_empty() && app.pr_viewed_write.is_none());
+        // ... with what GitHub said before it: unviewed.
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(
+            String::from("a.rs"),
+            crate::pr_review::ViewedState::Unviewed,
+        );
+        tx.send(Ok((String::from("PR_kw42"), states))).unwrap();
+        app.poll_pr_viewed();
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert!(view.viewed.contains("a.rs"), "the stale answer is ignored");
+        assert!(
+            crate::pr_review::ViewedStore::load(&App::pr_viewed_path())
+                .viewed("x/y#42")
+                .contains("a.rs"),
+            "and does not reach the local store"
+        );
+        // A read that begins after the write settled is trusted again.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(
+            String::from("a.rs"),
+            crate::pr_review::ViewedState::Unviewed,
+        );
+        tx.send(Ok((String::from("PR_kw42"), states))).unwrap();
+        app.poll_pr_viewed();
+        assert!(
+            !app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("a.rs")
         );
     });
 }

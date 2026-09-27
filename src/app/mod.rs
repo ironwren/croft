@@ -1618,6 +1618,9 @@ struct PrViewedWrite {
     viewed: bool,
 }
 
+/// Where `gh`'s answer to one viewed mutation arrives (#365).
+type PrViewedWriteRx = std::sync::mpsc::Receiver<Result<String, String>>;
+
 /// A code scanning lookup in flight (#577).
 struct CodeScanList {
     branch: String,
@@ -3924,13 +3927,23 @@ pub struct App {
     /// When the open review tab's checks were last re-read (#365).
     pr_checks_polled: Option<std::time::Instant>,
     /// GitHub's viewed state being read for the review tab keyed by the
-    /// first half (#365).
-    pr_viewed_fetch: Option<(String, PrViewedRx)>,
+    /// first half (#365), and [`Self::pr_viewed_seq`] when the read began.
+    pr_viewed_fetch: Option<(String, u64, PrViewedRx)>,
     /// Viewed marks waiting to reach GitHub, sent one at a time so two
     /// quick toggles of one file arrive in order (#365).
     pr_viewed_queue: std::collections::VecDeque<PrViewedWrite>,
-    /// The viewed mutation in flight: its tab's key, and gh's answer.
-    pr_viewed_write: Option<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
+    /// The viewed mutation in flight: its tab's key and file, and gh's
+    /// answer.
+    pr_viewed_write: Option<(String, String, PrViewedWriteRx)>,
+    /// A counter stamped on every viewed write when it is queued and when
+    /// it finishes (#365).
+    pr_viewed_seq: u64,
+    /// Each `(tab key, file)`'s latest stamp from [`Self::pr_viewed_seq`].
+    /// A viewed-state read that began before a file's write settled may
+    /// have seen GitHub before the write landed, so its answer does not
+    /// overwrite that file. Kept on the app, not the review view, so a
+    /// refresh that replaces the view keeps the protection.
+    pr_viewed_touched: std::collections::HashMap<(String, String), u64>,
     /// The pull request head review mode checked out (#365), removed again
     /// when review is left with nothing in it worth keeping.
     pr_checkout: Option<PrCheckout>,
@@ -5796,6 +5809,8 @@ impl App {
             pr_viewed_fetch: None,
             pr_viewed_queue: std::collections::VecDeque::new(),
             pr_viewed_write: None,
+            pr_viewed_seq: 0,
+            pr_viewed_touched: std::collections::HashMap::new(),
             pr_checkout: None,
             pr_checkout_rx: None,
             review_tx,
@@ -54921,7 +54936,40 @@ impl App {
                 crate::pr_review::GH_TIMEOUT,
             ));
         });
-        self.pr_viewed_fetch = Some((key, rx));
+        self.pr_viewed_fetch = Some((key, self.pr_viewed_seq, rx));
+    }
+
+    /// Queue a viewed mark for GitHub (#365), stamping its file so a
+    /// viewed-state read already under way cannot undo it.
+    fn queue_pr_viewed_write(&mut self, write: PrViewedWrite) {
+        self.touch_pr_viewed(&write.key, &write.path);
+        self.pr_viewed_queue.push_back(write);
+    }
+
+    /// Stamp `(key, path)` with the next [`Self::pr_viewed_seq`].
+    fn touch_pr_viewed(&mut self, key: &str, path: &str) {
+        self.pr_viewed_seq += 1;
+        self.pr_viewed_touched
+            .insert((key.to_string(), path.to_string()), self.pr_viewed_seq);
+    }
+
+    /// Whether GitHub's answer from a read that began at `since` may be
+    /// older than a viewed write of `path` in the tab keyed `key`: one
+    /// still queued or in flight, or one that settled after the read began.
+    fn pr_viewed_fenced(&self, key: &str, path: &str, since: u64) -> bool {
+        let pending = self
+            .pr_viewed_queue
+            .iter()
+            .any(|w| w.key == key && w.path == path)
+            || self
+                .pr_viewed_write
+                .as_ref()
+                .is_some_and(|(k, p, _)| k == key && p == path);
+        pending
+            || self
+                .pr_viewed_touched
+                .get(&(key.to_string(), path.to_string()))
+                .is_some_and(|&stamp| stamp > since)
     }
 
     /// Apply GitHub's viewed state when it arrives, report a failed viewed
@@ -54930,23 +54978,26 @@ impl App {
     fn poll_pr_viewed(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
-        if let Some((key, rx)) = self.pr_viewed_fetch.as_ref() {
+        if let Some((key, since, rx)) = self.pr_viewed_fetch.as_ref() {
             let got = rx.try_recv();
             if !matches!(got, Err(TryRecvError::Empty)) {
-                let key = key.clone();
+                let (key, since) = (key.clone(), *since);
                 self.pr_viewed_fetch = None;
                 // gh missing, signed out or refused: the marks stay local,
                 // exactly as before, and nothing is said about it.
                 if let Ok(Ok((pr_id, states))) = got {
-                    changed |= self.apply_github_viewed(&key, pr_id, states);
+                    changed |= self.apply_github_viewed(&key, since, pr_id, states);
                 }
             }
         }
-        if let Some((key, rx)) = self.pr_viewed_write.as_ref() {
+        if let Some((key, path, rx)) = self.pr_viewed_write.as_ref() {
             let got = rx.try_recv();
             if !matches!(got, Err(TryRecvError::Empty)) {
-                let key = key.clone();
+                let (key, path) = (key.clone(), path.clone());
                 self.pr_viewed_write = None;
+                // Settled after any read already under way began: that
+                // read may predate it.
+                self.touch_pr_viewed(&key, &path);
                 let why = match got {
                     Ok(Ok(_)) => None,
                     Ok(Err(why)) => Some(why),
@@ -54983,33 +55034,43 @@ impl App {
                     crate::pr_review::GH_TIMEOUT,
                 ));
             });
-            self.pr_viewed_write = Some((write.key, rx));
+            self.pr_viewed_write = Some((write.key, write.path, rx));
         }
         changed
     }
 
-    /// GitHub's viewed state for the tab keyed `key` becomes the truth
-    /// (#365): the checkboxes and the local store follow it, except for a
-    /// file toggled while the answer was on its way, whose newer mark is
-    /// sent to GitHub instead. Files GitHub did not list keep their local
-    /// mark.
+    /// GitHub's viewed state for the tab keyed `key`, read from `since`,
+    /// becomes the truth (#365): the checkboxes and the local store follow
+    /// it, except for a file toggled while the answer was on its way, whose
+    /// newer mark is sent to GitHub instead, and a file whose write had not
+    /// settled when the read began, which keeps its mark. Files GitHub did
+    /// not list keep their local mark.
     fn apply_github_viewed(
         &mut self,
         key: &str,
+        since: u64,
         pr_id: String,
         states: std::collections::BTreeMap<String, crate::pr_review::ViewedState>,
     ) -> bool {
-        let Some(view) = self.editor.pr_review.as_mut().filter(|v| v.key == key) else {
+        if self.editor.pr_review.as_ref().is_none_or(|v| v.key != key) {
+            return false;
+        }
+        let states: Vec<_> = states
+            .into_iter()
+            .filter(|(path, _)| !self.pr_viewed_fenced(key, path, since))
+            .collect();
+        let Some(view) = self.editor.pr_review.as_mut() else {
             return false;
         };
         let store_path = Self::pr_viewed_path();
         let mut store = crate::pr_review::ViewedStore::load(&store_path);
         let unsynced = std::mem::take(&mut view.unsynced);
+        let mut resend = Vec::new();
         for (path, state) in states {
             let local = view.viewed.contains(&path);
             if unsynced.contains(&path) {
                 if local != state.is_viewed() {
-                    self.pr_viewed_queue.push_back(PrViewedWrite {
+                    resend.push(PrViewedWrite {
                         key: key.to_string(),
                         pr_id: pr_id.clone(),
                         path,
@@ -55029,6 +55090,9 @@ impl App {
         // GitHub holds the marks now; a cache that cannot be written only
         // costs the offline copy.
         let _ = store.save(&store_path);
+        for write in resend {
+            self.queue_pr_viewed_write(write);
+        }
         true
     }
 
@@ -55193,16 +55257,24 @@ impl App {
                 // The mark flips at once; GitHub hears about it off the UI
                 // thread, or once its viewed state has loaded.
                 match view.github_id.clone() {
-                    Some(pr_id) => self.pr_viewed_queue.push_back(PrViewedWrite {
-                        key: view.key.clone(),
-                        pr_id,
-                        path: path.clone(),
-                        viewed: now,
-                    }),
+                    Some(pr_id) => {
+                        let write = PrViewedWrite {
+                            key: view.key.clone(),
+                            pr_id,
+                            path: path.clone(),
+                            viewed: now,
+                        };
+                        // The fields directly, as `view` still borrows the
+                        // editor: what `queue_pr_viewed_write` does.
+                        self.pr_viewed_seq += 1;
+                        self.pr_viewed_touched
+                            .insert((write.key.clone(), write.path.clone()), self.pr_viewed_seq);
+                        self.pr_viewed_queue.push_back(write);
+                    }
                     None if self
                         .pr_viewed_fetch
                         .as_ref()
-                        .is_some_and(|(k, _)| *k == view.key) =>
+                        .is_some_and(|(k, _, _)| *k == view.key) =>
                     {
                         view.unsynced.insert(path.clone());
                     }
