@@ -14,6 +14,7 @@
 // viewer features; the tests exercise them meanwhile.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub mod details;
 pub mod load;
 pub mod model;
 pub mod region;
