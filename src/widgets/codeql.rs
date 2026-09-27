@@ -578,12 +578,14 @@ mod tests {
                 path: "/x/a-db".into(),
                 language: Some("python".into()),
                 added: 0,
+                former_names: Vec::new(),
             },
             crate::codeql_db::DbEntry {
                 name: "b-db".into(),
                 path: "/x/b-db".into(),
                 language: Some("go".into()),
                 added: 0,
+                former_names: Vec::new(),
             },
         ];
         p.current_db = Some(1);
@@ -612,6 +614,7 @@ mod tests {
             path: format!("/x/{name}").into(),
             language: lang.map(Into::into),
             added: 0,
+            former_names: Vec::new(),
         };
         let mut p = CodeqlPanel::new();
         p.databases = vec![

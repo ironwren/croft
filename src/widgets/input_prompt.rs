@@ -55,6 +55,12 @@ pub enum InputPurpose {
     CodeqlRemoveDatabase {
         path: PathBuf,
     },
+    /// Confirm deleting the unused CodeQL databases at `paths` (#578), all
+    /// copies in croft's cache. Submitting (Enter) deletes them; Esc keeps
+    /// them. The value is a sentinel.
+    CodeqlDeleteUnusedDatabases {
+        paths: Vec<PathBuf>,
+    },
     /// A new display name for the CodeQL database at `path` (#578).
     CodeqlRenameDatabase {
         path: PathBuf,
