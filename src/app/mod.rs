@@ -1586,6 +1586,18 @@ type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
 /// How often an open review tab with running checks re-reads them (#365).
 const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where a pull request checkout's worktree path and commit, or git's
+/// refusal, arrive (#365).
+type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, String), String>>;
+
+/// A pull request head checked out into a sibling worktree (#365).
+struct PrCheckout {
+    number: u64,
+    path: PathBuf,
+    /// The commit checked out: a HEAD anywhere else means new commits.
+    oid: String,
+}
+
 /// What a pull request review tab's `gh` call is fetching (#365).
 enum PrGhJob {
     /// The PR itself (`gh pr view`), by number or URL.
@@ -3840,6 +3852,12 @@ pub struct App {
     pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// When the open review tab's checks were last re-read (#365).
     pr_checks_polled: Option<std::time::Instant>,
+    /// The pull request head review mode checked out (#365), removed again
+    /// when review is left with nothing in it worth keeping.
+    pr_checkout: Option<PrCheckout>,
+    /// A checkout still fetching: the PR number, and where the worktree
+    /// path and commit (or git's refusal) arrive.
+    pr_checkout_rx: Option<(u64, PrCheckoutRx)>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -5651,6 +5669,8 @@ impl App {
             review_gh: String::from("gh"),
             pr_gh: None,
             pr_checks_polled: None,
+            pr_checkout: None,
+            pr_checkout_rx: None,
             review_tx,
             review_rx,
             recording: None,
@@ -52349,6 +52369,7 @@ impl App {
                 }
             }
             KeyCode::Char('l') => self.show_pr_check_log(),
+            KeyCode::Char('c') => self.checkout_pr_head(),
             KeyCode::Char('r') => {
                 // By URL, so a PR opened from another repository refreshes
                 // as itself.
@@ -52363,8 +52384,108 @@ impl App {
                 let n = view.pr.number;
                 self.editor.close_active();
                 self.status = format!("Left review of PR #{n}");
+                self.leave_pr_checkout();
             }
             _ => {}
+        }
+    }
+
+    /// Check the reviewed pull request's head out into a sibling worktree
+    /// and add it to the workspace (#365), so its code has the language
+    /// server, go-to-definition and tests. Fetching runs off the UI thread.
+    fn checkout_pr_head(&mut self) {
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        if self.pr_checkout_rx.is_some() {
+            self.status = String::from("A pull request checkout is already fetching");
+            return;
+        }
+        let number = view.pr.number;
+        let slug = view.key.split('#').next().unwrap_or_default().to_string();
+        let repo = self.workspace_root().to_path_buf();
+        let Some(path) = crate::git::pr_worktree_path(&repo, number) else {
+            self.status = format!(
+                "No place beside {} to check PR #{number} out",
+                repo.display()
+            );
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let remote = crate::git::remote_for_slug(&repo, &slug);
+            // Canonical, like the workspace roots it is added to and later
+            // removed from.
+            let result = crate::git::checkout_pr_worktree(&repo, &remote, number, &path)
+                .map(|oid| (path.canonicalize().unwrap_or(path), oid));
+            let _ = tx.send(result);
+        });
+        self.pr_checkout_rx = Some((number, rx));
+        self.status = format!("Fetching PR #{number}…");
+    }
+
+    /// Apply a finished pull request checkout. Returns true when it changed
+    /// what is on screen.
+    fn poll_pr_checkout(&mut self) -> bool {
+        let Some((number, rx)) = self.pr_checkout_rx.as_ref() else {
+            return false;
+        };
+        let number = *number;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the checkout stopped without answering"))
+            }
+        };
+        self.pr_checkout_rx = None;
+        match result {
+            Ok((path, oid)) => {
+                if !self.roots.iter().any(|r| r == path) {
+                    self.add_workspace_folder(path.clone());
+                }
+                let short: String = oid.chars().take(8).collect();
+                self.status = format!(
+                    "PR #{number} checked out at {short} in {} — leaving review removes it if nothing changed",
+                    path.display()
+                );
+                self.pr_checkout = Some(PrCheckout { number, path, oid });
+            }
+            Err(why) => self.status = format!("Could not check out PR #{number}: {why}"),
+        }
+        true
+    }
+
+    /// Leaving review mode (#365): remove the pull request's checkout and
+    /// its workspace folder, unless it holds work — edits, build output or
+    /// new commits — which stay, with the reason in the status.
+    fn leave_pr_checkout(&mut self) {
+        let Some(checkout) = self.pr_checkout.take() else {
+            return;
+        };
+        let PrCheckout { number, path, oid } = checkout;
+        if !path.exists() {
+            return;
+        }
+        if let Some(why) = crate::git::pr_worktree_keep_reason(&path, &oid) {
+            self.status = format!(
+                "Left review of PR #{number}; kept its checkout at {}: {why}",
+                path.display()
+            );
+            return;
+        }
+        match crate::git::remove_worktree_lane(&path) {
+            Ok(()) => {
+                self.close_lane_panes(&path);
+                self.remove_workspace_folder(path);
+                self.status = format!("Left review of PR #{number} and removed its checkout");
+            }
+            Err(why) => {
+                self.status = format!(
+                    "Left review of PR #{number}; could not remove {}: {why}",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -59318,7 +59439,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh();
+        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_pr_checkout();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();

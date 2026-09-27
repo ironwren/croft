@@ -1355,6 +1355,126 @@ pub fn remove_worktree_lane(lane: &Path) -> Result<(), String> {
     run_git_mut(lane, &["worktree", "remove", path])
 }
 
+/// Where review mode checks pull request `number` out (#365): a sibling of
+/// `repo`, like a worktree lane, never a child git would then see.
+pub fn pr_worktree_path(repo: &Path, number: u64) -> Option<PathBuf> {
+    let name = repo.file_name()?.to_str()?;
+    Some(repo.parent()?.join(format!("{name}-pr-{number}")))
+}
+
+/// Which remote to fetch `owner/repo`'s pull requests from: the one whose
+/// URL names it (`git@github.com:o/r.git`, `https://github.com/o/r`), else
+/// the repository's own URL, which `git fetch` takes as well.
+pub fn remote_for_slug(repo: &Path, slug: &str) -> String {
+    let slug = slug.to_ascii_lowercase();
+    let names = |url: &str| {
+        let url = url.trim().to_ascii_lowercase();
+        let url = url.strip_suffix(".git").unwrap_or(&url).to_string();
+        url.ends_with(&format!("/{slug}")) || url.ends_with(&format!(":{slug}"))
+    };
+    run_git(repo, &["remote", "-v"])
+        .ok()
+        .and_then(|out| {
+            out.lines().find_map(|l| {
+                let mut parts = l.split_whitespace();
+                let (name, url) = (parts.next()?, parts.next()?);
+                names(url).then(|| name.to_string())
+            })
+        })
+        .unwrap_or_else(|| format!("https://github.com/{slug}.git"))
+}
+
+/// Whether `path` is one of `repo`'s worktrees.
+fn is_worktree_of(repo: &Path, path: &Path) -> bool {
+    let want = path.canonicalize().ok();
+    run_git(repo, &["worktree", "list", "--porcelain"]).is_ok_and(|out| {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|w| Path::new(w).canonicalize().ok() == want)
+    })
+}
+
+/// Fetch pull request `number` from `remote` and check its head out,
+/// detached, in a worktree at `path` (#365). An existing checkout of the
+/// same repository is moved to the new head, so re-running after a push
+/// updates it. Anything else already at `path` is refused, never touched.
+/// Returns the commit checked out.
+pub fn checkout_pr_worktree(
+    repo: &Path,
+    remote: &str,
+    number: u64,
+    path: &Path,
+) -> Result<String, String> {
+    let Some(path_s) = path.to_str() else {
+        return Err(String::from("worktree path is not valid UTF-8"));
+    };
+    let Some(repo_s) = repo.to_str() else {
+        return Err(String::from("repository path is not valid UTF-8"));
+    };
+    // No prompt: this runs off the UI thread, where a credential prompt
+    // would wait forever on a terminal nobody sees.
+    let fetch = Command::new("git")
+        .args(["-C", repo_s, "fetch", "--quiet", remote])
+        .arg(format!("refs/pull/{number}/head"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !fetch.status.success() {
+        let err = String::from_utf8_lossy(&fetch.stderr);
+        return Err(err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("git fetch failed")
+            .to_string());
+    }
+    let oid = run_git(repo, &["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if path.exists() {
+        if !is_worktree_of(repo, path) {
+            return Err(format!(
+                "{path_s} already exists and is not a worktree of this repository"
+            ));
+        }
+        if let Some(why) =
+            lane_removal_block(path).filter(|_| worktree_head(path).as_deref() != Some(&oid))
+        {
+            return Err(format!("the existing checkout has work in it: {why}"));
+        }
+        run_git_mut(path, &["checkout", "--quiet", "--detach", &oid])?;
+    } else {
+        run_git_mut(repo, &["worktree", "add", "--detach", path_s, &oid])?;
+    }
+    Ok(oid)
+}
+
+/// The commit a worktree's HEAD is on.
+pub fn worktree_head(path: &Path) -> Option<String> {
+    run_git(path, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Why leaving review must keep the pull request's checkout: uncommitted or
+/// ignored files (see [`lane_removal_block`]), or commits made on top of the
+/// checked-out head, which a detached worktree would leave unreachable.
+pub fn pr_worktree_keep_reason(path: &Path, checked_out: &str) -> Option<String> {
+    if let Some(why) = lane_removal_block(path) {
+        return Some(why);
+    }
+    match worktree_head(path) {
+        Some(head) if head == checked_out => None,
+        Some(_) => Some(String::from(
+            "it has commits beyond the pull request's head — put them on a branch first",
+        )),
+        None => Some(String::from("git cannot read its HEAD")),
+    }
+}
+
 /// The current branch's first-parent history, newest first (#371).
 ///
 /// NOT [`commit_graph`], which logs `--branches --tags HEAD` to draw the
@@ -3132,6 +3252,97 @@ mod tests {
             want.join("\n") + "\n",
             "reverted at working line 12"
         );
+    }
+
+    /// #365: review mode's checkout fetches `refs/pull/N/head` into a
+    /// detached sibling worktree, moves it on a re-run after a new push,
+    /// refuses a directory that is not its worktree, and says why leaving
+    /// must keep a checkout with edits or new commits in it.
+    #[test]
+    fn a_pull_request_head_checks_out_into_a_sibling_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let up = tmp.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        init_repo_with_commit(&up);
+        let pr_commit = |msg: &str| {
+            std::fs::write(up.join("pr.txt"), msg).unwrap();
+            git(&up, &["add", "."]);
+            git(&up, &["commit", "-q", "-m", msg]);
+            let sha = git(&up, &["rev-parse", "HEAD"]);
+            git(&up, &["update-ref", "refs/pull/7/head", &sha]);
+            sha
+        };
+        let first = pr_commit("one");
+        let app = tmp.path().join("app");
+        git(tmp.path(), &["clone", "-q", up.to_str().unwrap(), "app"]);
+        git(&app, &["config", "user.email", "a@b"]);
+        git(&app, &["config", "user.name", "a"]);
+
+        let path = pr_worktree_path(&app, 7).unwrap();
+        assert_eq!(path, tmp.path().join("app-pr-7"));
+        let remote = remote_for_slug(&app, "o/r");
+        assert_eq!(remote, "https://github.com/o/r.git", "no remote names o/r");
+        assert_eq!(
+            checkout_pr_worktree(&app, "origin", 7, &path),
+            Ok(first.clone())
+        );
+        assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "one");
+        assert_eq!(pr_worktree_keep_reason(&path, &first), None);
+
+        // A new push moves the existing checkout.
+        let second = pr_commit("two");
+        assert_eq!(
+            checkout_pr_worktree(&app, "origin", 7, &path),
+            Ok(second.clone())
+        );
+        assert_eq!(std::fs::read_to_string(path.join("pr.txt")).unwrap(), "two");
+
+        // Edits and new commits are reasons to keep it.
+        std::fs::write(path.join("pr.txt"), "edited").unwrap();
+        assert!(pr_worktree_keep_reason(&path, &second).is_some());
+        git(&path, &["commit", "-q", "-am", "mine"]);
+        let why = pr_worktree_keep_reason(&path, &second).expect("a new commit keeps it");
+        assert!(why.contains("commits"), "{why}");
+
+        // Something else at the path is never touched.
+        let stray = pr_worktree_path(&app, 8).unwrap();
+        std::fs::create_dir(&stray).unwrap();
+        let second_pr = git(&up, &["rev-parse", "HEAD"]);
+        git(&up, &["update-ref", "refs/pull/8/head", &second_pr]);
+        let err = checkout_pr_worktree(&app, "origin", 8, &stray).unwrap_err();
+        assert!(err.contains("not a worktree"), "{err}");
+    }
+
+    #[test]
+    fn the_pull_request_remote_is_the_one_naming_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo_with_commit(tmp.path());
+        for (name, url) in [
+            ("origin", "git@github.com:me/fork.git"),
+            ("upstream", "https://github.com/Owner/Repo"),
+        ] {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["remote", "add", name, url])
+                .status();
+        }
+        assert_eq!(remote_for_slug(tmp.path(), "owner/repo"), "upstream");
+        assert_eq!(remote_for_slug(tmp.path(), "me/fork"), "origin");
     }
 
     fn init_repo_with_commit(p: &Path) {
