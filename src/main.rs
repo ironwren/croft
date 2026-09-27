@@ -82,6 +82,7 @@ mod scrubber;
 mod search_editor;
 mod session;
 mod session_host;
+mod session_record;
 mod session_state;
 mod sheet;
 mod shell_integration;
