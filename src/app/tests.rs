@@ -58408,6 +58408,63 @@ fn only_a_remote_launched_croft_polls_the_build_marker() {
     );
 }
 
+/// #737: the poll's positive path. A marker naming a live build pauses the
+/// servers of a remote-launched croft; the marker going resumes them.
+#[test]
+fn a_live_build_marker_pauses_the_servers_and_its_removal_resumes_them() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_watch = Some(crate::update_watch::UpdateWatch::start(
+            tmp.path().to_path_buf(),
+            String::new(),
+        ));
+        let cache = croft_cache_dir();
+        std::fs::create_dir_all(&cache).unwrap();
+        let marker = cache.join(format!(
+            "{}{}",
+            crate::update_watch::BUILD_MARKER_PREFIX,
+            std::process::id()
+        ));
+        // This test process stands in for the compile: alive, and ours.
+        std::fs::write(&marker, std::process::id().to_string()).unwrap();
+        if let Some(boot) = crate::update_watch::boot_id() {
+            let sidecar = format!(
+                "{}{}",
+                marker.display(),
+                crate::update_watch::BOOT_SIDECAR_SUFFIX
+            );
+            std::fs::write(sidecar, boot).unwrap();
+        }
+        assert!(app.poll_source_build_marker());
+        assert!(app.lsp.is_none() && app.lsp_paused_for_build);
+
+        std::fs::remove_file(&marker).unwrap();
+        app.build_marker_checked = None; // past the once-a-second gate
+        assert!(app.poll_source_build_marker());
+        assert!(app.lsp.is_some() && !app.lsp_paused_for_build);
+    });
+}
+
+/// #737: a re-root starts a new manager, which numbers semantic replies from
+/// 0 again, so the old high-water marks go with the old one.
+#[test]
+fn a_reroot_forgets_the_old_semantic_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let p = tmp.path().join("a.rs");
+    app.semantic_generation_seen.insert(p.clone(), 500);
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(
+        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        "the new server's first reply must be accepted"
+    );
+    assert!(app.lsp.is_some(), "the new root's servers started");
+}
+
 /// #694: an "all clear" from the last server reporting on a path drops the
 /// path from the store instead of leaving an empty entry behind; another
 /// server's findings on it survive.

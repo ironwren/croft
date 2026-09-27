@@ -34901,7 +34901,11 @@ impl App {
                 self.semantic_generation_seen.clear();
                 // A tab closed during the pause was never in `lsp_last_seen`
                 // again, so nothing would drop its diagnostics: drop what no
-                // open buffer owns, and let the new servers publish the rest.
+                // open buffer owns. That includes workspace-scope diagnostics
+                // for files never opened, which the old servers published
+                // unasked; the new servers publish those again as they index,
+                // and until then keeping them would show findings nothing can
+                // retract.
                 let open = self.open_buffer_paths();
                 self.lsp_diagnostics.retain(|p, _| open.contains(p));
                 self.rebuild_problems();
@@ -52266,8 +52270,9 @@ impl App {
         // into a child repo left rust-analyzer running `cargo metadata` against
         // the parent, which has no Cargo.toml, so every opened .rs came back as
         // an `unlinked-file` with no hover / completion / semantic tokens.
-        // Spawn a fresh manager rooted at new_root; assigning over the Option
-        // drops the old manager, whose Drop shuts its servers down. Clearing
+        // Spawn a fresh manager rooted at new_root. The old one's Drop shuts
+        // its servers down and waits up to 3 s for them, so it is dropped
+        // off the UI thread, as the build pause does (#737). Clearing
         // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
         // against the new servers; the stale diagnostics / progress from the
         // old root are dropped with it.
@@ -52276,6 +52281,9 @@ impl App {
         // starting them now would put rust-analyzer back beside the compile.
         // The manager drops either way, and the end of the build starts one
         // at the new root, since the resume reads `workspace_root()`.
+        if let Some(old) = self.lsp.take() {
+            fs_watch::offload_drop(old);
+        }
         self.lsp = match self.lsp_paused_for_build {
             true => None,
             false => match crate::lsp::LspManager::new(new_root.clone()) {
