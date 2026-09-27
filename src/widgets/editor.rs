@@ -3952,6 +3952,28 @@ impl Editor {
         out
     }
 
+    /// A read-only view of `path` as it was at some commit (#371): `text` is
+    /// the file then, `baseline` the parent commit's version, so the git
+    /// gutter shows that commit's own change (a root commit, or a file the
+    /// commit added, has an empty baseline and marks every line added).
+    pub fn historical(path: &Path, text: &str, baseline: Vec<String>) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.lang = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .and_then(lang_for_extension);
+        e.recompute_highlights();
+        e.set_git_head_lines(path.to_path_buf(), Some(baseline));
+        // Never edited, so the marks are computed once, here.
+        e.refresh_git_marks();
+        e
+    }
+
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
     /// last computed marks (call after a render, or after `refresh_git_marks`).
     pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
@@ -12428,7 +12450,7 @@ fn follow_moved_bookmark_lines(
 /// position past that `\r` (semantic tokens, diagnostics, hover, definition)
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
-fn split_into_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())
@@ -14936,6 +14958,10 @@ pub struct Crumb {
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
 pub struct EditorTabs {
+    /// The active editor's rect below the tab strip and breadcrumbs, from
+    /// the last frame: where a view standing in for it (the history
+    /// scrubber's, #371) paints.
+    pub last_body: Rect,
     pub editors: Vec<Editor>,
     active: usize,
     /// Breadcrumb segments for the active file, set by `App` each frame from
@@ -14980,6 +15006,7 @@ pub struct EditorTabs {
 impl EditorTabs {
     pub fn new() -> Self {
         Self {
+            last_body: Rect::default(),
             editors: vec![Editor::new()],
             active: 0,
             breadcrumbs: Vec::new(),
@@ -16132,6 +16159,7 @@ impl Widget for &mut EditorTabs {
             };
         }
 
+        self.last_body = body;
         let active_editor = &mut self.editors[active];
         Widget::render(active_editor, body, buf);
     }
