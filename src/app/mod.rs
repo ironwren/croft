@@ -62019,15 +62019,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-<<<<<<< HEAD
-        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_pr_checkout();
-        app.sync_approval_check();
-=======
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()
             | app.poll_pr_checkout()
             | app.poll_code_scanning();
->>>>>>> origin/main
+        app.sync_approval_check();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
