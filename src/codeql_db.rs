@@ -42,13 +42,21 @@ pub fn find_database_in(dir: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(first)
 }
 
+/// The most a database's `src.zip` may expand to when croft extracts it to
+/// browse (#578): generous for real source trees, but a crafted archive
+/// cannot fill the disk.
+pub const SOURCE_ZIP_LIMIT: u64 = 4 << 30;
+
 /// Extract `zip` into `dest`, refusing any entry whose path would land
-/// outside it (zip slip). Returns `dest`.
-pub fn extract_zip(zip: &Path, dest: &Path) -> Result<PathBuf, String> {
+/// outside it (zip slip) and, with a `limit`, an archive whose contents
+/// would exceed that many bytes. Returns `dest`.
+pub fn extract_zip(zip: &Path, dest: &Path, limit: Option<u64>) -> Result<PathBuf, String> {
     let file = std::fs::File::open(zip).map_err(|e| format!("{}: {e}", zip.display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("not a zip: {e}"))?;
     // Check every name before writing anything, so a hostile entry late in
     // the archive cannot leave the earlier ones half-extracted.
+    let too_big = |limit: u64| format!("refusing it: it expands to more than {limit} bytes");
+    let mut declared: u64 = 0;
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| e.to_string())?;
         if entry.enclosed_name().is_none() {
@@ -57,7 +65,14 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> Result<PathBuf, String> {
                 entry.name()
             ));
         }
+        declared = declared.saturating_add(entry.size());
+        if let Some(limit) = limit.filter(|&l| declared > l) {
+            return Err(too_big(limit));
+        }
     }
+    // The sizes above are what the archive claims; the copy below counts
+    // what it actually writes, so a lying header cannot get past either.
+    let mut written: u64 = 0;
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -73,7 +88,20 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> Result<PathBuf, String> {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut f = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        match limit {
+            None => {
+                std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+            }
+            Some(limit) => {
+                let room = limit - written;
+                let n = std::io::copy(&mut std::io::Read::take(&mut entry, room + 1), &mut f)
+                    .map_err(|e| e.to_string())?;
+                if n > room {
+                    return Err(too_big(limit));
+                }
+                written += n;
+            }
+        }
     }
     Ok(dest.to_path_buf())
 }
@@ -110,6 +138,59 @@ pub fn language_label(id: &str) -> Option<&'static str> {
     Some(crate::widgets::codeql::LANGUAGES[i])
 }
 
+/// Where a database keeps the source it was extracted from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbSource {
+    /// A `src` folder, ready to browse.
+    Folder(PathBuf),
+    /// The `src.zip` the CLI writes by default, to extract first.
+    Zip(PathBuf),
+}
+
+/// The database's source: its `src` folder when it has one, else its
+/// `src.zip`, else `None`.
+pub fn database_source(dir: &Path) -> Option<DbSource> {
+    let folder = dir.join("src");
+    if folder.is_dir() {
+        return Some(DbSource::Folder(folder));
+    }
+    let zip = dir.join("src.zip");
+    zip.is_file().then_some(DbSource::Zip(zip))
+}
+
+/// The folder name a database's extracted `src.zip` gets in croft's cache:
+/// its folder name, a short hash of its canonical path (so two databases
+/// with the same name never share one) and a short hash of the archive's
+/// contents (so a database replaced at the same path is extracted afresh,
+/// even when the new archive has the same size and timestamp). The first
+/// two parts, from [`source_cache_prefix`], name every extraction of it.
+pub fn source_cache_name(db: &Path, zip: &Path) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    if let Ok(mut f) = std::fs::File::open(zip) {
+        let _ = std::io::copy(&mut f, &mut hasher);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{}{}", source_cache_prefix(db), &digest[..12])
+}
+
+/// The part of [`source_cache_name`] shared by every extraction of the
+/// database at `db`, whatever its archive: older ones are found and
+/// removed by it.
+pub fn source_cache_prefix(db: &Path) -> String {
+    use sha2::Digest;
+    let canon = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+    let digest = format!(
+        "{:x}",
+        sha2::Sha256::digest(canon.to_string_lossy().as_bytes())
+    );
+    let name = canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("database"));
+    format!("{name}-{}-", &digest[..12])
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -126,6 +207,18 @@ pub struct DbEntry {
     /// existed read as 0, so they sort as the oldest.
     #[serde(default)]
     pub added: u64,
+    /// Names it had before being renamed. History saved before runs
+    /// recorded their database's path names the database it ran on, so
+    /// these keep such a run tied to it after a rename (#578).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
+}
+
+impl DbEntry {
+    /// Whether it goes by `name`, now or before a rename.
+    pub fn has_had_name(&self, name: &str) -> bool {
+        self.name == name || self.former_names.iter().any(|n| n == name)
+    }
 }
 
 /// The orders VS Code's Databases view sorts by.
@@ -206,6 +299,7 @@ impl DatabaseStore {
             path: dir.to_path_buf(),
             language: database_language(dir),
             added: now_secs(),
+            former_names: Vec::new(),
         });
         self.current = Some(self.databases.len() - 1);
         // A new database takes its place in the chosen order.
@@ -225,6 +319,10 @@ impl DatabaseStore {
             .databases
             .get_mut(index)
             .ok_or_else(|| String::from("No such database"))?;
+        if db.name != name && !db.former_names.contains(&db.name) {
+            let old = std::mem::take(&mut db.name);
+            db.former_names.push(old);
+        }
         db.name = name.to_string();
         Ok(())
     }
@@ -344,6 +442,7 @@ mod tests {
             path: PathBuf::from("/dbs").join(name),
             language: lang.map(Into::into),
             added,
+            former_names: Vec::new(),
         }
     }
 
@@ -358,6 +457,12 @@ mod tests {
         assert!(s.rename(0, "   ").is_err());
         assert_eq!(s.databases[0].name, "flask main", "unchanged");
         assert!(s.rename(3, "x").is_err());
+        // It remembers what it was called, once each, for older history.
+        s.rename(0, "flask").unwrap();
+        s.rename(0, "flask").unwrap();
+        assert_eq!(s.databases[0].former_names, ["a", "flask main"]);
+        assert!(s.databases[0].has_had_name("a") && s.databases[0].has_had_name("flask"));
+        assert!(!s.databases[0].has_had_name("b"));
     }
 
     #[test]
@@ -467,7 +572,7 @@ mod tests {
         z.write_all(b"primaryLanguage: \"python\"\n").unwrap();
         z.finish().unwrap();
         let dest = tmp.path().join("out");
-        let got = extract_zip(&good, &dest).unwrap();
+        let got = extract_zip(&good, &dest, None).unwrap();
         assert_eq!(find_database_in(&got), Some(dest.join("mydb")));
 
         let evil = tmp.path().join("evil.zip");
@@ -475,11 +580,76 @@ mod tests {
         z.start_file("../escaped.txt", opts).unwrap();
         z.write_all(b"x").unwrap();
         z.finish().unwrap();
-        assert!(extract_zip(&evil, &tmp.path().join("out2")).is_err());
+        assert!(extract_zip(&evil, &tmp.path().join("out2"), None).is_err());
         assert!(
             !tmp.path().join("escaped.txt").exists(),
             "nothing written outside"
         );
+    }
+
+    /// #578: a limit caps what an archive may expand to, both by the sizes
+    /// it declares and by what the copy actually writes.
+    #[test]
+    fn zip_extraction_stops_at_its_size_limit() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("src.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("a.txt", opts).unwrap();
+        z.write_all(&[b'a'; 600]).unwrap();
+        z.start_file("b.txt", opts).unwrap();
+        z.write_all(&[b'b'; 600]).unwrap();
+        z.finish().unwrap();
+        let err = extract_zip(&zip, &tmp.path().join("small"), Some(1000)).unwrap_err();
+        assert!(err.contains("more than 1000 bytes"), "{err}");
+        let got = extract_zip(&zip, &tmp.path().join("roomy"), Some(1200)).unwrap();
+        assert_eq!(std::fs::read(got.join("b.txt")).unwrap().len(), 600);
+    }
+
+    #[test]
+    fn a_databases_source_is_its_src_folder_else_its_src_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path(), "app", "go");
+        assert_eq!(database_source(&db), None);
+        std::fs::write(db.join("src.zip"), b"").unwrap();
+        assert_eq!(
+            database_source(&db),
+            Some(DbSource::Zip(db.join("src.zip")))
+        );
+        std::fs::create_dir(db.join("src")).unwrap();
+        assert_eq!(
+            database_source(&db),
+            Some(DbSource::Folder(db.join("src"))),
+            "the folder wins"
+        );
+        let other = make_db(&tmp.path().join("elsewhere"), "app", "go");
+        let zip = db.join("src.zip");
+        let name = source_cache_name(&db, &zip);
+        assert!(name.starts_with("app-") && name.len() == 29, "{name}");
+        assert!(name.starts_with(&source_cache_prefix(&db)));
+        let other_zip = other.join("src.zip");
+        assert_ne!(
+            name,
+            source_cache_name(&other, &other_zip),
+            "same name, other path"
+        );
+        assert_eq!(name, source_cache_name(&db, &zip), "stable");
+        std::fs::write(&zip, b"archive one").unwrap();
+        let one = source_cache_name(&db, &zip);
+        let mtime = std::fs::metadata(&zip).unwrap().modified().unwrap();
+        // Same size and timestamp, other contents: still a new folder.
+        std::fs::write(&zip, b"archive two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&zip)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let two = source_cache_name(&db, &zip);
+        assert_ne!(one, two, "a changed archive gets a new folder");
+        assert!(two.starts_with(&source_cache_prefix(&db)));
     }
 
     #[test]
