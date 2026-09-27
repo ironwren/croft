@@ -15999,13 +15999,13 @@ impl App {
     /// row from reality is the kind of bug nobody notices until the demo is
     /// published.
     ///
-    /// **The recording is monochrome, and the cursor is not restored.**
-    /// `grid_lines` returns plain `String`s — the cell attributes are in the
-    /// grid but not in that view — so a cast records the TEXT of a session
-    /// and not its colour. That is a real limit rather than an oversight:
-    /// carrying attributes means re-emitting SGR per run of cells, which is
-    /// the byte stream this deliberately does not tap. Named here so nobody
-    /// files it as a bug and so the follow-on knows what it costs.
+    /// Each row is written with the colours and attributes its cells
+    /// showed, re-emitted as SGR per run of equal style, and the frame ends
+    /// with the cursor where the shell left it (hidden when the program hid
+    /// it), so a player shows the session rather than its text. A row a
+    /// redact rule touches is written as its masked plain text and gives up
+    /// its colour, as the scrollback dump's rows do: a mask spliced between
+    /// escapes could break them.
     fn record_active_screen(&mut self) {
         // Read everything the frame needs from the pane in ONE borrow, then
         // write. The two writes below both take `&mut self`, so interleaving
@@ -16013,22 +16013,24 @@ impl App {
         // them — which compiles but reads as an accident rather than as a
         // decision.
         let triggers = self.triggers.clone();
-        let Some((size, lines)) = self.terminals.get(self.active_terminal).map(|t| {
-            let (mut all, mut wraps, top) = t.grid_lines_wrapped();
-            // The VISIBLE screen only. `grid_lines` starts at
-            // `topmost_line()`, which is negative scrollback — up to
-            // 5000 rows. Writing all of it after a clear scrolls the
-            // live screen straight off the top, so the cast shows the
-            // tail of the history rather than what the user was looking
-            // at, at ~400 KB per frame.
-            let first = ((-top).max(0) as usize).min(all.len());
-            let visible = all.split_off(first);
-            let visible_wraps = wraps.split_off(first.min(wraps.len()));
+        let Some((size, lines, cursor)) = self.terminals.get(self.active_terminal).map(|t| {
+            // The VISIBLE screen only, never the scrollback above it: writing
+            // history after a clear scrolls the live screen straight off the
+            // top, so the cast would show the tail of the history rather
+            // than what the user was looking at, at ~400 KB per frame.
+            let (rows, cursor) = t.screen_ansi_wrapped();
+            let plains: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+            let wraps: Vec<bool> = rows.iter().map(|r| r.2).collect();
             // Masked like a scrollback dump (#360): a cast is a file made to
             // be shared, so every redact rule applies, and a reveal on
             // screen never reaches it.
-            let visible = crate::triggers::mask_rows(&visible, &visible_wraps, &triggers);
-            ((t.last_inner.width, t.last_inner.height), visible)
+            let masked = crate::triggers::mask_rows(&plains, &wraps, &triggers);
+            let lines: Vec<String> = rows
+                .into_iter()
+                .zip(masked)
+                .map(|((plain, ansi, _), masked)| if masked == plain { ansi } else { masked })
+                .collect();
+            ((t.last_inner.width, t.last_inner.height), lines, cursor)
         }) else {
             return;
         };
@@ -16041,6 +16043,7 @@ impl App {
         }
         let mut frame = String::from("\u{1b}[H\u{1b}[2J");
         frame.push_str(&lines.join("\r\n"));
+        frame.push_str(&cursor_suffix(cursor));
         self.record_terminal_output(&frame);
     }
 
@@ -60854,6 +60857,17 @@ fn sweep_staged_stdin(dir: &Path) {
         if too_old {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+/// The tail of a recorded frame (#356) that leaves a player's cursor where
+/// the pane's was: moved to its `(row, col)` and shown, or hidden when the
+/// program hid it. Always one or the other, so a frame never inherits the
+/// previous frame's cursor state.
+fn cursor_suffix(cursor: Option<(u16, u16)>) -> String {
+    match cursor {
+        Some((row, col)) => format!("\u{1b}[{};{}H\u{1b}[?25h", row + 1, col + 1),
+        None => String::from("\u{1b}[?25l"),
     }
 }
 

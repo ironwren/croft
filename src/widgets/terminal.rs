@@ -455,6 +455,10 @@ struct PaneAnnotation {
     text: String,
 }
 
+/// The visible screen as `(plain, coloured, wraps)` rows plus the cursor's
+/// `(row, col)` on it, `None` when hidden: [`PtyTerminal::screen_ansi_wrapped`].
+pub type ScreenAnsi = (Vec<(String, String, bool)>, Option<(u16, u16)>);
+
 pub struct PtyTerminal {
     term: Arc<FairMutex<Term<VoidListener>>>,
     /// Set by the PTY reader thread on every chunk and by `write_input`;
@@ -1575,65 +1579,27 @@ impl PtyTerminal {
             return Vec::new();
         }
         let top = term.grid().topmost_line().0;
-        let bottom = term.screen_lines() as i32 - 1;
-        let ncols = term.columns();
-        let mut lines = Vec::new();
-        let mut l = top;
-        while l <= bottom {
-            // Cells are collected as (char, style key) - three Copy values,
-            // no allocation per cell - so trailing default-styled blanks can
-            // be trimmed before anything is serialised, and the SGR string
-            // is built once per run of equal style rather than once per
-            // cell. This runs under the term lock the reader thread shares,
-            // and a saturated scrollback is hundreds of thousands of rows.
-            let mut cells: Vec<(char, (AnsiColor, AnsiColor, Flags))> = Vec::with_capacity(ncols);
-            for c in 0..ncols {
-                let cell = &term.grid()[Point::new(Line(l), Column(c))];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                cells.push((ch, (cell.fg, cell.bg, cell.flags)));
-            }
-            let wraps_on = l < bottom && row_wraps(&term, l);
-            let plain: String = cells.iter().map(|(ch, _)| *ch).collect::<String>();
-            // Trailing blanks trimmed only where the row does not wrap (see
-            // `grid_lines_wrapped`).
-            let plain = if wraps_on {
-                plain
-            } else {
-                plain.trim_end().to_string()
-            };
-            while cells.last().is_some_and(|(ch, (fg, bg, flags))| {
-                *ch == ' ' && style_is_default(*fg, *bg, *flags)
-            }) {
-                cells.pop();
-            }
-            let mut out = String::new();
-            let mut current: Option<(AnsiColor, AnsiColor, Flags)> = None;
-            let mut styled = false;
-            for (ch, key) in cells {
-                if current != Some(key) {
-                    if styled {
-                        out.push_str("\x1b[0m");
-                    }
-                    let sgr = cell_sgr(key.0, key.1, key.2);
-                    styled = !sgr.is_empty();
-                    out.push_str(&sgr);
-                    current = Some(key);
-                }
-                out.push(ch);
-            }
-            if styled {
-                out.push_str("\x1b[0m");
-            }
-            lines.push((plain, out, wraps_on));
-            l += 1;
+        ansi_rows(&term, top)
+    }
+
+    /// The visible screen as [`Self::grid_lines_ansi_wrapped`] rows, with
+    /// the shell cursor's cell on that screen, read under ONE term lock so
+    /// the cursor belongs to the rows it is drawn over (#356: a recorded
+    /// frame is the screen in colour, cursor included). The cursor is
+    /// `None` when the program hid it; scrollback is never walked, so the
+    /// cost is one screen however long the history is.
+    pub fn screen_ansi_wrapped(&self) -> ScreenAnsi {
+        let term = self.term.lock();
+        if term.columns() == 0 {
+            return (Vec::new(), None);
         }
-        lines
+        let rows = ansi_rows(&term, 0);
+        let p = term.grid().cursor.point;
+        let cursor = (term.mode().contains(TermMode::SHOW_CURSOR)
+            && p.line.0 >= 0
+            && (p.line.0 as usize) < rows.len())
+        .then_some((p.line.0 as u16, p.column.0 as u16));
+        (rows, cursor)
     }
 
     /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
@@ -4167,6 +4133,73 @@ pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, us
         joined.push_str(&s);
     }
     (joined, offset)
+}
+
+/// Grid rows from `top` to the bottom of the screen as `(plain, coloured,
+/// wraps)`: see [`PtyTerminal::grid_lines_ansi_wrapped`], which reads from
+/// the top of the scrollback, and [`PtyTerminal::screen_ansi_wrapped`],
+/// which reads the visible screen only.
+fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
+    let bottom = term.screen_lines() as i32 - 1;
+    let ncols = term.columns();
+    let mut lines = Vec::new();
+    let mut l = top;
+    while l <= bottom {
+        // Cells are collected as (char, style key) - three Copy values,
+        // no allocation per cell - so trailing default-styled blanks can
+        // be trimmed before anything is serialised, and the SGR string
+        // is built once per run of equal style rather than once per
+        // cell. This runs under the term lock the reader thread shares,
+        // and a saturated scrollback is hundreds of thousands of rows.
+        let mut cells: Vec<(char, (AnsiColor, AnsiColor, Flags))> = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let cell = &term.grid()[Point::new(Line(l), Column(c))];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            cells.push((ch, (cell.fg, cell.bg, cell.flags)));
+        }
+        let wraps_on = l < bottom && row_wraps(term, l);
+        let plain: String = cells.iter().map(|(ch, _)| *ch).collect::<String>();
+        // Trailing blanks trimmed only where the row does not wrap (see
+        // `grid_lines_wrapped`).
+        let plain = if wraps_on {
+            plain
+        } else {
+            plain.trim_end().to_string()
+        };
+        while cells
+            .last()
+            .is_some_and(|(ch, (fg, bg, flags))| *ch == ' ' && style_is_default(*fg, *bg, *flags))
+        {
+            cells.pop();
+        }
+        let mut out = String::new();
+        let mut current: Option<(AnsiColor, AnsiColor, Flags)> = None;
+        let mut styled = false;
+        for (ch, key) in cells {
+            if current != Some(key) {
+                if styled {
+                    out.push_str("\x1b[0m");
+                }
+                let sgr = cell_sgr(key.0, key.1, key.2);
+                styled = !sgr.is_empty();
+                out.push_str(&sgr);
+                current = Some(key);
+            }
+            out.push(ch);
+        }
+        if styled {
+            out.push_str("\x1b[0m");
+        }
+        lines.push((plain, out, wraps_on));
+        l += 1;
+    }
+    lines
 }
 
 /// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
@@ -8078,6 +8111,52 @@ mod tests {
             plain.is_none_or(|s| s.style.fg.is_none() && !s.style.bold),
             "the reset ends the run: {:?}",
             parsed.spans
+        );
+    }
+
+    /// #356: the recorder's screen read is the visible screen in colour,
+    /// with the cursor where the program put it, and no cursor once the
+    /// program hides it.
+    #[test]
+    fn screen_ansi_wrapped_carries_colour_and_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from(
+                    "s=QQ; printf \"\\033[1;31m${s}RED\\033[0m plain\\n\\033[4;7H\"; sleep 30",
+                ),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.contains("QQRED plain")));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (rows, cursor) = loop {
+            let (rows, cursor) = term.screen_ansi_wrapped();
+            if cursor == Some((3, 6)) || std::time::Instant::now() > deadline {
+                break (rows, cursor);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(cursor, Some((3, 6)), "CSI 4;7H is row 3, column 6");
+        let (_, ansi, _) = rows
+            .iter()
+            .find(|(plain, _, _)| plain.contains("QQRED"))
+            .expect("the coloured row is on screen");
+        assert!(ansi.contains("\x1b[1;31mQQRED\x1b[0m plain"), "{ansi:?}");
+        assert_eq!(
+            rows.len(),
+            term.term.lock().screen_lines(),
+            "the screen, and none of the scrollback above it"
+        );
+
+        term.feed_bytes_for_test(b"\x1b[?25l");
+        assert_eq!(
+            term.screen_ansi_wrapped().1,
+            None,
+            "a hidden cursor is none"
         );
     }
 

@@ -3059,8 +3059,20 @@ fn try_prebuilt_install(
         triple,
         &cache,
         &crate::remote_prebuilt::http_get,
+        &crate::remote_prebuilt::cosign_verify,
     ) {
-        Ok(b) => b,
+        Ok((b, crate::remote_prebuilt::Signature::Verified)) => {
+            log(format!(
+                "Release signature verified: v{version}'s SHA256SUMS was signed by its release workflow"
+            ));
+            b
+        }
+        Ok((b, crate::remote_prebuilt::Signature::Unchecked)) => {
+            log(format!(
+                "Release signature NOT checked: cosign is not installed here, so v{version}'s SHA256SUMS rests on HTTPS to GitHub; install cosign to verify it"
+            ));
+            b
+        }
         // Not every version has release artifacts; that is a plain skip,
         // not a failure to shout about on every connect.
         Err(e) if crate::remote_prebuilt::is_not_published(&e) => {
