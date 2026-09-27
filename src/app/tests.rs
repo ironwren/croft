@@ -42718,11 +42718,7 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
     // And no row may exceed it. This is the half that catches the 80-column
     // grid: there the line wraps at 80, so the widest row is twice what a
     // player sizes its window to.
-    let widest = body
-        .split("\r\n")
-        .map(|row| row.chars().count())
-        .max()
-        .unwrap_or(0);
+    let widest = body.split("\r\n").map(visible_width).max().unwrap_or(0);
     assert!(
         widest as u64 <= declared,
         "the widest row is {widest} columns and the header promises {declared}: \
@@ -42938,7 +42934,7 @@ fn a_fold_mid_recording_narrows_the_frame_and_announces_nothing() {
                 .strip_prefix("\u{1b}[H\u{1b}[2J")
                 .expect("a recorded frame opens with clear-and-home")
                 .split("\r\n")
-                .map(|row| row.chars().count())
+                .map(visible_width)
                 .max()
                 .unwrap_or(0)
         })
@@ -43037,7 +43033,7 @@ fn a_widened_pane_announces_its_new_geometry_before_the_wider_frame() {
         .strip_prefix("\u{1b}[H\u{1b}[2J")
         .expect("a recorded frame opens with clear-and-home")
         .split("\r\n")
-        .map(|row| row.chars().count())
+        .map(visible_width)
         .max()
         .unwrap_or(0);
     assert!(
@@ -59776,4 +59772,116 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
             Some(Command::CodeqlSetUpController)
         );
     });
+}
+
+/// A recorded row's width as a player draws it: its characters with the
+/// SGR and cursor escapes (#356) taken out, since those occupy no column.
+fn visible_width(row: &str) -> usize {
+    crate::remote_connect::strip_ansi(row.as_bytes())
+        .chars()
+        .count()
+}
+
+/// The output frames of the one cast `app` wrote into its workspace.
+fn recorded_frames(app: &App) -> Vec<String> {
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|ev| ev[1] == "o")
+        .filter_map(|ev| ev[2].as_str().map(String::from))
+        .collect()
+}
+
+/// #356: a recorded frame keeps the colours the pane showed, as SGR per
+/// run, and ends by putting the player's cursor where the pane's was, or
+/// hiding it, so each frame sets the cursor state rather than inheriting it.
+#[test]
+fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.terminals[0].resize(60, 10);
+    app.terminals[0].feed_bytes_for_test(b"\r\n\x1b[1;31mQQRED\x1b[0m plain\r\n");
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let frames = recorded_frames(&app);
+    let frame = frames.first().expect("an output event");
+    assert!(
+        frame.contains("\u{1b}[1;31mQQRED\u{1b}[0m plain"),
+        "the red, bold run is recorded as SGR: {frame:?}"
+    );
+    let shown = frame.rsplit_once('\u{1b}').map(|(_, tail)| tail);
+    assert!(
+        matches!(shown, Some("[?25h" | "[?25l")),
+        "the frame ends by setting the cursor: {frame:?}"
+    );
+    if shown == Some("[?25h") {
+        let (row, col) = app.terminals[0].screen_ansi_wrapped().1.unwrap();
+        assert!(
+            frame.ends_with(&format!("\u{1b}[{};{}H\u{1b}[?25h", row + 1, col + 1)),
+            "the cursor is put back where the pane has it: {frame:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hidden_cursor_is_recorded_hidden() {
+    assert_eq!(super::cursor_suffix(None), "\u{1b}[?25l");
+    assert_eq!(super::cursor_suffix(Some((0, 0))), "\u{1b}[1;1H\u{1b}[?25h");
+    assert_eq!(super::cursor_suffix(Some((3, 6))), "\u{1b}[4;7H\u{1b}[?25h");
+}
+
+/// #356: a row a redact rule touches is written as its masked text and
+/// gives up its colour, since a mask spliced between escapes could break
+/// them; the rows around it keep theirs.
+#[test]
+fn a_masked_row_is_recorded_plain_and_its_neighbours_in_colour() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.terminals[0].resize(60, 10);
+    let key = "AKIAIOSFODNN7EXAMPLE";
+    app.terminals[0].feed_bytes_for_test(
+        format!("\r\n\x1b[32mexport KEY={key}\x1b[0m\r\n\x1b[34mQQBLUE\x1b[0m\r\n").as_bytes(),
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let frames = recorded_frames(&app);
+    let frame = frames.first().expect("an output event");
+    assert!(!frame.contains(key), "the key reached the cast: {frame:?}");
+    let masked = frame
+        .split("\r\n")
+        .find(|row| row.contains("export KEY="))
+        .expect("the masked row is recorded");
+    assert!(
+        !masked.contains('\u{1b}'),
+        "the masked row carries no escapes: {masked:?}"
+    );
+    assert!(
+        frame.contains("\u{1b}[34mQQBLUE\u{1b}[0m"),
+        "the next row keeps its colour: {frame:?}"
+    );
 }
