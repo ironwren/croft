@@ -64,6 +64,10 @@ pub enum Action {
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
+    /// Step the Databases list to its next sort order.
+    SortDatabases,
+    /// Step the Query History list to its next sort order.
+    SortHistory,
     /// Open the results of the query history entry at this index.
     OpenHistory(usize),
     /// Fold or unfold the query pack at this index of `queries`.
@@ -131,8 +135,12 @@ pub struct CodeqlPanel {
     /// The databases the user added, and which one queries run against.
     pub databases: Vec<crate::codeql_db::DbEntry>,
     pub current_db: Option<usize>,
-    /// Query history labels, newest first (#578).
+    /// The order the store keeps the databases in, shown on the sort row.
+    pub db_sort: Option<crate::codeql_db::DbSort>,
+    /// Query history labels, in the store's order (#578).
     pub history: Vec<String>,
+    /// The order the store keeps the history in, shown on the sort row.
+    pub history_sort: crate::codeql_query::HistSort,
     /// The workspace's queries by pack, from the last discovery.
     pub queries: Vec<crate::codeql_query::QueryPack>,
     /// Folded packs, by folder, so a fold survives rediscovery.
@@ -156,6 +164,53 @@ impl CodeqlPanel {
         match (self.language, pack.language.as_deref()) {
             (Some(i), Some(lang)) => LANGUAGE_IDS[i] == lang,
             _ => true,
+        }
+    }
+
+    /// Whether database `db` shows under the selected language. One whose
+    /// language is unknown shows under any, like a pack that does not say.
+    pub fn db_matches_language(&self, db: &crate::codeql_db::DbEntry) -> bool {
+        match (self.language, db.language.as_deref()) {
+            (Some(i), Some(lang)) => crate::codeql_db::language_label(lang) == Some(LANGUAGES[i]),
+            _ => true,
+        }
+    }
+
+    /// The store index of the database whose row is selected.
+    pub fn selected_database(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::SelectDatabase(i))) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on database `index`'s row, when it shows.
+    pub fn select_database(&mut self, index: usize) {
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::SelectDatabase(i), _) if *i == index))
+        {
+            self.selected = n;
+        }
+    }
+
+    /// The store index of the query history entry whose row is selected.
+    pub fn selected_history(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::OpenHistory(i))) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the selection on history entry `index`'s row, when it shows.
+    pub fn select_history(&mut self, index: usize) {
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::OpenHistory(i), _) if *i == index))
+        {
+            self.selected = n;
         }
     }
 
@@ -199,7 +254,19 @@ impl CodeqlPanel {
                     }
                 }
                 Section::Databases => {
+                    if !self.databases.is_empty() {
+                        let by = self.db_sort.map_or("date added", |b| b.label());
+                        out.push(Line::Action(
+                            Action::SortDatabases,
+                            format!("Sort by: {by}"),
+                        ));
+                    }
+                    let mut shown = 0;
                     for (i, db) in self.databases.iter().enumerate() {
+                        if !self.db_matches_language(db) {
+                            continue;
+                        }
+                        shown += 1;
                         let mark = if self.current_db == Some(i) {
                             "●"
                         } else {
@@ -214,6 +281,9 @@ impl CodeqlPanel {
                             Action::SelectDatabase(i),
                             format!("{mark} {}{lang}", db.name),
                         ));
+                    }
+                    if shown == 0 && !self.databases.is_empty() {
+                        out.push(Line::Text("No databases in this language."));
                     }
                     out.push(Line::Text("Add a CodeQL database:"));
                     for (a, label) in [
@@ -274,6 +344,10 @@ impl CodeqlPanel {
                     ));
                 }
                 Section::QueryHistory if !self.history.is_empty() => {
+                    out.push(Line::Action(
+                        Action::SortHistory,
+                        format!("Sort by: {}", self.history_sort.label()),
+                    ));
                     for (i, label) in self.history.iter().enumerate() {
                         out.push(Line::Action(Action::OpenHistory(i), label.clone()));
                     }
@@ -494,11 +568,13 @@ mod tests {
                 name: "a-db".into(),
                 path: "/x/a-db".into(),
                 language: Some("python".into()),
+                added: 0,
             },
             crate::codeql_db::DbEntry {
                 name: "b-db".into(),
                 path: "/x/b-db".into(),
                 language: Some("go".into()),
+                added: 0,
             },
         ];
         p.current_db = Some(1);
@@ -517,6 +593,58 @@ mod tests {
                 "From GitHub".into()
             )),
             "adding more stays on offer"
+        );
+    }
+
+    #[test]
+    fn databases_follow_the_language_and_keep_their_store_index() {
+        let db = |name: &str, lang: Option<&str>| crate::codeql_db::DbEntry {
+            name: name.into(),
+            path: format!("/x/{name}").into(),
+            language: lang.map(Into::into),
+            added: 0,
+        };
+        let mut p = CodeqlPanel::new();
+        p.databases = vec![
+            db("gin", Some("go")),
+            db("web", Some("typescript")),
+            db("odd", None),
+        ];
+        assert!(
+            p.lines().contains(&Line::Action(
+                Action::SortDatabases,
+                "Sort by: date added".into()
+            )),
+            "the list offers its order"
+        );
+        p.db_sort = Some(crate::codeql_db::DbSort::Name);
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::SortDatabases, "Sort by: name".into()))
+        );
+        // JavaScript / TypeScript (index 5) hides the Go database.
+        p.language = Some(5);
+        let dbs: Vec<Action> = p
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Action(a @ Action::SelectDatabase(_), _) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dbs,
+            [Action::SelectDatabase(1), Action::SelectDatabase(2)],
+            "store indices, and the unknown language shows under any"
+        );
+        p.select_database(1);
+        assert_eq!(p.selected_database(), Some(1));
+        // Swift: nothing but the one of unknown language.
+        p.databases.pop();
+        p.language = Some(9);
+        assert!(
+            p.lines()
+                .contains(&Line::Text("No databases in this language."))
         );
     }
 
@@ -552,6 +680,17 @@ mod tests {
             Action::OpenHistory(1),
             "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
         )));
+        assert!(
+            lines.contains(&Line::Action(Action::SortHistory, "Sort by: date".into())),
+            "the list offers its order"
+        );
+        p.history_sort = crate::codeql_query::HistSort::Name;
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::SortHistory, "Sort by: name".into()))
+        );
+        p.select_history(1);
+        assert_eq!(p.selected_history(), Some(1));
     }
 
     fn pack(

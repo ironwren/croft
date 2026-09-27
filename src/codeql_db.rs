@@ -89,11 +89,71 @@ pub fn github_database_args(owner_repo: &str, language: &str) -> Vec<String> {
     ]
 }
 
+/// The [`crate::widgets::codeql::LANGUAGES`] label a database's
+/// `primaryLanguage` belongs under, so the Language section can filter the
+/// Databases one. CodeQL's combined extractors (`javascript` also covers
+/// TypeScript, `java` Kotlin, `cpp` C) have one label each, as in VS Code.
+pub fn language_label(id: &str) -> Option<&'static str> {
+    let i = match id {
+        "cpp" | "c" | "c-cpp" => 0,
+        "csharp" => 1,
+        "actions" => 2,
+        "go" => 3,
+        "java" | "kotlin" | "java-kotlin" => 4,
+        "javascript" | "typescript" | "javascript-typescript" => 5,
+        "python" => 6,
+        "ruby" => 7,
+        "rust" => 8,
+        "swift" => 9,
+        _ => return None,
+    };
+    Some(crate::widgets::codeql::LANGUAGES[i])
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DbEntry {
     pub name: String,
     pub path: PathBuf,
     pub language: Option<String>,
+    /// When it was added, in unix seconds. Lists saved before this field
+    /// existed read as 0, so they sort as the oldest.
+    #[serde(default)]
+    pub added: u64,
+}
+
+/// The orders VS Code's Databases view sorts by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DbSort {
+    #[default]
+    Name,
+    Language,
+    Added,
+}
+
+impl DbSort {
+    /// The next order in the cycle the side bar's sort row steps through.
+    pub fn next(self) -> DbSort {
+        match self {
+            DbSort::Name => DbSort::Language,
+            DbSort::Language => DbSort::Added,
+            DbSort::Added => DbSort::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DbSort::Name => "name",
+            DbSort::Language => "language",
+            DbSort::Added => "date added",
+        }
+    }
 }
 
 /// The databases the user added, and which one queries run against.
@@ -103,6 +163,9 @@ pub struct DatabaseStore {
     pub databases: Vec<DbEntry>,
     #[serde(default)]
     pub current: Option<usize>,
+    /// The order the user last chose; `None` keeps the order they were added.
+    #[serde(default)]
+    pub sort_by: Option<DbSort>,
 }
 
 impl DatabaseStore {
@@ -142,12 +205,57 @@ impl DatabaseStore {
             name,
             path: dir.to_path_buf(),
             language: database_language(dir),
+            added: now_secs(),
         });
-        let i = self.databases.len() - 1;
-        self.current = Some(i);
-        Ok(i)
+        self.current = Some(self.databases.len() - 1);
+        // A new database takes its place in the chosen order.
+        if let Some(by) = self.sort_by {
+            self.sort(by);
+        }
+        Ok(self.current.unwrap_or(0))
     }
 
+    /// Give database `index` a display name. A blank name is refused.
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(String::from("A database name cannot be empty"));
+        }
+        let db = self
+            .databases
+            .get_mut(index)
+            .ok_or_else(|| String::from("No such database"))?;
+        db.name = name.to_string();
+        Ok(())
+    }
+
+    /// Reorder the list and remember the order. `current` follows its
+    /// entry, so sorting never changes which database queries run against.
+    pub fn sort(&mut self, by: DbSort) {
+        let current = self
+            .current
+            .and_then(|i| self.databases.get(i))
+            .map(|d| d.path.clone());
+        let name_key = |d: &DbEntry| d.name.to_lowercase();
+        match by {
+            DbSort::Name => self.databases.sort_by_key(name_key),
+            DbSort::Language => self
+                .databases
+                .sort_by_key(|d| (d.language.is_none(), d.language.clone(), name_key(d))),
+            DbSort::Added => self.databases.sort_by_key(|d| (d.added, name_key(d))),
+        }
+        self.sort_by = Some(by);
+        self.current = current.and_then(|p| self.databases.iter().position(|d| d.path == p));
+    }
+
+    /// The index of the database at `path`, if it is listed.
+    pub fn position(&self, path: &Path) -> Option<usize> {
+        self.databases.iter().position(|d| d.path == path)
+    }
+
+    /// Forget database `index` (its files are the caller's business).
+    /// `current` keeps pointing at the same entry, or clears when that
+    /// entry is the one removed.
     pub fn remove(&mut self, index: usize) {
         if index >= self.databases.len() {
             return;
@@ -228,6 +336,123 @@ mod tests {
         back.remove(0);
         assert_eq!(back.databases.len(), 1);
         assert_eq!(back.current, None, "removing the current one clears it");
+    }
+
+    fn entry(name: &str, lang: Option<&str>, added: u64) -> DbEntry {
+        DbEntry {
+            name: name.into(),
+            path: PathBuf::from("/dbs").join(name),
+            language: lang.map(Into::into),
+            added,
+        }
+    }
+
+    #[test]
+    fn a_database_is_renamed_but_never_to_blank() {
+        let mut s = DatabaseStore {
+            databases: vec![entry("a", None, 0)],
+            ..DatabaseStore::default()
+        };
+        assert_eq!(s.rename(0, "  flask main  "), Ok(()));
+        assert_eq!(s.databases[0].name, "flask main");
+        assert!(s.rename(0, "   ").is_err());
+        assert_eq!(s.databases[0].name, "flask main", "unchanged");
+        assert!(s.rename(3, "x").is_err());
+    }
+
+    #[test]
+    fn sorting_keeps_the_current_database_current() {
+        let mut s = DatabaseStore {
+            databases: vec![
+                entry("kafka", Some("java"), 30),
+                entry("Flask", Some("python"), 10),
+                entry("gin", Some("go"), 20),
+            ],
+            current: Some(0),
+            sort_by: None,
+        };
+        let names = |s: &DatabaseStore| {
+            s.databases
+                .iter()
+                .map(|d| d.name.clone())
+                .collect::<Vec<_>>()
+        };
+        s.sort(DbSort::Name);
+        assert_eq!(names(&s), ["Flask", "gin", "kafka"], "case-insensitive");
+        assert_eq!(s.current, Some(2), "kafka is still current");
+        s.sort(DbSort::Language);
+        assert_eq!(names(&s), ["gin", "kafka", "Flask"]);
+        assert_eq!(s.current, Some(1));
+        s.sort(DbSort::Added);
+        assert_eq!(names(&s), ["Flask", "gin", "kafka"]);
+        assert_eq!(s.current, Some(2));
+        assert_eq!(s.sort_by, Some(DbSort::Added), "the order is remembered");
+        assert_eq!(DbSort::Added.next(), DbSort::Name);
+    }
+
+    #[test]
+    fn a_new_database_takes_its_place_in_the_chosen_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = DatabaseStore::default();
+        s.add(&make_db(tmp.path(), "zeta", "go")).unwrap();
+        s.sort(DbSort::Name);
+        let i = s.add(&make_db(tmp.path(), "alpha", "python")).unwrap();
+        assert_eq!(i, 0, "sorted in by name");
+        assert_eq!(s.current, Some(0));
+        assert_eq!(s.databases[0].name, "alpha");
+        assert!(s.databases[0].added > 0, "stamped when added");
+    }
+
+    #[test]
+    fn removing_keeps_current_on_its_entry() {
+        let mut s = DatabaseStore {
+            databases: vec![
+                entry("a", None, 0),
+                entry("b", None, 0),
+                entry("c", None, 0),
+            ],
+            current: Some(2),
+            sort_by: None,
+        };
+        s.remove(0);
+        assert_eq!(s.current, Some(1), "c moved up one");
+        assert_eq!(s.databases[1].name, "c");
+        s.remove(0);
+        assert_eq!(s.current, Some(0));
+        s.remove(5);
+        assert_eq!(s.databases.len(), 1, "out of range is a no-op");
+        s.remove(0);
+        assert_eq!(s.current, None);
+    }
+
+    #[test]
+    fn a_list_saved_before_dates_and_sorting_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.json");
+        std::fs::write(
+            &path,
+            r#"{"databases":[{"name":"a","path":"/dbs/a","language":"go"}],"current":0}"#,
+        )
+        .unwrap();
+        let s = DatabaseStore::load(&path);
+        assert_eq!(s.databases, vec![entry("a", Some("go"), 0)]);
+        assert_eq!(s.current, Some(0));
+        assert_eq!(s.sort_by, None);
+    }
+
+    #[test]
+    fn database_languages_map_to_the_language_sections_labels() {
+        assert_eq!(language_label("python"), Some("Python"));
+        assert_eq!(
+            language_label("typescript"),
+            Some("JavaScript / TypeScript")
+        );
+        assert_eq!(language_label("kotlin"), Some("Java / Kotlin"));
+        assert_eq!(language_label("c"), Some("C / C++"));
+        assert_eq!(language_label("cobol"), None);
+        for id in crate::widgets::codeql::LANGUAGE_IDS {
+            assert!(language_label(id).is_some(), "{id}");
+        }
     }
 
     #[test]
