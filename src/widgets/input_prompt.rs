@@ -69,6 +69,12 @@ pub enum InputPurpose {
     CodeqlRenameHistory {
         output: PathBuf,
     },
+    /// The name of a new CodeQL query to write into `dir` (#578), in
+    /// `language` when it is known.
+    CodeqlCreateQuery {
+        dir: PathBuf,
+        language: Option<String>,
+    },
     /// Where a SARIF result's file lives on this machine (#577): the value
     /// is a path; `uri` is the location the log named.
     SarifLocate {

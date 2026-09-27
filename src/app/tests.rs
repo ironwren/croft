@@ -55478,6 +55478,130 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
     });
 }
 
+#[test]
+fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
+    // #578: "CodeQL: Create Query" asks for a name and writes a starter
+    // query into the selected pack, in its language; from the empty
+    // Queries section it goes to the workspace root, with a pack file in
+    // the Language section's language.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::codeql::{Action, Hit, Section};
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_str = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, KeyCode::Char(c));
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::TogglePack(0), _)
+                )
+            })
+            .expect("the pack is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlCreateQuery);
+        let prompt = app.input_prompt.as_ref().expect("a name is asked for");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlCreateQuery {
+                dir: pack.clone(),
+                language: Some(String::from("go")),
+            }
+        );
+        assert!(prompt.title.contains("acme/go"), "{}", prompt.title);
+        type_str(&mut app, "find-calls");
+        press(&mut app, KeyCode::Enter);
+        let created = pack.join("find-calls.ql");
+        let text = std::fs::read_to_string(&created).expect("written");
+        assert!(text.contains("\nimport go\n"), "{text}");
+        assert!(text.contains("@id go/find-calls"), "{text}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(app.focus == Pane::Editor);
+        assert!(app.codeql.queries[0].queries.contains(&created), "listed");
+        assert!(app.status.contains("pack/find-calls.ql"), "{}", app.status);
+        assert!(!pack.join("sub").exists());
+
+        // The same name again is refused on the status line.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "find-calls.ql");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.contains("already exists"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), text);
+
+        // An empty workspace: the welcome row, in the chosen language.
+        let empty = tempfile::tempdir().unwrap();
+        let mut app = App::new(empty.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.language = Some(6);
+        app.codeql.collapsed.insert(Section::Databases);
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::CreateQuery, _)
+                )
+            })
+            .expect("the welcome offers to create one");
+        app.codeql.selected = row;
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::CreateQuery))
+        );
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "hello");
+        press(&mut app, KeyCode::Enter);
+        let created = empty.path().join("hello.ql");
+        assert!(
+            std::fs::read_to_string(&created)
+                .unwrap()
+                .contains("import python"),
+            "{}",
+            app.status
+        );
+        let qlpack = std::fs::read_to_string(empty.path().join("qlpack.yml")).unwrap();
+        assert!(qlpack.contains("codeql/python-all"), "{qlpack}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(
+            app.codeql
+                .queries
+                .iter()
+                .any(|p| p.queries.contains(&created)),
+            "{:?}",
+            app.codeql.queries
+        );
+        assert_eq!(
+            Command::from_id("codeql_create_query"),
+            Some(Command::CodeqlCreateQuery)
+        );
+        assert_eq!(Command::CodeqlCreateQuery.title(), "CodeQL: Create Query");
+    });
+}
+
 /// The phone loop (#359), end to end through the App: a proposal sends one
 /// notification whose Approve link carries the proposal's token, and that
 /// token, sent back the way `croft decide` sends it, answers the hook and
