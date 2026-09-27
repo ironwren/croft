@@ -57040,3 +57040,56 @@ fn a_macros_file_written_outside_croft_is_reloaded_live() {
     // Nothing more changed: the next check reloads nothing.
     assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
 }
+
+/// #577: export to a `.sarif` name writes the visible results as SARIF,
+/// each run kept with its tool and rules, filtered results left out and a
+/// run with nothing left dropped; any other name still gets CSV.
+#[test]
+fn sarif_export_writes_the_visible_results_as_sarif_or_csv() {
+    use crate::sarif::semantics::Level;
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("two.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[
+            {"tool":{"driver":{"name":"lint","rules":[{"id":"R1"},{"id":"R2"}]}},
+             "results":[{"ruleId":"R1","level":"error","message":{"text":"bad"}},
+                        {"ruleId":"R2","level":"note","message":{"text":"meh"}}]},
+            {"tool":{"driver":{"name":"other"}},
+             "results":[{"ruleId":"X","level":"note","message":{"text":"quiet"}}]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor
+        .sarif
+        .as_mut()
+        .unwrap()
+        .filters
+        .hidden_levels
+        .insert(Level::Note);
+    app.submit_sarif_export("out.sarif");
+    assert!(app.status.contains("Exported 1 result"), "{}", app.status);
+    let out: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("out.sarif")).unwrap())
+            .unwrap();
+    assert_eq!(out["version"], "2.1.0");
+    let runs = out["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "the run left empty is dropped");
+    assert_eq!(runs[0]["tool"]["driver"]["name"], "lint");
+    assert_eq!(
+        runs[0]["tool"]["driver"]["rules"].as_array().unwrap().len(),
+        2
+    );
+    let results = runs[0]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ruleId"], "R1");
+    // And the exported log opens again in the viewer.
+    app.editor.open(&tmp.path().join("out.sarif")).unwrap();
+    assert_eq!(app.editor.sarif.as_ref().unwrap().entries.len(), 1);
+
+    app.editor.open(&log).unwrap();
+    app.submit_sarif_export("out.csv");
+    let csv = std::fs::read_to_string(tmp.path().join("out.csv")).unwrap();
+    assert!(csv.starts_with("rule,level,file"), "{csv}");
+}
