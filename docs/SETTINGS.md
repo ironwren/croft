@@ -158,16 +158,29 @@ optionally, which events it takes:
 
 Events are `command_finished` (a command in a pane you are not focused on,
 lasting at least `min_duration_secs`, default 10), `tests_failed` (once per
-red Test Explorer run), `osc9` (a terminal's own notification), and
+red Test Explorer run), `osc9` (a terminal's own notification),
+`approval_pending` (an agent's edit waits in the approval popup), and
 `agent_waiting` (reserved). An empty `events` takes all of them.
 `ntfy` posts to `server` (default `https://ntfy.sh`) under `topic`; both `ntfy` and `webhook` endpoints must be `https`, or `http` only to localhost — a plain-http endpoint across a network is refused and named in the channel;
-`webhook` posts JSON `{event, title, body, workspace, host, link}` with your
+`webhook` posts JSON `{event, title, body, workspace, host, link, actions}` with your
 `headers`; `termux` runs `termux-notification`; `command` runs `argv` with
 the notification in `CROFT_TITLE`, `CROFT_BODY`, `CROFT_LINK`, and
 `CROFT_EVENT`. Delivery is off the render path on one worker with a bounded
 queue and one retry for transient failures; what finally fails appears in
 the **Notifications** OUTPUT channel, naming only a URL's host. The key is
 user-config only, and a webhook's headers belong in `config.local.json`.
+
+An `approval_pending` notification can be answered from the phone. Its link
+(`croft://attach?…&focus=approval`) opens the session with the popup up.
+Its **Approve** and **Deny** buttons (ntfy action buttons, termux
+`--button1`/`--button2`, a webhook's `actions` array,
+`CROFT_APPROVE_LINK`/`CROFT_DENY_LINK` for a command) are
+`croft://decide?host=…&path=…&token=…&decision=allow|deny` links.
+`croft open-link` runs `croft decide` for them, over ssh when the host is
+not this machine. That answers the agent without attaching. The token is
+random, belongs to that one edit, and stops working once the edit is
+answered anywhere or its 120 s window passes. Links open through
+`croft install-link-handler`, as for attach links.
 
 ## Profiles
 

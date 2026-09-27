@@ -2737,6 +2737,9 @@ pub struct App {
     macro_replaying: bool,
     /// The store path, held so tests can point saves at a tempdir.
     macros_path: std::path::PathBuf,
+    /// croft's own config files, checked for changes made outside croft,
+    /// such as a file arriving by config sync (#262).
+    config_watch: crate::config_sync::ConfigWatch,
     /// The click a user mouse binding is running for (#259), set only for
     /// the duration of that dispatch. Position-carrying commands read it;
     /// `None` everywhere else, so a keyboard invocation of the same command
@@ -3263,6 +3266,10 @@ pub struct App {
     /// proposals waiting on the user in arrival order, and the popup's
     /// state for the one at the head (`Some` exactly while one waits).
     hook_listener: Option<std::os::unix::net::UnixListener>,
+    /// The workspace the hook socket was bound for: an approval
+    /// notification's links name it, so `croft decide` finds this croft
+    /// (#359).
+    hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
@@ -5053,6 +5060,13 @@ impl App {
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
+            config_watch: crate::config_sync::ConfigWatch::new(vec![
+                crate::keymap::keybindings_path(),
+                crate::snippets::snippets_path(),
+                crate::triggers::triggers_path(),
+                crate::problem_matchers::matchers_path(),
+                crate::macros::macros_path(),
+            ]),
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
@@ -5256,6 +5270,7 @@ impl App {
             pending_remote_pulls: Vec::new(),
             view_listener,
             hook_listener,
+            hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
             notebook_kernels: std::collections::HashMap::new(),
@@ -15611,6 +15626,7 @@ impl App {
             Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
             None => false,
         };
+        self.notify_new_approvals();
         let now = std::time::Instant::now();
         let before = self.approvals.len();
         self.approvals.retain(|p| !p.expired(now));
@@ -15625,6 +15641,31 @@ impl App {
             changed = true;
         }
         changed
+    }
+
+    /// Tell the notification sinks about each proposal that arrived since
+    /// the last pass, once, with its Approve and Deny links (#359).
+    fn notify_new_approvals(&mut self) {
+        for i in 0..self.approvals.len() {
+            if self.approvals[i].notified {
+                continue;
+            }
+            self.approvals[i].notified = true;
+            let pending = &self.approvals[i];
+            let path = &pending.proposal.path;
+            let file = path
+                .strip_prefix(&self.hook_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let event = crate::notifications::Event::ApprovalPending {
+                agent: pending.request.agent.clone(),
+                file,
+                token: pending.token.clone(),
+            };
+            self.notifier
+                .emit(event, &self.hook_root, &remote_host_label());
+        }
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
@@ -39919,6 +39960,8 @@ impl App {
             {
                 crate::output::push("Macros", crate::output::OutputLevel::Warn, &e);
             }
+            // Written by croft itself: nothing for the config watch to reload.
+            self.config_watch.note(&self.macros_path.clone());
             self.status = format!("Recorded {len} keys into @{r}");
         } else {
             self.status = format!("Recorded {len} keys");
@@ -47979,6 +48022,21 @@ impl App {
         self.write_current_to_disk();
     }
 
+    /// Apply croft's own config files that changed on disk outside croft
+    /// (#262): a file that arrived by config sync, or was written by another
+    /// tool. Returns true when something was reloaded, for a redraw.
+    pub fn tick_config_watch(&mut self) -> bool {
+        self.tick_config_watch_at(std::time::Instant::now())
+    }
+
+    fn tick_config_watch_at(&mut self, now: std::time::Instant) -> bool {
+        let changed = self.config_watch.poll(now);
+        for path in &changed {
+            self.reload_config_for_path(path);
+        }
+        !changed.is_empty()
+    }
+
     /// After a save, if the file was one of croft's JSON configs, re-read it so
     /// the change applies without a relaunch (VS Code applies keybindings and
     /// snippets on save). settings.json fields are read at startup, so that one
@@ -47994,6 +48052,8 @@ impl App {
     /// Shared by the explicit-save path (active tab) and the auto-save
     /// sweep (every written tab, background and inactive splits included).
     fn reload_config_for_path(&mut self, path: &std::path::Path) {
+        // Applied now, so the config watch does not reload it a second time.
+        self.config_watch.note(path);
         if path == crate::keymap::keybindings_path() {
             // The non-reporting loader: this path needs the warnings itself
             // for the status summary below, and `load` would print each one to
@@ -48026,6 +48086,9 @@ impl App {
                     String::new()
                 }
             );
+        } else if path == self.macros_path {
+            self.macro_registers = crate::macros::load(path);
+            self.status = format!("Macros reloaded ({} registers)", self.macro_registers.len());
         } else if path == crate::triggers::triggers_path() {
             self.triggers = load_trigger_set(self.secret_redaction);
             self.status = match &self.triggers.problem {
@@ -56984,6 +57047,15 @@ pub fn run(
     match std::env::var("CROFT_FOCUS").as_deref() {
         Ok("terminal") => app.focus_pane(Pane::Terminal),
         Ok("editor") => app.focus_pane(Pane::Editor),
+        // The approval popup is modal and opens by itself for a waiting
+        // edit, so landing on it needs no focus change; say so when there
+        // is nothing to land on (answered or expired on the way here).
+        Ok("approval") => {
+            app.drain_hook_requests();
+            if app.approvals.is_empty() {
+                app.status = String::from("No agent edit is waiting for approval");
+            }
+        }
         _ => {}
     }
     app.start_update_watch_if_remote();
@@ -57635,7 +57707,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
-        let code_lens_changed = app.drain_lsp_code_lens()
+        let code_lens_changed = app.tick_config_watch()
+            | app.drain_lsp_code_lens()
             | app.drain_search_editor()
             | app.tick_inline_complete()
             | app.drain_review_ops();
