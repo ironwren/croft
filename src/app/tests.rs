@@ -54323,3 +54323,151 @@ esac
         assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
     });
 }
+
+/// #694: a source build of croft on this host stops the language servers
+/// for its duration and restarts them after, since a compile next to
+/// rust-analyzer is what exhausted memory on small remotes.
+#[test]
+fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.lsp.is_some(), "precondition: a manager is running");
+
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none(), "the servers must stop for the build");
+    assert!(
+        !app.apply_source_build_state(true),
+        "a build still running changes nothing"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        app.lsp.is_some(),
+        "the servers must come back once the build ends"
+    );
+    assert!(!app.apply_source_build_state(false));
+
+    // Nothing running is nothing to pause, and nothing to start later: a
+    // manager that failed to start is not brought up by an unrelated build.
+    app.lsp = None;
+    assert!(!app.apply_source_build_state(true));
+    assert!(!app.apply_source_build_state(false));
+    assert!(app.lsp.is_none());
+}
+
+/// #694: re-rooting while a build has the language servers stopped must not
+/// start them beside the compile; the build's end starts them at the new
+/// root instead.
+#[test]
+fn a_reroot_during_a_source_build_leaves_the_servers_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.apply_source_build_state(true));
+    assert!(app.lsp.is_none());
+
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(
+        app.lsp.is_none(),
+        "a re-root started the servers while the build still runs"
+    );
+
+    assert!(app.apply_source_build_state(false));
+    let lsp = app
+        .lsp
+        .as_ref()
+        .expect("the build's end restarts the servers");
+    assert_eq!(
+        lsp.workspace_root(),
+        app.workspace_root(),
+        "the restarted servers must serve the NEW root"
+    );
+}
+
+/// #694 review: a resumed manager numbers semantic replies from 0 again, so
+/// the old manager's per-file high-water marks must go with it, or every
+/// reply for those files is rejected until the new count catches up.
+#[test]
+fn resuming_after_a_build_forgets_the_old_semantic_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let p = tmp.path().join("a.rs");
+    app.semantic_generation_seen.insert(p.clone(), 500);
+    assert!(app.apply_source_build_state(true));
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        "the restarted server's first reply must be accepted"
+    );
+}
+
+/// #694 review: diagnostics of a file with no open buffer do not outlive a
+/// pause; nothing else would ever drop them.
+#[test]
+fn resuming_after_a_build_drops_diagnostics_no_open_tab_owns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "open.rs", "fn main() {}");
+    let open = app.editor.path.clone().unwrap();
+    let closed = tmp.path().join("closed.rs");
+    app.lsp_diagnostics.insert(open.clone(), Default::default());
+    app.lsp_diagnostics
+        .insert(closed.clone(), Default::default());
+    assert!(app.apply_source_build_state(true));
+    assert!(app.apply_source_build_state(false));
+    assert!(
+        !app.lsp_diagnostics.contains_key(&closed),
+        "a tab closed during the build kept its diagnostics"
+    );
+    assert!(
+        app.lsp_diagnostics.contains_key(&open),
+        "an open tab's diagnostics stay until the new servers publish"
+    );
+}
+
+/// #694 review: a format-on-save in flight when the servers stop is saved at
+/// once, unformatted, rather than left armed for an unrelated reply.
+#[test]
+fn pausing_for_a_build_completes_a_pending_format_on_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
+    let file = app.editor.path.clone().unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.format_request_id = Some(7);
+    app.save_after_format = Some(file.clone());
+    assert!(app.apply_source_build_state(true));
+    assert!(app.format_request_id.is_none());
+    assert!(app.save_after_format.is_none(), "the save was left armed");
+    assert!(
+        std::fs::read_to_string(&file).unwrap().starts_with('x'),
+        "the edit must reach disk"
+    );
+}
+
+/// A local croft (no update watcher) never pauses its servers, and the
+/// marker is read at most once a second.
+#[test]
+fn only_a_remote_launched_croft_polls_the_build_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.update_watch.is_none());
+    assert!(!app.poll_source_build_marker());
+    assert!(
+        app.build_marker_checked.is_none(),
+        "a local croft read the marker"
+    );
+    assert!(app.lsp.is_some());
+
+    app.update_watch = Some(crate::update_watch::UpdateWatch::start(
+        tmp.path().to_path_buf(),
+        String::new(),
+    ));
+    let just_now = std::time::Instant::now();
+    app.build_marker_checked = Some(just_now);
+    assert!(!app.poll_source_build_marker());
+    assert_eq!(
+        app.build_marker_checked,
+        Some(just_now),
+        "the marker was read again within the second"
+    );
+}

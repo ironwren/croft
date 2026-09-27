@@ -3052,6 +3052,14 @@ pub(crate) fn shell_quote_for_e_arg(p: &std::path::Path) -> String {
     }
 }
 
+/// True when croft runs inside an SSH login, which is how a remote croft is
+/// launched (`croft remote` execs it over ssh).
+pub fn running_over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
 fn remote_install_command(source_stamp: &str) -> String {
     format!(
         r#"set -e
@@ -3152,19 +3160,83 @@ CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
 # is typing into a shell that shares these cores, RAM, and disk. Half the
 # cores still wrecks a small VPS, so drop to one compile job and put all
 # codegen IO in the idle class; the update simply takes longer.
+CROFT_LIVE=""
 if pgrep -x croft >/dev/null 2>&1; then
   CROFT_JOBS=1
+  CROFT_LIVE=1
+fi
+# nice and ionice ration CPU and IO, not memory (#694). Each rustc job on
+# croft costs well over a GB, so on a host under 16 GB two of them next to
+# rust-analyzer were enough to wake the OOM killer, which then took croft or
+# a terminal pane. Below that, compile one crate at a time.
+CROFT_MEM_KB=$(awk '/^MemTotal:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+CROFT_AVAIL_KB=$(awk '/^MemAvailable:/ {{ print $2 }}' /proc/meminfo 2>/dev/null || true)
+if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
+  CROFT_JOBS=1
+fi
+# Little memory free right now counts too, whatever the total: a big host
+# can still be mostly spoken for by the time the update runs.
+if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
+  CROFT_JOBS=1
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job" >&2
+fi
+# And cap the build's memory outright where systemd can: the compile runs
+# in its own scope limited to 60% of RAM with no swap, so if it outgrows
+# that it is the BUILD the kernel kills, inside its scope, and never croft
+# or a shell. Probed first, because a user manager or a delegated memory
+# controller is not a given on a server; without one the build runs uncapped
+# but still single-job on a small host.
+CROFT_MEMCAP=""
+# The probe reads the limit back from inside a test scope: systemd accepts
+# MemoryMax without complaint where the memory controller is not delegated
+# to the user manager (cgroup v1 and hybrid hosts), and enforces nothing.
+if [ -n "$CROFT_MEM_KB" ] && command -v systemd-run >/dev/null 2>&1 \
+  && [ "$(systemd-run --user --scope --quiet -p MemoryMax=64M -p MemorySwapMax=0 \
+    sh -c 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"' 2>/dev/null)" = 67108864 ]; then
+  CROFT_MEMCAP="systemd-run --user --scope --quiet -p MemoryMax=$(( CROFT_MEM_KB * 6 / 10 ))K -p MemorySwapMax=0"
 fi
 CROFT_NICE=""
 if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
 CROFT_IONICE=""
 if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+# Tell a croft running on this box that a compile is under way, so it stops
+# its own language servers (rust-analyzer alone held 2.4 GB in the OOM that
+# prompted #694) and restarts them once no marker names a live build.
+#
+# One marker per build (`building.<this shell's pid>`), so a second install
+# finishing first cannot clear the first's. It holds the pid of the COMPILE
+# once it starts (systemd-run --scope, nice and ionice all exec, so `$!` is
+# cargo itself): a shell killed mid-build leaves cargo running as an orphan,
+# and the marker must keep naming it. Markers whose pid is gone are stale;
+# they are swept here, and croft ignores them and any from before a reboot.
+mkdir -p "$HOME/.cache/croft"
+for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
+  [ -f "$CROFT_OLD" ] || continue
+  CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
+  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null; then
+    rm -f "$CROFT_OLD"
+  fi
+done
+CROFT_MARK="$HOME/.cache/croft/building.$$"
+CROFT_BUILD_PID=""
+printf %s "$$" > "$CROFT_MARK"
+# Keep the marker while the compile outlives this shell; croft sees it go
+# stale the moment the compile ends.
+trap 'if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK"; fi' EXIT
+if [ -n "$CROFT_LIVE" ]; then
+  # croft polls the marker once a second, and a server gets up to three
+  # seconds to shut down cleanly: let both finish before the first rustc.
+  sleep 5
+fi
 # eval, because this script runs under the remote user's login shell and
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
-eval "$CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
-mkdir -p "$HOME/.cache/croft"
+eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked &'
+CROFT_BUILD_PID=$!
+printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
+wait "$CROFT_BUILD_PID"
+rm -f "$CROFT_MARK"
 printf %s {stamp} > "$HOME/.cache/croft/install-stamp"
 rm -f "$HOME/.cache/croft/updating"
 "#,
@@ -4499,6 +4571,159 @@ Host !blocked *.internal
         let gate = command.find("pgrep -x croft").unwrap();
         let install = command.find("cargo install --path").unwrap();
         assert!(gate < install, "the session check must precede the compile");
+    }
+
+    // #694: nice/ionice ration CPU and IO but not memory, and a two-job
+    // compile beside rust-analyzer OOM-killed croft on 8 GB hosts. The
+    // build must drop to one job below 16 GB, run memory-capped where
+    // systemd allows it, and flag itself so a live croft stops its language
+    // servers — all before the compile starts.
+    #[test]
+    fn remote_install_compile_is_memory_bounded() {
+        let command = remote_install_command("abc123");
+        let install = command.find("cargo install --path").unwrap();
+        let before = |needle: &str| {
+            let at = command
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}"));
+            assert!(at < install, "{needle:?} must come before the compile");
+        };
+        before("/proc/meminfo");
+        before("-lt 16777216");
+        before("systemd-run --user --scope");
+        before("MemoryMax=");
+        before("MemorySwapMax=0");
+        before("CROFT_MARK=\"$HOME/.cache/croft/building.$$\"");
+        before("trap '");
+        assert!(
+            command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            "the memory cap must wrap the compile itself"
+        );
+        // Little memory FREE drops to one job too, not just a small total:
+        // a warning that promised one job without setting it was the bug.
+        let avail = command.find("-lt 2097152").unwrap();
+        let avail_branch = &command[avail..command[avail..].find("fi\n").unwrap() + avail];
+        assert!(
+            avail_branch.contains("CROFT_JOBS=1"),
+            "low available memory must drop to one job: {avail_branch}"
+        );
+        // The marker goes as soon as the compile does, so language servers
+        // are not held back through the rest of the install.
+        let cleared = command.rfind("rm -f \"$CROFT_MARK\"").unwrap();
+        assert!(cleared > install);
+    }
+
+    /// Run the rendered install script under `sh` with stub tools, and
+    /// report what the stub `cargo` saw of the build marker while it ran.
+    ///
+    /// Stubs stand in for everything the script would otherwise install or
+    /// probe, so it goes straight to the compile: `cc`, `pkg-config` and
+    /// `dtach` exist, `pgrep` finds no live croft (so no 5 s wait), and
+    /// `systemd-run` is absent (no cap to probe).
+    #[cfg(unix)]
+    fn run_install_script(dir: &std::path::Path, cargo_exit: u8) -> (bool, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".cache/croft")).unwrap();
+        let stub = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        for ok in ["cc", "pkg-config", "dtach"] {
+            stub(ok, "exit 0");
+        }
+        stub("pgrep", "exit 1");
+        // Waits for the script to record its pid, then reports the marker
+        // it finds alongside its own pid (nice/ionice exec, so it is cargo's).
+        stub(
+            "cargo",
+            &format!(
+                "sleep 0.5\n\
+                 printf '%s %s' \"$$\" \"$(cat \"$HOME\"/.cache/croft/building.* 2>/dev/null)\" > \"{}\"\n\
+                 exit {cargo_exit}",
+                dir.join("seen").display()
+            ),
+        );
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_install_command("abc123"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let seen = std::fs::read_to_string(dir.join("seen")).unwrap_or_default();
+        (status.success(), seen)
+    }
+
+    /// Any `building.*` marker left under the scratch home.
+    #[cfg(unix)]
+    fn leftover_markers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir.join("home/.cache/croft"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("building."))
+            .collect()
+    }
+
+    /// #694 review: the marker names the COMPILE's pid while it runs, and is
+    /// gone after the build, whether it succeeded or failed.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_marks_the_compile_and_clears_the_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, seen) = run_install_script(tmp.path(), 0);
+        assert!(ok, "the stubbed install must succeed");
+        let (own, marked) = seen.split_once(' ').expect("cargo ran and reported");
+        assert_eq!(
+            own, marked,
+            "while cargo runs the marker must name cargo itself, so a killed \
+             script shell cannot make the build look finished"
+        );
+        assert!(leftover_markers(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
+            "abc123"
+        );
+
+        // A failing compile: `set -e` ends the script, and the EXIT trap
+        // still removes the marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, _) = run_install_script(tmp.path(), 3);
+        assert!(!ok, "a failing compile must fail the install");
+        assert!(
+            leftover_markers(tmp.path()).is_empty(),
+            "a failed build left its marker behind"
+        );
+    }
+
+    /// Stale markers from dead builds are swept; a live one is kept.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_sweeps_only_dead_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("home/.cache/croft");
+        std::fs::create_dir_all(&cache).unwrap();
+        // This test process is alive and ours, as a real build's compile
+        // is: `kill -0` on another user's pid (pid 1, say) fails with EPERM
+        // for a non-root user and would read as dead. A pid past pid_max is
+        // never alive.
+        std::fs::write(cache.join("building.1"), std::process::id().to_string()).unwrap();
+        std::fs::write(cache.join("building.2"), "2147483646").unwrap();
+        let (ok, _) = run_install_script(tmp.path(), 0);
+        assert!(ok);
+        assert_eq!(
+            leftover_markers(tmp.path()),
+            vec![String::from("building.1")],
+            "only the live build's marker may survive another build"
+        );
     }
 
     // A backgrounded install's log lines died with the connect dialog,
