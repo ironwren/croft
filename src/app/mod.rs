@@ -15619,15 +15619,22 @@ impl App {
         // them with pane reads would need the pane borrowed twice around
         // them — which compiles but reads as an accident rather than as a
         // decision.
+        let triggers = self.triggers.clone();
         let Some((size, lines)) = self.terminals.get(self.active_terminal).map(|t| {
-            let (mut all, top) = t.grid_lines();
+            let (mut all, mut wraps, top) = t.grid_lines_wrapped();
             // The VISIBLE screen only. `grid_lines` starts at
             // `topmost_line()`, which is negative scrollback — up to
             // 5000 rows. Writing all of it after a clear scrolls the
             // live screen straight off the top, so the cast shows the
             // tail of the history rather than what the user was looking
             // at, at ~400 KB per frame.
-            let visible = all.split_off((-top).max(0) as usize);
+            let first = ((-top).max(0) as usize).min(all.len());
+            let visible = all.split_off(first);
+            let visible_wraps = wraps.split_off(first.min(wraps.len()));
+            // Masked like a scrollback dump (#360): a cast is a file made to
+            // be shared, so every redact rule applies, and a reveal on
+            // screen never reaches it.
+            let visible = crate::triggers::mask_rows(&visible, &visible_wraps, &triggers);
             ((t.last_inner.width, t.last_inner.height), visible)
         }) else {
             return;

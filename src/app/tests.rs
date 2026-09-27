@@ -56187,3 +56187,33 @@ esac
         );
     });
 }
+
+/// #356: a recorded frame is masked like a scrollback dump. The cast is a
+/// file made to be shared, so a key on screen is recorded as •••, and a
+/// reveal on screen does not reach it.
+#[test]
+fn a_recorded_frame_masks_secrets_even_while_revealed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.terminals[0].resize(60, 10);
+    let key = "AKIAIOSFODNN7EXAMPLE";
+    app.terminals[0].feed_bytes_for_test(format!("export KEY={key}\r\n").as_bytes());
+    app.reveal_redacted_secrets();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains(key), "the key reached the cast:\n{text}");
+    assert!(text.contains("export KEY="), "{text}");
+}
