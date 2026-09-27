@@ -55736,3 +55736,63 @@ fn a_terminal_recording_shows_its_own_badge_until_it_stops() {
     term.draw(|f| app.render(f)).unwrap();
     assert!(!status_row(&term).contains("CAST"));
 }
+
+/// #371: at a scrubbed commit, Enter opens that version of the file as a
+/// tab of its own, and "Diff Scrubbed File to Working Tree" diffs it
+/// against the file on disk. Both leave the scrubber and the live buffer
+/// (dirty or not) untouched. At the working tree, Enter is ordinary typing.
+#[test]
+fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
+    let repo = scrub_repo();
+    let file = repo.path().join("a.txt");
+    // Uncommitted work on disk, and more unsaved in the buffer.
+    std::fs::write(&file, "v1\nv2\nv3\nv4\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor.lines.push(String::from("unsaved"));
+    app.editor.dirty = true;
+    app.scrub_history();
+    assert!(
+        !app.handle_scrubber_key(KeyCode::Enter),
+        "at the working tree there is nothing to open"
+    );
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to v2");
+    let short = app
+        .scrubber
+        .as_ref()
+        .unwrap()
+        .commit()
+        .unwrap()
+        .short_hash
+        .clone();
+
+    assert!(app.handle_scrubber_key(KeyCode::Enter));
+    assert!(app.scrubber.is_none() && app.scrub_view.is_none());
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(Path::new(&format!("a.txt @ {short}")))
+    );
+    assert_eq!(app.editor.lines, vec!["v1", "v2"]);
+    let live = app.editor.find_tab_with_path(&file).expect("the live tab");
+    app.editor.select(live);
+    assert!(app.editor.dirty, "the live buffer keeps its unsaved edit");
+    assert_eq!(app.editor.lines.last().map(String::as_str), Some("unsaved"));
+
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    app.run_command(crate::widgets::command_palette::Command::ScrubDiffToWorkingTree);
+    assert!(app.scrubber.is_none());
+    let diff = app.editor.diff.as_ref().expect("a diff tab");
+    assert_eq!(diff.left_lines, vec!["v1", "v2"]);
+    assert_eq!(
+        diff.right_lines,
+        vec!["v1", "v2", "v3", "v4"],
+        "the file on disk"
+    );
+
+    // With no scrubbed commit, the commands say so rather than guess.
+    app.run_command(crate::widgets::command_palette::Command::ScrubOpenHere);
+    assert!(app.status.contains("Step the scrubber"), "{}", app.status);
+}

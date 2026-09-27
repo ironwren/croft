@@ -29975,8 +29975,9 @@ impl App {
         }
         let n = commits.len();
         self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
-        self.status =
-            format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+        self.status = format!(
+            "Scrubbing {n} commits — arrows step, Enter opens a commit's version, Home returns to your working tree"
+        );
     }
 
     /// Keep symbol tabs (#369) and the other tabs of their files in step.
@@ -31292,6 +31293,13 @@ impl App {
             KeyCode::Left => scrub.older(),
             KeyCode::Right => scrub.newer(),
             KeyCode::Home => scrub.home(),
+            // Enter at a commit opens that version as a tab of its own; at
+            // the working tree there is nothing to open, so it passes
+            // through to the live buffer like any other typing.
+            KeyCode::Enter if scrub.commit().is_some() => {
+                self.scrub_open_here();
+                return true;
+            }
             KeyCode::Esc => {
                 // Closing returns to the live buffer by construction: the
                 // scrubber never replaced it, so there is nothing to put
@@ -31312,6 +31320,93 @@ impl App {
         };
         self.rebuild_scrub_view();
         true
+    }
+
+    /// The active file at the scrubber's commit (#371): its path, its
+    /// workspace-relative name, the commit, and its text there (`None` when
+    /// the file did not exist yet). `None` with a status line when there is
+    /// no scrubbed commit or no file to show.
+    fn scrubbed_file(
+        &mut self,
+    ) -> Option<(PathBuf, String, crate::git::GraphCommit, Option<String>)> {
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
+            self.status = String::from("Step the scrubber to a commit first");
+            return None;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file is open to scrub");
+            return None;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            self.status = String::from("The open file is outside the workspace");
+            return None;
+        };
+        let text = self
+            .scrub_cache
+            .entry((commit.hash.clone(), rel.clone()))
+            .or_insert_with(|| crate::git::read_file_at_rev(&root, &commit.hash, &rel).ok())
+            .clone();
+        Some((path, rel, commit, text))
+    }
+
+    /// Leave the scrubber for a tab that shows what it was showing.
+    fn close_scrubber_for_tab(&mut self) {
+        self.scrubber = None;
+        self.scrub_view = None;
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// **Open here** (#371): the scrubbed version of the file as a normal
+    /// tab, highlighted as its language, labelled with the commit. It has no
+    /// file on disk behind it, so nothing reloads or overwrites it.
+    fn scrub_open_here(&mut self) {
+        let Some((path, rel, commit, text)) = self.scrubbed_file() else {
+            return;
+        };
+        let Some(text) = text else {
+            self.status = format!("{rel} did not exist at {}", commit.short_hash);
+            return;
+        };
+        let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        if let Err(e) = self.editor.open_text_buffer(&label, &text) {
+            self.status = format!("Could not open {rel} at {}: {e}", commit.short_hash);
+            return;
+        }
+        // Highlighting only: no language server hears about a tab with no
+        // file behind it.
+        self.editor.set_language(
+            path.extension()
+                .and_then(|x| x.to_str())
+                .and_then(crate::highlight::lang_for_extension),
+        );
+        self.close_scrubber_for_tab();
+        self.status = format!("{rel} at {} — {}", commit.short_hash, commit.summary);
+    }
+
+    /// **Diff to working tree** (#371): the scrubbed version against the
+    /// file on disk, in the side-by-side diff.
+    fn scrub_diff_to_working_tree(&mut self) {
+        let Some((path, rel, commit, text)) = self.scrubbed_file() else {
+            return;
+        };
+        let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        // A file the commit predates diffs as all added, which is what
+        // happened to it since.
+        let text = text.unwrap_or_default();
+        if let Err(e) = self
+            .editor
+            .open_head_diff_with_text(label, &text, &path, false)
+        {
+            self.status = format!("Could not diff {rel}: {e}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        self.close_scrubber_for_tab();
+        self.status = format!("{rel}: {} → working tree", commit.short_hash);
     }
 
     /// Build the read-only view of the active file at the scrubber's commit
@@ -40554,6 +40649,8 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::ScrubOpenHere => self.scrub_open_here(),
+            Cmd::ScrubDiffToWorkingTree => self.scrub_diff_to_working_tree(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
             Cmd::LoadReviewThreads => self.load_review_threads(),
             Cmd::ReviewAddComment => self.open_review_comment_prompt(),
