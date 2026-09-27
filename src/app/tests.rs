@@ -18853,35 +18853,6 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     body()
 }
 
-/// A second click on the same forwarded loopback link reuses the tunnel
-/// instead of asking for another (each one was a new tunnel on a random port
-/// and a new browser tab, #648); a click while one is in flight asks nothing.
-#[test]
-fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
-    use crate::widgets::ports::PortOrigin;
-    let _guard = relay_test_lock().lock().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
-    let log = with_relay_home(home.path(), || {
-        let log = app.relay_log_path().expect("relay log path derivable");
-        app.request_remote_forward(3000, true);
-        app.request_remote_forward(3000, true);
-        let first = std::fs::read_to_string(&log).unwrap_or_default();
-        assert_eq!(first.matches("forward\t").count(), 1, "{first:?}");
-        // Once forwarded, a click opens the existing tunnel.
-        app.pending_remote_pulls.clear();
-        app.ports
-            .upsert(3000, None, None, PortOrigin::Remote("box".into()));
-        app.ports.mark_forwarded(3000, 3001);
-        app.request_remote_forward(3000, true);
-        log
-    });
-    let all = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(all.matches("forward\t").count(), 1, "{all:?}");
-    assert!(all.contains("http://127.0.0.1:3001/"), "{all:?}");
-}
-
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
     let _guard = relay_test_lock().lock().unwrap();
@@ -56035,6 +56006,201 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
     );
 }
 
+fn status_row(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let y = buf.area.height - 1;
+    (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+}
+
+/// #355: the notebook in the editor names its kernel in the status bar
+/// once the kernel is up, and says when a cell is running.
+#[test]
+fn the_status_bar_names_the_notebooks_kernel_and_when_it_is_busy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("t.ipynb");
+    std::fs::write(&path, NOTEBOOK_355).unwrap();
+    std::fs::write(tmp.path().join("other.py"), "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (run, kernel, _requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !status_row(&term).contains("kernel:"),
+        "no name before the kernel says it is up"
+    );
+
+    kernel
+        .send(crate::notebook_kernel::Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(row.contains("kernel: Python 3 (ipykernel)"), "{row}");
+    assert!(!row.contains("busy"), "{row}");
+
+    click_first_cell_glyph(&mut app, &mut term);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(status_row(&term).contains("kernel: Python 3 (ipykernel) · busy"));
+
+    // Another file in the editor has no kernel to name.
+    app.editor.open(&tmp.path().join("other.py")).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("kernel:"));
+}
+
+/// #356: a terminal recording has its own status-bar badge with the time
+/// it has run, apart from the macro recorder's REC.
+#[test]
+fn a_terminal_recording_shows_its_own_badge_until_it_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("CAST"));
+    app.toggle_session_recording();
+    assert!(app.recording.is_some(), "{}", app.status);
+    // The start message names the file; the badge must stand on its own.
+    app.status.clear();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(row.contains("● CAST 0:00"), "{row}");
+    assert!(!row.contains("REC "), "not the macro badge: {row}");
+    app.toggle_session_recording();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("CAST"));
+}
+
+/// #371: at a scrubbed commit, Enter opens that version of the file as a
+/// tab of its own, and "Diff Scrubbed File to Working Tree" diffs it
+/// against the file on disk. Both leave the scrubber and the live buffer
+/// (dirty or not) untouched. At the working tree, Enter is ordinary typing.
+#[test]
+fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
+    let repo = scrub_repo();
+    let file = repo.path().join("a.txt");
+    // Uncommitted work on disk, and more unsaved in the buffer.
+    std::fs::write(&file, "v1\nv2\nv3\nv4\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor.lines.push(String::from("unsaved"));
+    app.editor.dirty = true;
+    app.scrub_history();
+    assert!(
+        !app.handle_scrubber_key(KeyCode::Enter),
+        "at the working tree there is nothing to open"
+    );
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to v2");
+    let short = app
+        .scrubber
+        .as_ref()
+        .unwrap()
+        .commit()
+        .unwrap()
+        .short_hash
+        .clone();
+
+    assert!(app.handle_scrubber_key(KeyCode::Enter));
+    assert!(app.scrubber.is_none() && app.scrub_view.is_none());
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(Path::new(&format!("a.txt @ {short}")))
+    );
+    assert_eq!(app.editor.lines, vec!["v1", "v2"]);
+    let live = app.editor.find_tab_with_path(&file).expect("the live tab");
+    app.editor.select(live);
+    assert!(app.editor.dirty, "the live buffer keeps its unsaved edit");
+    assert_eq!(app.editor.lines.last().map(String::as_str), Some("unsaved"));
+
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    assert!(app.handle_scrubber_key(KeyCode::Left));
+    app.run_command(crate::widgets::command_palette::Command::ScrubDiffToWorkingTree);
+    assert!(app.scrubber.is_none());
+    let diff = app.editor.diff.as_ref().expect("a diff tab");
+    assert_eq!(diff.left_lines, vec!["v1", "v2"]);
+    assert_eq!(
+        diff.right_lines,
+        vec!["v1", "v2", "v3", "v4"],
+        "the file on disk"
+    );
+
+    // With no scrubbed commit, the commands say so rather than guess.
+    app.run_command(crate::widgets::command_palette::Command::ScrubOpenHere);
+    assert!(app.status.contains("Step the scrubber"), "{}", app.status);
+}
+
+/// #345: a lane row counts the lines added and removed since the content
+/// the user reviewed, follows later writes, and shows nothing for a row
+/// with no review to count against.
+#[test]
+fn a_lane_row_counts_lines_added_and_removed_since_the_review() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.rs");
+    let g = tmp.path().join("g.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    let working = vec![String::from("claude")];
+    let write = |app: &mut App, path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        app.agent_ledger.record_write(
+            path,
+            crate::agent_lane::content_hash(text.as_bytes()),
+            &working,
+        );
+    };
+    let changes_of = |app: &mut App, path: &Path| {
+        app.agent_lane_panel_rows()
+            .into_iter()
+            .find_map(|r| match r {
+                LaneRow::File {
+                    path: p, changes, ..
+                } if p == path => Some(changes),
+                _ => None,
+            })
+            .expect("the file has a row")
+    };
+
+    write(&mut app, &f, "a\nb\nc\n");
+    write(&mut app, &g, "new\n");
+    assert_eq!(
+        changes_of(&mut app, &g),
+        None,
+        "never reviewed: no baseline"
+    );
+    assert!(app.mark_agent_file_reviewed("claude", &f));
+    assert_eq!(changes_of(&mut app, &f), Some((0, 0)));
+
+    // Replace one line and add two.
+    write(&mut app, &f, "a\nB\nc\nd\ne\n");
+    assert_eq!(changes_of(&mut app, &f), Some((3, 1)));
+    // A later write is counted afresh, not served from the cache.
+    write(&mut app, &f, "a\n");
+    assert_eq!(changes_of(&mut app, &f), Some((0, 2)));
+
+    // Painted beside the label.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    app.show_agent_lane_section();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("f.rs  +0 −2"), "{screen}");
+}
+
 /// Starting the tour while it runs keeps the first one: a second start
 /// would record the first tour's scratch project as the way home, and the
 /// user's own workspace would be lost when it ended.
@@ -56142,6 +56308,529 @@ esac
         );
         assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
     });
+}
+
+/// #345: clicking an unreviewed lane row's ● marks that file reviewed;
+/// clicking its name still opens the diff.
+#[test]
+fn clicking_a_lane_rows_dot_marks_the_file_reviewed() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    std::fs::write(&f, "a\n").unwrap();
+    app.agent_ledger.record_write(
+        &f,
+        crate::agent_lane::content_hash(b"a\n"),
+        &[String::from("claude")],
+    );
+    app.show_agent_lane_section();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let (x, y) = (0..buf.area.height)
+        .find_map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let at = row.find("● f.rs")?;
+            Some((row[..at].chars().count() as u16, y))
+        })
+        .expect("the unreviewed row is painted");
+    let unreviewed = |app: &mut App| {
+        app.agent_lane_panel_rows().into_iter().any(|r| {
+            matches!(
+                r,
+                LaneRow::File {
+                    unreviewed: true,
+                    ..
+                }
+            )
+        })
+    };
+    assert!(unreviewed(&mut app));
+    let click = |app: &mut App, column: u16| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    // The name opens the diff (refused here: never reviewed) and marks
+    // nothing.
+    click(&mut app, x + 3);
+    assert!(unreviewed(&mut app), "{}", app.status);
+    click(&mut app, x);
+    assert!(!unreviewed(&mut app), "{}", app.status);
+    assert!(app.status.contains("f.rs: reviewed"), "{}", app.status);
+}
+
+/// #365: an open review tab whose checks are still running re-reads them
+/// in the background, and says when the last one finishes.
+#[test]
+fn running_pr_checks_refresh_themselves_until_they_finish() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {"login": "a"}, "files": [], "statusCheckRollup": [{"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}]}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        let mut pr = crate::pr_review::parse_pr(
+            r#"{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {"login": "a"}, "files": [], "statusCheckRollup": [{"__typename": "CheckRun", "name": "build", "status": "IN_PROGRESS", "conclusion": ""}]}"#,
+        )
+        .unwrap();
+        pr.number = 42;
+        app.open_pr_review(pr, String::from("x/y#42"));
+        assert!(app.editor.pr_review.as_ref().unwrap().has_pending_checks());
+        // The first pass only starts the clock; nothing is fetched yet.
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_none());
+        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_some(), "a due refresh runs gh");
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the refresh", || {
+            app.poll_pr_gh();
+            !app.editor.pr_review.as_ref().unwrap().has_pending_checks()
+        });
+        assert_eq!(
+            app.editor.pr_review.as_ref().unwrap().pr.checks[0].state,
+            crate::pr_review::CheckState::Pass
+        );
+        assert!(
+            app.status.contains("every check has finished"),
+            "{}",
+            app.status
+        );
+        // Nothing pending: no more refreshes.
+        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_none());
+    });
+}
+
+/// #263: the coverage report opens as a tab, least covered file first,
+/// and without a run it says how to get one.
+#[test]
+fn show_coverage_report_opens_the_last_run_as_a_tab() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::TestingShowCoverageReport);
+    assert!(app.status.contains("No coverage yet"), "{}", app.status);
+    let root = app.active_test_root.clone();
+    app.testing.coverage = Some(crate::testing::coverage::Coverage::from_lcov(
+        "SF:a.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
+        &root,
+    ));
+    app.run_command(Command::TestingShowCoverageReport);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(Path::new("Coverage Report"))
+    );
+    assert_eq!(app.editor.lines[0], "Coverage: 50.0% of 2 lines");
+    assert!(
+        app.editor.lines[2].ends_with(" a.rs"),
+        "{:?}",
+        app.editor.lines
+    );
+}
+
+/// #365: Review Pull Request lists the open PRs to pick from (off the UI
+/// thread), picking one opens it by URL, and the last row asks for a
+/// number instead. When gh cannot list, the prompt opens directly.
+#[test]
+fn review_pull_request_picks_from_the_open_prs() {
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{}'
+case "$2" in
+  list) echo '[{{"number": 9, "title": "Add it", "author": {{"login": "ada"}}, "url": "https://github.com/o/r/pull/9", "isDraft": false}}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        app.run_command(Command::ReviewPullRequest);
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr list", || {
+            app.poll_pr_gh();
+            app.list_picker.is_some()
+        });
+        let picker = app.list_picker.as_ref().unwrap();
+        assert_eq!(picker.rows.len(), 2);
+        assert!(picker.rows[0].label.contains("#9") && picker.rows[0].label.contains("Add it"));
+        assert_eq!(picker.rows[1].id, crate::widgets::list_picker::PR_BY_NUMBER);
+        app.confirm_list_picker();
+        assert!(
+            app.status
+                .contains("Loading PR https://github.com/o/r/pull/9"),
+            "{}",
+            app.status
+        );
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+            app.poll_pr_gh();
+            app.pr_gh.is_none()
+        });
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("pr view https://github.com/o/r/pull/9"),
+            "{args}"
+        );
+
+        // gh unable to list: straight to the prompt, with the reason.
+        app.review_gh = String::from("/nonexistent/gh");
+        app.run_command(Command::ReviewPullRequest);
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the fallback",
+            || {
+                app.poll_pr_gh();
+                app.input_prompt.is_some()
+            },
+        );
+        assert!(
+            app.status.contains("Could not list pull requests"),
+            "{}",
+            app.status
+        );
+    });
+}
+
+/// #356: a recorded frame is masked like a scrollback dump. The cast is a
+/// file made to be shared, so a key on screen is recorded as •••, and a
+/// reveal on screen does not reach it.
+#[test]
+fn a_recorded_frame_masks_secrets_even_while_revealed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].last_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 60,
+        height: 10,
+    };
+    app.terminals[0].resize(60, 10);
+    let key = "AKIAIOSFODNN7EXAMPLE";
+    app.terminals[0].feed_bytes_for_test(format!("export KEY={key}\r\n").as_bytes());
+    app.reveal_redacted_secrets();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    let path = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains(key), "the key reached the cast:\n{text}");
+    assert!(text.contains("export KEY="), "{text}");
+}
+
+/// #263 against real pytest-cov: "Run Test at Cursor with Coverage" runs
+/// only the caret's test, so code that only another test reaches stays
+/// uncovered. Set `CROFT_TEST_PYTEST_COV_PYTHON` as for the whole-run test.
+#[test]
+#[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
+fn a_real_scoped_coverage_run_covers_only_the_test_at_the_cursor() {
+    use crate::testing::coverage::LineCov;
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_PYTEST_COV_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(
+        python.parent().and_then(Path::parent).unwrap(),
+        root.join(".venv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("test_calc.py"),
+        "from calc import add, sub\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\ndef test_sub():\n    assert sub(3, 2) == 1\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("test_calc.py")).unwrap();
+    app.editor.cursor_row = 4; // inside test_add
+    app.run_command(crate::widgets::command_palette::Command::RunTestAtCursorWithCoverage);
+    assert!(app.status.contains("with coverage"), "{}", app.status);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while app.testing.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let cov = app.testing.coverage.clone().unwrap();
+    let calc = cov
+        .files
+        .get(&root.join("calc.py"))
+        .expect("calc.py measured");
+    assert_eq!(calc.line(2), Some(LineCov::Covered), "`return a + b` ran");
+    assert_eq!(
+        calc.line(6),
+        Some(LineCov::Uncovered),
+        "only test_sub reaches `return a - b`"
+    );
+}
+
+/// #371: the scrubber's slider sits on the editor's bottom row; a click at
+/// its left end shows the oldest commit, and dragging to its right end
+/// returns to the working tree.
+#[test]
+fn the_scrubber_slider_seeks_on_click_and_drag() {
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let track = app.scrub_slider;
+    assert!(track.width > 10, "the slider lays out: {track:?}");
+    let row: String = (0..120)
+        .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
+        .collect();
+    assert!(row.contains("working tree"), "{row}");
+    let mouse = |app: &mut App, kind, column| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row: track.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        track.x,
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1"],
+        "the oldest commit"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    let row: String = (0..120)
+        .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
+        .collect();
+    assert!(row.contains(" 1/3 "), "{row}");
+    // The drag keeps seeking off the row too.
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Drag(MouseButton::Left),
+        track.x + track.width + 5,
+    );
+    assert!(app.scrub_view.is_none(), "back at the working tree");
+    mouse(
+        &mut app,
+        crossterm::event::MouseEventKind::Up(MouseButton::Left),
+        0,
+    );
+    assert!(!app.scrub_dragging);
+    assert!(app.scrubber.is_some(), "the scrubber stays open");
+}
+
+/// #347: `a` in the approval popup approves this edit and the same agent's
+/// next ones for ten minutes, with a countdown chip; another agent still
+/// asks, and Agents: Stop Auto-Approving (or the time running out) ends it.
+#[test]
+fn approve_all_lets_one_agent_through_until_stopped() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = tmp.path().join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let propose = |app: &mut App, agent: &str| {
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: agent.into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({"file_path": tmp.path().join("a.rs"), "old_string": "1", "new_string": "2"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        app.drain_hook_requests();
+        hook
+    };
+    let answer = |hook: std::os::unix::net::UnixStream| {
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(hook).read_line(&mut line);
+        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).ok()
+    };
+
+    let first = propose(&mut app, "claude-code");
+    let other = propose(&mut app, "other-agent");
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(answer(first), Some(crate::agent_hook::Decision::Allow));
+    assert!(app.status.contains("for 10 minutes"), "{}", app.status);
+    assert_eq!(app.approvals.len(), 1, "the other agent still asks");
+    assert_eq!(app.approvals[0].request.agent, "other-agent");
+
+    // The same agent's next edit goes straight through.
+    let next = propose(&mut app, "claude-code");
+    assert_eq!(answer(next), Some(crate::agent_hook::Decision::Allow));
+    assert_eq!(app.approvals.len(), 1);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let bottom: String = (0..160).map(|x| buf[(x, 29)].symbol()).collect();
+    assert!(
+        bottom.contains("auto-approving claude-code 9:")
+            || bottom.contains("auto-approving claude-code 10:00"),
+        "{bottom}"
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::StopAutoApprove);
+    let after = propose(&mut app, "claude-code");
+    assert_eq!(app.approvals.len(), 2, "asks again once stopped");
+    drop((after, other));
+
+    // A window that has run out closes by itself.
+    app.auto_approve = Some((String::from("x"), std::time::Instant::now()));
+    app.drain_hook_requests();
+    assert!(app.auto_approve.is_none());
+}
+
+/// #363 end to end: a fleet run's results open as tiles in the Fleet tab,
+/// `s` saves the whole run to a file, `d` switches to full output, Enter
+/// opens a shell pane on the selected host, and Esc closes the tab.
+#[test]
+fn a_fleet_run_opens_tiles_that_save_and_open_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_fleet_command("localhost: echo fleet-ok");
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(10), "the fleet run", || {
+        app.drain_fleet_results();
+        app.editor.fleet.is_some()
+    });
+    let view = app.editor.fleet.as_ref().unwrap();
+    assert_eq!(view.command, "echo fleet-ok");
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(view.results[0].output, "fleet-ok");
+    assert_eq!(app.editor.path.as_deref(), Some(Path::new("Fleet")));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen: String = (0..30)
+        .map(|y| {
+            (0..120)
+                .map(|x| term.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("localhost"), "{screen}");
+
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.fleet.as_ref().unwrap().diff_mode);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    let saved = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("fleet-"))
+        })
+        .expect("a capture file");
+    let text = std::fs::read_to_string(saved).unwrap();
+    assert!(text.starts_with("$ echo fleet-ok\n"), "{text}");
+    assert!(text.contains("== localhost (exit 0,"), "{text}");
+
+    let panes = app.terminals.len();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.terminals.len(),
+        panes + 1,
+        "a shell pane opened: {}",
+        app.status
+    );
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.fleet.is_none());
+}
+
+#[test]
+fn fleet_shell_commands_quote_the_target() {
+    assert_eq!(fleet_shell_command("localhost"), None);
+    assert_eq!(fleet_shell_command("db-1").as_deref(), Some("ssh 'db-1'"));
+    assert_eq!(
+        fleet_shell_command("docker:web").as_deref(),
+        Some("docker exec -it 'web' sh")
+    );
+}
+
+/// A second click on the same forwarded loopback link reuses the tunnel
+/// instead of asking for another (each one was a new tunnel on a random port
+/// and a new browser tab, #648); a click while one is in flight asks nothing.
+#[test]
+fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
+    use crate::widgets::ports::PortOrigin;
+    let _guard = relay_test_lock().lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    let log = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.request_remote_forward(3000, true);
+        app.request_remote_forward(3000, true);
+        let first = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(first.matches("forward\t").count(), 1, "{first:?}");
+        // Once forwarded, a click opens the existing tunnel.
+        app.pending_remote_pulls.clear();
+        app.ports
+            .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+        app.ports.mark_forwarded(3000, 3001);
+        app.request_remote_forward(3000, true);
+        log
+    });
+    let all = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(all.matches("forward\t").count(), 1, "{all:?}");
+    assert!(all.contains("http://127.0.0.1:3001/"), "{all:?}");
 }
 
 /// #694: a source build of croft on this host stops the language servers

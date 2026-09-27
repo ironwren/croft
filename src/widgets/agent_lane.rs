@@ -22,6 +22,8 @@ const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_FILE: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_AGENT: Color = Color::Rgb(0x8f, 0xd9, 0xcf);
 const COLOR_DOT: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
+const COLOR_ADDED: Color = Color::Rgb(0x73, 0xc9, 0x91);
+const COLOR_REMOVED: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 
 /// Left indent matching the tree's `Borders::ALL` inset.
 const CONTENT_INDENT: u16 = 1;
@@ -39,6 +41,9 @@ pub enum LaneRow {
         /// What the row shows: the path relative to its workspace root.
         label: String,
         unreviewed: bool,
+        /// Lines added and removed since the reviewed snapshot, when the row
+        /// has one to count against.
+        changes: Option<(usize, usize)>,
     },
 }
 
@@ -55,6 +60,8 @@ pub struct AgentLanePanel {
     last_header_x: u16,
     last_header_w: u16,
     first_row_y: u16,
+    /// Where rows start horizontally, for the dot's hit test.
+    first_row_x: u16,
     visible_rows: u16,
 }
 
@@ -72,6 +79,7 @@ impl AgentLanePanel {
             last_header_x: 0,
             last_header_w: 0,
             first_row_y: 0,
+            first_row_x: 0,
             visible_rows: 0,
         }
     }
@@ -118,6 +126,20 @@ impl AgentLanePanel {
         y == self.last_header_row
             && x >= self.last_header_x
             && x < self.last_header_x.saturating_add(self.last_header_w)
+    }
+
+    /// Whether a click at (`x`, `y`) lands on an unreviewed file row's dot,
+    /// which marks that file reviewed rather than opening its diff.
+    pub fn hit_dot(&self, x: u16, y: u16) -> bool {
+        let dot = self.first_row_x.saturating_add(2);
+        (dot..dot.saturating_add(2)).contains(&x)
+            && matches!(
+                self.row_at(y),
+                Some(LaneRow::File {
+                    unreviewed: true,
+                    ..
+                })
+            )
     }
 
     /// The row a click at `y` lands on.
@@ -205,6 +227,7 @@ impl Widget for &mut AgentLanePanel {
         let body_y = inner.y + 1;
         let body_h = inner.height - 1;
         self.first_row_y = body_y;
+        self.first_row_x = inner.x;
         if self.rows.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No agent has changed a file",
@@ -256,18 +279,33 @@ impl Widget for &mut AgentLanePanel {
                     Line::from(spans)
                 }
                 LaneRow::File {
-                    label, unreviewed, ..
+                    label,
+                    unreviewed,
+                    changes,
+                    ..
                 } => {
                     let (dot, fg) = if *unreviewed {
                         ("\u{25cf} ", COLOR_FILE)
                     } else {
                         ("  ", COLOR_DIM)
                     };
-                    Line::from(vec![
+                    let mut spans = vec![
                         Span::raw("  "),
                         Span::styled(dot, Style::default().fg(self.theme.ui(COLOR_DOT))),
                         Span::styled(label.clone(), Style::default().fg(self.theme.ui(fg))),
-                    ])
+                    ];
+                    // Nothing to say for a row that matches its review.
+                    if let Some((added, removed)) = changes.filter(|&(a, r)| a + r > 0) {
+                        spans.push(Span::styled(
+                            format!("  +{added}"),
+                            Style::default().fg(self.theme.ui(COLOR_ADDED)),
+                        ));
+                        spans.push(Span::styled(
+                            format!(" \u{2212}{removed}"),
+                            Style::default().fg(self.theme.ui(COLOR_REMOVED)),
+                        ));
+                    }
+                    Line::from(spans)
                 }
             };
             Paragraph::new(line).render(rect, buf);
@@ -290,12 +328,14 @@ mod tests {
                 path: PathBuf::from("/w/src/a.rs"),
                 label: "src/a.rs".into(),
                 unreviewed: true,
+                changes: Some((3, 1)),
             },
             LaneRow::File {
                 agent: "claude".into(),
                 path: PathBuf::from("/w/src/b.rs"),
                 label: "src/b.rs".into(),
                 unreviewed: false,
+                changes: Some((0, 0)),
             },
         ]
     }

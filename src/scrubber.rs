@@ -128,17 +128,35 @@ impl Scrubber {
         self.position = Position::At(index.min(self.commits.len() - 1));
     }
 
+    /// Move to the stop nearest `f` along the slider, 0.0 the oldest loaded
+    /// commit and 1.0 the working tree: the inverse of [`Self::fraction`],
+    /// which is what a click or drag on the slider calls.
+    pub fn seek_fraction(&mut self, f: f32) {
+        let stops = self.commits.len();
+        if stops == 0 {
+            self.position = Position::Working;
+            return;
+        }
+        let p = (f.clamp(0.0, 1.0) * stops as f32).round() as usize;
+        self.position = if p >= stops {
+            Position::Working
+        } else {
+            Position::At(stops - 1 - p)
+        };
+    }
+
+    /// How many commits are loaded.
+    pub fn len(&self) -> usize {
+        self.commits.len()
+    }
+
     /// Where the slider's handle sits, as a fraction from 0.0 (oldest loaded)
     /// to 1.0 (the working tree).
-    ///
-    /// Same as [`Self::seek`]: the widget that reads this does not exist
-    /// yet.
     ///
     /// The working tree is its own stop at the far right rather than sharing
     /// HEAD's position, because they are different views and a slider that
     /// showed them at the same place would give the user no way to tell
     /// which one they are looking at.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fraction(&self) -> f32 {
         let stops = self.commits.len();
         if stops == 0 {
@@ -157,6 +175,30 @@ impl Scrubber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeking_by_fraction_inverts_the_handle_position() {
+        let mut s = Scrubber::new((0..4).map(commit).collect());
+        for p in [
+            Position::Working,
+            Position::At(0),
+            Position::At(2),
+            Position::At(3),
+        ] {
+            let mut probe = Scrubber::new((0..4).map(commit).collect());
+            probe.position = p;
+            s.seek_fraction(probe.fraction());
+            assert_eq!(s.position(), p);
+        }
+        s.seek_fraction(-3.0);
+        assert_eq!(
+            s.position(),
+            Position::At(3),
+            "past the left end is the oldest"
+        );
+        s.seek_fraction(9.0);
+        assert_eq!(s.position(), Position::Working);
+    }
 
     fn commit(i: usize) -> crate::git::GraphCommit {
         crate::git::GraphCommit {

@@ -114,6 +114,8 @@ pub fn render(
             Span::styled(" approve   ", dim),
             Span::styled("Esc", key),
             Span::styled(" deny   ", dim),
+            Span::styled("a", key),
+            Span::styled(" approve all from this agent for 10 min   ", dim),
             Span::styled("r", key),
             Span::styled(" deny with a reason   ", dim),
             Span::styled("↑↓", key),

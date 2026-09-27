@@ -54,6 +54,14 @@ impl PrReviewView {
             .collect()
     }
 
+    /// Whether any check is still running.
+    pub fn has_pending_checks(&self) -> bool {
+        self.pr
+            .checks
+            .iter()
+            .any(|c| c.state == crate::pr_review::CheckState::Pending)
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         let last = self.rows().len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);

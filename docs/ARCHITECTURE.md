@@ -404,7 +404,7 @@ The multiplayer session mux (docs/MULTIPLAYER.md): a hidden `croft session-host`
 
 Running one command across N ssh hosts and comparing what came back, behind "Terminal: Fleet Run".
 
-**Output shape.** Results are TEXT LINES in a `Fleet` OUTPUT channel: one per host marked `same`/`DIFFERS`/`FAILED`, then the summary. Under a `DIFFERS` row, `- line` is a reference line the host's output lacks and `+ line` is one the host printed instead, so a missing line is named too, not just an extra one. `localhost` and `docker:<name>` targets come from the request and the groups. croft never runs `docker ps`, which would wait on the Docker daemon before the run started; a container that does not exist fails in its own row. This is not the tiled view the issue describes, which is still to build — see #363. Broadcast typing covers "type once"; this is the other half, and the comparison is the whole value, because reading ten near-identical `uname -r` outputs by eye is the task a person is worst at.
+**Output shape.** Results are TEXT LINES in a `Fleet` OUTPUT channel: one per host marked `same`/`DIFFERS`/`FAILED`, then the summary. Under a `DIFFERS` row, `- line` is a reference line the host's output lacks and `+ line` is one the host printed instead, so a missing line is named too, not just an extra one. `localhost` and `docker:<name>` targets come from the request and the groups. croft never runs `docker ps`, which would wait on the Docker daemon before the run started; a container that does not exist fails in its own row. The same results also open as tiles in the **Fleet** tab (`widgets/fleet.rs`). Each tile has an exit-status dot and the host's time, and in diff mode it shows only its `- `/`+ ` lines against the reference. `r` makes the selected tile the reference, `s` saves the run to `fleet-<time>.txt`, and Enter opens a shell pane on that host. Broadcast typing covers "type once"; this is the other half, and the comparison is the whole value, because reading ten near-identical `uname -r` outputs by eye is the task a person is worst at.
 
 **The fleet must be named.** The request is `hosts: command`, with `*` as the explicit broadcast. Defaulting to every entry in `~/.ssh/config` would mean running arbitrary text on every remote the user ever configured — a live production box beside a `github.com` entry that is not a shell host — and a confirmation reading "run on 5 hosts?" asks them to approve a list they cannot inspect. Choosing the fleet is the feature, not a nicety on top of it.
 
@@ -564,7 +564,9 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 ### scrubber.rs
 
-Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree.
+Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the file on disk. Both leave the scrubber.
+
+**Enter opens here only at a commit.** There, the edit guard already refuses typing into the live buffer hidden under the historical view. At the working tree, Enter is ordinary typing. The diff is a palette command.
 
 **Leaving must restore the live buffer exactly, unsaved edits included.** Scrubbing is a way of looking, not of editing, and losing uncommitted work to answer a question about history would be worse than not having the feature. So the working tree is a *position* in the cursor rather than something the scrubber replaces — there is no state where the live buffer has been discarded and the scrubber owes it back.
 
