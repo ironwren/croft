@@ -52535,7 +52535,7 @@ impl App {
                 self.open_input_prompt(
                     InputPrompt::new(
                         InputPurpose::SarifExport,
-                        String::from("Export Results as CSV"),
+                        String::from("Export Results (CSV, or SARIF for a .sarif name)"),
                         String::from("file to write the visible results to"),
                     )
                     .with_value("sarif-results.csv"),
@@ -52967,9 +52967,21 @@ impl App {
         let Some(view) = self.editor.sarif.as_ref() else {
             return;
         };
-        let csv = view.export_csv();
-        let count = csv.lines().count().saturating_sub(1);
         let v = value.trim();
+        // A `.sarif` name gets SARIF, anything else the CSV (#577).
+        let as_sarif = v.to_ascii_lowercase().ends_with(".sarif");
+        let count = view.visible().len();
+        let csv = if as_sarif {
+            match view.export_sarif() {
+                Some(text) => text,
+                None => {
+                    self.status = String::from("Could not reread the log to export it");
+                    return;
+                }
+            }
+        } else {
+            view.export_csv()
+        };
         let path = if std::path::Path::new(v).is_absolute() {
             PathBuf::from(v)
         } else {
