@@ -3877,6 +3877,9 @@ pub struct App {
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
     scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
+    /// Each scrubbed commit's tree under the workspace root, for the
+    /// Explorer's dimming (#371); `None` records that the listing failed.
+    scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
     /// The running `croft demo` tour (#377), with its scratch project and
     /// the workspace to return to.
     pub tour: Option<TourRun>,
@@ -5663,6 +5666,7 @@ impl App {
             scrub_slider: Rect::default(),
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
+            scrub_trees: std::collections::HashMap::new(),
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
@@ -22395,6 +22399,7 @@ impl App {
         self.show_tree = true;
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
+        self.refresh_codeql_queries();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
@@ -22414,9 +22419,9 @@ impl App {
         }
     }
 
-    /// Run what a CodeQL side-bar row offers. Sections fold; the language
-    /// list selects; the database, query and variant-analysis actions are
-    /// the parts of #578 that follow, and say so rather than do nothing.
+    /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
+    /// the language and database lists select; a query row runs; the actions
+    /// still to come in #578 say so rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22498,6 +22503,24 @@ impl App {
                     }
                 }
             }
+            Hit::Action(Action::TogglePack(i)) => self.codeql.toggle_pack(i),
+            Hit::Action(Action::RunQuery(pack, query)) => {
+                let Some(path) = self
+                    .codeql
+                    .queries
+                    .get(pack)
+                    .and_then(|p| p.queries.get(query))
+                    .cloned()
+                else {
+                    return;
+                };
+                // A side-bar row runs the file as saved, as VS Code's
+                // Queries view does.
+                match std::fs::read_to_string(&path) {
+                    Ok(source) => self.run_codeql_file(path, &source),
+                    Err(e) => self.status = format!("{}: {e}", path.display()),
+                }
+            }
             Hit::Action(action) => {
                 let what = match action {
                     Action::CreateQuery => "Creating CodeQL queries",
@@ -22530,12 +22553,15 @@ impl App {
         self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
     }
 
-    /// Run the open `.ql` file on the current database (#578): alerts
-    /// through `database analyze` into SARIF, anything else through
-    /// `query run` into a table decoded as CSV. The run happens on a worker
-    /// thread; [`Self::drain_codeql_run`] collects it.
+    /// Find the workspace's queries for the side bar's Queries section.
+    /// Called when the view opens, not every frame: it walks the tree.
+    fn refresh_codeql_queries(&mut self) {
+        self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Run the open `.ql` file on the current database (#578), from the
+    /// buffer, not the disk: an unsaved edit is what the user means.
     fn run_codeql_query(&mut self) {
-        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         let query = match self.editor.path.clone() {
             Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
             _ => {
@@ -22543,6 +22569,16 @@ impl App {
                 return;
             }
         };
+        let source = self.editor.lines.join("\n");
+        self.run_codeql_file(query, &source);
+    }
+
+    /// Run `query`, whose text is `source`, on the current database (#578):
+    /// alerts through `database analyze` into SARIF, anything else through
+    /// `query run` into a table decoded as CSV. The run happens on a worker
+    /// thread; [`Self::drain_codeql_run`] collects it.
+    fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
             return;
@@ -22552,8 +22588,6 @@ impl App {
             self.status = String::from("Add a CodeQL database and select it first");
             return;
         };
-        // The buffer, not the disk: an unsaved edit is what the user means.
-        let source = self.editor.lines.join("\n");
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -22566,7 +22600,7 @@ impl App {
             .join("codeql")
             .join("results")
             .join(format!("{started}-{stem}"));
-        let kind = cq::output_for(&source);
+        let kind = cq::output_for(source);
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
@@ -30726,6 +30760,7 @@ impl App {
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
         self.scrub_view = None;
+        self.tree.scrub_tree = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -32166,6 +32201,7 @@ impl App {
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
                 self.scrub_view = None;
+                self.sync_scrub_tree();
                 self.status = String::from("Left the history scrubber");
                 return true;
             }
@@ -32217,6 +32253,7 @@ impl App {
     fn close_scrubber_for_tab(&mut self) {
         self.scrubber = None;
         self.scrub_view = None;
+        self.sync_scrub_tree();
         self.focus_pane(Pane::Editor);
     }
 
@@ -32356,11 +32393,30 @@ impl App {
         self.scrub_slider = track;
     }
 
+    /// Point the Explorer's dimming at the scrubber's commit (#371), or
+    /// clear it at the working tree and once the scrubber closes. The tree
+    /// listing is cached per commit like the file text, so stepping back
+    /// over a visited commit costs no git process.
+    fn sync_scrub_tree(&mut self) {
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()) else {
+            self.tree.scrub_tree = None;
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let present = self
+            .scrub_trees
+            .entry(commit.hash.clone())
+            .or_insert_with(|| crate::git::tree_paths(&root, &commit.hash).map(std::sync::Arc::new))
+            .clone();
+        self.tree.scrub_tree = present.map(|set| (root, set));
+    }
+
     /// Build the read-only view of the active file at the scrubber's commit
     /// (#371), or drop it at the working tree. File text is cached per
     /// (commit, path), so stepping back and forth after the first visit
     /// costs no git process.
     fn rebuild_scrub_view(&mut self) {
+        self.sync_scrub_tree();
         self.scrub_for = self.editor.path.clone();
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.scrub_view = None;
