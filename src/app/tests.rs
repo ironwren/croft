@@ -55115,6 +55115,7 @@ fn seed_codeql_history(
         history.push(crate::codeql_query::HistoryEntry {
             query: tmp.join(query),
             database: String::from("app"),
+            database_path: None,
             started: *started,
             seconds: 3,
             status: status.clone(),
@@ -55357,6 +55358,7 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
             path: db,
             language: Some(String::from("rust")),
             added: 0,
+            former_names: Vec::new(),
         }],
         current: Some(0),
         sort_by: None,
@@ -55752,6 +55754,332 @@ fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
         assert!(app.codeql_run.is_none());
         assert!(app.codeql_run_queue.is_empty());
         assert_eq!(app.codeql.history.len(), 1);
+    });
+}
+
+/// Drain the database upgrade until it lands, or fail after a few seconds.
+fn wait_for_codeql_upgrade(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_upgrade() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upgrade never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrading_a_codeql_database_runs_the_cli_off_the_ui_thread() {
+    // #578: VS Code's "CodeQL: Upgrade Database". `u` on a database row
+    // runs `codeql database upgrade` on a worker; the status line says how
+    // it went, with the CLI's first error line when it failed. An upgrade
+    // and a query run never overlap.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_database(0);
+        let u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        app.handle_codeql_key(u);
+        assert_eq!(app.status, "Upgrading CodeQL database app\u{2026}");
+        app.handle_codeql_key(u);
+        assert_eq!(app.status, "A CodeQL database upgrade is already running");
+        app.run_command(Command::CodeqlRunQuery);
+        assert_eq!(app.status, "Wait for the CodeQL database upgrade to finish");
+        assert!(app.codeql_run.is_none());
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Upgraded CodeQL database app");
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!("database upgrade {}", tmp.path().join("dbs/app").display())
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: the database is too new");
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not upgrade CodeQL database app: ERROR: the database is too new"
+        );
+
+        // A query is running: the upgrade waits its turn.
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(app.codeql_run.is_some());
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL query run to finish before upgrading"
+        );
+        assert!(app.codeql_upgrade.is_none());
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_upgrade_database"),
+            Some(Command::CodeqlUpgradeDatabase)
+        );
+        assert_eq!(
+            Command::CodeqlUpgradeDatabase.title(),
+            "CodeQL: Upgrade Database"
+        );
+    });
+}
+
+#[test]
+fn a_codeql_databases_source_is_added_to_the_workspace() {
+    // #578: VS Code's "CodeQL: Add Database Source to Workspace". A `src`
+    // folder is added as it is; a `src.zip` is extracted once into croft's
+    // cache and that folder added.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder_db = make_codeql_db(&tmp.path().join("dbs"), "folder", "go");
+        std::fs::create_dir_all(folder_db.join("src/proj")).unwrap();
+        std::fs::write(folder_db.join("src/proj/main.go"), "package main\n").unwrap();
+        let zip_db = make_codeql_db(&tmp.path().join("dbs"), "zipped", "go");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("proj/main.go", opts).unwrap();
+        z.write_all(b"package main\n").unwrap();
+        z.finish().unwrap();
+        let bare_db = make_codeql_db(&tmp.path().join("dbs"), "bare", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&folder_db, &zip_db, &bare_db] {
+            store.add(db).unwrap();
+        }
+        store.current = Some(0);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut app = App::new(ws).unwrap();
+        app.workspace_folders_path = tmp.path().join("folders.json");
+        let has_root = |app: &App, p: &std::path::Path| {
+            app.roots.iter().any(|r| r == p.canonicalize().unwrap())
+        };
+
+        app.run_command(Command::CodeqlAddDatabaseSource);
+        assert_eq!(
+            app.status,
+            "Added the source of CodeQL database folder to the workspace"
+        );
+        assert!(has_root(&app, &folder_db.join("src")));
+        app.run_command(Command::CodeqlAddDatabaseSource);
+        assert_eq!(
+            app.status,
+            "The source of CodeQL database folder is already in the workspace"
+        );
+
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        let w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_codeql_key(w);
+        assert_eq!(
+            app.status,
+            "Added the source of CodeQL database zipped to the workspace"
+        );
+        let extracted = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("proj/main.go")).unwrap(),
+            "package main\n"
+        );
+        assert!(has_root(&app, &extracted));
+
+        // Extracted once: adding it again reuses the folder as it is.
+        std::fs::write(extracted.join("mine.txt"), "kept").unwrap();
+        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        assert!(!has_root(&app, &extracted));
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        app.handle_codeql_key(w);
+        assert!(has_root(&app, &extracted));
+        assert!(extracted.join("mine.txt").exists());
+
+        // A database replaced at the same path has a new src.zip: it is
+        // extracted afresh and the out-of-date copy dropped.
+        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
+        z.start_file("proj/main.go", opts).unwrap();
+        z.write_all(b"package main // v2\n").unwrap();
+        z.finish().unwrap();
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        app.handle_codeql_key(w);
+        let fresh = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
+        assert_ne!(fresh, extracted);
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("proj/main.go")).unwrap(),
+            "package main // v2\n"
+        );
+        assert!(has_root(&app, &fresh));
+        assert!(!extracted.exists(), "the stale extraction is removed");
+
+        app.codeql.select_database(2);
+        app.handle_codeql_key(w);
+        assert_eq!(
+            app.status,
+            "CodeQL database bare has no src folder or src.zip"
+        );
+        assert_eq!(
+            Command::CodeqlAddDatabaseSource.title(),
+            "CodeQL: Add Database Source to Workspace"
+        );
+    });
+}
+
+#[test]
+fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
+    // #578: VS Code's "CodeQL: Delete Unused Databases". Only copies in
+    // croft's cache that no query history entry ran on go, after a
+    // confirmation; the current database and ones elsewhere stay.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = App::codeql_db_cache_dir();
+        // An archive's extraction keeps the database one level down.
+        let cached = |name: &str| make_codeql_db(&cache.join(name), name, "go");
+        let used = cached("used");
+        let legacy = cached("legacy");
+        let current = cached("current");
+        let stale_a = cached("stale-a");
+        let stale_b = cached("stale-b");
+        let outside = make_codeql_db(tmp.path(), "outside", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&used, &legacy, &current, &stale_a, &stale_b, &outside] {
+            store.add(db).unwrap();
+        }
+        // Renamed since its run: the history still finds it by path.
+        store.rename(0, "used, renamed").unwrap();
+        store.current = Some(2);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let mut history = crate::codeql_query::History::default();
+        for (db, name, path) in [
+            (&used, "used", Some(used.clone())),
+            // Saved before runs recorded a path: matched by name.
+            (&legacy, "legacy", None),
+        ] {
+            history.push(crate::codeql_query::HistoryEntry {
+                query: tmp.path().join("q.ql"),
+                database: name.to_string(),
+                database_path: path,
+                started: 1,
+                seconds: 1,
+                status: crate::codeql_query::RunStatus::Succeeded,
+                output: db.join("unused-output.csv"),
+                name: None,
+            });
+        }
+        history.save(&App::codeql_history_path()).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Renaming the database a pre-path run named pins that run to its
+        // path first, so the rename does not make it look unused.
+        app.submit_rename_codeql_database(&legacy, "legacy, renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert!(history.entries.iter().any(
+            |e| e.database == "legacy" && e.database_path.as_deref() == Some(legacy.as_path())
+        ));
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        let prompt = app.input_prompt.as_ref().expect("asks first");
+        assert_eq!(prompt.title, "Delete 2 unused CodeQL databases?");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlDeleteUnusedDatabases {
+                paths: vec![stale_a.clone(), stale_b.clone()]
+            }
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.status, "Deleted 2 unused CodeQL databases");
+        let store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        let names: Vec<&str> = store.databases.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["used, renamed", "legacy, renamed", "current", "outside"]
+        );
+        assert_eq!(store.current, Some(2), "still the current one");
+        assert!(!cache.join("stale-a").exists() && !cache.join("stale-b").exists());
+        for kept in [&used, &legacy, &current, &outside] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        assert!(app.input_prompt.is_none());
+        assert_eq!(app.status, "There are no unused CodeQL databases to delete");
+        assert_eq!(
+            Command::from_id("codeql_delete_unused_databases"),
+            Some(Command::CodeqlDeleteUnusedDatabases)
+        );
+    });
+}
+
+#[test]
+fn renaming_one_of_two_same_named_databases_keeps_both_protected() {
+    // #578: an old run that names "dup" could have been on either of two
+    // databases called that. After one is renamed, Delete Unused must
+    // still leave both alone: the renamed one remembers its former name.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = App::codeql_db_cache_dir();
+        let first = make_codeql_db(&cache.join("one"), "dup", "go");
+        let second = make_codeql_db(&cache.join("two"), "dup", "go");
+        let current = make_codeql_db(&cache.join("cur"), "current", "go");
+        let mut store = crate::codeql_db::DatabaseStore::default();
+        for db in [&first, &second, &current] {
+            store.add(db).unwrap();
+        }
+        store.current = Some(2);
+        store.save(&App::codeql_db_store_path()).unwrap();
+        let mut history = crate::codeql_query::History::default();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.path().join("q.ql"),
+            database: String::from("dup"),
+            database_path: None,
+            started: 1,
+            seconds: 1,
+            status: crate::codeql_query::RunStatus::Succeeded,
+            output: tmp.path().join("r.csv"),
+            name: None,
+        });
+        history.save(&App::codeql_history_path()).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_rename_codeql_database(&first, "renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(
+            history.entries[0].database_path, None,
+            "ambiguous: not pinned to either"
+        );
+        app.run_command(Command::CodeqlDeleteUnusedDatabases);
+        assert!(app.input_prompt.is_none());
+        assert_eq!(app.status, "There are no unused CodeQL databases to delete");
+        assert!(first.exists() && second.exists());
     });
 }
 

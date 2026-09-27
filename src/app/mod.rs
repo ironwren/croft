@@ -3116,6 +3116,8 @@ pub struct App {
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
+    /// The database upgrade in flight (#578).
+    codeql_upgrade: Option<CodeqlUpgrade>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5329,6 +5331,7 @@ impl App {
             codeql_run: None,
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
+            codeql_upgrade: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -22518,8 +22521,9 @@ impl App {
 
     /// CodeQL view keys: arrows move between headers and actions, Enter or
     /// Space folds a section or runs an action, Esc returns to the Explorer.
-    /// On a database row, Delete removes it, F2 renames it and `e` shows its
-    /// folder in the Explorer. On a query history row, Delete removes it, F2
+    /// On a database row, Delete removes it, F2 renames it, `e` shows its
+    /// folder in the Explorer, `u` upgrades it and `w` adds its source to
+    /// the workspace. On a query history row, Delete removes it, F2
     /// renames it, `v` opens its query and `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
@@ -22556,6 +22560,16 @@ impl App {
             KeyCode::Char('e') => {
                 if let Some(i) = db {
                     self.reveal_codeql_database(i);
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(i) = db {
+                    self.upgrade_codeql_database(i);
+                }
+            }
+            KeyCode::Char('w') => {
+                if let Some(i) = db {
+                    self.add_codeql_database_source(i);
                 }
             }
             KeyCode::Char('v') => {
@@ -22814,9 +22828,31 @@ impl App {
             self.status = String::from("That CodeQL database is no longer listed");
             return;
         };
+        let old = store.databases[i].name.clone();
         if let Err(e) = store.rename(i, value) {
             self.status = e;
             return;
+        }
+        // History from before runs recorded their database's path names it
+        // only by its old name. The rename keeps that name among its former
+        // names, so such runs still count for it; with no other database
+        // ever called that, they are also pinned to its path. Otherwise the
+        // runs could be either's, and both stay protected by name.
+        let same_name = store
+            .databases
+            .iter()
+            .enumerate()
+            .filter(|&(j, d)| j != i && d.has_had_name(&old))
+            .count();
+        if same_name == 0 {
+            let history_path = Self::codeql_history_path();
+            let mut history = crate::codeql_query::History::load(&history_path);
+            if history.adopt_legacy(&old, path)
+                && let Err(e) = history.save(&history_path)
+            {
+                self.status = format!("Could not save the CodeQL query history: {e}");
+                return;
+            }
         }
         // Renaming can move it in a name-sorted list.
         if let Some(by) = store.sort_by {
@@ -22872,6 +22908,207 @@ impl App {
         }
     }
 
+    /// Upgrade database `index` to the CLI's current schema (#578, VS
+    /// Code's "CodeQL: Upgrade Database") on a worker thread;
+    /// [`Self::drain_codeql_upgrade`] collects it. Refused while a query or
+    /// another upgrade runs: either would read a database being rewritten.
+    fn upgrade_codeql_database(&mut self, index: usize) {
+        if self.codeql_upgrade.is_some() {
+            self.status = String::from("A CodeQL database upgrade is already running");
+            return;
+        }
+        if self.codeql_run.is_some() {
+            self.status = String::from("Wait for the CodeQL query run to finish before upgrading");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index).cloned() else {
+            return;
+        };
+        let program = self.codeql_program.clone();
+        let path = db.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let args = crate::codeql_query::upgrade_args(&path);
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = format!("Upgrading CodeQL database {}\u{2026}", db.name);
+        self.codeql_upgrade = Some((rx, db.name, db.path));
+    }
+
+    /// Collect a finished database upgrade (#578) onto the status line.
+    pub fn drain_codeql_upgrade(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_upgrade.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the upgrade stopped unexpectedly"))
+            }
+        };
+        let Some((_, name, _)) = self.codeql_upgrade.take() else {
+            return false;
+        };
+        self.status = match outcome {
+            Ok(()) => format!("Upgraded CodeQL database {name}"),
+            Err(why) => format!("Could not upgrade CodeQL database {name}: {why}"),
+        };
+        true
+    }
+
+    /// Add database `index`'s source to the workspace (#578, VS Code's
+    /// "CodeQL: Add Database Source to Workspace"): its `src` folder, else
+    /// its `src.zip`, extracted once into croft's cache.
+    fn add_codeql_database_source(&mut self, index: usize) {
+        use crate::codeql_db::DbSource;
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index) else {
+            return;
+        };
+        let folder = match crate::codeql_db::database_source(&db.path) {
+            None => {
+                self.status = format!("CodeQL database {} has no src folder or src.zip", db.name);
+                return;
+            }
+            Some(DbSource::Folder(folder)) => folder,
+            Some(DbSource::Zip(zip)) => {
+                let cache = Self::codeql_source_cache_dir();
+                let dest = cache.join(crate::codeql_db::source_cache_name(&db.path, &zip));
+                if !dest.is_dir() {
+                    // An older extraction of this database's source is out
+                    // of date: its archive changed, which is why the name
+                    // no longer matches. Drop it, unless it is open as a
+                    // workspace root.
+                    let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+                    for old in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
+                        let path = old.path();
+                        let stale = old.file_name().to_string_lossy().starts_with(&prefix);
+                        let open = path
+                            .canonicalize()
+                            .is_ok_and(|p| self.roots.iter().any(|r| r == p));
+                        if stale && !open {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                    // Extract beside it and rename, so an interrupted
+                    // extraction never passes for a finished one.
+                    let partial = PathBuf::from(format!("{}.partial", dest.display()));
+                    let _ = std::fs::remove_dir_all(&partial);
+                    let done = crate::codeql_db::extract_zip(
+                        &zip,
+                        &partial,
+                        Some(crate::codeql_db::SOURCE_ZIP_LIMIT),
+                    )
+                    .and_then(|_| std::fs::rename(&partial, &dest).map_err(|e| e.to_string()));
+                    if let Err(e) = done {
+                        let _ = std::fs::remove_dir_all(&partial);
+                        self.status = format!("Could not extract {}: {e}", zip.display());
+                        return;
+                    }
+                }
+                dest
+            }
+        };
+        let folder = folder.canonicalize().unwrap_or(folder);
+        let name = db.name.clone();
+        if self.roots.iter().any(|r| r == folder) {
+            self.status =
+                format!("The source of CodeQL database {name} is already in the workspace");
+            return;
+        }
+        self.add_workspace_folder(folder.clone());
+        if self.roots.iter().any(|r| r == folder) {
+            self.status = format!("Added the source of CodeQL database {name} to the workspace");
+        }
+    }
+
+    /// The databases "Delete Unused Databases" removes: copies in croft's
+    /// cache that no query history entry ran on, never the current one or
+    /// one being upgraded. A database the user pointed at elsewhere is
+    /// theirs and never listed.
+    fn unused_codeql_databases(&self) -> Vec<PathBuf> {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, p)| p);
+        store
+            .databases
+            .iter()
+            .enumerate()
+            .filter(|&(i, d)| store.current != Some(i) && Some(&d.path) != upgrading)
+            .filter(|(_, d)| Self::codeql_cached_copy(&d.path).is_some())
+            .filter(|(_, d)| {
+                let mut names = vec![d.name.as_str()];
+                names.extend(d.former_names.iter().map(String::as_str));
+                !history.entries.iter().any(|e| e.refers_to(&d.path, &names))
+            })
+            .map(|(_, d)| d.path.clone())
+            .collect()
+    }
+
+    /// Ask before deleting the unused databases (#578); says so when there
+    /// are none.
+    fn confirm_delete_unused_codeql_databases(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let paths = self.unused_codeql_databases();
+        let title = match paths.len() {
+            0 => {
+                self.status = String::from("There are no unused CodeQL databases to delete");
+                return;
+            }
+            1 => String::from("Delete 1 unused CodeQL database?"),
+            n => format!("Delete {n} unused CodeQL databases?"),
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlDeleteUnusedDatabases { paths },
+                title,
+                "Enter to delete · Esc to keep",
+            )
+            .with_value("delete"),
+        );
+    }
+
+    /// Remove the databases at `paths` from the list, delete their cached
+    /// folders, and save. Each is checked again first: one that became
+    /// current or was run on while the prompt was open is kept.
+    fn perform_delete_unused_codeql_databases(&mut self, paths: &[PathBuf]) {
+        let unused = self.unused_codeql_databases();
+        let store_path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
+        let mut deleted = 0;
+        let mut file_error = None;
+        for path in paths.iter().filter(|p| unused.contains(p)) {
+            let Some(i) = store.position(path) else {
+                continue;
+            };
+            let cached = Self::codeql_cached_copy(path);
+            store.remove(i);
+            deleted += 1;
+            if let Some(Err(e)) = cached.map(std::fs::remove_dir_all) {
+                file_error.get_or_insert(e);
+            }
+        }
+        if let Err(e) = store.save(&store_path) {
+            self.status = format!("Could not save the CodeQL database list: {e}");
+            return;
+        }
+        let what = match deleted {
+            0 => String::from("There are no unused CodeQL databases to delete"),
+            1 => String::from("Deleted 1 unused CodeQL database"),
+            n => format!("Deleted {n} unused CodeQL databases"),
+        };
+        self.status = match file_error {
+            Some(e) => format!("{what}, but not all their files: {e}"),
+            None => what,
+        };
+        self.refresh_codeql_databases();
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
     fn codeql_db_store_path() -> PathBuf {
         croft_cache_dir().join("codeql-databases.json")
     }
@@ -22880,6 +23117,12 @@ impl App {
     /// beside the archive the user pointed at.
     fn codeql_db_cache_dir() -> PathBuf {
         croft_cache_dir().join("codeql").join("databases")
+    }
+
+    /// Where a database's `src.zip` is extracted to be browsed, one folder
+    /// per database, beside the database cache.
+    fn codeql_source_cache_dir() -> PathBuf {
+        croft_cache_dir().join("codeql").join("sources")
     }
 
     fn codeql_history_path() -> PathBuf {
@@ -23177,6 +23420,10 @@ impl App {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
+        if self.codeql_upgrade.is_some() {
+            self.status = String::from("Wait for the CodeQL database upgrade to finish");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
             self.status = String::from("Add a CodeQL database and select it first");
@@ -23208,6 +23455,7 @@ impl App {
         history.push(HistoryEntry {
             query: query.clone(),
             database: db.name.clone(),
+            database_path: Some(db.path.clone()),
             started,
             seconds: 0,
             status: RunStatus::Running,
@@ -23223,22 +23471,7 @@ impl App {
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let run = |args: Vec<String>| -> Result<(), String> {
-                let out = std::process::Command::new(&program)
-                    .args(&args)
-                    .output()
-                    .map_err(|e| format!("could not run codeql: {e}"))?;
-                if out.status.success() {
-                    return Ok(());
-                }
-                let err = String::from_utf8_lossy(&out.stderr);
-                Err(err
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("codeql failed")
-                    .to_string())
-            };
+            let run = |args: Vec<String>| Self::codeql_command(&program, &args);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
                 .and_then(|()| match kind {
@@ -23256,6 +23489,25 @@ impl App {
         });
         self.codeql_run = Some((rx, std::time::Instant::now()));
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Run `codeql` with `args` and wait. A failure is the first line it
+    /// printed on stderr, where the CLI puts the reason.
+    fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("codeql failed")
+            .to_string())
     }
 
     /// Collect a finished query run (#578): record how it went in the
@@ -23486,7 +23738,7 @@ impl App {
 
     fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
         let dest = Self::codeql_db_cache_dir().join(name);
-        crate::codeql_db::extract_zip(zip, &dest)?;
+        crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
@@ -27428,6 +27680,10 @@ impl App {
             InputPurpose::CodeqlRemoveDatabase { path } => {
                 self.close_input_prompt();
                 self.perform_remove_codeql_database(&path);
+            }
+            InputPurpose::CodeqlDeleteUnusedDatabases { paths } => {
+                self.close_input_prompt();
+                self.perform_delete_unused_codeql_databases(&paths);
             }
             InputPurpose::CodeqlRenameDatabase { path } => {
                 self.close_input_prompt();
@@ -42652,6 +42908,17 @@ impl App {
                     self.reveal_codeql_database(i);
                 }
             }
+            Cmd::CodeqlUpgradeDatabase => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.upgrade_codeql_database(i);
+                }
+            }
+            Cmd::CodeqlAddDatabaseSource => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.add_codeql_database_source(i);
+                }
+            }
+            Cmd::CodeqlDeleteUnusedDatabases => self.confirm_delete_unused_codeql_databases(),
             Cmd::CodeqlRemoveHistory => {
                 if let Some(i) = self.current_codeql_history() {
                     self.confirm_remove_codeql_history(i);
@@ -59293,6 +59560,14 @@ fn sweep_staged_stdin(dir: &Path) {
 /// when the user next looks at the status bar.
 const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// A CodeQL database upgrade in flight (#578): where its outcome arrives,
+/// and the database's name and folder.
+type CodeqlUpgrade = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    PathBuf,
+);
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -60733,7 +61008,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run();
+        let codeql_changed = app.drain_codeql_run() | app.drain_codeql_upgrade();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
