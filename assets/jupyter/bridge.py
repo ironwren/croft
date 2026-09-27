@@ -152,6 +152,14 @@ for line in sys.stdin:
         elif op == "restart":
             km.restart_kernel(now=False)
             kc.wait_for_ready(timeout=60)
+            # The old kernel never answers what it was running or had
+            # queued, so no idle status will settle those cells: settle
+            # them here, as failed, or they show In [*] for good.
+            with cells_lock:
+                lost = list(cells.values())
+                cells.clear()
+            for cell in lost:
+                emit({"ev": "done", "id": cell[0], "execution_count": cell[1], "status": "error"})
             ready()
         elif op == "shutdown":
             break

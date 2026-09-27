@@ -53585,14 +53585,16 @@ fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
         lines[odd]
     );
     assert_eq!(
-        lines[odd + 1],
-        "    ≠ 6.8.0-31",
-        "the differing line, alone"
+        lines[odd + 1..odd + 3],
+        ["    - 6.8.0-45", "    + 6.8.0-31"],
+        "the reference's line and the host's, alone"
     );
     let a = lines.iter().find(|l| l.starts_with("zz363-a")).unwrap();
     assert!(a.contains("0.1s"), "{a}");
     assert!(
-        !lines.iter().any(|l| l == "    ≠ Linux"),
+        !lines
+            .iter()
+            .any(|l| l.ends_with(" Linux") && l.starts_with("    ")),
         "an equal line is not marked"
     );
 }
@@ -54787,4 +54789,113 @@ fn an_approval_notifies_once_and_its_approve_token_answers_the_hook() {
         serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).unwrap(),
         crate::agent_hook::Decision::Allow
     );
+}
+
+/// Starting the tour while it runs keeps the first one: a second start
+/// would record the first tour's scratch project as the way home, and the
+/// user's own workspace would be lost when it ended.
+#[test]
+fn starting_the_tour_again_while_it_runs_keeps_the_way_home() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        app.run_command(crate::widgets::command_palette::Command::TakeTheTour);
+        assert!(app.status.contains("already running"), "{}", app.status);
+        assert_eq!(app.workspace_root(), scratch);
+        app.finish_tour();
+        assert_eq!(
+            app.workspace_root(),
+            tmp.path(),
+            "back in the user's workspace"
+        );
+        assert!(!scratch.exists());
+    });
+}
+
+/// #371: switching to another file while scrubbing shows that file at the
+/// scrubbed commit, not the previous file's history over it.
+#[test]
+fn switching_files_while_scrubbing_shows_the_new_files_history() {
+    let repo = scrub_repo();
+    std::fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1", "v2", "v3"]
+    );
+    app.editor.open(&repo.path().join("new.txt")).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let view = app.scrub_view.as_ref().expect("still scrubbing");
+    assert!(
+        view.lines[0].contains("new.txt did not exist"),
+        "{:?}",
+        view.lines
+    );
+}
+
+/// #365: the review tab's `gh` calls run off the UI thread, and a pasted
+/// URL from another repository opens that repository's pull request.
+#[test]
+fn a_pr_review_loads_off_the_ui_thread_and_a_url_keeps_its_repository() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{}'
+sleep 0.3
+case "$2" in
+  view) echo '{{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {{"login": "a"}}, "files": [{{"path": "a.rs", "additions": 1, "deletions": 0, "changeType": "ADDED"}}], "statusCheckRollup": []}}' ;;
+  diff) printf 'diff --git a/a.rs b/a.rs\nnew file mode 100644\n--- /dev/null\n+++ b/a.rs\n@@ -0,0 +1 @@\n+fn a() {{}}\n' ;;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+
+        let started = std::time::Instant::now();
+        app.submit_pr_number("https://github.com/x/y/pull/42/files");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "the prompt returns before gh does"
+        );
+        assert!(app.status.contains("Loading PR"), "{}", app.status);
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+            app.poll_pr_gh();
+            app.editor.pr_review.is_some()
+        });
+        assert_eq!(app.editor.pr_review.as_ref().unwrap().pr.number, 42);
+
+        app.handle_pr_review_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("Fetching the diff"), "{}", app.status);
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr diff", || {
+            app.poll_pr_gh();
+            app.editor.diff.is_some()
+        });
+        let args = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            lines[0].starts_with("pr view https://github.com/x/y/pull/42 --json"),
+            "the URL, not a bare 42 this repository would resolve: {args}"
+        );
+        assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
+    });
 }

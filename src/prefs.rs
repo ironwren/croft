@@ -587,7 +587,9 @@ pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String
 /// config dir so a test can point it at a scratch dir.
 pub fn save_tour_done_in(config_dir: &Path) -> Result<()> {
     let path = config_dir.join("config.json");
-    let mut prefs = Prefs::load(&path).unwrap_or_default();
+    // A config.json croft cannot read is left alone, not replaced by
+    // defaults with only this flag set.
+    let mut prefs = Prefs::load_for_update(&path)?;
     prefs.tour_done = true;
     prefs.save(&path)
 }
@@ -881,6 +883,24 @@ pub(crate) fn config_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn finishing_the_tour_leaves_an_unreadable_config_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let broken = "{ \"theme\": \"dark\", oops }";
+        std::fs::write(&path, broken).unwrap();
+        assert!(save_tour_done_in(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        // With no file yet, it is created with the flag set.
+        let fresh = tempfile::tempdir().unwrap();
+        save_tour_done_in(fresh.path()).unwrap();
+        assert!(
+            Prefs::load(&fresh.path().join("config.json"))
+                .unwrap()
+                .tour_done
+        );
+    }
     use super::*;
 
     #[test]
