@@ -19955,6 +19955,8 @@ impl App {
             self.status = String::from(
                 "Looking at history - Esc returns to your working tree before editing",
             );
+            return Ok(());
+        }
         // The tour (#377): with no picker or palette open, Enter moves on and
         // Esc leaves. Below the modal guards, so a picker a step opened keeps
         // its own Enter and Esc.
@@ -55282,6 +55284,7 @@ pub fn run(
     // `croft pr <n>` (#365): open the review once the app is up.
     if let Some(n) = crate::pr_review::take_startup_pr() {
         app.start_pr_review(n);
+    }
     // `croft demo` (#377): start the tour once the app is up.
     if crate::tour::take_startup_demo() {
         app.start_demo();

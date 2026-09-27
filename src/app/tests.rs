@@ -36763,7 +36763,7 @@ fn debug_config_picker_lists_configs_and_selection_drives_f5() {
         tmp.path().join(".vscode/launch.json"),
         r#"{ "configurations": [
             { "name": "API", "type": "python", "request": "launch", "program": "api.py" },
-            { "name": "Gopher", "type": "go", "program": "main.go" }
+            { "name": "Javan", "type": "java", "program": "Main.java" }
         ]}"#,
     )
     .unwrap();
@@ -36778,14 +36778,14 @@ fn debug_config_picker_lists_configs_and_selection_drives_f5() {
     // type must surface a named error, not vanish from the picker silently.
     app.list_picker.as_mut().unwrap().selected = 2;
     app.confirm_list_picker();
-    assert_eq!(app.selected_debug_config.as_deref(), Some("Gopher"));
+    assert_eq!(app.selected_debug_config.as_deref(), Some("Javan"));
     assert!(
         app.run_debug.feedback_is_error,
         "unsupported type is an error: {:?}",
         app.run_debug.feedback
     );
     assert!(
-        app.status.contains("unsupported type \"go\""),
+        app.status.contains("unsupported type \"java\""),
         "{}",
         app.status
     );
@@ -44981,78 +44981,6 @@ fn a_re_root_drops_the_previous_workspaces_review_queue() {
     assert!(!app.tree.is_agent_touched(&inside));
 }
 
-/// #345: the AGENT LANE rows are each agent then its files, unreviewed
-/// first, labelled relative to the workspace root.
-#[test]
-fn agent_lane_rows_list_each_agent_then_its_files_unreviewed_first() {
-    use crate::widgets::agent_lane::LaneRow;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    let a = root.join("src/a.rs");
-    let b = root.join("src/b.rs");
-    std::fs::write(&a, "a").unwrap();
-    std::fs::write(&b, "b").unwrap();
-    let mut app = App::new(root.clone()).unwrap();
-    assert!(
-        app.agent_lane_panel_rows().is_empty(),
-        "nothing to show before any agent wrote"
-    );
-    let working = vec![String::from("claude")];
-    app.agent_ledger.record_write(&a, 1, &working);
-    app.agent_ledger.record_write(&b, 2, &working);
-    app.agent_ledger.mark_reviewed("claude", &a, 1, None);
-    let rows = app.agent_lane_panel_rows();
-    assert_eq!(
-        rows[0],
-        LaneRow::Agent {
-            name: String::from("claude"),
-            unreviewed: 1
-        }
-    );
-    let files: Vec<(String, bool)> = rows[1..]
-        .iter()
-        .map(|r| match r {
-            LaneRow::File {
-                label, unreviewed, ..
-            } => (label.clone(), *unreviewed),
-            other => panic!("expected a file row, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(
-        files,
-        vec![
-            (String::from("src/b.rs"), true),
-            (String::from("src/a.rs"), false)
-        ]
-    );
-}
-
-/// #345: "Agents: Open Agent Lane" shows the section, open, even after it
-/// was hidden from the ⋯ menu; with no agent activity it says so instead.
-#[test]
-fn agents_open_agent_lane_shows_the_section_open() {
-    use crate::widgets::command_palette::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    let f = root.join("x.rs");
-    std::fs::write(&f, "x").unwrap();
-    let mut app = App::new(root).unwrap();
-    app.run_command(Command::OpenAgentLaneSection);
-    assert!(app.status.contains("no agent"), "status: {}", app.status);
-
-    app.agent_ledger
-        .record_write(&f, 1, &[String::from("claude")]);
-    if app.explorer_views.is_visible(ExplorerView::AgentLane) {
-        app.toggle_explorer_view(ExplorerView::AgentLane);
-    }
-    assert!(app.agent_lane_panel.collapsed);
-    app.run_command(Command::OpenAgentLaneSection);
-    assert!(app.explorer_views.is_visible(ExplorerView::AgentLane));
-    assert!(!app.agent_lane_panel.collapsed);
-    assert_eq!(app.sidebar_view, SidebarView::Explorer);
-}
-
 /// #345: the agent lane attributes workspace writes to whichever agents
 /// were WORKING when they landed, keeps a review baseline per file, and
 /// never blames an agent for the user's own saves.
@@ -52636,74 +52564,6 @@ tool = "go"
     );
 }
 
-/// An agent's edit proposal, end to end through the App: the hook's
-/// request opens the popup over everything, keys go to the popup and not
-/// to the editor under it, and the answer reaches the hook's connection.
-#[test]
-fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
-    use std::io::{BufRead, Write};
-    let tmp = tempfile::tempdir().unwrap();
-    let file = tmp.path().join("a.rs");
-    std::fs::write(&file, "let x = 1;\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let sock = tmp.path().join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    app.hook_listener = Some(listener);
-    assert!(!app.drain_hook_requests());
-    assert!(app.approval_ui.is_none());
-
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-    let req = crate::agent_hook::EditRequest {
-        agent: "claude-code".into(),
-        tool: "Edit".into(),
-        input: serde_json::json!({"file_path": file, "old_string": "1", "new_string": "2"}),
-        cwd: tmp.path().into(),
-    };
-    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
-    assert!(app.drain_hook_requests());
-    assert!(app.modal_overlay_open());
-    // A proposal the hook has stopped waiting for leaves with the popup.
-    app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
-    assert!(app.drain_hook_requests());
-    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
-    assert!(app.drain_hook_requests());
-
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let mut screen = String::new();
-    for y in 0..30 {
-        for x in 0..100 {
-            screen.push_str(term.backend().buffer()[(x, y)].symbol());
-        }
-    }
-    assert!(
-        screen.contains("claude-code wants to edit a.rs"),
-        "{screen}"
-    );
-    assert!(screen.contains("+ let x = 2;") && screen.contains("- let x = 1;"));
-
-    // Too soon after it appeared: the Enter is swallowed, not an approval.
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert!(app.approval_ui.is_some());
-    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
-    let mut line = String::new();
-    std::io::BufReader::new(hook).read_line(&mut line).unwrap();
-    assert_eq!(
-        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).unwrap(),
-        crate::agent_hook::Decision::Allow
-    );
-    // Approving answers the agent; croft itself does not write the file.
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "let x = 1;\n");
-}
-
 #[test]
 fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
     // The cache-dir override is process-global; serialize with the
@@ -53102,6 +52962,146 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
+/// An agent's edit proposal, end to end through the App: the hook's
+/// request opens the popup over everything, keys go to the popup and not
+/// to the editor under it, and the answer reaches the hook's connection.
+#[test]
+fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
+    use std::io::{BufRead, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sock = tmp.path().join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    assert!(!app.drain_hook_requests());
+    assert!(app.approval_ui.is_none());
+
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": "1", "new_string": "2"}),
+        cwd: tmp.path().into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    assert!(app.modal_overlay_open());
+    // A proposal the hook has stopped waiting for leaves with the popup.
+    app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
+    assert!(app.drain_hook_requests());
+    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut screen = String::new();
+    for y in 0..30 {
+        for x in 0..100 {
+            screen.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+    }
+    assert!(
+        screen.contains("claude-code wants to edit a.rs"),
+        "{screen}"
+    );
+    assert!(screen.contains("+ let x = 2;") && screen.contains("- let x = 1;"));
+
+    // Too soon after it appeared: the Enter is swallowed, not an approval.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approval_ui.is_some());
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approval_ui.is_none() && app.approvals.is_empty());
+    let mut line = String::new();
+    std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::agent_hook::Decision>(line.trim()).unwrap(),
+        crate::agent_hook::Decision::Allow
+    );
+    // Approving answers the agent; croft itself does not write the file.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "let x = 1;\n");
+}
+
+/// #345: the AGENT LANE rows are each agent then its files, unreviewed
+/// first, labelled relative to the workspace root.
+#[test]
+fn agent_lane_rows_list_each_agent_then_its_files_unreviewed_first() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let a = root.join("src/a.rs");
+    let b = root.join("src/b.rs");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    assert!(
+        app.agent_lane_panel_rows().is_empty(),
+        "nothing to show before any agent wrote"
+    );
+    let working = vec![String::from("claude")];
+    app.agent_ledger.record_write(&a, 1, &working);
+    app.agent_ledger.record_write(&b, 2, &working);
+    app.agent_ledger.mark_reviewed("claude", &a, 1, None);
+    let rows = app.agent_lane_panel_rows();
+    assert_eq!(
+        rows[0],
+        LaneRow::Agent {
+            name: String::from("claude"),
+            unreviewed: 1
+        }
+    );
+    let files: Vec<(String, bool)> = rows[1..]
+        .iter()
+        .map(|r| match r {
+            LaneRow::File {
+                label, unreviewed, ..
+            } => (label.clone(), *unreviewed),
+            other => panic!("expected a file row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            (String::from("src/b.rs"), true),
+            (String::from("src/a.rs"), false)
+        ]
+    );
+}
+
+/// #345: "Agents: Open Agent Lane" shows the section, open, even after it
+/// was hidden from the ⋯ menu; with no agent activity it says so instead.
+#[test]
+fn agents_open_agent_lane_shows_the_section_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let f = root.join("x.rs");
+    std::fs::write(&f, "x").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.run_command(Command::OpenAgentLaneSection);
+    assert!(app.status.contains("no agent"), "status: {}", app.status);
+
+    app.agent_ledger
+        .record_write(&f, 1, &[String::from("claude")]);
+    if app.explorer_views.is_visible(ExplorerView::AgentLane) {
+        app.toggle_explorer_view(ExplorerView::AgentLane);
+    }
+    assert!(app.agent_lane_panel.collapsed);
+    app.run_command(Command::OpenAgentLaneSection);
+    assert!(app.explorer_views.is_visible(ExplorerView::AgentLane));
+    assert!(!app.agent_lane_panel.collapsed);
+    assert_eq!(app.sidebar_view, SidebarView::Explorer);
+}
+
 #[test]
 fn provisioning_outcomes_are_logged_to_the_remote_output_channel() {
     // The cache-dir override is process-global; serialize with the
@@ -53109,29 +53109,6 @@ fn provisioning_outcomes_are_logged_to_the_remote_output_channel() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // #364: a host that gets croft through provisioning says so in OUTPUT >
     // Remote, success and failure alike, with the reason on failure.
-}
-
-fn pr_screen(app: &mut App) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let mut s = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            s.push_str(buf[(x, y)].symbol());
-        }
-        s.push('\n');
-    }
-    s
-}
-
-#[test]
-fn a_pr_review_tab_lists_files_checks_and_a_summary() {
-    // The cache-dir override is process-global; serialize with the
-    // other tests that redirect it.
-    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    // #365: the PULL REQUEST tab shows every changed file with +n -m, the
-    // checks, and a summary line.
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
@@ -53154,55 +53131,6 @@ fn a_pr_review_tab_lists_files_checks_and_a_summary() {
             lines.iter().any(|l| l.text.contains("zz364-b.example")
                 && l.level != crate::output::OutputLevel::Error),
             "the success is logged"
-}
-
-        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
-        assert!(app.editor.pr_review.is_some(), "the PR tab is active");
-        let screen = pr_screen(&mut app);
-        for want in [
-            "PR #579",
-            "feat(sarif): model",
-            "src/sarif/view.rs",
-            "+1048",
-            "0 of 2 viewed",
-            "docs",
-        ] {
-            assert!(screen.contains(want), "{want:?} on screen:\n{screen}");
-        }
-    });
-}
-
-#[test]
-fn space_marks_a_file_viewed_and_it_persists() {
-    // The cache-dir override is process-global; serialize with the
-    // other tests that redirect it.
-}
-
-fn the_demo_tour_runs_in_a_scratch_project_and_esc_cleans_up() {
-    // #377: the tour never runs in the user's workspace, and Esc leaves a
-    // normal croft with no scratch files behind.
-    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
-    with_relay_home(home.path(), || {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
-        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
-        let view = app.editor.pr_review.as_ref().unwrap();
-        assert!(view.viewed.contains("src/sarif/view.rs"));
-        assert!(pr_screen(&mut app).contains("1 of 2 viewed"));
-        // A new session sees the mark.
-        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
-        again.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
-        assert!(
-            again
-                .editor
-                .pr_review
-                .as_ref()
-                .unwrap()
-                .viewed
-                .contains("src/sarif/view.rs"),
-            "viewed marks persist"
         );
     });
 }
@@ -53334,8 +53262,8 @@ fn a_file_that_did_not_exist_yet_says_so() {
         .expect("a view even for a missing file");
     assert!(view.lines[0].contains("did not exist"), "{:?}", view.lines);
 }
-}
 
+#[test]
 fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
     // #363: a DIFFERS row says what differs, line by line, not just that
     // something did; every row says how long the host took.
@@ -53400,6 +53328,347 @@ fn click_first_cell_glyph(
         md.last_area.x,
         md.last_area.y + (md.run_rows[0] - md.scroll as usize) as u16,
     );
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+/// A notebook cell's run glyph, end to end through the App with the test
+/// standing in for the kernel: the click sends the cell's code, the cell
+/// shows `In [*]` while it runs, and the kernel's output and count land in
+/// the buffer as an edit.
+#[test]
+fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("t.ipynb");
+    // A previous run's output, which this run must replace.
+    let stale = NOTEBOOK_355.replace(
+        "\"outputs\": [],",
+        "\"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\", \"text\": [\"stale\\n\"]}],",
+    );
+    assert_ne!(stale, NOTEBOOK_355);
+    std::fs::write(&path, stale).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (run, kernel, requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+
+    let sent: Vec<_> = requests.try_iter().collect();
+    let id = match sent.as_slice() {
+        [crate::notebook_kernel::Request::Execute { id, code }] => {
+            assert_eq!(code, "print(1+1)");
+            id.clone()
+        }
+        other => panic!("expected one execute, got {other:?}"),
+    };
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    assert!(
+        !app.editor.lines.join("\n").contains("stale"),
+        "the run clears the old output"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().unwrap();
+    let frame = &md.lines[md.runnables[0].first_line];
+    assert_eq!(frame.spans[1].content.as_ref(), "In [*]:");
+
+    kernel
+        .send(crate::notebook_kernel::Event::Output {
+            id: id.clone(),
+            output: serde_json::json!({"output_type": "stream", "name": "stdout", "text": "2\n"}),
+        })
+        .unwrap();
+    kernel
+        .send(crate::notebook_kernel::Event::Done {
+            id,
+            execution_count: Some(1),
+            status: "ok".into(),
+        })
+        .unwrap();
+    assert!(app.poll_notebook_kernels());
+    let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
+    assert_eq!(doc["cells"][0]["execution_count"], 1);
+    assert_eq!(doc["cells"][0]["outputs"][0]["text"][0], "2\n");
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(app.editor.dirty, "outputs are an edit; Save writes them");
+}
+
+/// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
+/// after Save the file holds the output in the standard format. Set
+/// `CROFT_TEST_JUPYTER_PYTHON` to a venv python with ipykernel.
+#[test]
+#[ignore = "needs a Python with ipykernel; set CROFT_TEST_JUPYTER_PYTHON"]
+fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_JUPYTER_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let venv = python.parent().and_then(Path::parent).unwrap();
+    std::os::unix::fs::symlink(venv, tmp.path().join(".venv")).unwrap();
+    let path = tmp.path().join("t.ipynb");
+    std::fs::write(&path, NOTEBOOK_355).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app
+        .editor
+        .lines
+        .join("\n")
+        .contains("\"execution_count\": 1")
+    {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        app.poll_notebook_kernels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    app.save();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["cells"][0]["outputs"][0]["output_type"], "stream");
+    assert_eq!(saved["cells"][0]["outputs"][0]["text"][0], "2\n");
+}
+
+fn pr_screen(app: &mut App) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+#[test]
+fn a_pr_review_tab_lists_files_checks_and_a_summary() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #365: the PULL REQUEST tab shows every changed file with +n -m, the
+    // checks, and a summary line.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        assert!(app.editor.pr_review.is_some(), "the PR tab is active");
+        let screen = pr_screen(&mut app);
+        for want in [
+            "PR #579",
+            "feat(sarif): model",
+            "src/sarif/view.rs",
+            "+1048",
+            "0 of 2 viewed",
+            "docs",
+        ] {
+            assert!(screen.contains(want), "{want:?} on screen:\n{screen}");
+        }
+    });
+}
+
+#[test]
+fn space_marks_a_file_viewed_and_it_persists() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert!(view.viewed.contains("src/sarif/view.rs"));
+        assert!(pr_screen(&mut app).contains("1 of 2 viewed"));
+        // A new session sees the mark.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        assert!(
+            again
+                .editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("src/sarif/view.rs"),
+            "viewed marks persist"
+        );
+    });
+}
+
+#[test]
+fn enter_opens_the_files_diff_and_esc_leaves_review() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
+        let patch = "diff --git a/src/sarif/view.rs b/src/sarif/view.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/sarif/view.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+fn b() {}\n";
+        app.editor.pr_review.as_mut().unwrap().diff =
+            Some(crate::pr_review::split_diff_by_file(patch));
+        let pr_tab = app.editor.active_index();
+        app.handle_pr_review_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.editor.diff.is_some(),
+            "a diff tab opened: {}",
+            app.status
+        );
+        assert_ne!(app.editor.active_index(), pr_tab, "in its own tab");
+        app.editor.select(pr_tab);
+        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            (0..app.editor.tab_count()).all(|i| {
+                app.editor.select(i);
+                app.editor.pr_review.is_none()
+            }),
+            "Esc leaves review: the PR tab is closed"
+        );
+    });
+}
+
+#[test]
+fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("review_pull_request"),
+        Some(Command::ReviewPullRequest)
+    );
+    assert_eq!(
+        Command::ReviewPullRequest.title(),
+        "Source Control: Review Pull Request"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.submit_pr_number("not a number");
+    assert!(
+        app.status.contains("not a pull request number"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn the_demo_tour_runs_in_a_scratch_project_and_esc_cleans_up() {
+    // #377: the tour never runs in the user's workspace, and Esc leaves a
+    // normal croft with no scratch files behind.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        assert_ne!(scratch, tmp.path(), "not the user's workspace");
+        assert!(scratch.join(crate::tour::SCRATCH_MARKER).is_file());
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(scratch.join("src/main.rs").as_path())
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 36)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            screen.contains("1/9"),
+            "the caption chip shows progress:\n{screen}"
+        );
+        // Enter advances the tour instead of typing into the file.
+        let lines = app.editor.lines.clone();
+        app.focus_pane(Pane::Editor);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tour.as_ref().unwrap().tour.index, 1);
+        assert_eq!(app.editor.lines, lines, "no newline typed into the sample");
+        app.close_all_modals_for_test();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tour.is_none(), "Esc leaves the tour");
+        assert_eq!(
+            app.workspace_root(),
+            tmp.path(),
+            "back in the original workspace"
+        );
+        assert!(!scratch.exists(), "the sample project is gone");
+    });
+}
+
+#[test]
+fn walking_the_whole_tour_ends_it_and_cleans_up() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        let mut steps = 0;
+        while app.tour.is_some() && steps < 40 {
+            app.close_all_modals_for_test();
+            app.advance_tour();
+            steps += 1;
+        }
+        assert!(app.tour.is_none(), "the tour ends");
+        assert_eq!(steps, 9, "one advance per step");
+        assert_eq!(app.workspace_root(), tmp.path());
+        assert!(!scratch.exists());
+    });
+}
+
+#[test]
+fn the_welcome_tour_button_starts_the_tour_and_goes_away_once_done() {
+    // #377: shown until the first completed or skipped tour, persisted.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.config_dir = tmp.path().join("config");
+        app.tour_done = false;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let button = app.welcome_tour_button;
+        assert!(button.width > 0, "the welcome panel offers the tour");
+        left_click(&mut app, button.x + 1, button.y);
+        assert!(app.tour.is_some(), "clicking starts it: {}", app.status);
+        app.close_all_modals_for_test();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.tour_done, "a skipped tour counts as done");
+        let saved = crate::prefs::Prefs::load(&tmp.path().join("config").join("config.json"))
+            .unwrap_or_default();
+        assert!(saved.tour_done, "persisted in prefs");
+        // Back on the welcome screen, the button is gone.
+        while app.editor.tab_count() > 1 {
+            app.editor.close_active();
+        }
+        app.editor.close_active();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.welcome_tour_button.width, 0, "not offered again");
+    });
+}
+
+#[test]
+fn take_the_tour_is_a_palette_command() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("help_take_the_tour"),
+        Some(Command::TakeTheTour)
+    );
+    assert_eq!(Command::TakeTheTour.title(), "Help: Take the Tour");
 }
 
 /// Coverage (#263) through the App, from a report arriving the way the
@@ -53572,214 +53841,6 @@ fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
         row: y,
         modifiers: KeyModifiers::NONE,
     });
-}
-
-/// A notebook cell's run glyph, end to end through the App with the test
-/// standing in for the kernel: the click sends the cell's code, the cell
-/// shows `In [*]` while it runs, and the kernel's output and count land in
-/// the buffer as an edit.
-#[test]
-fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("t.ipynb");
-    // A previous run's output, which this run must replace.
-    let stale = NOTEBOOK_355.replace(
-        "\"outputs\": [],",
-        "\"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\", \"text\": [\"stale\\n\"]}],",
-    );
-    assert_ne!(stale, NOTEBOOK_355);
-    std::fs::write(&path, stale).unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&path).unwrap();
-    let (run, kernel, requests) = crate::notebook_kernel::NotebookRun::for_test();
-    app.notebook_kernels.insert(path.clone(), run);
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    click_first_cell_glyph(&mut app, &mut term);
-
-    let sent: Vec<_> = requests.try_iter().collect();
-    let id = match sent.as_slice() {
-        [crate::notebook_kernel::Request::Execute { id, code }] => {
-            assert_eq!(code, "print(1+1)");
-            id.clone()
-        }
-        other => panic!("expected one execute, got {other:?}"),
-    };
-    assert_eq!(app.editor.notebook_running, vec![0]);
-    assert!(
-        !app.editor.lines.join("\n").contains("stale"),
-        "the run clears the old output"
-    );
-    term.draw(|f| app.render(f)).unwrap();
-    let md = app.editor.markdown_preview.as_ref().unwrap();
-    let frame = &md.lines[md.runnables[0].first_line];
-    assert_eq!(frame.spans[1].content.as_ref(), "In [*]:");
-
-    kernel
-        .send(crate::notebook_kernel::Event::Output {
-            id: id.clone(),
-            output: serde_json::json!({"output_type": "stream", "name": "stdout", "text": "2\n"}),
-        })
-        .unwrap();
-    kernel
-        .send(crate::notebook_kernel::Event::Done {
-            id,
-            execution_count: Some(1),
-            status: "ok".into(),
-        })
-        .unwrap();
-    assert!(app.poll_notebook_kernels());
-    let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
-    assert_eq!(doc["cells"][0]["execution_count"], 1);
-    assert_eq!(doc["cells"][0]["outputs"][0]["text"][0], "2\n");
-    assert!(app.editor.notebook_running.is_empty());
-    assert!(app.editor.dirty, "outputs are an edit; Save writes them");
-}
-
-/// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
-/// after Save the file holds the output in the standard format. Set
-/// `CROFT_TEST_JUPYTER_PYTHON` to a venv python with ipykernel.
-#[test]
-#[ignore = "needs a Python with ipykernel; set CROFT_TEST_JUPYTER_PYTHON"]
-fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
-    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_JUPYTER_PYTHON").unwrap());
-    let tmp = tempfile::tempdir().unwrap();
-    let venv = python.parent().and_then(Path::parent).unwrap();
-    std::os::unix::fs::symlink(venv, tmp.path().join(".venv")).unwrap();
-    let path = tmp.path().join("t.ipynb");
-    std::fs::write(&path, NOTEBOOK_355).unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&path).unwrap();
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    click_first_cell_glyph(&mut app, &mut term);
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !app
-        .editor
-        .lines
-        .join("\n")
-        .contains("\"execution_count\": 1")
-    {
-        assert!(std::time::Instant::now() < end, "status: {}", app.status);
-        app.poll_notebook_kernels();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    app.save();
-    let saved: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(saved["cells"][0]["outputs"][0]["output_type"], "stream");
-    assert_eq!(saved["cells"][0]["outputs"][0]["text"][0], "2\n");
-}
-}
-
-#[test]
-fn enter_opens_the_files_diff_and_esc_leaves_review() {
-    // The cache-dir override is process-global; serialize with the
-    // other tests that redirect it.
-}
-
-        app.start_demo();
-        let scratch = app.workspace_root().to_path_buf();
-        assert_ne!(scratch, tmp.path(), "not the user's workspace");
-        assert!(scratch.join(crate::tour::SCRATCH_MARKER).is_file());
-        assert_eq!(
-            app.editor.path.as_deref(),
-            Some(scratch.join("src/main.rs").as_path())
-        );
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 36)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let buf = term.backend().buffer();
-        let mut screen = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                screen.push_str(buf[(x, y)].symbol());
-            }
-        }
-        assert!(
-            screen.contains("1/9"),
-            "the caption chip shows progress:\n{screen}"
-        );
-        // Enter advances the tour instead of typing into the file.
-        let lines = app.editor.lines.clone();
-        app.focus_pane(Pane::Editor);
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(app.tour.as_ref().unwrap().tour.index, 1);
-        assert_eq!(app.editor.lines, lines, "no newline typed into the sample");
-        app.close_all_modals_for_test();
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        assert!(app.tour.is_none(), "Esc leaves the tour");
-        assert_eq!(
-            app.workspace_root(),
-            tmp.path(),
-            "back in the original workspace"
-        );
-        assert!(!scratch.exists(), "the sample project is gone");
-    });
-}
-
-#[test]
-fn walking_the_whole_tour_ends_it_and_cleans_up() {
-    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
-    with_relay_home(home.path(), || {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
-        let patch = "diff --git a/src/sarif/view.rs b/src/sarif/view.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/sarif/view.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+fn b() {}\n";
-        app.editor.pr_review.as_mut().unwrap().diff =
-            Some(crate::pr_review::split_diff_by_file(patch));
-        let pr_tab = app.editor.active_index();
-        app.handle_pr_review_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(
-            app.editor.diff.is_some(),
-            "a diff tab opened: {}",
-            app.status
-        );
-        assert_ne!(app.editor.active_index(), pr_tab, "in its own tab");
-        app.editor.select(pr_tab);
-        app.handle_pr_review_key(key(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            (0..app.editor.tab_count()).all(|i| {
-                app.editor.select(i);
-                app.editor.pr_review.is_none()
-            }),
-            "Esc leaves review: the PR tab is closed"
-        );
-}
-
-        app.start_demo();
-        let scratch = app.workspace_root().to_path_buf();
-        let mut steps = 0;
-        while app.tour.is_some() && steps < 40 {
-            app.close_all_modals_for_test();
-            app.advance_tour();
-            steps += 1;
-        }
-        assert!(app.tour.is_none(), "the tour ends");
-        assert_eq!(steps, 9, "one advance per step");
-        assert_eq!(app.workspace_root(), tmp.path());
-        assert!(!scratch.exists());
-    });
-}
-
-#[test]
-fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
-    use crate::widgets::command_palette::Command;
-    assert_eq!(
-        Command::from_id("review_pull_request"),
-        Some(Command::ReviewPullRequest)
-    );
-    assert_eq!(
-        Command::ReviewPullRequest.title(),
-        "Source Control: Review Pull Request"
-    );
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.submit_pr_number("not a number");
-    assert!(
-        app.status.contains("not a pull request number"),
-}
-
     assert!(
         app.testing
             .watch
@@ -53815,47 +53876,3 @@ fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
         app.status
     );
 }
-
-fn the_welcome_tour_button_starts_the_tour_and_goes_away_once_done() {
-    // #377: shown until the first completed or skipped tour, persisted.
-    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
-    with_relay_home(home.path(), || {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.config_dir = tmp.path().join("config");
-        app.tour_done = false;
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let button = app.welcome_tour_button;
-        assert!(button.width > 0, "the welcome panel offers the tour");
-        left_click(&mut app, button.x + 1, button.y);
-        assert!(app.tour.is_some(), "clicking starts it: {}", app.status);
-        app.close_all_modals_for_test();
-        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-            .unwrap();
-        assert!(app.tour_done, "a skipped tour counts as done");
-        let saved = crate::prefs::Prefs::load(&tmp.path().join("config").join("config.json"))
-            .unwrap_or_default();
-        assert!(saved.tour_done, "persisted in prefs");
-        // Back on the welcome screen, the button is gone.
-        while app.editor.tab_count() > 1 {
-            app.editor.close_active();
-        }
-        app.editor.close_active();
-        term.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.welcome_tour_button.width, 0, "not offered again");
-    });
-}
-
-#[test]
-fn take_the_tour_is_a_palette_command() {
-    use crate::widgets::command_palette::Command;
-    assert_eq!(
-        Command::from_id("help_take_the_tour"),
-        Some(Command::TakeTheTour)
-    );
-    assert_eq!(Command::TakeTheTour.title(), "Help: Take the Tour");
-}
-}
-
