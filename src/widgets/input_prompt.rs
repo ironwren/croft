@@ -55,6 +55,12 @@ pub enum InputPurpose {
     CodeqlRemoveDatabase {
         path: PathBuf,
     },
+    /// Confirm deleting the unused CodeQL databases at `paths` (#578), all
+    /// copies in croft's cache. Submitting (Enter) deletes them; Esc keeps
+    /// them. The value is a sentinel.
+    CodeqlDeleteUnusedDatabases {
+        paths: Vec<PathBuf>,
+    },
     /// A new display name for the CodeQL database at `path` (#578).
     CodeqlRenameDatabase {
         path: PathBuf,
@@ -74,6 +80,27 @@ pub enum InputPurpose {
     CodeqlCreateQuery {
         dir: PathBuf,
         language: Option<String>,
+    },
+    /// The controller repository variant analysis runs from (#578):
+    /// `owner/repo` or its GitHub URL.
+    CodeqlControllerRepository,
+    /// A repository to add for variant analysis (#578), into the list
+    /// called `list` when there is one.
+    CodeqlAddVariantRepo {
+        list: Option<String>,
+    },
+    /// The name of a new variant analysis repository list (#578).
+    CodeqlAddVariantList,
+    /// A GitHub user or organisation to add for variant analysis (#578).
+    CodeqlAddVariantOwner,
+    /// A new name for the variant analysis list called `name` (#578).
+    CodeqlRenameVariantList {
+        name: String,
+    },
+    /// Confirm removing the variant analysis list called `name` (#578).
+    /// Submitting (Enter) removes it; Esc keeps it. The value is a sentinel.
+    CodeqlRemoveVariantList {
+        name: String,
     },
     /// Where a SARIF result's file lives on this machine (#577): the value
     /// is a path; `uri` is the location the log named.
@@ -160,6 +187,11 @@ pub enum InputPurpose {
         range: (usize, usize),
         selection: String,
     },
+    /// One field of **Debug: Add Configuration…** (#250); the draft it
+    /// fills is the App's.
+    DebugConfigField {
+        field: crate::dap::configs::DraftField,
+    },
 }
 
 pub struct InputPrompt {
@@ -169,6 +201,9 @@ pub struct InputPrompt {
     pub value: String,
     pub cursor: usize,
     pub last_rect: Rect,
+    /// Whether Enter on an empty field submits (an optional field left
+    /// blank) rather than waiting for a value.
+    pub allow_blank: bool,
 }
 
 impl InputPrompt {
@@ -184,7 +219,14 @@ impl InputPrompt {
             value: String::new(),
             cursor: 0,
             last_rect: Rect::default(),
+            allow_blank: false,
         }
+    }
+
+    /// Let Enter submit an empty field, for a value that is optional.
+    pub fn allowing_blank(mut self) -> Self {
+        self.allow_blank = true;
+        self
     }
 
     /// Seed the field with an initial value (e.g. the current branch name
@@ -253,7 +295,7 @@ impl InputPrompt {
     /// field is a no-op the caller treats as "keep waiting").
     pub fn submit_value(&self) -> Option<String> {
         let v = self.value.trim();
-        (!v.is_empty()).then(|| v.to_string())
+        (self.allow_blank || !v.is_empty()).then(|| v.to_string())
     }
 }
 

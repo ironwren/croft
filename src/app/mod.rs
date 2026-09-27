@@ -184,6 +184,15 @@ pub enum ActivityIcon {
 /// the first version so it cannot be slow on a large repo.
 const SCRUB_COMMIT_LIMIT: usize = 500;
 
+/// Finished history-scrubber views kept for stepping back to (#371): a
+/// few either side of the cursor. Each holds a whole file with its
+/// highlighting, so this stays small.
+const SCRUB_VIEWS_KEPT: usize = 8;
+
+/// Outlines of built history views kept while scrubbing (#371); cleared
+/// wholesale past this, and rebuilt with each view the builder lands.
+const SCRUB_OUTLINES_KEPT: usize = 256;
+
 /// How long one host gets in a fleet run (#363).
 ///
 /// A ceiling on the CONNECT and a wall-clock bound on the whole thing: the
@@ -3116,6 +3125,8 @@ pub struct App {
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
+    /// The database upgrade in flight (#578).
+    codeql_upgrade: Option<CodeqlUpgrade>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -3341,6 +3352,10 @@ pub struct App {
     hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
+    /// A proposal being edited before approval (#347): its token, and the
+    /// scratch file whose save approves the edited text. The popup stays
+    /// down while it lasts.
+    approval_edit: Option<(String, PathBuf)>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
@@ -3912,6 +3927,10 @@ pub struct App {
     /// rebuilds the view for the new file rather than showing the old one's
     /// history over it.
     scrub_for: Option<PathBuf>,
+    /// The file and commit the OUTLINE currently shows while scrubbing
+    /// (#371), so it is recomputed once per step, and so leaving the
+    /// scrubber knows to bring the live file's outline back.
+    outline_scrub_key: Option<(PathBuf, String)>,
     /// `a` in the approval popup (#347): the agent whose edits are
     /// approved without asking, until when.
     auto_approve: Option<(String, std::time::Instant)>,
@@ -3921,10 +3940,27 @@ pub struct App {
     scrub_dragging: bool,
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
-    scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
+    scrub_cache: std::collections::HashMap<(String, String), Option<std::sync::Arc<str>>>,
     /// Each scrubbed commit's tree under the workspace root, for the
     /// Explorer's dimming (#371); `None` records that the listing failed.
     scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Builds highlighted historical views off the UI thread (#371),
+    /// started on the first step.
+    scrub_builder: Option<crate::scrubber::ViewBuilder>,
+    /// Finished views near the scrubber's cursor, most recently used last,
+    /// at most `SCRUB_VIEWS_KEPT`.
+    scrub_views: crate::scrubber::KeptViews,
+    /// Plain stand-ins near the cursor, ready for the next step, likewise.
+    scrub_plain: crate::scrubber::KeptViews,
+    /// Each built view's outline, parsed with it off the UI thread, for the
+    /// OUTLINE to show while scrubbing. Dropped with the kept views.
+    scrub_outlines: std::collections::HashMap<
+        crate::scrubber::ViewKey,
+        Vec<crate::lsp::manager::OutlineSymbol>,
+    >,
+    /// What `scrub_view` shows, and whether it is the finished view rather
+    /// than the plain stand-in awaiting one.
+    scrub_view_key: Option<(crate::scrubber::ViewKey, bool)>,
     /// The running `croft demo` tour (#377), with its scratch project and
     /// the workspace to return to.
     pub tour: Option<TourRun>,
@@ -4216,6 +4252,9 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// The configuration **Debug: Add Configuration…** is building (#250),
+    /// between its steps.
+    debug_config_draft: Option<crate::dap::configs::ConfigDraft>,
     /// Compounds declared beside those configurations. Listed in the picker so
     /// a workspace's compounds are visible; launching one needs the
     /// multi-session model tracked in #310.
@@ -5318,6 +5357,7 @@ impl App {
             codeql_run: None,
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
+            codeql_upgrade: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -5383,6 +5423,7 @@ impl App {
             hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
+            approval_edit: None,
             notebook_kernels: std::collections::HashMap::new(),
             coverage_at: None,
             coverage_lens_path: None,
@@ -5600,6 +5641,7 @@ impl App {
             process_picker: None,
             debug_sessions: Default::default(),
             debug_configs: Vec::new(),
+            debug_config_draft: None,
             debug_compounds: Vec::new(),
             selected_debug_config: None,
             selected_debug_compound: None,
@@ -5715,11 +5757,17 @@ impl App {
             scrubber: None,
             scrub_view: None,
             scrub_for: None,
+            outline_scrub_key: None,
             auto_approve: None,
             scrub_slider: Rect::default(),
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             scrub_trees: std::collections::HashMap::new(),
+            scrub_builder: None,
+            scrub_views: std::collections::VecDeque::new(),
+            scrub_plain: std::collections::VecDeque::new(),
+            scrub_outlines: std::collections::HashMap::new(),
+            scrub_view_key: None,
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
@@ -10060,7 +10108,12 @@ impl App {
         // Symbol scope chain, only when the outline belongs to this file so a
         // stale outline from the previous tab never leaks into the bar.
         if self.outline.path() == Some(path) {
-            let line = self.editor.cursor_row as u32;
+            // While scrubbing (#371) the outline is the commit's, so the
+            // chain follows the historical view's caret.
+            let line = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let symbols = self.outline.symbols();
             for i in breadcrumb_symbol_chain(symbols, line) {
                 let s = &symbols[i];
@@ -10110,6 +10163,52 @@ impl App {
             self.outline_synced = None;
             return false;
         };
+        // A tab switch while scrubbing is noticed by render, which runs
+        // after this: rebuild here first, or the new file's key would be
+        // paired with the previous file's historical text.
+        if self.scrubber.is_some() && self.scrub_for.as_ref() != Some(&path) {
+            self.rebuild_scrub_view();
+        }
+        // Scrubbing (#371): the outline is the file as it was at the commit
+        // on screen, from its own syntax tree; no language server knows that
+        // text. Parsing a big file takes far longer than a frame, so the
+        // scrubber's builder parses it off the UI thread with the finished
+        // view, and until that lands the previous outline stays. Leaving
+        // drops the key, so the live outline is recomputed.
+        let commit = self
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if let (Some(row), Some(commit)) = (self.scrub_view.as_ref().map(|v| v.cursor_row), commit)
+        {
+            let key = (path.clone(), commit.clone());
+            if self.outline_scrub_key.as_ref() != Some(&key) {
+                let rel = path
+                    .strip_prefix(self.workspace_root())
+                    .map(|p| p.to_string_lossy().into_owned());
+                let symbols = rel.ok().and_then(|rel| {
+                    self.scrub_outlines
+                        .get(&crate::scrubber::ViewKey { hash: commit, rel })
+                        .cloned()
+                });
+                if let Some(symbols) = symbols {
+                    self.outline.set_syntax_symbols(path, symbols, false);
+                    self.outline_scrub_key = Some(key);
+                    self.outline_synced = None;
+                } else if self.outline.path.as_ref() != Some(&path) {
+                    // Another file's outline must never stand in for this
+                    // one's: empty until its own lands.
+                    self.outline.set_syntax_symbols(path, Vec::new(), false);
+                    self.outline_scrub_key = None;
+                    self.outline_synced = None;
+                }
+            }
+            return self.outline.follow_caret(row as u32);
+        }
+        if self.outline_scrub_key.take().is_some() {
+            self.outline_synced = None;
+        }
         // `lsp_last_seen` carries the edit seq the manager last saw for an open
         // doc; absent means no language server tracks this file.
         let seq = self.lsp_last_seen.get(&path).copied();
@@ -10489,12 +10588,7 @@ impl App {
         &self,
         path: &std::path::Path,
     ) -> Vec<crate::lsp::manager::OutlineSymbol> {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let Some(kind) = crate::highlight::lang_for_extension(ext) else {
-            return Vec::new();
-        };
-        let text = self.editor.lines.join("\n");
-        crate::outline_syntax::symbols_for(kind, text.as_bytes())
+        syntax_outline_for(path, &self.editor.lines)
     }
 
     /// Drain pending `documentSymbol` replies and offer every one to
@@ -15953,9 +16047,10 @@ impl App {
         if self.approvals.front().map(|p| p.arrived) != head {
             self.approval_ui = None;
         }
+        changed |= self.check_approval_edit();
         if self.approvals.is_empty() {
             self.approval_ui = None;
-        } else if self.approval_ui.is_none() {
+        } else if self.approval_ui.is_none() && self.approval_edit.is_none() {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
             changed = true;
         }
@@ -16039,6 +16134,9 @@ impl App {
             return;
         };
         let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
+            if std::mem::take(&mut ui.edit_requested) {
+                self.start_approval_edit();
+            }
             return;
         };
         let approve_all = ui.approve_all;
@@ -16061,6 +16159,134 @@ impl App {
         }
         self.approval_ui = (!self.approvals.is_empty())
             .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
+    }
+
+    /// `e` in the approval popup (#347): open the head proposal's text as a
+    /// scratch file named like the real one (so it gets its language's
+    /// highlighting and server), with the popup put away. Saving it
+    /// approves the saved text; closing it unsaved brings the popup back.
+    fn start_approval_edit(&mut self) {
+        let Some(head) = self.approvals.front() else {
+            return;
+        };
+        // Refused up front rather than after the user has done the editing.
+        if let Err(why) = crate::agent_approval::edited_input(
+            &head.request.tool,
+            &head.request.input,
+            head.proposal.before.as_deref(),
+            &head.proposal.after,
+        ) {
+            self.status = why;
+            return;
+        }
+        let name = head
+            .proposal
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("proposal.txt"));
+        let dir = croft_cache_dir().join("approval-edits").join(&head.token);
+        let file = dir.join(name);
+        let token = head.token.clone();
+        let agent = head.request.agent.clone();
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&file, &head.proposal.after));
+        if let Err(e) = written {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        // A tab of its own: `open` on the strip's deref would load the
+        // scratch file INTO the current tab, over whatever it held.
+        if let Err(e) = self.editor.open_pinned(&file) {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        self.approval_ui = None;
+        self.approval_edit = Some((token, file));
+        self.focus_pane(Pane::Editor);
+        self.status = format!(
+            "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+        );
+    }
+
+    /// Keep an in-progress proposal edit honest (#347): the proposal gone
+    /// (answered elsewhere, or the agent stopped waiting) ends it with a
+    /// note; its tab closed unsaved ends it quietly, and the popup returns.
+    fn check_approval_edit(&mut self) -> bool {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return false;
+        };
+        if !self.approvals.iter().any(|p| p.token == token) {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return true;
+        }
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let open = groups
+            .flat_map(|g| g.editors.iter())
+            .any(|e| e.path.as_deref() == Some(file.as_path()));
+        if !open {
+            self.approval_edit = None;
+            let _ = std::fs::remove_file(&file);
+            return true;
+        }
+        false
+    }
+
+    /// A save of the proposal being edited approves it with the saved text
+    /// as the tool's new input (#347), and closes the scratch tab.
+    fn approve_saved_edit(&mut self, saved: &std::path::Path) {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return;
+        };
+        if saved != file {
+            return;
+        }
+        let Some(idx) = self.approvals.iter().position(|p| p.token == token) else {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return;
+        };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Could not read the edited proposal: {e}");
+                return;
+            }
+        };
+        let pending = &self.approvals[idx];
+        let input = match crate::agent_approval::edited_input(
+            &pending.request.tool,
+            &pending.request.input,
+            pending.proposal.before.as_deref(),
+            &text,
+        ) {
+            Ok(input) => input,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let Some(pending) = self.approvals.remove(idx) else {
+            return;
+        };
+        let agent = pending.request.agent.clone();
+        pending.answer(&crate::agent_hook::Decision::AllowEdited { input });
+        self.approval_edit = None;
+        if self.editor.path.as_deref() == Some(file.as_path()) {
+            self.editor.close_active();
+        }
+        let _ = std::fs::remove_file(&file);
+        self.status = format!("Approved {agent}'s edit as you changed it");
+        if !self.approvals.is_empty() {
+            self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(
+                std::time::Instant::now(),
+            ));
+        }
     }
 
     fn render_approval_popup(&self, frame: &mut ratatui::Frame) {
@@ -17576,7 +17802,8 @@ impl App {
                 editor_area
             };
             // The history scrubber's view stands in for the live editor's
-            // text (#371); the tab strip and breadcrumbs stay the live ones.
+            // text (#371); the tab strip stays the live one, while the breadcrumbs
+            // and Outline follow the commit (see `sync_outline`).
             if paint_history
                 && let Some(view) = self.scrub_view.as_mut()
                 && self.editor.last_body.width > 0
@@ -22453,27 +22680,42 @@ impl App {
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
         self.refresh_codeql_queries();
+        self.refresh_codeql_variant();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
     /// CodeQL view keys: arrows move between headers and actions, Enter or
     /// Space folds a section or runs an action, Esc returns to the Explorer.
-    /// On a database row, Delete removes it, F2 renames it and `e` shows its
-    /// folder in the Explorer. On a query history row, Delete removes it, F2
+    /// On a database row, Delete removes it, F2 renames it, `e` shows its
+    /// folder in the Explorer, `u` upgrades it and `w` adds its source to
+    /// the workspace. On a query history row, Delete removes it, F2
     /// renames it, `v` opens its query and `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
     /// query in the pack; Esc then first cancels the ones still queued.
+    /// In the Variant Analysis Repositories section `a` adds a repository
+    /// (into the selected list), `l` a list, `o` an owner and `g` opens the
+    /// selected repository or owner on GitHub; Enter selects what a run
+    /// targets, Space folds a list, F2 renames a list and Delete removes an
+    /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
-        use crate::widgets::codeql::{Action, Hit};
+        use crate::codeql_variant::Item;
+        use crate::widgets::codeql::{Action, Hit, Section};
         let db = self.codeql.selected_database();
         let run = self.codeql.selected_history();
+        let va_item = self.codeql.selected_variant_item();
+        let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
+            KeyCode::Char(' ') if matches!(va_item, Some(Item::List(_))) => {
+                if let Some(Item::List(i)) = va_item {
+                    self.codeql.toggle_variant_list(i);
+                }
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(hit) = self.codeql.selected_hit() {
                     self.activate_codeql(hit);
@@ -22484,6 +22726,8 @@ impl App {
                     self.confirm_remove_codeql_database(i);
                 } else if let Some(i) = run {
                     self.confirm_remove_codeql_history(i);
+                } else if let Some(item) = va_item {
+                    self.remove_codeql_variant_item(item);
                 }
             }
             KeyCode::F(2) => {
@@ -22491,11 +22735,27 @@ impl App {
                     self.prompt_rename_codeql_database(i);
                 } else if let Some(i) = run {
                     self.prompt_rename_codeql_history(i);
+                } else if let Some(Item::List(i)) = va_item {
+                    self.prompt_rename_codeql_variant_list(i);
                 }
             }
+            KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
+            KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
+            KeyCode::Char('o') if in_va => self.prompt_add_codeql_variant_owner(),
+            KeyCode::Char('g') if in_va => self.open_codeql_variant_on_github(),
             KeyCode::Char('e') => {
                 if let Some(i) = db {
                     self.reveal_codeql_database(i);
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(i) = db {
+                    self.upgrade_codeql_database(i);
+                }
+            }
+            KeyCode::Char('w') => {
+                if let Some(i) = db {
+                    self.add_codeql_database_source(i);
                 }
             }
             KeyCode::Char('v') => {
@@ -22527,8 +22787,9 @@ impl App {
 
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
     /// the language and database lists select; a query row runs; "Create
-    /// one" asks for a query name; the actions still to come in #578 say so
-    /// rather than do nothing.
+    /// one" asks for a query name; a variant analysis entry becomes what a
+    /// run targets (a list already selected folds instead); the actions
+    /// still to come in #578 say so rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22631,15 +22892,398 @@ impl App {
                 }
             }
             Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
-            Hit::Action(action) => {
-                let what = match action {
-                    Action::SetUpControllerRepository => "Variant analysis",
-                    Action::ViewAst => "The AST viewer",
-                    _ => unreachable!("handled above"),
-                };
-                self.status = format!("{what} is not available yet (#578)");
+            Hit::Action(Action::SetUpControllerRepository) => self.prompt_codeql_controller(),
+            Hit::Action(Action::VariantList(i))
+                if self
+                    .codeql
+                    .variant
+                    .is_selected(crate::codeql_variant::Item::List(i)) =>
+            {
+                self.codeql.toggle_variant_list(i);
+            }
+            Hit::Action(Action::VariantList(i)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::List(i));
+            }
+            Hit::Action(Action::VariantRepo(list, j)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::Repo(list, j));
+            }
+            Hit::Action(Action::VariantOwner(i)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::Owner(i));
+            }
+            Hit::Action(Action::AddVariantRepo) => self.prompt_add_codeql_variant_repo(),
+            Hit::Action(Action::AddVariantList) => self.prompt_add_codeql_variant_list(),
+            Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
+            Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
+            Hit::Action(Action::ViewAst) => {
+                self.status = String::from("The AST viewer is not available yet (#578)");
             }
         }
+    }
+
+    fn codeql_variant_path() -> PathBuf {
+        croft_cache_dir().join("codeql-variant-analysis.json")
+    }
+
+    /// Reload the variant analysis config into the side bar. One that
+    /// cannot be read is reported, and the section says so rather than
+    /// showing it empty.
+    fn refresh_codeql_variant(&mut self) {
+        match crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path()) {
+            Ok(config) => {
+                self.codeql.variant = config;
+                self.codeql.variant_error = false;
+            }
+            Err(e) => {
+                self.codeql.variant = crate::codeql_variant::VariantConfig::default();
+                self.codeql.variant_error = true;
+                self.status = format!("Could not read the variant analysis config: {e}");
+            }
+        }
+    }
+
+    /// Change the variant analysis config with `edit` and save it, showing
+    /// `edit`'s message. A config that cannot be read is left as it is,
+    /// never saved over with an empty one. Returns whether it saved.
+    fn edit_codeql_variant(
+        &mut self,
+        edit: impl FnOnce(&mut crate::codeql_variant::VariantConfig) -> Result<String, String>,
+    ) -> bool {
+        let path = Self::codeql_variant_path();
+        let mut config = match crate::codeql_variant::VariantConfig::load(&path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.codeql.variant_error = true;
+                self.status =
+                    format!("Could not read the variant analysis config, so it is unchanged: {e}");
+                return false;
+            }
+        };
+        let message = match edit(&mut config) {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = e;
+                return false;
+            }
+        };
+        if let Err(e) = config.save(&path) {
+            self.status = format!("Could not save the variant analysis config: {e}");
+            return false;
+        }
+        self.status = message;
+        self.codeql.variant = config;
+        self.codeql.variant_error = false;
+        true
+    }
+
+    /// Ask for the controller repository variant analysis runs from (#578,
+    /// VS Code's "Set up controller repository"), starting from the current
+    /// one.
+    fn prompt_codeql_controller(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        // From the file: the palette can ask before the side bar loaded it.
+        let current = crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path())
+            .ok()
+            .and_then(|c| c.controller_repo);
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlControllerRepository,
+                String::from("Set Up Controller Repository"),
+                "owner/repo or its GitHub URL",
+            )
+            .with_value(current.unwrap_or_default()),
+        );
+    }
+
+    fn submit_codeql_controller(&mut self, value: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            c.set_controller(value)
+                .map(|nwo| format!("Variant analysis controller repository: {nwo}"))
+        });
+        if saved {
+            self.codeql
+                .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
+        }
+    }
+
+    /// Ask for a repository to add for variant analysis, into the list whose
+    /// line (or one of whose repositories) is selected in the side bar.
+    fn prompt_add_codeql_variant_repo(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let list = self
+            .codeql
+            .selected_variant_list()
+            .and_then(|i| self.codeql.variant.lists.get(i))
+            .map(|l| l.name.clone());
+        let title = match &list {
+            Some(name) => format!("Add Repository to {name}"),
+            None => String::from("Add Variant Analysis Repository"),
+        };
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantRepo { list },
+            title,
+            "owner/repo or its GitHub URL",
+        ));
+    }
+
+    fn submit_add_codeql_variant_repo(&mut self, list: Option<&str>, value: &str) {
+        use crate::codeql_variant::Item;
+        let mut added = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let index = match list {
+                Some(name) => Some(
+                    c.list_index(name)
+                        .ok_or_else(|| format!("The list {name} is no longer there"))?,
+                ),
+                None => None,
+            };
+            let nwo = c.add_repo(index, value)?;
+            let len = match index {
+                Some(i) => c.lists[i].repos.len(),
+                None => c.repos.len(),
+            };
+            added = Some(Item::Repo(index, len - 1));
+            Ok(match list {
+                Some(name) => format!("Added {nwo} to {name}"),
+                None => format!("Added {nwo} for variant analysis"),
+            })
+        });
+        if let (true, Some(item)) = (saved, added) {
+            if let Some(name) = list {
+                self.codeql.folded_lists.remove(name);
+            }
+            self.codeql.select_variant_item(item);
+        }
+    }
+
+    fn prompt_add_codeql_variant_list(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantList,
+            String::from("Add Repository List"),
+            "the list's name",
+        ));
+    }
+
+    fn submit_add_codeql_variant_list(&mut self, value: &str) {
+        let mut added = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c.add_list(value)?;
+            added = Some(i);
+            Ok(format!("Added repository list {}", c.lists[i].name))
+        });
+        if let (true, Some(i)) = (saved, added) {
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::List(i));
+        }
+    }
+
+    fn prompt_add_codeql_variant_owner(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantOwner,
+            String::from("Add Variant Analysis Owner"),
+            "a user or organisation, or its GitHub URL",
+        ));
+    }
+
+    fn submit_add_codeql_variant_owner(&mut self, value: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            c.add_owner(value)
+                .map(|o| format!("Added every repository of {o} for variant analysis"))
+        });
+        if saved {
+            let last = self.codeql.variant.owners.len().saturating_sub(1);
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::Owner(last));
+        }
+    }
+
+    fn prompt_rename_codeql_variant_list(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(name) = self.codeql.variant.lists.get(index).map(|l| l.name.clone()) else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRenameVariantList { name: name.clone() },
+                String::from("Rename Repository List"),
+                "the list's name",
+            )
+            .with_value(name),
+        );
+    }
+
+    fn submit_rename_codeql_variant_list(&mut self, name: &str, value: &str) {
+        let mut renamed = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c
+                .list_index(name)
+                .ok_or_else(|| format!("The list {name} is no longer there"))?;
+            c.rename_list(i, value)?;
+            renamed = Some(i);
+            Ok(format!("Renamed repository list to {}", c.lists[i].name))
+        });
+        if let (true, Some(i)) = (saved, renamed) {
+            // A fold is kept by name; it follows the list.
+            if self.codeql.folded_lists.remove(name) {
+                self.codeql.folded_lists.insert(value.trim().to_string());
+            }
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::List(i));
+        }
+    }
+
+    /// Remove a variant analysis entry: a repository or owner at once, a
+    /// list (with its repositories) after asking.
+    fn remove_codeql_variant_item(&mut self, item: crate::codeql_variant::Item) {
+        use crate::codeql_variant::Item;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(name) = self.codeql.variant.name_of(item).map(str::to_string) else {
+            return;
+        };
+        if let Item::List(i) = item {
+            let n = self.codeql.variant.lists[i].repos.len();
+            let what = match n {
+                0 => String::new(),
+                1 => String::from(" and its 1 repository"),
+                n => format!(" and its {n} repositories"),
+            };
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::CodeqlRemoveVariantList { name: name.clone() },
+                    format!("Remove repository list '{name}'{what}?"),
+                    "Enter to remove · Esc to keep",
+                )
+                .with_value("remove"),
+            );
+            return;
+        }
+        let saved = self.edit_codeql_variant(|c| {
+            // The side bar names the entry by position; make sure the file
+            // still has it there before removing anything.
+            if c.name_of(item) != Some(name.as_str()) {
+                return Err(String::from(
+                    "The variant analysis config changed on disk; look again",
+                ));
+            }
+            c.remove(item)?;
+            Ok(format!("Removed {name}"))
+        });
+        if saved {
+            self.keep_codeql_selection_on_a_row();
+        }
+    }
+
+    fn perform_remove_codeql_variant_list(&mut self, name: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c
+                .list_index(name)
+                .ok_or_else(|| format!("The list {name} is no longer there"))?;
+            c.remove(crate::codeql_variant::Item::List(i))?;
+            Ok(format!("Removed repository list {name}"))
+        });
+        if saved {
+            self.codeql.folded_lists.remove(name);
+            self.keep_codeql_selection_on_a_row();
+        }
+    }
+
+    /// After a row went away, keep the selection on a row rather than on
+    /// the welcome text that moved up under it.
+    fn keep_codeql_selection_on_a_row(&mut self) {
+        let last = self.codeql.lines().len().saturating_sub(1);
+        self.codeql.selected = self.codeql.selected.min(last);
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
+    /// Make `item` what a variant analysis runs against (VS Code's "Select").
+    fn select_codeql_variant_item(&mut self, item: crate::codeql_variant::Item) {
+        let Some(name) = self.codeql.variant.name_of(item).map(str::to_string) else {
+            return;
+        };
+        let saved = self.edit_codeql_variant(|c| {
+            if c.name_of(item) != Some(name.as_str()) {
+                return Err(String::from(
+                    "The variant analysis config changed on disk; look again",
+                ));
+            }
+            c.select(item)?;
+            Ok(format!("Variant analysis runs against {name}"))
+        });
+        if saved {
+            self.codeql.select_variant_item(item);
+        }
+    }
+
+    /// Open the variant analysis config in an editor tab, writing an empty
+    /// one first when there is none. One that cannot be parsed opens as it
+    /// is, to be fixed.
+    fn open_codeql_variant_config(&mut self) {
+        let path = Self::codeql_variant_path();
+        if !path.exists()
+            && let Err(e) = crate::codeql_variant::VariantConfig::default().save(&path)
+        {
+            self.status = format!("Could not create {}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    /// The GitHub page of the variant analysis repository or owner selected
+    /// in the side bar (the controller on its row), else of the one a run
+    /// targets.
+    fn codeql_variant_github_url(&self) -> Option<String> {
+        use crate::codeql_variant::{Item, Selection};
+        use crate::widgets::codeql::{Action, Hit};
+        let v = &self.codeql.variant;
+        let name = match self.codeql.selected_variant_item() {
+            Some(item @ (Item::Repo(..) | Item::Owner(_))) => v.name_of(item)?.to_string(),
+            Some(Item::List(_)) => return None,
+            None if self.codeql.selected_hit()
+                == Some(Hit::Action(Action::SetUpControllerRepository)) =>
+            {
+                v.controller_repo.clone()?
+            }
+            None => match v.selected.as_ref()? {
+                Selection::Repo { nwo, .. } => nwo.clone(),
+                Selection::Owner { owner } => owner.clone(),
+                Selection::List { .. } => return None,
+            },
+        };
+        Some(format!("https://github.com/{name}"))
+    }
+
+    /// Open the selected variant analysis repository or owner on GitHub
+    /// (VS Code's "Open on GitHub"). Where no browser can be reached the
+    /// status line shows the address instead.
+    fn open_codeql_variant_on_github(&mut self) {
+        let Some(url) = self.codeql_variant_github_url() else {
+            self.status = String::from(
+                "Select a variant analysis repository or owner in the CodeQL side bar first",
+            );
+            return;
+        };
+        if cfg!(test) {
+            // Tests never start a browser.
+            self.status = format!("Open {url}");
+            return;
+        }
+        if self.drop_relay_active() || is_remote_session() {
+            self.open_detected_url(&url);
+            return;
+        }
+        self.status = match open_url(&url) {
+            Ok(()) => format!("Opened {url}"),
+            Err(e) => format!("Could not open a browser ({e}): {url}"),
+        };
     }
 
     /// The store index of the current database, for the palette commands
@@ -22754,9 +23398,31 @@ impl App {
             self.status = String::from("That CodeQL database is no longer listed");
             return;
         };
+        let old = store.databases[i].name.clone();
         if let Err(e) = store.rename(i, value) {
             self.status = e;
             return;
+        }
+        // History from before runs recorded their database's path names it
+        // only by its old name. The rename keeps that name among its former
+        // names, so such runs still count for it; with no other database
+        // ever called that, they are also pinned to its path. Otherwise the
+        // runs could be either's, and both stay protected by name.
+        let same_name = store
+            .databases
+            .iter()
+            .enumerate()
+            .filter(|&(j, d)| j != i && d.has_had_name(&old))
+            .count();
+        if same_name == 0 {
+            let history_path = Self::codeql_history_path();
+            let mut history = crate::codeql_query::History::load(&history_path);
+            if history.adopt_legacy(&old, path)
+                && let Err(e) = history.save(&history_path)
+            {
+                self.status = format!("Could not save the CodeQL query history: {e}");
+                return;
+            }
         }
         // Renaming can move it in a name-sorted list.
         if let Some(by) = store.sort_by {
@@ -22812,6 +23478,207 @@ impl App {
         }
     }
 
+    /// Upgrade database `index` to the CLI's current schema (#578, VS
+    /// Code's "CodeQL: Upgrade Database") on a worker thread;
+    /// [`Self::drain_codeql_upgrade`] collects it. Refused while a query or
+    /// another upgrade runs: either would read a database being rewritten.
+    fn upgrade_codeql_database(&mut self, index: usize) {
+        if self.codeql_upgrade.is_some() {
+            self.status = String::from("A CodeQL database upgrade is already running");
+            return;
+        }
+        if self.codeql_run.is_some() {
+            self.status = String::from("Wait for the CodeQL query run to finish before upgrading");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index).cloned() else {
+            return;
+        };
+        let program = self.codeql_program.clone();
+        let path = db.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let args = crate::codeql_query::upgrade_args(&path);
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = format!("Upgrading CodeQL database {}\u{2026}", db.name);
+        self.codeql_upgrade = Some((rx, db.name, db.path));
+    }
+
+    /// Collect a finished database upgrade (#578) onto the status line.
+    pub fn drain_codeql_upgrade(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_upgrade.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the upgrade stopped unexpectedly"))
+            }
+        };
+        let Some((_, name, _)) = self.codeql_upgrade.take() else {
+            return false;
+        };
+        self.status = match outcome {
+            Ok(()) => format!("Upgraded CodeQL database {name}"),
+            Err(why) => format!("Could not upgrade CodeQL database {name}: {why}"),
+        };
+        true
+    }
+
+    /// Add database `index`'s source to the workspace (#578, VS Code's
+    /// "CodeQL: Add Database Source to Workspace"): its `src` folder, else
+    /// its `src.zip`, extracted once into croft's cache.
+    fn add_codeql_database_source(&mut self, index: usize) {
+        use crate::codeql_db::DbSource;
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index) else {
+            return;
+        };
+        let folder = match crate::codeql_db::database_source(&db.path) {
+            None => {
+                self.status = format!("CodeQL database {} has no src folder or src.zip", db.name);
+                return;
+            }
+            Some(DbSource::Folder(folder)) => folder,
+            Some(DbSource::Zip(zip)) => {
+                let cache = Self::codeql_source_cache_dir();
+                let dest = cache.join(crate::codeql_db::source_cache_name(&db.path, &zip));
+                if !dest.is_dir() {
+                    // An older extraction of this database's source is out
+                    // of date: its archive changed, which is why the name
+                    // no longer matches. Drop it, unless it is open as a
+                    // workspace root.
+                    let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+                    for old in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
+                        let path = old.path();
+                        let stale = old.file_name().to_string_lossy().starts_with(&prefix);
+                        let open = path
+                            .canonicalize()
+                            .is_ok_and(|p| self.roots.iter().any(|r| r == p));
+                        if stale && !open {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                    // Extract beside it and rename, so an interrupted
+                    // extraction never passes for a finished one.
+                    let partial = PathBuf::from(format!("{}.partial", dest.display()));
+                    let _ = std::fs::remove_dir_all(&partial);
+                    let done = crate::codeql_db::extract_zip(
+                        &zip,
+                        &partial,
+                        Some(crate::codeql_db::SOURCE_ZIP_LIMIT),
+                    )
+                    .and_then(|_| std::fs::rename(&partial, &dest).map_err(|e| e.to_string()));
+                    if let Err(e) = done {
+                        let _ = std::fs::remove_dir_all(&partial);
+                        self.status = format!("Could not extract {}: {e}", zip.display());
+                        return;
+                    }
+                }
+                dest
+            }
+        };
+        let folder = folder.canonicalize().unwrap_or(folder);
+        let name = db.name.clone();
+        if self.roots.iter().any(|r| r == folder) {
+            self.status =
+                format!("The source of CodeQL database {name} is already in the workspace");
+            return;
+        }
+        self.add_workspace_folder(folder.clone());
+        if self.roots.iter().any(|r| r == folder) {
+            self.status = format!("Added the source of CodeQL database {name} to the workspace");
+        }
+    }
+
+    /// The databases "Delete Unused Databases" removes: copies in croft's
+    /// cache that no query history entry ran on, never the current one or
+    /// one being upgraded. A database the user pointed at elsewhere is
+    /// theirs and never listed.
+    fn unused_codeql_databases(&self) -> Vec<PathBuf> {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, p)| p);
+        store
+            .databases
+            .iter()
+            .enumerate()
+            .filter(|&(i, d)| store.current != Some(i) && Some(&d.path) != upgrading)
+            .filter(|(_, d)| Self::codeql_cached_copy(&d.path).is_some())
+            .filter(|(_, d)| {
+                let mut names = vec![d.name.as_str()];
+                names.extend(d.former_names.iter().map(String::as_str));
+                !history.entries.iter().any(|e| e.refers_to(&d.path, &names))
+            })
+            .map(|(_, d)| d.path.clone())
+            .collect()
+    }
+
+    /// Ask before deleting the unused databases (#578); says so when there
+    /// are none.
+    fn confirm_delete_unused_codeql_databases(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let paths = self.unused_codeql_databases();
+        let title = match paths.len() {
+            0 => {
+                self.status = String::from("There are no unused CodeQL databases to delete");
+                return;
+            }
+            1 => String::from("Delete 1 unused CodeQL database?"),
+            n => format!("Delete {n} unused CodeQL databases?"),
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlDeleteUnusedDatabases { paths },
+                title,
+                "Enter to delete · Esc to keep",
+            )
+            .with_value("delete"),
+        );
+    }
+
+    /// Remove the databases at `paths` from the list, delete their cached
+    /// folders, and save. Each is checked again first: one that became
+    /// current or was run on while the prompt was open is kept.
+    fn perform_delete_unused_codeql_databases(&mut self, paths: &[PathBuf]) {
+        let unused = self.unused_codeql_databases();
+        let store_path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
+        let mut deleted = 0;
+        let mut file_error = None;
+        for path in paths.iter().filter(|p| unused.contains(p)) {
+            let Some(i) = store.position(path) else {
+                continue;
+            };
+            let cached = Self::codeql_cached_copy(path);
+            store.remove(i);
+            deleted += 1;
+            if let Some(Err(e)) = cached.map(std::fs::remove_dir_all) {
+                file_error.get_or_insert(e);
+            }
+        }
+        if let Err(e) = store.save(&store_path) {
+            self.status = format!("Could not save the CodeQL database list: {e}");
+            return;
+        }
+        let what = match deleted {
+            0 => String::from("There are no unused CodeQL databases to delete"),
+            1 => String::from("Deleted 1 unused CodeQL database"),
+            n => format!("Deleted {n} unused CodeQL databases"),
+        };
+        self.status = match file_error {
+            Some(e) => format!("{what}, but not all their files: {e}"),
+            None => what,
+        };
+        self.refresh_codeql_databases();
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
     fn codeql_db_store_path() -> PathBuf {
         croft_cache_dir().join("codeql-databases.json")
     }
@@ -22820,6 +23687,12 @@ impl App {
     /// beside the archive the user pointed at.
     fn codeql_db_cache_dir() -> PathBuf {
         croft_cache_dir().join("codeql").join("databases")
+    }
+
+    /// Where a database's `src.zip` is extracted to be browsed, one folder
+    /// per database, beside the database cache.
+    fn codeql_source_cache_dir() -> PathBuf {
+        croft_cache_dir().join("codeql").join("sources")
     }
 
     fn codeql_history_path() -> PathBuf {
@@ -23117,6 +23990,10 @@ impl App {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
+        if self.codeql_upgrade.is_some() {
+            self.status = String::from("Wait for the CodeQL database upgrade to finish");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
             self.status = String::from("Add a CodeQL database and select it first");
@@ -23148,6 +24025,7 @@ impl App {
         history.push(HistoryEntry {
             query: query.clone(),
             database: db.name.clone(),
+            database_path: Some(db.path.clone()),
             started,
             seconds: 0,
             status: RunStatus::Running,
@@ -23163,22 +24041,7 @@ impl App {
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let run = |args: Vec<String>| -> Result<(), String> {
-                let out = std::process::Command::new(&program)
-                    .args(&args)
-                    .output()
-                    .map_err(|e| format!("could not run codeql: {e}"))?;
-                if out.status.success() {
-                    return Ok(());
-                }
-                let err = String::from_utf8_lossy(&out.stderr);
-                Err(err
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("codeql failed")
-                    .to_string())
-            };
+            let run = |args: Vec<String>| Self::codeql_command(&program, &args);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
                 .and_then(|()| match kind {
@@ -23196,6 +24059,25 @@ impl App {
         });
         self.codeql_run = Some((rx, std::time::Instant::now()));
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Run `codeql` with `args` and wait. A failure is the first line it
+    /// printed on stderr, where the CLI puts the reason.
+    fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("codeql failed")
+            .to_string())
     }
 
     /// Collect a finished query run (#578): record how it went in the
@@ -23426,7 +24308,7 @@ impl App {
 
     fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
         let dest = Self::codeql_db_cache_dir().join(name);
-        crate::codeql_db::extract_zip(zip, &dest)?;
+        crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
@@ -24552,6 +25434,94 @@ impl App {
         }
     }
 
+    /// Debug: Add Configuration… (#250): the native form for a launch.json
+    /// entry, one step at a time, written to `.croft/launch.json` at the end.
+    /// Starts with the adapter.
+    pub fn open_add_debug_config(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        self.debug_config_draft = None;
+        let rows = crate::dap::configs::DRAFT_TYPES
+            .iter()
+            .map(|(id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DebugConfigType,
+                "Add Configuration: Debugger",
+                rows,
+            ),
+            "",
+        );
+    }
+
+    /// Ask for `field` of the draft, seeded with `retry` (a value just
+    /// refused) or the field's default; `None` means the draft is complete,
+    /// so write it.
+    fn prompt_debug_config_field(
+        &mut self,
+        field: Option<crate::dap::configs::DraftField>,
+        retry: Option<&str>,
+    ) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(draft) = self.debug_config_draft.as_ref() else {
+            return;
+        };
+        let Some(field) = field else {
+            self.finish_debug_config_draft();
+            return;
+        };
+        let (title, hint, seed) = draft.prompt(field);
+        let mut prompt = InputPrompt::new(InputPurpose::DebugConfigField { field }, title, hint)
+            .with_value(retry.map_or(seed, str::to_string));
+        if crate::dap::configs::ConfigDraft::optional(field) {
+            prompt = prompt.allowing_blank();
+        }
+        self.open_input_prompt(prompt);
+    }
+
+    /// Take a field's value: on to the next field, or back to this one with
+    /// the reason when it does not fit.
+    fn submit_debug_config_field(&mut self, field: crate::dap::configs::DraftField, value: &str) {
+        let Some(draft) = self.debug_config_draft.as_mut() else {
+            return;
+        };
+        match draft.set(field, value) {
+            Ok(()) => {
+                let next = draft.next_field(Some(field));
+                self.prompt_debug_config_field(next, None);
+            }
+            Err(why) => {
+                self.status = why;
+                self.prompt_debug_config_field(Some(field), Some(value));
+            }
+        }
+    }
+
+    /// Write the finished draft to `.croft/launch.json` and pick up the file
+    /// again, so the new configuration is in the picker and F5 at once.
+    fn finish_debug_config_draft(&mut self) {
+        let Some(draft) = self.debug_config_draft.take() else {
+            return;
+        };
+        let root = self.active_workspace_root();
+        match crate::dap::configs::add_to_croft_launch_json(&root, &draft) {
+            Ok(_) => {
+                self.debug_configs = crate::dap::configs::discover_configs(&root);
+                self.selected_debug_config = Some(draft.name.clone());
+                self.selected_debug_compound = None;
+                self.run_debug.selected_config = Some(draft.name.clone());
+                self.status = format!(
+                    "Added \"{}\" to .croft/launch.json and selected it; F5 starts it",
+                    draft.name
+                );
+            }
+            Err(why) => self.status = why,
+        }
+    }
+
     /// Debug: Select and Start Debugging — the launch.json configurations
     /// plus the synthesized zero-config entry.
     pub fn open_debug_config_picker(&mut self) {
@@ -24611,6 +25581,10 @@ impl App {
                 .into_iter()
                 .map(|(row, _)| row),
         );
+        rows.push(ListRow {
+            id: String::from("add"),
+            label: String::from("Add Configuration…"),
+        });
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -27369,6 +28343,10 @@ impl App {
                 self.close_input_prompt();
                 self.perform_remove_codeql_database(&path);
             }
+            InputPurpose::CodeqlDeleteUnusedDatabases { paths } => {
+                self.close_input_prompt();
+                self.perform_delete_unused_codeql_databases(&paths);
+            }
             InputPurpose::CodeqlRenameDatabase { path } => {
                 self.close_input_prompt();
                 self.submit_rename_codeql_database(&path, &value);
@@ -27384,6 +28362,30 @@ impl App {
             InputPurpose::CodeqlCreateQuery { dir, language } => {
                 self.close_input_prompt();
                 self.submit_create_codeql_query(&dir, language.as_deref(), &value);
+            }
+            InputPurpose::CodeqlControllerRepository => {
+                self.close_input_prompt();
+                self.submit_codeql_controller(&value);
+            }
+            InputPurpose::CodeqlAddVariantRepo { list } => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_repo(list.as_deref(), &value);
+            }
+            InputPurpose::CodeqlAddVariantList => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_list(&value);
+            }
+            InputPurpose::CodeqlAddVariantOwner => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_owner(&value);
+            }
+            InputPurpose::CodeqlRenameVariantList { name } => {
+                self.close_input_prompt();
+                self.submit_rename_codeql_variant_list(&name, &value);
+            }
+            InputPurpose::CodeqlRemoveVariantList { name } => {
+                self.close_input_prompt();
+                self.perform_remove_codeql_variant_list(&name);
             }
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
@@ -27470,6 +28472,10 @@ impl App {
                 self.close_input_prompt();
                 let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
                 self.run_scm_op("switch -c (from)", r, "Created branch");
+            }
+            InputPurpose::DebugConfigField { field } => {
+                self.close_input_prompt();
+                self.submit_debug_config_field(field, &value);
             }
             InputPurpose::AddRemoteName => {
                 // First step: capture the name, then re-prompt for the URL.
@@ -29736,6 +30742,42 @@ impl App {
                     self.launch_resolved_in(rc, slot);
                 }
             }
+            ListPurpose::DebugConfigType => {
+                self.debug_config_draft = Some(crate::dap::configs::ConfigDraft::new(
+                    &row.id,
+                    crate::dap::configs::RequestKind::Launch,
+                ));
+                self.open_list_picker(
+                    crate::widgets::list_picker::ListPicker::new(
+                        ListPurpose::DebugConfigRequest,
+                        "Add Configuration: Launch or Attach",
+                        vec![
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("launch"),
+                                label: String::from(
+                                    "Launch — start the program under the debugger",
+                                ),
+                            },
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("attach"),
+                                label: String::from("Attach — to a program already running"),
+                            },
+                        ],
+                    ),
+                    "",
+                );
+            }
+            ListPurpose::DebugConfigRequest => {
+                if let Some(draft) = self.debug_config_draft.as_mut() {
+                    draft.request = if row.id == "attach" {
+                        crate::dap::configs::RequestKind::Attach
+                    } else {
+                        crate::dap::configs::RequestKind::Launch
+                    };
+                    let first = draft.next_field(None);
+                    self.prompt_debug_config_field(first, None);
+                }
+            }
             ListPurpose::DebugConfig => {
                 if let Some(idx) = row.id.strip_prefix("compound:") {
                     // Index the row straight through rather than round-tripping
@@ -29753,6 +30795,8 @@ impl App {
                         self.run_debug.selected_config = Some(compound.name.clone());
                         self.launch_compound(&compound);
                     }
+                } else if row.id == "add" {
+                    self.open_add_debug_config();
                 } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.selected_debug_compound = None;
@@ -31420,6 +32464,7 @@ impl App {
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
         self.scrub_view = None;
+        self.scrub_view_key = None;
         self.tree.scrub_tree = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
@@ -31430,6 +32475,7 @@ impl App {
         self.status = format!(
             "Scrubbing {n} commits — arrows step, Enter opens a commit's version, Home returns to your working tree"
         );
+        self.prefetch_scrub_views();
     }
 
     /// Keep symbol tabs (#369) and the other tabs of their files in step.
@@ -32861,6 +33907,11 @@ impl App {
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
                 self.scrub_view = None;
+                self.scrub_view_key = None;
+                self.scrub_views.clear();
+                self.scrub_plain.clear();
+                self.scrub_outlines.clear();
+                self.scrub_builder = None;
                 self.sync_scrub_tree();
                 self.status = String::from("Left the history scrubber");
                 return true;
@@ -32884,7 +33935,12 @@ impl App {
     /// no scrubbed commit or no file to show.
     fn scrubbed_file(
         &mut self,
-    ) -> Option<(PathBuf, String, crate::git::GraphCommit, Option<String>)> {
+    ) -> Option<(
+        PathBuf,
+        String,
+        crate::git::GraphCommit,
+        Option<std::sync::Arc<str>>,
+    )> {
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.status = String::from("Step the scrubber to a commit first");
             return None;
@@ -32904,7 +33960,11 @@ impl App {
         let text = self
             .scrub_cache
             .entry((commit.hash.clone(), rel.clone()))
-            .or_insert_with(|| crate::git::read_file_at_rev(&root, &commit.hash, &rel).ok())
+            .or_insert_with(|| {
+                crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                    .ok()
+                    .map(std::sync::Arc::from)
+            })
             .clone();
         Some((path, rel, commit, text))
     }
@@ -32913,6 +33973,11 @@ impl App {
     fn close_scrubber_for_tab(&mut self) {
         self.scrubber = None;
         self.scrub_view = None;
+        self.scrub_view_key = None;
+        self.scrub_views.clear();
+        self.scrub_plain.clear();
+        self.scrub_outlines.clear();
+        self.scrub_builder = None;
         self.sync_scrub_tree();
         self.focus_pane(Pane::Editor);
     }
@@ -32961,7 +34026,9 @@ impl App {
             self.status = format!("Could not diff {rel}: {e}");
             return;
         }
-        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft {
+            left_text: text.to_string(),
+        });
         self.close_scrubber_for_tab();
         self.status = format!("{rel}: {} → working tree", commit.short_hash);
     }
@@ -33053,6 +34120,21 @@ impl App {
         self.scrub_slider = track;
     }
 
+    /// While a commit is on screen (#371), an Outline or breadcrumb jump
+    /// lands in the historical view, whose symbols they list, not in the
+    /// hidden live buffer. Returns whether it did.
+    fn jump_in_scrub_view(&mut self, line: u32) -> bool {
+        let Some(view) = self.scrub_view.as_mut() else {
+            return false;
+        };
+        let line = (line as usize).min(view.lines.len().saturating_sub(1));
+        view.cursor_row = line;
+        view.cursor_col = 0;
+        let rows = (self.editor.last_body.height as usize).max(1);
+        view.scroll = line.saturating_sub(rows / 3);
+        true
+    }
+
     /// Point the Explorer's dimming at the scrubber's commit (#371), or
     /// clear it at the working tree and once the scrubber closes. The tree
     /// listing is cached per commit like the file text, so stepping back
@@ -33078,12 +34160,19 @@ impl App {
     fn rebuild_scrub_view(&mut self) {
         self.sync_scrub_tree();
         self.scrub_for = self.editor.path.clone();
+        // Read before the view is parked: the next one looks where it did.
+        let anchor = self.scrub_view_anchor();
+        self.park_scrub_view();
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
+            // At the working tree: have the first steps back ready.
+            self.prefetch_scrub_views();
             return;
         };
         let Some(path) = self.editor.path.clone() else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
             return;
         };
         let root = self.workspace_root().to_path_buf();
@@ -33092,37 +34181,244 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
         else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
             return;
         };
-        let mut read = |rev: &str| -> Option<String> {
-            let key = (rev.to_string(), rel.clone());
-            self.scrub_cache
-                .entry(key)
-                .or_insert_with(|| crate::git::read_file_at_rev(&root, rev, &rel).ok())
-                .clone()
+        let key = crate::scrubber::ViewKey {
+            hash: commit.hash.clone(),
+            rel: rel.clone(),
         };
-        let text = read(&commit.hash);
-        let baseline = commit
-            .parents
-            .first()
-            .and_then(|p| read(p))
-            .map(|t| crate::widgets::editor::split_into_lines(&t))
-            .unwrap_or_default();
-        let mut view = match text {
-            Some(text) => crate::widgets::editor::Editor::historical(&path, &text, baseline),
-            None => crate::widgets::editor::Editor::historical(
-                &PathBuf::from("history.txt"),
-                &format!("({rel} did not exist at {})", commit.short_hash),
-                Vec::new(),
-            ),
+        // A finished view when one is ready; otherwise a plain stand-in (the
+        // builder keeps those ready around the cursor) and the finished view
+        // when it lands, so a step never waits on highlighting a big file.
+        let take = |kept: &mut crate::scrubber::KeptViews| {
+            kept.iter()
+                .position(|(k, _)| *k == key)
+                .and_then(|i| kept.remove(i))
+                .map(|(_, v)| v)
         };
-        // Look at the same stretch of the file the live buffer shows.
-        view.scroll = self.editor.scroll.min(view.lines.len().saturating_sub(1));
-        view.cursor_row = self
-            .editor
-            .cursor_row
-            .min(view.lines.len().saturating_sub(1));
+        let (view, finished) = match take(&mut self.scrub_views) {
+            Some(v) => (Some(v), true),
+            None => (take(&mut self.scrub_plain), false),
+        };
+        // Neither ready (the first step, or a jump): build the stand-in here.
+        let view = view.or_else(|| {
+            let text = self
+                .scrub_cache
+                .entry((commit.hash.clone(), rel.clone()))
+                .or_insert_with(|| {
+                    crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                        .ok()
+                        .map(std::sync::Arc::from)
+                })
+                .clone();
+            Some(crate::scrubber::plain_view(
+                &path,
+                &rel,
+                &commit.short_hash,
+                text.as_deref(),
+            ))
+        });
+        let Some(mut view) = view else { return };
+        Self::align_scrub_view(&mut view, anchor);
         self.scrub_view = Some(view);
+        self.scrub_view_key = Some((key, finished));
+        self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// Put the finished view being left back among the kept ones, so
+    /// stepping back to it is free; drop the least recently used beyond
+    /// `SCRUB_VIEWS_KEPT` (a big file's view holds its whole text and
+    /// highlighting).
+    fn park_scrub_view(&mut self) {
+        let Some((key, finished)) = self.scrub_view_key.take() else {
+            return;
+        };
+        let Some(view) = self.scrub_view.take() else {
+            return;
+        };
+        if finished {
+            self.keep_scrub_view(key, view);
+        } else {
+            Self::keep_view(&mut self.scrub_plain, key, view);
+        }
+    }
+
+    fn keep_scrub_view(
+        &mut self,
+        key: crate::scrubber::ViewKey,
+        view: crate::widgets::editor::Editor,
+    ) {
+        // Its stand-in is no longer needed.
+        if let Some(i) = self.scrub_plain.iter().position(|(k, _)| *k == key)
+            && let Some(stale) = self.scrub_plain.remove(i)
+        {
+            fs_watch::offload_drop(stale);
+        }
+        Self::keep_view(&mut self.scrub_views, key, view);
+    }
+
+    /// Keep `view` as the most recently used in `kept`, dropping the least
+    /// recently used beyond `SCRUB_VIEWS_KEPT`. Dropped off the UI thread:
+    /// a big file's view is tens of thousands of strings, and freeing them
+    /// is a frame's worth of work a held arrow key cannot spare.
+    fn keep_view(
+        kept: &mut crate::scrubber::KeptViews,
+        key: crate::scrubber::ViewKey,
+        view: crate::widgets::editor::Editor,
+    ) {
+        if let Some(i) = kept.iter().position(|(k, _)| *k == key)
+            && let Some(old) = kept.remove(i)
+        {
+            fs_watch::offload_drop(old);
+        }
+        kept.push_back((key, view));
+        while kept.len() > SCRUB_VIEWS_KEPT {
+            if let Some(evicted) = kept.pop_front() {
+                fs_watch::offload_drop(evicted);
+            }
+        }
+    }
+
+    /// Request the views around the cursor for the active file, when it is
+    /// one the scrubber can show.
+    fn prefetch_scrub_views(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// Where a new view of the active file should look: where the view on
+    /// screen was looking (a symbol jump moves it), else where the live
+    /// buffer is. `(scroll, cursor_row)`.
+    fn scrub_view_anchor(&self) -> (usize, usize) {
+        match self.scrub_view.as_ref() {
+            Some(prev) if prev.path.is_some() && prev.path == self.editor.path => {
+                (prev.scroll, prev.cursor_row)
+            }
+            _ => (self.editor.scroll, self.editor.cursor_row),
+        }
+    }
+
+    /// Look at the stretch of the file `anchor` names.
+    fn align_scrub_view(view: &mut crate::widgets::editor::Editor, (scroll, row): (usize, usize)) {
+        let last = view.lines.len().saturating_sub(1);
+        view.scroll = scroll.min(last);
+        view.cursor_row = row.min(last);
+    }
+
+    /// Ask the builder for what the commits around the cursor still lack:
+    /// stand-ins for the ones with neither a stand-in nor a finished view,
+    /// and finished views for the ones without one; most urgent first.
+    fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return;
+        };
+        let jobs: Vec<crate::scrubber::ViewJob> = scrub
+            .around()
+            .into_iter()
+            .map(|c| crate::scrubber::ViewJob {
+                key: crate::scrubber::ViewKey {
+                    hash: c.hash.clone(),
+                    rel: rel.to_string(),
+                },
+                path: path.to_path_buf(),
+                short: c.short_hash.clone(),
+                parent: c.parents.first().cloned(),
+                text: self
+                    .scrub_cache
+                    .get(&(c.hash.clone(), rel.to_string()))
+                    .cloned(),
+                parent_text: c
+                    .parents
+                    .first()
+                    .and_then(|p| self.scrub_cache.get(&(p.clone(), rel.to_string())).cloned()),
+            })
+            .collect();
+        let shown = self.scrub_view_key.as_ref();
+        let has_finished = |key: &crate::scrubber::ViewKey| {
+            self.scrub_views.iter().any(|(k, _)| k == key)
+                || shown.is_some_and(|(k, f)| k == key && *f)
+        };
+        let has_plain = |key: &crate::scrubber::ViewKey| {
+            self.scrub_plain.iter().any(|(k, _)| k == key) || shown.is_some_and(|(k, _)| k == key)
+        };
+        let finished: Vec<crate::scrubber::ViewJob> = jobs
+            .iter()
+            .filter(|j| !has_finished(&j.key))
+            .cloned()
+            .collect();
+        let plain: Vec<crate::scrubber::ViewJob> = jobs
+            .into_iter()
+            .filter(|j| !has_finished(&j.key) && !has_plain(&j.key))
+            .collect();
+        let builder = self
+            .scrub_builder
+            .get_or_insert_with(|| crate::scrubber::ViewBuilder::start(root.to_path_buf()));
+        builder.want(plain, finished);
+    }
+
+    /// Take in what the builder produced (#371): keep each view, and swap a
+    /// finished one in for the stand-in on screen. True when the screen
+    /// changed.
+    pub fn drain_scrub_views(&mut self) -> bool {
+        let Some(builder) = self.scrub_builder.as_ref() else {
+            return false;
+        };
+        let built = builder.drain();
+        let mut changed = false;
+        for b in built {
+            let rel = b.key.rel.clone();
+            self.scrub_cache
+                .entry((b.key.hash.clone(), rel.clone()))
+                .or_insert(b.text);
+            if let Some((parent, text)) = b.parent_text {
+                self.scrub_cache.entry((parent, rel)).or_insert(text);
+            }
+            if let Some(outline) = b.outline {
+                // Symbols are small next to a view, but a long session visits
+                // many commits: keep a bounded set.
+                if self.scrub_outlines.len() >= SCRUB_OUTLINES_KEPT {
+                    self.scrub_outlines.clear();
+                }
+                self.scrub_outlines.insert(b.key.clone(), outline);
+                changed = true;
+            }
+            let mut view = b.view;
+            let on_screen = self.scrubber.is_some()
+                && self.scrub_view.is_some()
+                && self
+                    .scrub_view_key
+                    .as_ref()
+                    .is_some_and(|(k, _)| *k == b.key);
+            if b.finished {
+                if on_screen && matches!(self.scrub_view_key, Some((_, false))) {
+                    Self::align_scrub_view(&mut view, self.scrub_view_anchor());
+                    if let Some(stand_in) = self.scrub_view.replace(view) {
+                        fs_watch::offload_drop(stand_in);
+                    }
+                    self.scrub_view_key = Some((b.key, true));
+                    changed = true;
+                } else if on_screen {
+                    fs_watch::offload_drop(view);
+                } else {
+                    self.keep_scrub_view(b.key, view);
+                }
+            } else if !on_screen && !self.scrub_views.iter().any(|(k, _)| *k == b.key) {
+                Self::keep_view(&mut self.scrub_plain, b.key, view);
+            } else {
+                fs_watch::offload_drop(view);
+            }
+        }
+        changed
     }
 
     pub fn poll_connect_dialog(&mut self) -> bool {
@@ -42344,6 +43640,17 @@ impl App {
                     self.reveal_codeql_database(i);
                 }
             }
+            Cmd::CodeqlUpgradeDatabase => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.upgrade_codeql_database(i);
+                }
+            }
+            Cmd::CodeqlAddDatabaseSource => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.add_codeql_database_source(i);
+                }
+            }
+            Cmd::CodeqlDeleteUnusedDatabases => self.confirm_delete_unused_codeql_databases(),
             Cmd::CodeqlRemoveHistory => {
                 if let Some(i) = self.current_codeql_history() {
                     self.confirm_remove_codeql_history(i);
@@ -42370,6 +43677,16 @@ impl App {
                 }
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
+            Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
+            Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
+            Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
+            Cmd::CodeqlAddVariantOwner => self.prompt_add_codeql_variant_owner(),
+            Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
+            Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
+            Cmd::CodeqlRunVariantAnalysis => {
+                self.status =
+                    String::from("Running a variant analysis is not available yet (#578)");
+            }
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
@@ -42493,6 +43810,7 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
+            Cmd::AddDebugConfig => self.open_add_debug_config(),
             Cmd::StopDebugging => self.debug_stop_by_user(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::SwitchDebugSession => self.switch_debug_session(),
@@ -46296,6 +47614,7 @@ impl App {
                         self.outline.toggle_collapse();
                     } else if let Some(idx) = self.outline.row_at(m.row)
                         && let Some((path, line, col)) = self.outline.jump_target(idx)
+                        && !self.jump_in_scrub_view(line)
                     {
                         self.go_to_definition(path, line, col);
                     }
@@ -47065,7 +48384,9 @@ impl App {
                         // A click on a symbol crumb jumps to that symbol (same
                         // file); path crumbs return None and fall through.
                         self.focus_pane(Pane::Editor);
-                        if let Some(path) = self.editor.path.clone() {
+                        if !self.jump_in_scrub_view(line)
+                            && let Some(path) = self.editor.path.clone()
+                        {
                             self.go_to_definition(path, line, col);
                         }
                         self.poke_cursor();
@@ -49817,6 +51138,9 @@ impl App {
             return;
         };
         self.reload_config_for_path(&path);
+        // The explicit-save path's other follow-up: a save of an agent's
+        // proposal being edited approves it (#347).
+        self.approve_saved_edit(&path);
     }
 
     /// Reload whichever of croft's own config files `path` is, if any.
@@ -56992,6 +58316,15 @@ fn is_emmet_expand_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'e')
 }
 
+/// The outline of `lines` as the file at `path` from its own syntax tree,
+/// empty for a language croft has no grammar for.
+fn syntax_outline_for(
+    path: &std::path::Path,
+    lines: &[String],
+) -> Vec<crate::lsp::manager::OutlineSymbol> {
+    crate::outline_syntax::symbols_for_lines(path, lines)
+}
+
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
 /// whose range encloses the caret line, ordered outermost first (the enclosing
 /// class before the method inside it). Sibling symbols never overlap, so the
@@ -59134,6 +60467,14 @@ fn sweep_staged_stdin(dir: &Path) {
 /// when the user next looks at the status bar.
 const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// A CodeQL database upgrade in flight (#578): where its outcome arrives,
+/// and the database's name and folder.
+type CodeqlUpgrade = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    PathBuf,
+);
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -60574,7 +61915,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run();
+        let codeql_changed = app.drain_codeql_run() | app.drain_codeql_upgrade();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
@@ -60608,7 +61949,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_search_editor()
             | app.tick_inline_complete()
             | app.drain_review_ops();
-        let connect_changed = app.poll_connect_dialog();
+        let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
         let http_changed = app.drain_http_responses();
