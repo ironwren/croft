@@ -17684,6 +17684,28 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if let Some(chip) = self.notebook_kernel_chip() {
+            spans.push(Span::styled(
+                chip,
+                Style::default()
+                    .fg(self.theme.ui(Color::Rgb(0xf3, 0x9c, 0x12)))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some((_, _, started)) = &self.recording {
+            // A terminal recording (#356) is the other state a user can
+            // leave on; it is not the macro recorder, so it has its own
+            // badge and says how long it has run.
+            let secs = started.elapsed().as_secs();
+            spans.push(Span::styled(
+                format!(" \u{25cf} CAST {}:{:02} ", secs / 60, secs % 60),
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         if let Some(rec) = &self.macro_recording {
             // Recording is state a user can forget they left on, so it gets a
             // filled red badge rather than a dim hint (#255). A named register
@@ -30325,6 +30347,19 @@ impl App {
         self.sync_open_file_poll_mtime();
         self.focus_pane(Pane::Editor);
         self.status = format!("Opened {name} as its own tab");
+    }
+
+    /// The status bar's kernel chip for the notebook in the editor (#355):
+    /// the kernel's name once it is up, and whether a cell is running.
+    /// `None` for any other file, or before a kernel has started.
+    fn notebook_kernel_chip(&self) -> Option<String> {
+        let run = self.notebook_kernels.get(self.editor.path.as_ref()?)?;
+        let name = run.kernel.as_deref()?;
+        Some(if run.running_indices().is_empty() {
+            format!(" kernel: {name} ")
+        } else {
+            format!(" kernel: {name} \u{b7} busy ")
+        })
     }
 
     /// Start or stop recording the active terminal as an asciicast (#356).

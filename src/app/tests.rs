@@ -55667,3 +55667,72 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
         ["300"]
     );
 }
+
+fn status_row(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let y = buf.area.height - 1;
+    (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+}
+
+/// #355: the notebook in the editor names its kernel in the status bar
+/// once the kernel is up, and says when a cell is running.
+#[test]
+fn the_status_bar_names_the_notebooks_kernel_and_when_it_is_busy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("t.ipynb");
+    std::fs::write(&path, NOTEBOOK_355).unwrap();
+    std::fs::write(tmp.path().join("other.py"), "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let (run, kernel, _requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !status_row(&term).contains("kernel:"),
+        "no name before the kernel says it is up"
+    );
+
+    kernel
+        .send(crate::notebook_kernel::Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(row.contains("kernel: Python 3 (ipykernel)"), "{row}");
+    assert!(!row.contains("busy"), "{row}");
+
+    click_first_cell_glyph(&mut app, &mut term);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(status_row(&term).contains("kernel: Python 3 (ipykernel) · busy"));
+
+    // Another file in the editor has no kernel to name.
+    app.editor.open(&tmp.path().join("other.py")).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("kernel:"));
+}
+
+/// #356: a terminal recording has its own status-bar badge with the time
+/// it has run, apart from the macro recorder's REC.
+#[test]
+fn a_terminal_recording_shows_its_own_badge_until_it_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("CAST"));
+    app.toggle_session_recording();
+    assert!(app.recording.is_some(), "{}", app.status);
+    // The start message names the file; the badge must stand on its own.
+    app.status.clear();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(row.contains("● CAST 0:00"), "{row}");
+    assert!(!row.contains("REC "), "not the macro badge: {row}");
+    app.toggle_session_recording();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("CAST"));
+}
