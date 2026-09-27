@@ -7450,8 +7450,15 @@ impl App {
     /// happens when a tab's edit_seq has actually moved, so the cost
     /// scales with edits, not with frames.
     pub fn sync_lsp(&mut self) {
-        if self.lsp.is_none() {
+        let Some(lsp) = self.lsp.as_ref() else {
             return;
+        };
+        // A language server that exited was restarted (#694). It knows no
+        // documents, so forget which ones were sent: every open tab goes out
+        // again as a fresh open below, as it does for a new manager.
+        if lsp.take_servers_restarted() {
+            self.lsp_last_seen.clear();
+            self.lsp_progress.clear();
         }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         // `(is_open, path, text, seq, viewport)`. The viewport `(start, end)`
