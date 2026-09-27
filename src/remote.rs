@@ -2450,6 +2450,7 @@ impl ConfigRepush {
         let worker = std::thread::spawn(move || {
             let dir = crate::prefs::config_dir();
             let mut state = RepushState::new(watch);
+            let mut exclusions = SyncExclusions::load();
             let mut log = config_sync_log();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -2467,14 +2468,8 @@ impl ConfigRepush {
                     &dir,
                     std::time::Instant::now(),
                     &mut || {
-                        // User layers only, as at connect: a workspace must
-                        // not decide what leaves the laptop.
-                        let prefs = crate::config_layers::load_merged(None).prefs;
-                        (!crate::config_sync::host_excluded(
-                            &host,
-                            &prefs.config_sync_excluded_hosts,
-                        ))
-                        .then_some(prefs.config_sync_excluded_files)
+                        let (hosts, files) = exclusions.current();
+                        (!crate::config_sync::host_excluded(&host, &hosts)).then_some(files)
                     },
                     &mut |files| push_over_bulk_lane(&host, &socket, files),
                     &mut log,
@@ -2503,6 +2498,45 @@ impl Drop for ConfigRepush {
         // transfer already started rather than cutting it off.
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+/// The user's config-sync exclusions (#603) as a live re-push reads them.
+///
+/// Read again whenever a file changes, so an edited exclusion applies
+/// without a reconnect, but a read that skipped a layer (a config file
+/// half-written or invalid at that moment) keeps the last clean read:
+/// falling back to the defaults would send a file to a host the user had
+/// excluded.
+struct SyncExclusions {
+    hosts: Vec<String>,
+    files: Vec<String>,
+}
+
+impl SyncExclusions {
+    /// The exclusions as of the session start, the same read the
+    /// connect-time push makes.
+    fn load() -> Self {
+        let prefs = crate::config_layers::load_merged(None).prefs;
+        SyncExclusions {
+            hosts: prefs.config_sync_excluded_hosts,
+            files: prefs.config_sync_excluded_files,
+        }
+    }
+
+    /// Re-read the exclusions, keeping the previous ones when this read
+    /// reported a problem with a layer. User layers only, as at connect: a
+    /// workspace must not decide what leaves the laptop.
+    fn current(&mut self) -> (Vec<String>, Vec<String>) {
+        self.update(crate::config_layers::load_merged(None));
+        (self.hosts.clone(), self.files.clone())
+    }
+
+    fn update(&mut self, merged: crate::config_layers::MergedConfig) {
+        if merged.warnings.is_empty() {
+            self.hosts = merged.prefs.config_sync_excluded_hosts;
+            self.files = merged.prefs.config_sync_excluded_files;
         }
     }
 }
@@ -4785,6 +4819,35 @@ Host !blocked *.internal
     // box, and even niced, a rustc compile on a small VPS wrecks the live
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
+    /// #262 review: a read of the settings that skipped a broken layer keeps
+    /// the last clean exclusions rather than falling back to none, which
+    /// would push to a host the user excluded.
+    #[test]
+    fn a_broken_config_read_keeps_the_last_good_sync_exclusions() {
+        let mut ex = SyncExclusions {
+            hosts: vec![String::from("shared-box")],
+            files: vec![String::from("macros.json")],
+        };
+        let broken = crate::config_layers::MergedConfig {
+            prefs: crate::prefs::Prefs::default(),
+            provenance: Default::default(),
+            chain: Vec::new(),
+            warnings: vec![String::from("config.json: expected value at line 1")],
+        };
+        ex.update(broken);
+        assert_eq!(ex.hosts, vec![String::from("shared-box")]);
+        assert_eq!(ex.files, vec![String::from("macros.json")]);
+        // A clean read applies, including an emptied list.
+        let clean = crate::config_layers::MergedConfig {
+            prefs: crate::prefs::Prefs::default(),
+            provenance: Default::default(),
+            chain: Vec::new(),
+            warnings: Vec::new(),
+        };
+        ex.update(clean);
+        assert!(ex.hosts.is_empty() && ex.files.is_empty());
+    }
+
     /// #262: a config file edited during the session is pushed once, on the
     /// next check; an excluded file or host gets nothing; a failed push is
     /// logged, kept, and retried after `REPUSH_RETRY` (not sooner), so an
