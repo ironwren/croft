@@ -184,6 +184,15 @@ pub enum ActivityIcon {
 /// the first version so it cannot be slow on a large repo.
 const SCRUB_COMMIT_LIMIT: usize = 500;
 
+/// Finished history-scrubber views kept for stepping back to (#371): a
+/// few either side of the cursor. Each holds a whole file with its
+/// highlighting, so this stays small.
+const SCRUB_VIEWS_KEPT: usize = 8;
+
+/// Outlines of built history views kept while scrubbing (#371); cleared
+/// wholesale past this, and rebuilt with each view the builder lands.
+const SCRUB_OUTLINES_KEPT: usize = 256;
+
 /// How long one host gets in a fleet run (#363).
 ///
 /// A ceiling on the CONNECT and a wall-clock bound on the whole thing: the
@@ -3327,6 +3336,10 @@ pub struct App {
     /// The language server's check of the proposal at the head of the
     /// queue (#347): its diagnostics show in the popup before approval.
     approval_check: Option<crate::agent_approval::ProposalCheck>,
+    /// A proposal being edited before approval (#347): its token, and the
+    /// scratch file whose save approves the edited text. The popup stays
+    /// down while it lasts.
+    approval_edit: Option<(String, PathBuf)>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
@@ -3911,10 +3924,27 @@ pub struct App {
     scrub_dragging: bool,
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
-    scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
+    scrub_cache: std::collections::HashMap<(String, String), Option<std::sync::Arc<str>>>,
     /// Each scrubbed commit's tree under the workspace root, for the
     /// Explorer's dimming (#371); `None` records that the listing failed.
     scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Builds highlighted historical views off the UI thread (#371),
+    /// started on the first step.
+    scrub_builder: Option<crate::scrubber::ViewBuilder>,
+    /// Finished views near the scrubber's cursor, most recently used last,
+    /// at most `SCRUB_VIEWS_KEPT`.
+    scrub_views: crate::scrubber::KeptViews,
+    /// Plain stand-ins near the cursor, ready for the next step, likewise.
+    scrub_plain: crate::scrubber::KeptViews,
+    /// Each built view's outline, parsed with it off the UI thread, for the
+    /// OUTLINE to show while scrubbing. Dropped with the kept views.
+    scrub_outlines: std::collections::HashMap<
+        crate::scrubber::ViewKey,
+        Vec<crate::lsp::manager::OutlineSymbol>,
+    >,
+    /// What `scrub_view` shows, and whether it is the finished view rather
+    /// than the plain stand-in awaiting one.
+    scrub_view_key: Option<(crate::scrubber::ViewKey, bool)>,
     /// The running `croft demo` tour (#377), with its scratch project and
     /// the workspace to return to.
     pub tour: Option<TourRun>,
@@ -4206,6 +4236,9 @@ pub struct App {
     /// launch.json configurations discovered for the picker (#250); refreshed
     /// on every picker open so edits are picked up without a restart.
     debug_configs: Vec<crate::dap::configs::DebugConfig>,
+    /// The configuration **Debug: Add Configuration…** is building (#250),
+    /// between its steps.
+    debug_config_draft: Option<crate::dap::configs::ConfigDraft>,
     /// Compounds declared beside those configurations. Listed in the picker so
     /// a workspace's compounds are visible; launching one needs the
     /// multi-session model tracked in #310.
@@ -5371,6 +5404,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             approval_check: None,
             approval_ui: None,
+            approval_edit: None,
             notebook_kernels: std::collections::HashMap::new(),
             coverage_at: None,
             coverage_lens_path: None,
@@ -5588,6 +5622,7 @@ impl App {
             process_picker: None,
             debug_sessions: Default::default(),
             debug_configs: Vec::new(),
+            debug_config_draft: None,
             debug_compounds: Vec::new(),
             selected_debug_config: None,
             selected_debug_compound: None,
@@ -5709,6 +5744,11 @@ impl App {
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             scrub_trees: std::collections::HashMap::new(),
+            scrub_builder: None,
+            scrub_views: std::collections::VecDeque::new(),
+            scrub_plain: std::collections::VecDeque::new(),
+            scrub_outlines: std::collections::HashMap::new(),
+            scrub_view_key: None,
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
@@ -10139,21 +10179,40 @@ impl App {
         }
         // Scrubbing (#371): the outline is the file as it was at the commit
         // on screen, from its own syntax tree; no language server knows that
-        // text. Leaving drops the key, so the live outline is recomputed.
+        // text. Parsing a big file takes far longer than a frame, so the
+        // scrubber's builder parses it off the UI thread with the finished
+        // view, and until that lands the previous outline stays. Leaving
+        // drops the key, so the live outline is recomputed.
         let commit = self
             .scrubber
             .as_ref()
             .and_then(|s| s.commit())
             .map(|c| c.hash.clone());
-        if let (Some(view), Some(commit)) = (self.scrub_view.as_ref(), commit) {
-            let key = (path.clone(), commit);
+        if let (Some(row), Some(commit)) = (self.scrub_view.as_ref().map(|v| v.cursor_row), commit)
+        {
+            let key = (path.clone(), commit.clone());
             if self.outline_scrub_key.as_ref() != Some(&key) {
-                let symbols = syntax_outline_for(&path, &view.lines);
-                self.outline.set_syntax_symbols(path, symbols, false);
-                self.outline_scrub_key = Some(key);
-                self.outline_synced = None;
+                let rel = path
+                    .strip_prefix(self.workspace_root())
+                    .map(|p| p.to_string_lossy().into_owned());
+                let symbols = rel.ok().and_then(|rel| {
+                    self.scrub_outlines
+                        .get(&crate::scrubber::ViewKey { hash: commit, rel })
+                        .cloned()
+                });
+                if let Some(symbols) = symbols {
+                    self.outline.set_syntax_symbols(path, symbols, false);
+                    self.outline_scrub_key = Some(key);
+                    self.outline_synced = None;
+                } else if self.outline.path.as_ref() != Some(&path) {
+                    // Another file's outline must never stand in for this
+                    // one's: empty until its own lands.
+                    self.outline.set_syntax_symbols(path, Vec::new(), false);
+                    self.outline_scrub_key = None;
+                    self.outline_synced = None;
+                }
             }
-            return self.outline.follow_caret(view.cursor_row as u32);
+            return self.outline.follow_caret(row as u32);
         }
         if self.outline_scrub_key.take().is_some() {
             self.outline_synced = None;
@@ -16060,9 +16119,10 @@ impl App {
         if self.approvals.front().map(|p| p.arrived) != head {
             self.approval_ui = None;
         }
+        changed |= self.check_approval_edit();
         if self.approvals.is_empty() {
             self.approval_ui = None;
-        } else if self.approval_ui.is_none() {
+        } else if self.approval_ui.is_none() && self.approval_edit.is_none() {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
             changed = true;
         }
@@ -16146,6 +16206,9 @@ impl App {
             return;
         };
         let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
+            if std::mem::take(&mut ui.edit_requested) {
+                self.start_approval_edit();
+            }
             return;
         };
         let approve_all = ui.approve_all;
@@ -16168,6 +16231,134 @@ impl App {
         }
         self.approval_ui = (!self.approvals.is_empty())
             .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
+    }
+
+    /// `e` in the approval popup (#347): open the head proposal's text as a
+    /// scratch file named like the real one (so it gets its language's
+    /// highlighting and server), with the popup put away. Saving it
+    /// approves the saved text; closing it unsaved brings the popup back.
+    fn start_approval_edit(&mut self) {
+        let Some(head) = self.approvals.front() else {
+            return;
+        };
+        // Refused up front rather than after the user has done the editing.
+        if let Err(why) = crate::agent_approval::edited_input(
+            &head.request.tool,
+            &head.request.input,
+            head.proposal.before.as_deref(),
+            &head.proposal.after,
+        ) {
+            self.status = why;
+            return;
+        }
+        let name = head
+            .proposal
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("proposal.txt"));
+        let dir = croft_cache_dir().join("approval-edits").join(&head.token);
+        let file = dir.join(name);
+        let token = head.token.clone();
+        let agent = head.request.agent.clone();
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&file, &head.proposal.after));
+        if let Err(e) = written {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        // A tab of its own: `open` on the strip's deref would load the
+        // scratch file INTO the current tab, over whatever it held.
+        if let Err(e) = self.editor.open_pinned(&file) {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        self.approval_ui = None;
+        self.approval_edit = Some((token, file));
+        self.focus_pane(Pane::Editor);
+        self.status = format!(
+            "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+        );
+    }
+
+    /// Keep an in-progress proposal edit honest (#347): the proposal gone
+    /// (answered elsewhere, or the agent stopped waiting) ends it with a
+    /// note; its tab closed unsaved ends it quietly, and the popup returns.
+    fn check_approval_edit(&mut self) -> bool {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return false;
+        };
+        if !self.approvals.iter().any(|p| p.token == token) {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return true;
+        }
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let open = groups
+            .flat_map(|g| g.editors.iter())
+            .any(|e| e.path.as_deref() == Some(file.as_path()));
+        if !open {
+            self.approval_edit = None;
+            let _ = std::fs::remove_file(&file);
+            return true;
+        }
+        false
+    }
+
+    /// A save of the proposal being edited approves it with the saved text
+    /// as the tool's new input (#347), and closes the scratch tab.
+    fn approve_saved_edit(&mut self, saved: &std::path::Path) {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return;
+        };
+        if saved != file {
+            return;
+        }
+        let Some(idx) = self.approvals.iter().position(|p| p.token == token) else {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return;
+        };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Could not read the edited proposal: {e}");
+                return;
+            }
+        };
+        let pending = &self.approvals[idx];
+        let input = match crate::agent_approval::edited_input(
+            &pending.request.tool,
+            &pending.request.input,
+            pending.proposal.before.as_deref(),
+            &text,
+        ) {
+            Ok(input) => input,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let Some(pending) = self.approvals.remove(idx) else {
+            return;
+        };
+        let agent = pending.request.agent.clone();
+        pending.answer(&crate::agent_hook::Decision::AllowEdited { input });
+        self.approval_edit = None;
+        if self.editor.path.as_deref() == Some(file.as_path()) {
+            self.editor.close_active();
+        }
+        let _ = std::fs::remove_file(&file);
+        self.status = format!("Approved {agent}'s edit as you changed it");
+        if !self.approvals.is_empty() {
+            self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(
+                std::time::Instant::now(),
+            ));
+        }
     }
 
     fn render_approval_popup(&self, frame: &mut ratatui::Frame) {
@@ -25318,6 +25509,94 @@ impl App {
         }
     }
 
+    /// Debug: Add Configuration… (#250): the native form for a launch.json
+    /// entry, one step at a time, written to `.croft/launch.json` at the end.
+    /// Starts with the adapter.
+    pub fn open_add_debug_config(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        self.debug_config_draft = None;
+        let rows = crate::dap::configs::DRAFT_TYPES
+            .iter()
+            .map(|(id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DebugConfigType,
+                "Add Configuration: Debugger",
+                rows,
+            ),
+            "",
+        );
+    }
+
+    /// Ask for `field` of the draft, seeded with `retry` (a value just
+    /// refused) or the field's default; `None` means the draft is complete,
+    /// so write it.
+    fn prompt_debug_config_field(
+        &mut self,
+        field: Option<crate::dap::configs::DraftField>,
+        retry: Option<&str>,
+    ) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(draft) = self.debug_config_draft.as_ref() else {
+            return;
+        };
+        let Some(field) = field else {
+            self.finish_debug_config_draft();
+            return;
+        };
+        let (title, hint, seed) = draft.prompt(field);
+        let mut prompt = InputPrompt::new(InputPurpose::DebugConfigField { field }, title, hint)
+            .with_value(retry.map_or(seed, str::to_string));
+        if crate::dap::configs::ConfigDraft::optional(field) {
+            prompt = prompt.allowing_blank();
+        }
+        self.open_input_prompt(prompt);
+    }
+
+    /// Take a field's value: on to the next field, or back to this one with
+    /// the reason when it does not fit.
+    fn submit_debug_config_field(&mut self, field: crate::dap::configs::DraftField, value: &str) {
+        let Some(draft) = self.debug_config_draft.as_mut() else {
+            return;
+        };
+        match draft.set(field, value) {
+            Ok(()) => {
+                let next = draft.next_field(Some(field));
+                self.prompt_debug_config_field(next, None);
+            }
+            Err(why) => {
+                self.status = why;
+                self.prompt_debug_config_field(Some(field), Some(value));
+            }
+        }
+    }
+
+    /// Write the finished draft to `.croft/launch.json` and pick up the file
+    /// again, so the new configuration is in the picker and F5 at once.
+    fn finish_debug_config_draft(&mut self) {
+        let Some(draft) = self.debug_config_draft.take() else {
+            return;
+        };
+        let root = self.active_workspace_root();
+        match crate::dap::configs::add_to_croft_launch_json(&root, &draft) {
+            Ok(_) => {
+                self.debug_configs = crate::dap::configs::discover_configs(&root);
+                self.selected_debug_config = Some(draft.name.clone());
+                self.selected_debug_compound = None;
+                self.run_debug.selected_config = Some(draft.name.clone());
+                self.status = format!(
+                    "Added \"{}\" to .croft/launch.json and selected it; F5 starts it",
+                    draft.name
+                );
+            }
+            Err(why) => self.status = why,
+        }
+    }
+
     /// Debug: Select and Start Debugging — the launch.json configurations
     /// plus the synthesized zero-config entry.
     pub fn open_debug_config_picker(&mut self) {
@@ -25377,6 +25656,10 @@ impl App {
                 .into_iter()
                 .map(|(row, _)| row),
         );
+        rows.push(ListRow {
+            id: String::from("add"),
+            label: String::from("Add Configuration…"),
+        });
         self.open_list_picker(
             ListPicker::new(ListPurpose::DebugConfig, "Debug Configuration", rows),
             "No debug configurations (.croft/launch.json or .vscode/launch.json)",
@@ -28265,6 +28548,10 @@ impl App {
                 let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
                 self.run_scm_op("switch -c (from)", r, "Created branch");
             }
+            InputPurpose::DebugConfigField { field } => {
+                self.close_input_prompt();
+                self.submit_debug_config_field(field, &value);
+            }
             InputPurpose::AddRemoteName => {
                 // First step: capture the name, then re-prompt for the URL.
                 self.close_input_prompt();
@@ -30530,6 +30817,42 @@ impl App {
                     self.launch_resolved_in(rc, slot);
                 }
             }
+            ListPurpose::DebugConfigType => {
+                self.debug_config_draft = Some(crate::dap::configs::ConfigDraft::new(
+                    &row.id,
+                    crate::dap::configs::RequestKind::Launch,
+                ));
+                self.open_list_picker(
+                    crate::widgets::list_picker::ListPicker::new(
+                        ListPurpose::DebugConfigRequest,
+                        "Add Configuration: Launch or Attach",
+                        vec![
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("launch"),
+                                label: String::from(
+                                    "Launch — start the program under the debugger",
+                                ),
+                            },
+                            crate::widgets::list_picker::ListRow {
+                                id: String::from("attach"),
+                                label: String::from("Attach — to a program already running"),
+                            },
+                        ],
+                    ),
+                    "",
+                );
+            }
+            ListPurpose::DebugConfigRequest => {
+                if let Some(draft) = self.debug_config_draft.as_mut() {
+                    draft.request = if row.id == "attach" {
+                        crate::dap::configs::RequestKind::Attach
+                    } else {
+                        crate::dap::configs::RequestKind::Launch
+                    };
+                    let first = draft.next_field(None);
+                    self.prompt_debug_config_field(first, None);
+                }
+            }
             ListPurpose::DebugConfig => {
                 if let Some(idx) = row.id.strip_prefix("compound:") {
                     // Index the row straight through rather than round-tripping
@@ -30547,6 +30870,8 @@ impl App {
                         self.run_debug.selected_config = Some(compound.name.clone());
                         self.launch_compound(&compound);
                     }
+                } else if row.id == "add" {
+                    self.open_add_debug_config();
                 } else if row.id == "active" {
                     self.selected_debug_config = None;
                     self.selected_debug_compound = None;
@@ -32214,6 +32539,7 @@ impl App {
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
         self.scrub_view = None;
+        self.scrub_view_key = None;
         self.tree.scrub_tree = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
@@ -32224,6 +32550,7 @@ impl App {
         self.status = format!(
             "Scrubbing {n} commits — arrows step, Enter opens a commit's version, Home returns to your working tree"
         );
+        self.prefetch_scrub_views();
     }
 
     /// Keep symbol tabs (#369) and the other tabs of their files in step.
@@ -33655,6 +33982,11 @@ impl App {
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
                 self.scrub_view = None;
+                self.scrub_view_key = None;
+                self.scrub_views.clear();
+                self.scrub_plain.clear();
+                self.scrub_outlines.clear();
+                self.scrub_builder = None;
                 self.sync_scrub_tree();
                 self.status = String::from("Left the history scrubber");
                 return true;
@@ -33678,7 +34010,12 @@ impl App {
     /// no scrubbed commit or no file to show.
     fn scrubbed_file(
         &mut self,
-    ) -> Option<(PathBuf, String, crate::git::GraphCommit, Option<String>)> {
+    ) -> Option<(
+        PathBuf,
+        String,
+        crate::git::GraphCommit,
+        Option<std::sync::Arc<str>>,
+    )> {
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.status = String::from("Step the scrubber to a commit first");
             return None;
@@ -33698,7 +34035,11 @@ impl App {
         let text = self
             .scrub_cache
             .entry((commit.hash.clone(), rel.clone()))
-            .or_insert_with(|| crate::git::read_file_at_rev(&root, &commit.hash, &rel).ok())
+            .or_insert_with(|| {
+                crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                    .ok()
+                    .map(std::sync::Arc::from)
+            })
             .clone();
         Some((path, rel, commit, text))
     }
@@ -33707,6 +34048,11 @@ impl App {
     fn close_scrubber_for_tab(&mut self) {
         self.scrubber = None;
         self.scrub_view = None;
+        self.scrub_view_key = None;
+        self.scrub_views.clear();
+        self.scrub_plain.clear();
+        self.scrub_outlines.clear();
+        self.scrub_builder = None;
         self.sync_scrub_tree();
         self.focus_pane(Pane::Editor);
     }
@@ -33755,7 +34101,9 @@ impl App {
             self.status = format!("Could not diff {rel}: {e}");
             return;
         }
-        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft {
+            left_text: text.to_string(),
+        });
         self.close_scrubber_for_tab();
         self.status = format!("{rel}: {} → working tree", commit.short_hash);
     }
@@ -33887,12 +34235,19 @@ impl App {
     fn rebuild_scrub_view(&mut self) {
         self.sync_scrub_tree();
         self.scrub_for = self.editor.path.clone();
+        // Read before the view is parked: the next one looks where it did.
+        let anchor = self.scrub_view_anchor();
+        self.park_scrub_view();
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
+            // At the working tree: have the first steps back ready.
+            self.prefetch_scrub_views();
             return;
         };
         let Some(path) = self.editor.path.clone() else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
             return;
         };
         let root = self.workspace_root().to_path_buf();
@@ -33901,42 +34256,244 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
         else {
             self.scrub_view = None;
+            self.scrub_view_key = None;
             return;
         };
-        let mut read = |rev: &str| -> Option<String> {
-            let key = (rev.to_string(), rel.clone());
-            self.scrub_cache
-                .entry(key)
-                .or_insert_with(|| crate::git::read_file_at_rev(&root, rev, &rel).ok())
-                .clone()
+        let key = crate::scrubber::ViewKey {
+            hash: commit.hash.clone(),
+            rel: rel.clone(),
         };
-        let text = read(&commit.hash);
-        let baseline = commit
-            .parents
-            .first()
-            .and_then(|p| read(p))
-            .map(|t| crate::widgets::editor::split_into_lines(&t))
-            .unwrap_or_default();
-        let mut view = match text {
-            Some(text) => crate::widgets::editor::Editor::historical(&path, &text, baseline),
-            None => crate::widgets::editor::Editor::historical(
-                &PathBuf::from("history.txt"),
-                &format!("({rel} did not exist at {})", commit.short_hash),
-                Vec::new(),
-            ),
+        // A finished view when one is ready; otherwise a plain stand-in (the
+        // builder keeps those ready around the cursor) and the finished view
+        // when it lands, so a step never waits on highlighting a big file.
+        let take = |kept: &mut crate::scrubber::KeptViews| {
+            kept.iter()
+                .position(|(k, _)| *k == key)
+                .and_then(|i| kept.remove(i))
+                .map(|(_, v)| v)
         };
-        // Look at the same stretch of the file: where the last step was
-        // looking (a symbol jump moves it), else where the live buffer is.
-        let (scroll, row) = match self.scrub_view.as_ref() {
-            Some(prev) if prev.path.as_deref() == Some(path.as_path()) => {
+        let (view, finished) = match take(&mut self.scrub_views) {
+            Some(v) => (Some(v), true),
+            None => (take(&mut self.scrub_plain), false),
+        };
+        // Neither ready (the first step, or a jump): build the stand-in here.
+        let view = view.or_else(|| {
+            let text = self
+                .scrub_cache
+                .entry((commit.hash.clone(), rel.clone()))
+                .or_insert_with(|| {
+                    crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                        .ok()
+                        .map(std::sync::Arc::from)
+                })
+                .clone();
+            Some(crate::scrubber::plain_view(
+                &path,
+                &rel,
+                &commit.short_hash,
+                text.as_deref(),
+            ))
+        });
+        let Some(mut view) = view else { return };
+        Self::align_scrub_view(&mut view, anchor);
+        self.scrub_view = Some(view);
+        self.scrub_view_key = Some((key, finished));
+        self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// Put the finished view being left back among the kept ones, so
+    /// stepping back to it is free; drop the least recently used beyond
+    /// `SCRUB_VIEWS_KEPT` (a big file's view holds its whole text and
+    /// highlighting).
+    fn park_scrub_view(&mut self) {
+        let Some((key, finished)) = self.scrub_view_key.take() else {
+            return;
+        };
+        let Some(view) = self.scrub_view.take() else {
+            return;
+        };
+        if finished {
+            self.keep_scrub_view(key, view);
+        } else {
+            Self::keep_view(&mut self.scrub_plain, key, view);
+        }
+    }
+
+    fn keep_scrub_view(
+        &mut self,
+        key: crate::scrubber::ViewKey,
+        view: crate::widgets::editor::Editor,
+    ) {
+        // Its stand-in is no longer needed.
+        if let Some(i) = self.scrub_plain.iter().position(|(k, _)| *k == key)
+            && let Some(stale) = self.scrub_plain.remove(i)
+        {
+            fs_watch::offload_drop(stale);
+        }
+        Self::keep_view(&mut self.scrub_views, key, view);
+    }
+
+    /// Keep `view` as the most recently used in `kept`, dropping the least
+    /// recently used beyond `SCRUB_VIEWS_KEPT`. Dropped off the UI thread:
+    /// a big file's view is tens of thousands of strings, and freeing them
+    /// is a frame's worth of work a held arrow key cannot spare.
+    fn keep_view(
+        kept: &mut crate::scrubber::KeptViews,
+        key: crate::scrubber::ViewKey,
+        view: crate::widgets::editor::Editor,
+    ) {
+        if let Some(i) = kept.iter().position(|(k, _)| *k == key)
+            && let Some(old) = kept.remove(i)
+        {
+            fs_watch::offload_drop(old);
+        }
+        kept.push_back((key, view));
+        while kept.len() > SCRUB_VIEWS_KEPT {
+            if let Some(evicted) = kept.pop_front() {
+                fs_watch::offload_drop(evicted);
+            }
+        }
+    }
+
+    /// Request the views around the cursor for the active file, when it is
+    /// one the scrubber can show.
+    fn prefetch_scrub_views(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// Where a new view of the active file should look: where the view on
+    /// screen was looking (a symbol jump moves it), else where the live
+    /// buffer is. `(scroll, cursor_row)`.
+    fn scrub_view_anchor(&self) -> (usize, usize) {
+        match self.scrub_view.as_ref() {
+            Some(prev) if prev.path.is_some() && prev.path == self.editor.path => {
                 (prev.scroll, prev.cursor_row)
             }
             _ => (self.editor.scroll, self.editor.cursor_row),
-        };
+        }
+    }
+
+    /// Look at the stretch of the file `anchor` names.
+    fn align_scrub_view(view: &mut crate::widgets::editor::Editor, (scroll, row): (usize, usize)) {
         let last = view.lines.len().saturating_sub(1);
         view.scroll = scroll.min(last);
         view.cursor_row = row.min(last);
-        self.scrub_view = Some(view);
+    }
+
+    /// Ask the builder for what the commits around the cursor still lack:
+    /// stand-ins for the ones with neither a stand-in nor a finished view,
+    /// and finished views for the ones without one; most urgent first.
+    fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return;
+        };
+        let jobs: Vec<crate::scrubber::ViewJob> = scrub
+            .around()
+            .into_iter()
+            .map(|c| crate::scrubber::ViewJob {
+                key: crate::scrubber::ViewKey {
+                    hash: c.hash.clone(),
+                    rel: rel.to_string(),
+                },
+                path: path.to_path_buf(),
+                short: c.short_hash.clone(),
+                parent: c.parents.first().cloned(),
+                text: self
+                    .scrub_cache
+                    .get(&(c.hash.clone(), rel.to_string()))
+                    .cloned(),
+                parent_text: c
+                    .parents
+                    .first()
+                    .and_then(|p| self.scrub_cache.get(&(p.clone(), rel.to_string())).cloned()),
+            })
+            .collect();
+        let shown = self.scrub_view_key.as_ref();
+        let has_finished = |key: &crate::scrubber::ViewKey| {
+            self.scrub_views.iter().any(|(k, _)| k == key)
+                || shown.is_some_and(|(k, f)| k == key && *f)
+        };
+        let has_plain = |key: &crate::scrubber::ViewKey| {
+            self.scrub_plain.iter().any(|(k, _)| k == key) || shown.is_some_and(|(k, _)| k == key)
+        };
+        let finished: Vec<crate::scrubber::ViewJob> = jobs
+            .iter()
+            .filter(|j| !has_finished(&j.key))
+            .cloned()
+            .collect();
+        let plain: Vec<crate::scrubber::ViewJob> = jobs
+            .into_iter()
+            .filter(|j| !has_finished(&j.key) && !has_plain(&j.key))
+            .collect();
+        let builder = self
+            .scrub_builder
+            .get_or_insert_with(|| crate::scrubber::ViewBuilder::start(root.to_path_buf()));
+        builder.want(plain, finished);
+    }
+
+    /// Take in what the builder produced (#371): keep each view, and swap a
+    /// finished one in for the stand-in on screen. True when the screen
+    /// changed.
+    pub fn drain_scrub_views(&mut self) -> bool {
+        let Some(builder) = self.scrub_builder.as_ref() else {
+            return false;
+        };
+        let built = builder.drain();
+        let mut changed = false;
+        for b in built {
+            let rel = b.key.rel.clone();
+            self.scrub_cache
+                .entry((b.key.hash.clone(), rel.clone()))
+                .or_insert(b.text);
+            if let Some((parent, text)) = b.parent_text {
+                self.scrub_cache.entry((parent, rel)).or_insert(text);
+            }
+            if let Some(outline) = b.outline {
+                // Symbols are small next to a view, but a long session visits
+                // many commits: keep a bounded set.
+                if self.scrub_outlines.len() >= SCRUB_OUTLINES_KEPT {
+                    self.scrub_outlines.clear();
+                }
+                self.scrub_outlines.insert(b.key.clone(), outline);
+                changed = true;
+            }
+            let mut view = b.view;
+            let on_screen = self.scrubber.is_some()
+                && self.scrub_view.is_some()
+                && self
+                    .scrub_view_key
+                    .as_ref()
+                    .is_some_and(|(k, _)| *k == b.key);
+            if b.finished {
+                if on_screen && matches!(self.scrub_view_key, Some((_, false))) {
+                    Self::align_scrub_view(&mut view, self.scrub_view_anchor());
+                    if let Some(stand_in) = self.scrub_view.replace(view) {
+                        fs_watch::offload_drop(stand_in);
+                    }
+                    self.scrub_view_key = Some((b.key, true));
+                    changed = true;
+                } else if on_screen {
+                    fs_watch::offload_drop(view);
+                } else {
+                    self.keep_scrub_view(b.key, view);
+                }
+            } else if !on_screen && !self.scrub_views.iter().any(|(k, _)| *k == b.key) {
+                Self::keep_view(&mut self.scrub_plain, b.key, view);
+            } else {
+                fs_watch::offload_drop(view);
+            }
+        }
+        changed
     }
 
     pub fn poll_connect_dialog(&mut self) -> bool {
@@ -43324,6 +43881,7 @@ impl App {
             },
             Cmd::StartDebugging => self.debug_start_or_continue(),
             Cmd::SelectDebugConfig => self.open_debug_config_picker(),
+            Cmd::AddDebugConfig => self.open_add_debug_config(),
             Cmd::StopDebugging => self.debug_stop_by_user(),
             Cmd::PauseDebugging => self.debug_pause(),
             Cmd::SwitchDebugSession => self.switch_debug_session(),
@@ -50651,6 +51209,9 @@ impl App {
             return;
         };
         self.reload_config_for_path(&path);
+        // The explicit-save path's other follow-up: a save of an agent's
+        // proposal being edited approves it (#347).
+        self.approve_saved_edit(&path);
     }
 
     /// Reload whichever of croft's own config files `path` is, if any.
@@ -57671,11 +58232,7 @@ fn syntax_outline_for(
     path: &std::path::Path,
     lines: &[String],
 ) -> Vec<crate::lsp::manager::OutlineSymbol> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(kind) = crate::highlight::lang_for_extension(ext) else {
-        return Vec::new();
-    };
-    crate::outline_syntax::symbols_for(kind, lines.join("\n").as_bytes())
+    crate::outline_syntax::symbols_for_lines(path, lines)
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
@@ -61300,7 +61857,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_search_editor()
             | app.tick_inline_complete()
             | app.drain_review_ops();
-        let connect_changed = app.poll_connect_dialog();
+        let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
         let update_changed = app.poll_update_watch();
         let http_changed = app.drain_http_responses();

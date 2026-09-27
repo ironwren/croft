@@ -24,6 +24,17 @@ use tree_sitter::{Language, Parser, Query, QueryCursor};
 use crate::highlight::LangKind;
 use crate::lsp::manager::{OutlineKind, OutlineSymbol};
 
+/// The outline of `lines` as the file at `path`, from its own syntax tree;
+/// empty for a language croft has no grammar for. Callable off the UI
+/// thread, which is where the history scrubber builds it (#371).
+pub fn symbols_for_lines(path: &std::path::Path, lines: &[String]) -> Vec<OutlineSymbol> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(kind) = crate::highlight::lang_for_extension(ext) else {
+        return Vec::new();
+    };
+    symbols_for(kind, lines.join("\n").as_bytes())
+}
+
 /// Extract the outline for `source` in `kind`'s grammar. Returns an empty vec
 /// for languages without an outline query (the panel then falls back to the
 /// LSP reply, exactly as before this provider existed) or when parsing fails.

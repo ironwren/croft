@@ -173,6 +173,8 @@ pub fn render(
             Span::styled(" approve all from this agent for 10 min   ", dim),
             Span::styled("r", key),
             Span::styled(" deny with a reason   ", dim),
+            Span::styled("e", key),
+            Span::styled(" edit, then approve   ", dim),
             Span::styled("↑↓", key),
             Span::styled(" scroll", dim),
         ]),
