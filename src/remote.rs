@@ -522,10 +522,15 @@ fn run_croft_session(
     // `launch_croft_with` and the in-app `launch_only` — which the install
     // hook does not, since an already-installed remote installs on a
     // detached thread and never waits.
+    // The re-push baseline is taken BEFORE the connect-time push: a file
+    // edited while that push runs then still reads as changed, instead of
+    // becoming the baseline with the remote holding the older copy.
+    let repush_watch =
+        crate::config_sync::ConfigWatch::new(crate::config_sync::watched_local_paths());
     push_config_files(&ssh, &mut |msg| println!("{msg}"));
     // A file edited on this machine while the session runs follows it
     // (#262); the remote croft applies it on arrival. Stops with the session.
-    let repush = ConfigRepush::start(&ssh);
+    let repush = ConfigRepush::start(&ssh, repush_watch);
     let mut bootstrapped = false;
     // The relay rendezvous is keyed on the launch identity — the very same
     // `hash(launch arg)` the dtach socket uses — NOT the remote croft's
@@ -2428,29 +2433,37 @@ struct ConfigRepush {
     /// Host and control socket to push through; swapped on a reconnect.
     target: std::sync::Arc<std::sync::Mutex<(String, PathBuf)>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Joined on drop, so no push starts after the session has ended.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ConfigRepush {
-    fn start(ssh: &SshControl) -> Self {
+    /// Start re-pushing changes relative to `watch`, whose baseline the
+    /// caller took before the connect-time push.
+    fn start(ssh: &SshControl, watch: crate::config_sync::ConfigWatch) -> Self {
         let target = std::sync::Arc::new(std::sync::Mutex::new((
             ssh.host.clone(),
             ssh.socket_path.clone(),
         )));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (t, s) = (target.clone(), stop.clone());
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let dir = crate::prefs::config_dir();
-            let mut watch =
-                crate::config_sync::ConfigWatch::new(crate::config_sync::watched_local_paths());
+            let mut state = RepushState::new(watch);
             let mut log = config_sync_log();
-            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+            loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
+                // Checked after the sleep too, so a session that ended
+                // during it starts no push.
+                if s.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let (host, socket) = match t.lock() {
                     Ok(g) => g.clone(),
                     Err(_) => return,
                 };
                 repush_tick(
-                    &mut watch,
+                    &mut state,
                     &dir,
                     std::time::Instant::now(),
                     &mut || {
@@ -2468,7 +2481,11 @@ impl ConfigRepush {
                 );
             }
         });
-        ConfigRepush { target, stop }
+        ConfigRepush {
+            target,
+            stop,
+            worker: Some(worker),
+        }
     }
 
     /// Push through the connection a reconnect just opened.
@@ -2482,6 +2499,36 @@ impl ConfigRepush {
 impl Drop for ConfigRepush {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // At most one sleep plus a push in flight: the teardown waits for a
+        // transfer already started rather than cutting it off.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// How long a failed re-push waits before it is tried again: long enough
+/// not to hammer a connection that is down, short enough that an edit lands
+/// soon after a reconnect.
+const REPUSH_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a live re-push carries between polls.
+struct RepushState {
+    watch: crate::config_sync::ConfigWatch,
+    /// Changed files not yet pushed: a failed push stays here and is
+    /// retried, so an edit made while the connection was down still lands
+    /// after the reconnect.
+    pending: std::collections::BTreeSet<PathBuf>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl RepushState {
+    fn new(watch: crate::config_sync::ConfigWatch) -> Self {
+        RepushState {
+            watch,
+            pending: std::collections::BTreeSet::new(),
+            retry_at: None,
+        }
     }
 }
 
@@ -2492,14 +2539,24 @@ type Pushes = [(crate::config_sync::Syncable, PathBuf)];
 /// exist, and log what went and what did not. `push` returns the names it
 /// could not ship.
 fn repush_tick(
-    watch: &mut crate::config_sync::ConfigWatch,
+    state: &mut RepushState,
     dir: &Path,
     now: std::time::Instant,
     exclusions: &mut dyn FnMut() -> Option<Vec<String>>,
     push: &mut dyn FnMut(&Pushes) -> Vec<&'static str>,
     log: &mut dyn FnMut(String),
 ) {
-    let files = crate::config_sync::repush_targets(&watch.poll(now), dir);
+    let changed = state.watch.poll(now);
+    let retry_due = state.retry_at.is_some_and(|t| now >= t);
+    if changed.is_empty() && !retry_due {
+        return;
+    }
+    state.pending.extend(changed);
+    // A pending file deleted since, or no longer syncable, drops out.
+    let pending: Vec<PathBuf> = state.pending.iter().cloned().collect();
+    let files = crate::config_sync::repush_targets(&pending, dir);
+    state.pending = files.iter().map(|(_, p)| p.clone()).collect();
+    state.retry_at = None;
     if files.is_empty() {
         return;
     }
@@ -2507,13 +2564,23 @@ fn repush_tick(
     // changes so an edited exclusion applies without a reconnect: `None`
     // is a host config sync never pushes to.
     let Some(excluded) = exclusions() else {
+        state.pending.clear();
         return;
     };
     let (files, _) = crate::config_sync::apply_exclusions(files, &excluded);
     if files.is_empty() {
+        state.pending.clear();
         return;
     }
     let failed = push(&files);
+    state.pending = files
+        .iter()
+        .filter(|(s, _)| failed.contains(&s.name))
+        .map(|(_, p)| p.clone())
+        .collect();
+    if !state.pending.is_empty() {
+        state.retry_at = Some(now + REPUSH_RETRY);
+    }
     let pushed: Vec<&str> = files
         .iter()
         .map(|(s, _)| s.name)
@@ -4719,31 +4786,36 @@ Host !blocked *.internal
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
     /// #262: a config file edited during the session is pushed once, on the
-    /// next check; a failed push is logged; nothing changed pushes nothing.
+    /// next check; an excluded file or host gets nothing; a failed push is
+    /// logged, kept, and retried after `REPUSH_RETRY` (not sooner), so an
+    /// edit made while the connection was down lands after the reconnect.
     #[test]
-    fn a_live_repush_ships_each_local_edit_once_and_logs_failures() {
+    fn a_live_repush_ships_each_edit_once_and_retries_a_failed_one() {
         use crate::config_sync::ConfigWatch;
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keybindings.json");
         let snips = dir.path().join("snippets.json");
         let macros = dir.path().join("macros.json");
         std::fs::write(&keys, "[]").unwrap();
-        let mut watch = ConfigWatch::new(vec![keys.clone(), snips.clone(), macros.clone()]);
+        let mut state = RepushState::new(ConfigWatch::new(vec![
+            keys.clone(),
+            snips.clone(),
+            macros.clone(),
+        ]));
         let t0 = std::time::Instant::now();
-        let at = |n: u32| t0 + ConfigWatch::INTERVAL * n;
         let mut sent: Vec<Vec<&'static str>> = Vec::new();
         let mut lines: Vec<String> = Vec::new();
         // `excluded`: None is an excluded host, else the excluded files.
-        let tick = |watch: &mut ConfigWatch,
-                    n: u32,
+        let tick = |state: &mut RepushState,
+                    now: std::time::Instant,
                     excluded: Option<Vec<String>>,
                     fail: &'static [&'static str],
                     sent: &mut Vec<Vec<&'static str>>,
                     lines: &mut Vec<String>| {
             repush_tick(
-                watch,
+                state,
                 dir.path(),
-                at(n),
+                now,
                 &mut || excluded.clone(),
                 &mut |files| {
                     sent.push(files.iter().map(|(s, _)| s.name).collect());
@@ -4752,15 +4824,25 @@ Host !blocked *.internal
                 &mut |l| lines.push(l),
             );
         };
-        tick(&mut watch, 1, Some(vec![]), &[], &mut sent, &mut lines);
+        let step = ConfigWatch::INTERVAL;
+        tick(
+            &mut state,
+            t0 + step,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
         assert!(sent.is_empty(), "nothing edited yet");
         std::fs::write(&keys, r#"[{"key": "ctrl+k"}]"#).unwrap();
         std::fs::write(&snips, "{}").unwrap();
         std::fs::write(&macros, "{}").unwrap();
-        // macros.json is in config_sync_excluded_files: it stays home.
+        // macros.json is in config_sync_excluded_files: it stays home. The
+        // snippets push fails (the connection is down).
+        let failed_at = t0 + step * 2;
         tick(
-            &mut watch,
-            2,
+            &mut state,
+            failed_at,
             Some(vec![String::from("macros.json")]),
             &["snippets.json"],
             &mut sent,
@@ -4775,12 +4857,36 @@ Host !blocked *.internal
                     .to_string(),
             ]
         );
-        tick(&mut watch, 3, Some(vec![]), &[], &mut sent, &mut lines);
-        assert_eq!(sent.len(), 1, "each edit is pushed once");
+        // Before the retry delay nothing is sent; keybindings is not resent.
+        tick(
+            &mut state,
+            t0 + step * 3,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent.len(), 1, "no retry before REPUSH_RETRY");
+        // After it, only the failed file goes again, and lands.
+        tick(
+            &mut state,
+            failed_at + REPUSH_RETRY,
+            Some(vec![]),
+            &[],
+            &mut sent,
+            &mut lines,
+        );
+        assert_eq!(sent.last().unwrap(), &vec!["snippets.json"]);
+        assert!(state.pending.is_empty());
+        assert_eq!(
+            lines.last().unwrap(),
+            "Config sync: re-pushed snippets.json"
+        );
         // A host in config_sync_excluded_hosts gets nothing.
         std::fs::write(&keys, "[ ]").unwrap();
-        tick(&mut watch, 4, None, &[], &mut sent, &mut lines);
-        assert_eq!(sent.len(), 1, "an excluded host is never pushed to");
+        let later = failed_at + REPUSH_RETRY + step;
+        tick(&mut state, later, None, &[], &mut sent, &mut lines);
+        assert_eq!(sent.len(), 2, "an excluded host is never pushed to");
     }
 
     /// #694: the build, and every rustc under it, is the kernel's first
