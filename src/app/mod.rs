@@ -1569,6 +1569,9 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
 /// snapshot, the agent's last write, and the file's mtime on disk.
 type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
 
+/// How often an open review tab with running checks re-reads them (#365).
+const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What a pull request review tab's `gh` call is fetching (#365).
 enum PrGhJob {
     /// The PR itself (`gh pr view`), by number or URL.
@@ -1577,6 +1580,9 @@ enum PrGhJob {
     Diff { path: String },
     /// A failing check's log, for OUTPUT > PR Checks.
     Log { name: String },
+    /// A background re-read of the PR while its checks run: only the
+    /// checks of the open tab for `url` are replaced.
+    Checks { url: String },
 }
 
 /// What a network git operation's worker hands back: the UI-thread half
@@ -3799,6 +3805,8 @@ pub struct App {
     /// The review tab's `gh` call in flight (#365): what it is for, and
     /// where its answer arrives.
     pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
+    /// When the open review tab's checks were last re-read (#365).
+    pr_checks_polled: Option<std::time::Instant>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -5581,6 +5589,7 @@ impl App {
             review_verdict: None,
             review_gh: String::from("gh"),
             pr_gh: None,
+            pr_checks_polled: None,
             review_tx,
             review_rx,
             recording: None,
@@ -51233,9 +51242,40 @@ impl App {
         self.pr_gh = Some((job, rx));
     }
 
+    /// While the open review tab has checks still running, re-read the PR
+    /// every [`PR_CHECKS_POLL`] so they turn green or red on their own
+    /// (#365). Never while another review call is in flight, which it would
+    /// otherwise replace.
+    fn refresh_pending_pr_checks(&mut self) {
+        if self.pr_gh.is_some() {
+            return;
+        }
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        if !view.has_pending_checks() || view.pr.url.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.pr_checks_polled {
+            Some(at) if now.duration_since(at) < PR_CHECKS_POLL => return,
+            // The first sight of a pending tab starts the clock.
+            None => {
+                self.pr_checks_polled = Some(now);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.pr_checks_polled = Some(now);
+        let url = view.pr.url.clone();
+        let args = crate::pr_review::view_args(&url);
+        self.spawn_pr_gh(PrGhJob::Checks { url }, args);
+    }
+
     /// Apply a finished review `gh` call. Returns true when it changed what
     /// is on screen.
     fn poll_pr_gh(&mut self) -> bool {
+        self.refresh_pending_pr_checks();
         let Some((_, rx)) = self.pr_gh.as_ref() else {
             return false;
         };
@@ -51269,6 +51309,21 @@ impl App {
                 }
                 Err(why) => self.status = format!("gh pr diff failed: {why}"),
             },
+            PrGhJob::Checks { url } => {
+                // A failed re-read changes nothing: the next one retries.
+                let Ok(pr) = result.and_then(|json| crate::pr_review::parse_pr(&json)) else {
+                    return false;
+                };
+                let Some(view) = self.editor.pr_review.as_mut().filter(|v| v.pr.url == url) else {
+                    return false;
+                };
+                let was_pending = view.has_pending_checks();
+                view.pr.checks = pr.checks;
+                view.move_selection(0);
+                if was_pending && !view.has_pending_checks() {
+                    self.status = format!("PR #{}: every check has finished", view.pr.number);
+                }
+            }
             PrGhJob::Log { name } => {
                 let channel = "PR Checks";
                 crate::output::clear(channel);

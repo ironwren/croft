@@ -56029,3 +56029,56 @@ fn clicking_a_lane_rows_dot_marks_the_file_reviewed() {
     assert!(!unreviewed(&mut app), "{}", app.status);
     assert!(app.status.contains("f.rs: reviewed"), "{}", app.status);
 }
+
+/// #365: an open review tab whose checks are still running re-reads them
+/// in the background, and says when the last one finishes.
+#[test]
+fn running_pr_checks_refresh_themselves_until_they_finish() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {"login": "a"}, "files": [], "statusCheckRollup": [{"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}]}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        let mut pr = crate::pr_review::parse_pr(
+            r#"{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {"login": "a"}, "files": [], "statusCheckRollup": [{"__typename": "CheckRun", "name": "build", "status": "IN_PROGRESS", "conclusion": ""}]}"#,
+        )
+        .unwrap();
+        pr.number = 42;
+        app.open_pr_review(pr, String::from("x/y#42"));
+        assert!(app.editor.pr_review.as_ref().unwrap().has_pending_checks());
+        // The first pass only starts the clock; nothing is fetched yet.
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_none());
+        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_some(), "a due refresh runs gh");
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the refresh", || {
+            app.poll_pr_gh();
+            !app.editor.pr_review.as_ref().unwrap().has_pending_checks()
+        });
+        assert_eq!(
+            app.editor.pr_review.as_ref().unwrap().pr.checks[0].state,
+            crate::pr_review::CheckState::Pass
+        );
+        assert!(
+            app.status.contains("every check has finished"),
+            "{}",
+            app.status
+        );
+        // Nothing pending: no more refreshes.
+        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        app.poll_pr_gh();
+        assert!(app.pr_gh.is_none());
+    });
+}
