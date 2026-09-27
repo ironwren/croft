@@ -210,6 +210,9 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".php" => i('\u{e73d}', 0xa0, 0x74, 0xc4),
         ".swift" => i('\u{e755}', 0xe3, 0x79, 0x33),
         ".lua" => i('\u{e620}', 0x00, 0x00, 0x80),
+        // cod-database: a CodeQL query runs against a database (#578). The
+        // tree draws glyphs, so the activity bar's `ql.svg` cannot serve here.
+        ".ql" | ".qll" => i('\u{eace}', 0x51, 0x9a, 0xba),
         ".vim" => i('\u{e7c5}', 0x01, 0x98, 0x33),
         ".xml" => i('\u{eabe}', 0xe3, 0x79, 0x33),
         ".svg" => i('\u{eabe}', 0xff, 0xb1, 0x3b),
@@ -273,6 +276,13 @@ mod tests {
         let upper = for_path("FILE.RS", ".RS");
         assert_eq!(lower.glyph, upper.glyph);
         assert_eq!(lower.color, upper.color);
+    }
+
+    #[test]
+    fn codeql_queries_and_libraries_share_an_icon() {
+        let query = for_path("q.ql", ".ql");
+        assert_eq!(query.glyph, '\u{eace}');
+        assert_eq!(query.glyph, for_path("lib.qll", ".qll").glyph);
     }
 
     #[test]

@@ -3102,6 +3102,11 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
+    /// Queries "Run Queries in Pack" has yet to start, in order (#578).
+    codeql_run_queue: std::collections::VecDeque<PathBuf>,
+    /// How many queries the pack run holds and how many have failed so
+    /// far, for the status line; the total is 0 when no pack run is on.
+    codeql_batch: (usize, usize),
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5296,6 +5301,8 @@ impl App {
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
             codeql_run: None,
+            codeql_run_queue: std::collections::VecDeque::new(),
+            codeql_batch: (0, 0),
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -22566,10 +22573,18 @@ impl App {
     /// CodeQL view keys: arrows move between headers and actions, Enter or
     /// Space folds a section or runs an action, Esc returns to the Explorer.
     /// On a database row, Delete removes it, F2 renames it and `e` shows its
-    /// folder in the Explorer; `s` anywhere steps the databases' sort order.
+    /// folder in the Explorer. On a query history row, Delete removes it, F2
+    /// renames it, `v` opens its query and `o` its results directory. `s`
+    /// steps the query history's sort order within that section and the
+    /// databases' anywhere else. `n` creates a query, in the selected pack
+    /// when there is one. `r` on a pack or one of its queries runs every
+    /// query in the pack; Esc then first cancels the ones still queued.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
+        use crate::widgets::codeql::{Action, Hit};
         let db = self.codeql.selected_database();
+        let run = self.codeql.selected_history();
         match key.code {
+            KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
@@ -22581,11 +22596,15 @@ impl App {
             KeyCode::Delete => {
                 if let Some(i) = db {
                     self.confirm_remove_codeql_database(i);
+                } else if let Some(i) = run {
+                    self.confirm_remove_codeql_history(i);
                 }
             }
             KeyCode::F(2) => {
                 if let Some(i) = db {
                     self.prompt_rename_codeql_database(i);
+                } else if let Some(i) = run {
+                    self.prompt_rename_codeql_history(i);
                 }
             }
             KeyCode::Char('e') => {
@@ -22593,14 +22612,37 @@ impl App {
                     self.reveal_codeql_database(i);
                 }
             }
+            KeyCode::Char('v') => {
+                if let Some(i) = run {
+                    self.view_codeql_history_query(i);
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some(i) = run {
+                    self.open_codeql_history_results_dir(i);
+                }
+            }
+            KeyCode::Char('s')
+                if run.is_some()
+                    || self.codeql.selected_hit() == Some(Hit::Action(Action::SortHistory)) =>
+            {
+                self.sort_codeql_history();
+            }
             KeyCode::Char('s') => self.sort_codeql_databases(),
+            KeyCode::Char('n') => self.prompt_create_codeql_query(),
+            KeyCode::Char('r') => {
+                if let Some(p) = self.codeql.selected_pack() {
+                    self.run_codeql_pack(p);
+                }
+            }
             _ => {}
         }
     }
 
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
-    /// the language and database lists select; a query row runs; the actions
-    /// still to come in #578 say so rather than do nothing.
+    /// the language and database lists select; a query row runs; "Create
+    /// one" asks for a query name; the actions still to come in #578 say so
+    /// rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22627,6 +22669,7 @@ impl App {
                 self.refresh_codeql_databases();
             }
             Hit::Action(Action::SortDatabases) => self.sort_codeql_databases(),
+            Hit::Action(Action::SortHistory) => self.sort_codeql_history(),
             Hit::Action(
                 action @ (Action::AddDatabaseFromFolder
                 | Action::AddDatabaseFromArchive
@@ -22701,9 +22744,9 @@ impl App {
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
+            Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
             Hit::Action(action) => {
                 let what = match action {
-                    Action::CreateQuery => "Creating CodeQL queries",
                     Action::SetUpControllerRepository => "Variant analysis",
                     Action::ViewAst => "The AST viewer",
                     _ => unreachable!("handled above"),
@@ -22755,7 +22798,14 @@ impl App {
     /// elsewhere, which croft only forgets. Both sides are canonicalised so
     /// a `..` in a hand-edited list cannot walk out of the cache.
     fn codeql_cached_copy(path: &Path) -> Option<PathBuf> {
-        let cache = Self::codeql_db_cache_dir().canonicalize().ok()?;
+        Self::cache_entry_holding(&Self::codeql_db_cache_dir(), path)
+    }
+
+    /// The entry directly under `cache` that holds `path`, both
+    /// canonicalised; `None` when `path` is elsewhere, is `cache` itself, or
+    /// either does not exist.
+    fn cache_entry_holding(cache: &Path, path: &Path) -> Option<PathBuf> {
+        let cache = cache.canonicalize().ok()?;
         let path = path.canonicalize().ok()?;
         let first = path.strip_prefix(&cache).ok()?.components().next()?;
         Some(cache.join(first))
@@ -22890,16 +22940,271 @@ impl App {
         croft_cache_dir().join("codeql-history.json")
     }
 
+    /// Where query runs write their results, one folder per run.
+    fn codeql_results_dir() -> PathBuf {
+        croft_cache_dir().join("codeql").join("results")
+    }
+
     /// Mirror the saved query history into the side bar.
     fn refresh_codeql_history(&mut self) {
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
         self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
+        self.codeql.history_sort = history.sort_by;
+    }
+
+    /// The query history entry the palette commands act on: the selected
+    /// row, else the most recent run; says so when there is none.
+    fn current_codeql_history(&mut self) -> Option<usize> {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let current = self
+            .codeql
+            .selected_history()
+            .filter(|&i| i < history.entries.len())
+            .or_else(|| history.newest());
+        if current.is_none() {
+            self.status = String::from("There is no CodeQL query history yet");
+        }
+        current
+    }
+
+    /// The results folder of a history entry that croft may delete: its
+    /// run's own folder under the results cache. `None` when the output
+    /// points anywhere else (a hand-edited history), which croft only
+    /// forgets.
+    fn codeql_cached_results(output: &Path) -> Option<PathBuf> {
+        Self::cache_entry_holding(&Self::codeql_results_dir(), output.parent()?)
+    }
+
+    /// Ask before removing history entry `index` (#578), saying whether its
+    /// results go too. A run still in flight is refused: its worker would
+    /// write the results back.
+    fn confirm_remove_codeql_history(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        if entry.status == crate::codeql_query::RunStatus::Running {
+            self.status = String::from("That query is still running");
+            return;
+        }
+        let what = if Self::codeql_cached_results(&entry.output).is_some() {
+            "Its results are deleted."
+        } else {
+            "Its results stay on disk."
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRemoveHistory {
+                    output: entry.output.clone(),
+                },
+                format!(
+                    "Remove query history entry '{}'?  {what}",
+                    entry.display_name()
+                ),
+                "Enter to remove · Esc to keep",
+            )
+            .with_value("remove"),
+        );
+    }
+
+    /// Remove the history entry whose run wrote `output`, deleting its
+    /// results folder when it is croft's own, and save.
+    fn perform_remove_codeql_history(&mut self, output: &Path) {
+        let path = Self::codeql_history_path();
+        let mut history = crate::codeql_query::History::load(&path);
+        let Some(i) = history.position(output) else {
+            self.status = String::from("That query history entry is no longer listed");
+            return;
+        };
+        let name = history.entries[i].display_name();
+        let cached = Self::codeql_cached_results(output);
+        history.remove(i);
+        if let Err(e) = history.save(&path) {
+            self.status = format!("Could not save the CodeQL query history: {e}");
+            return;
+        }
+        self.status = match cached.map(std::fs::remove_dir_all) {
+            Some(Err(e)) => {
+                format!("Removed {name} from the query history, but not its results: {e}")
+            }
+            _ => format!("Removed {name} from the query history"),
+        };
+        self.refresh_codeql_history();
+        // Stay in the list: on the row that took its place, else the one
+        // above, never on the welcome text.
+        let n = self.codeql.history.len();
+        if n > 0 {
+            self.codeql.select_history(i.min(n - 1));
+        }
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
+    fn prompt_rename_codeql_history(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRenameHistory {
+                    output: entry.output.clone(),
+                },
+                String::from("Rename Query History Entry"),
+                "the label shown in the side bar",
+            )
+            .with_value(entry.display_name()),
+        );
+    }
+
+    fn submit_rename_codeql_history(&mut self, output: &Path, value: &str) {
+        let path = Self::codeql_history_path();
+        let mut history = crate::codeql_query::History::load(&path);
+        let Some(i) = history.position(output) else {
+            self.status = String::from("That query history entry is no longer listed");
+            return;
+        };
+        if let Err(e) = history.rename(i, value) {
+            self.status = e;
+            return;
+        }
+        // Renaming can move it in a name-sorted list.
+        history.sort(history.sort_by);
+        self.status = match history.save(&path) {
+            Ok(()) => format!("Renamed query history entry to {}", value.trim()),
+            Err(e) => format!("Could not save the CodeQL query history: {e}"),
+        };
+        self.refresh_codeql_history();
+        if let Some(i) = history.position(output) {
+            self.codeql.select_history(i);
+        }
+    }
+
+    /// Step the query history to the next sort order (date, name, status),
+    /// keeping the selection on the same entry.
+    fn sort_codeql_history(&mut self) {
+        let path = Self::codeql_history_path();
+        let mut history = crate::codeql_query::History::load(&path);
+        let selected = self
+            .codeql
+            .selected_history()
+            .and_then(|i| history.entries.get(i))
+            .map(|e| e.output.clone());
+        let by = history.sort_by.next();
+        history.sort(by);
+        self.status = match history.save(&path) {
+            Ok(()) => format!("CodeQL query history sorted by {}", by.label()),
+            Err(e) => format!("Could not save the CodeQL query history: {e}"),
+        };
+        self.refresh_codeql_history();
+        if let Some(i) = selected.and_then(|o| history.position(&o)) {
+            self.codeql.select_history(i);
+        }
+    }
+
+    /// Open the query file history entry `index` ran (VS Code's "View
+    /// Query"): the file as it is now, which may have changed since.
+    fn view_codeql_history_query(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(query) = history.entries.get(index).map(|e| e.query.clone()) else {
+            return;
+        };
+        match self.editor.open(&query) {
+            Ok(()) => self.sync_open_file_poll_mtime(),
+            Err(e) => self.status = format!("{}: {e}", query.display()),
+        }
+    }
+
+    /// VS Code's "Open Results Directory" for history entry `index`. The
+    /// folder lives in croft's cache, outside the workspace, so the
+    /// Explorer can show it only when the user has it open; otherwise its
+    /// results file opens and the status line names the folder.
+    fn open_codeql_history_results_dir(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(output) = history.entries.get(index).map(|e| e.output.clone()) else {
+            return;
+        };
+        let Some(dir) = output.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        if !dir.is_dir() {
+            self.status = format!("{} does not exist (yet)", dir.display());
+        } else if self.tree.nodes.iter().any(|n| n.path == dir) {
+            self.reveal_in_explorer(dir);
+        } else if output.is_file() {
+            match self.editor.open(&output) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    self.status = format!("Results directory: {}", dir.display());
+                }
+                Err(e) => self.status = format!("{}: {e}", output.display()),
+            }
+        } else {
+            self.status = format!("Results directory: {}", dir.display());
+        }
     }
 
     /// Find the workspace's queries for the side bar's Queries section.
     /// Called when the view opens, not every frame: it walks the tree.
     fn refresh_codeql_queries(&mut self) {
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Ask for the name of a new query (#578, VS Code's "CodeQL: Create
+    /// Query"). It goes into the pack whose line or query row is selected in
+    /// the Queries section, else the workspace root, and is written in the
+    /// pack's language, else the Language section's, else none.
+    fn prompt_create_codeql_query(&mut self) {
+        use crate::widgets::codeql::LANGUAGE_IDS;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let pack = self
+            .codeql
+            .selected_pack()
+            .and_then(|p| self.codeql.queries.get(p));
+        let root = self.workspace_root().to_path_buf();
+        let dir = pack.map_or_else(|| root.clone(), |p| p.dir.clone());
+        let language = pack
+            .and_then(|p| p.language.clone())
+            .or_else(|| self.codeql.language.map(|i| LANGUAGE_IDS[i].to_string()));
+        let place = match pack {
+            Some(p) if p.name != crate::codeql_query::NO_PACK => p.name.clone(),
+            _ => String::from("the workspace root"),
+        };
+        let lang = language
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlCreateQuery { dir, language },
+            format!("Create CodeQL Query in {place}{lang}"),
+            "query name, e.g. find-unsafe-calls",
+        ));
+    }
+
+    /// Write the new query, open it and list it in the Queries section;
+    /// a refused name or an existing file is said on the status line.
+    fn submit_create_codeql_query(&mut self, dir: &Path, language: Option<&str>, name: &str) {
+        let root = self.workspace_root().to_path_buf();
+        let path = match crate::codeql_query::scaffold_query(&root, dir, name, language) {
+            Ok(path) => path,
+            Err(e) => {
+                self.status = format!("Could not create the query: {e}");
+                return;
+            }
+        };
+        self.refresh_codeql_queries();
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                let shown = path.strip_prefix(&root).unwrap_or(&path);
+                self.status = format!("Created CodeQL query {}", shown.display());
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
     }
 
     /// Run the open `.ql` file on the current database (#578), from the
@@ -22939,10 +23244,15 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let dir = croft_cache_dir()
-            .join("codeql")
-            .join("results")
-            .join(format!("{started}-{stem}"));
+        // Runs of a pack start back to back, so two queries of the same
+        // name can start within the same second; each keeps its own folder.
+        let base = Self::codeql_results_dir().join(format!("{started}-{stem}"));
+        let mut dir = base.clone();
+        let mut n = 1;
+        while dir.exists() {
+            n += 1;
+            dir = PathBuf::from(format!("{}-{n}", base.display()));
+        }
         let kind = cq::output_for(source);
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
@@ -22956,6 +23266,7 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
+            name: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
@@ -23002,9 +23313,10 @@ impl App {
     }
 
     /// Collect a finished query run (#578): record how it went in the
-    /// history, and open its results when it succeeded.
+    /// history, open its results when it succeeded, and start a pack run's
+    /// next query.
     pub fn drain_codeql_run(&mut self) -> bool {
-        use crate::codeql_query::{History, RunStatus};
+        use crate::codeql_query::RunStatus;
         let Some((rx, since)) = self.codeql_run.as_ref() else {
             return false;
         };
@@ -23017,9 +23329,29 @@ impl App {
         };
         let seconds = since.elapsed().as_secs();
         self.codeql_run = None;
+        let failed = matches!(status, RunStatus::Failed(_));
+        self.record_codeql_run(status, seconds);
+        if self.codeql_batch.0 > 0 {
+            self.codeql_batch.1 += usize::from(failed);
+            self.start_next_queued_codeql();
+        }
+        true
+    }
+
+    /// Write a finished run's outcome into its history entry and open its
+    /// results when it succeeded.
+    fn record_codeql_run(&mut self, status: crate::codeql_query::RunStatus, seconds: u64) {
+        use crate::codeql_query::{History, RunStatus};
         let mut history = History::load(&Self::codeql_history_path());
-        let Some(entry) = history.entries.first_mut() else {
-            return true;
+        // The newest run still marked running is this one; a sorted history
+        // need not have it on top, and it may have been removed meanwhile.
+        let Some(entry) = history
+            .entries
+            .iter_mut()
+            .filter(|e| e.status == RunStatus::Running)
+            .max_by_key(|e| e.started)
+        else {
+            return;
         };
         entry.status = status.clone();
         entry.seconds = seconds;
@@ -23041,7 +23373,85 @@ impl App {
                 Err(e) => self.status = format!("{}: {e}", output.display()),
             },
         }
-        true
+    }
+
+    /// Run every query in pack `pack` on the current database, one after
+    /// another (#578): the first starts now and [`Self::drain_codeql_run`]
+    /// starts each next one as the one before finishes, failed or not.
+    /// Each run keeps its own history entry. Refused while a query is
+    /// running, so two pack runs never interleave.
+    fn run_codeql_pack(&mut self, pack: usize) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let Some(queries) = self.codeql.queries.get(pack).map(|p| p.queries.clone()) else {
+            return;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        if store.current.and_then(|i| store.databases.get(i)).is_none() {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        }
+        if queries.is_empty() {
+            self.status = String::from("That pack has no queries");
+            return;
+        }
+        self.codeql_batch = (queries.len(), 0);
+        self.codeql_run_queue = queries.into();
+        self.start_next_queued_codeql();
+    }
+
+    /// Start the pack run's next query, read from disk as the side-bar rows
+    /// are; one that cannot be read counts as failed and the next is tried.
+    /// With the queue empty, the pack run is over and the status line sums
+    /// it up.
+    fn start_next_queued_codeql(&mut self) {
+        let (total, _) = self.codeql_batch;
+        while self.codeql_run.is_none() {
+            let Some(path) = self.codeql_run_queue.pop_front() else {
+                let failed = self.codeql_batch.1;
+                self.codeql_batch = (0, 0);
+                self.status = match failed {
+                    0 => format!("Ran {total} CodeQL queries"),
+                    n => format!("Ran {total} CodeQL queries, {n} failed"),
+                };
+                return;
+            };
+            let n = total - self.codeql_run_queue.len();
+            let source = match std::fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(e) => {
+                    self.codeql_batch.1 += 1;
+                    self.status = format!("{}: {e}", path.display());
+                    continue;
+                }
+            };
+            self.run_codeql_file(path, &source);
+            if self.codeql_run.is_none() {
+                // Refused (the database went away meanwhile): the rest
+                // would be refused too.
+                self.codeql_run_queue.clear();
+                self.codeql_batch = (0, 0);
+                return;
+            }
+            if let Some(rest) = self.status.strip_prefix("Running ") {
+                self.status = format!("Running CodeQL queries {n}/{total}: {rest}");
+            }
+        }
+    }
+
+    /// Drop the pack run's queries still waiting (#578); the one running
+    /// finishes and is recorded as usual.
+    fn cancel_codeql_queue(&mut self) {
+        let left = self.codeql_run_queue.len();
+        self.codeql_run_queue.clear();
+        self.codeql_batch = (0, 0);
+        self.status = match left {
+            0 => String::from("No CodeQL queries are queued"),
+            1 => String::from("Cancelled 1 queued CodeQL query"),
+            n => format!("Cancelled {n} queued CodeQL queries"),
+        };
     }
 
     /// Mirror the saved database list into the side bar.
@@ -27076,6 +27486,18 @@ impl App {
             InputPurpose::CodeqlRenameDatabase { path } => {
                 self.close_input_prompt();
                 self.submit_rename_codeql_database(&path, &value);
+            }
+            InputPurpose::CodeqlRemoveHistory { output } => {
+                self.close_input_prompt();
+                self.perform_remove_codeql_history(&output);
+            }
+            InputPurpose::CodeqlRenameHistory { output } => {
+                self.close_input_prompt();
+                self.submit_rename_codeql_history(&output, &value);
+            }
+            InputPurpose::CodeqlCreateQuery { dir, language } => {
+                self.close_input_prompt();
+                self.submit_create_codeql_query(&dir, language.as_deref(), &value);
             }
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
@@ -42032,6 +42454,32 @@ impl App {
                     self.reveal_codeql_database(i);
                 }
             }
+            Cmd::CodeqlRemoveHistory => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.confirm_remove_codeql_history(i);
+                }
+            }
+            Cmd::CodeqlRenameHistory => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.prompt_rename_codeql_history(i);
+                }
+            }
+            Cmd::CodeqlSortHistory => self.sort_codeql_history(),
+            Cmd::CodeqlViewQuery => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.view_codeql_history_query(i);
+                }
+            }
+            Cmd::CodeqlCreateQuery => self.prompt_create_codeql_query(),
+            Cmd::CodeqlRunPack => match self.codeql.selected_pack() {
+                Some(p) => self.run_codeql_pack(p),
+                None => {
+                    self.status = String::from(
+                        "Select a query pack or one of its queries in the CodeQL side bar first",
+                    );
+                }
+            },
+            Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),

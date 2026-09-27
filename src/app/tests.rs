@@ -55033,6 +55033,221 @@ fn codeql_database_palette_commands_act_on_the_current_database() {
     });
 }
 
+/// Save a query history of `(query, started, status, output)` runs, with
+/// each output file written, for the history management tests.
+fn seed_codeql_history(
+    tmp: &std::path::Path,
+    runs: &[(&str, u64, crate::codeql_query::RunStatus, PathBuf)],
+) {
+    let mut history = crate::codeql_query::History::default();
+    for (query, started, status, output) in runs {
+        std::fs::write(tmp.join(query), "select 1").unwrap();
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, "col0\n1\n").unwrap();
+        history.push(crate::codeql_query::HistoryEntry {
+            query: tmp.join(query),
+            database: String::from("app"),
+            started: *started,
+            seconds: 3,
+            status: status.clone(),
+            output: output.clone(),
+            name: None,
+        });
+    }
+    history.save(&App::codeql_history_path()).unwrap();
+}
+
+#[test]
+fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Query History view renames, sorts, views the query
+    // of, opens the results directory of and removes a run; removing
+    // deletes only results in croft's own cache.
+    use crate::codeql_query::RunStatus;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = App::codeql_results_dir().join("200-a");
+        let elsewhere = tmp.path().join("elsewhere");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                (
+                    "c.ql",
+                    50,
+                    RunStatus::Running,
+                    App::codeql_results_dir().join("50-c/results.csv"),
+                ),
+                (
+                    "b.ql",
+                    100,
+                    RunStatus::Succeeded,
+                    elsewhere.join("results.csv"),
+                ),
+                (
+                    "a.ql",
+                    200,
+                    RunStatus::Succeeded,
+                    cached.join("results.csv"),
+                ),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        assert_eq!(app.codeql.history.len(), 3);
+        assert!(app.codeql.history[0].contains("a.ql"), "newest first");
+
+        // F2 renames, starting from the query's name.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "a.ql");
+        for _ in 0.."a.ql".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "zeta".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history[0], "\u{2713} zeta", "{}", app.status);
+
+        // `s` on a history row sorts the history, not the databases.
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        assert_eq!(app.codeql.db_sort, None, "databases untouched");
+        assert!(app.codeql.history[0].contains("b.ql"));
+        assert_eq!(app.codeql.selected_history(), Some(2), "still on zeta");
+        assert_eq!(
+            crate::codeql_query::History::load(&App::codeql_history_path()).sort_by,
+            crate::codeql_query::HistSort::Name,
+            "the order is saved"
+        );
+
+        // `v` opens the query; `o` the results in their cache folder.
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a.ql").as_path())
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(cached.join("results.csv").as_path())
+        );
+        assert!(app.status.contains("Results directory"), "{}", app.status);
+
+        // A run in flight is not removed.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(app.input_prompt.is_none());
+        assert!(app.status.contains("still running"), "{}", app.status);
+
+        // Delete asks first; Esc keeps it; results outside the cache stay.
+        app.codeql.select_history(0);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("stay on disk"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.codeql.history.len(), 3, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 2, "{}", app.status);
+        assert!(
+            elsewhere.join("results.csv").is_file(),
+            "not croft's to delete"
+        );
+        assert_eq!(app.codeql.selected_history(), Some(0), "stays in the list");
+
+        // Croft's own results folder goes with its entry.
+        app.codeql.select_history(1);
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("results are deleted"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.codeql.history.len(), 1, "{}", app.status);
+        assert!(!cached.exists(), "the run's folder is gone");
+        assert!(
+            App::codeql_results_dir().join("50-c").is_dir(),
+            "only that run's folder"
+        );
+    });
+}
+
+#[test]
+fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlRemoveHistory);
+        assert!(
+            app.status.contains("no CodeQL query history"),
+            "{}",
+            app.status
+        );
+        assert!(app.input_prompt.is_none());
+        let out = |n: &str| App::codeql_results_dir().join(n).join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("a-old.ql", 1, RunStatus::Succeeded, out("1-old")),
+                ("b-new.ql", 2, RunStatus::Succeeded, out("2-new")),
+            ],
+        );
+        // Sorted by name, the newest run is no longer on top; it is still
+        // the one the commands pick.
+        app.run_command(Command::CodeqlSortHistory);
+        assert_eq!(app.codeql.history_sort, crate::codeql_query::HistSort::Name);
+        app.run_command(Command::CodeqlRenameHistory);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&InputPurpose::CodeqlRenameHistory {
+                output: out("2-new")
+            })
+        );
+        app.close_input_prompt();
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("b-new.ql").as_path())
+        );
+        // A selected row wins over the newest.
+        app.open_codeql_view();
+        app.codeql.select_history(0);
+        app.run_command(Command::CodeqlViewQuery);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("a-old.ql").as_path())
+        );
+        assert_eq!(
+            Command::from_id("codeql_remove_history"),
+            Some(Command::CodeqlRemoveHistory)
+        );
+        assert_eq!(Command::CodeqlViewQuery.title(), "CodeQL: View Query");
+    });
+}
+
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
 /// `--output=` names, and exits with `code` (printing `err` on stderr).
 #[cfg(unix)]
@@ -55260,6 +55475,339 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
             calls.starts_with("database analyze ") && calls.contains("pack/r.ql"),
             "the saved file's @kind picks SARIF: {calls}"
         );
+    });
+}
+
+/// A workspace whose pack `acme/rust` holds `a.ql`, `b.ql` and `c.ql`,
+/// database "app" current, the CodeQL view open on the pack's line, and a
+/// stand-in `codeql` in `bin` that fails whatever runs `b.ql`.
+#[cfg(unix)]
+fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
+    use std::os::unix::fs::PermissionsExt;
+    let pack = tmp.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        "name: acme/rust\nextractor: rust\n",
+    )
+    .unwrap();
+    for q in ["a", "b", "c"] {
+        std::fs::write(pack.join(format!("{q}.ql")), "select 1").unwrap();
+    }
+    let mut app = codeql_query_fixture(tmp, "select 1");
+    let reply = bin.join("codeql-reply");
+    std::fs::write(&reply, "col0\n1\n").unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in *b.ql*) echo 'ERROR: b is broken' >&2; exit 1 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; esac; done\nexit 0\n",
+        log = bin.join("codeql-calls.log").display(),
+        reply = reply.display(),
+    );
+    let program = bin.join("codeql");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    app.codeql_program = program;
+    app.open_codeql_view();
+    app.focus = Pane::Tree;
+    let row = app
+        .codeql
+        .lines()
+        .iter()
+        .position(|l| {
+            matches!(
+                l,
+                crate::widgets::codeql::Line::Action(
+                    crate::widgets::codeql::Action::TogglePack(0),
+                    _
+                )
+            )
+        })
+        .expect("the pack is listed");
+    app.codeql.selected = row;
+    app
+}
+
+/// Drain until one query run lands (the next of a pack run may start).
+fn drain_one_codeql_run(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_run() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query run never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
+    // #578: `r` on a pack line queues every query in it; each run lands in
+    // the query history in order and a failing one doesn't stop the rest.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        let pack = tmp.path().join("pack");
+        assert_eq!(
+            app.codeql.queries[0].queries,
+            vec![pack.join("a.ql"), pack.join("b.ql"), pack.join("c.ql")]
+        );
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/3: a.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/3: b.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 3/3: c.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(app.status, "Ran 3 CodeQL queries, 1 failed");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        // Newest first: one entry per query, in the order they ran.
+        assert_eq!(app.codeql.history.len(), 3, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[2].starts_with("\u{2713} a.ql \u{b7} app"));
+        assert_eq!(
+            app.codeql.history[1],
+            "\u{2717} b.ql \u{b7} app \u{b7} failed: ERROR: b is broken"
+        );
+        assert!(app.codeql.history[0].starts_with("\u{2713} c.ql \u{b7} app"));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let at = |q: &str| calls.find(&format!("pack/{q}.ql")).unwrap();
+        assert!(at("a") < at("b") && at("b") < at("c"), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_codeql_queries_are_cancelled_from_the_palette_or_with_esc() {
+    // #578: cancelling drops the queries still waiting; the one running
+    // finishes and is recorded.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("1/3"), "{}", app.status);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[0].starts_with("\u{2713} a.ql"));
+
+        // Esc in the side bar cancels first and leaves the view only after.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        assert!(app.sidebar_view == SidebarView::CodeQL);
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 2, "{:?}", app.codeql.history);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "No CodeQL queries are queued");
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.sidebar_view == SidebarView::Explorer);
+        assert_eq!(
+            Command::from_id("codeql_run_pack"),
+            Some(Command::CodeqlRunPack)
+        );
+        assert_eq!(
+            Command::CodeqlRunPack.title(),
+            "CodeQL: Run Queries in Pack"
+        );
+        assert_eq!(
+            Command::CodeqlCancelQueue.title(),
+            "CodeQL: Cancel Queued Queries"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        // A single query is running: the pack run is refused, not mixed in.
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(app.codeql_run.is_some());
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.status, "A CodeQL query is already running");
+        assert!(app.codeql_run_queue.is_empty());
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1);
+
+        // Nothing selected in the Queries section.
+        app.codeql.selected = 0;
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("Select a query pack"), "{}", app.status);
+
+        // No current database: nothing is queued or recorded.
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.current = None;
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.open_codeql_view();
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(
+                        crate::widgets::codeql::Action::RunQuery(0, 1),
+                        _
+                    )
+                )
+            })
+            .expect("b.ql is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlRunPack);
+        assert_eq!(app.status, "Add a CodeQL database and select it first");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        assert_eq!(app.codeql.history.len(), 1);
+    });
+}
+
+#[test]
+fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
+    // #578: "CodeQL: Create Query" asks for a name and writes a starter
+    // query into the selected pack, in its language; from the empty
+    // Queries section it goes to the workspace root, with a pack file in
+    // the Language section's language.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::codeql::{Action, Hit, Section};
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::input_prompt::InputPurpose;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_str = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, KeyCode::Char(c));
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::TogglePack(0), _)
+                )
+            })
+            .expect("the pack is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlCreateQuery);
+        let prompt = app.input_prompt.as_ref().expect("a name is asked for");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlCreateQuery {
+                dir: pack.clone(),
+                language: Some(String::from("go")),
+            }
+        );
+        assert!(prompt.title.contains("acme/go"), "{}", prompt.title);
+        type_str(&mut app, "find-calls");
+        press(&mut app, KeyCode::Enter);
+        let created = pack.join("find-calls.ql");
+        let text = std::fs::read_to_string(&created).expect("written");
+        assert!(text.contains("\nimport go\n"), "{text}");
+        assert!(text.contains("@id go/find-calls"), "{text}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(app.focus == Pane::Editor);
+        assert!(app.codeql.queries[0].queries.contains(&created), "listed");
+        assert!(app.status.contains("pack/find-calls.ql"), "{}", app.status);
+        assert!(!pack.join("sub").exists());
+
+        // The same name again is refused on the status line.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "find-calls.ql");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.contains("already exists"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), text);
+
+        // An empty workspace: the welcome row, in the chosen language.
+        let empty = tempfile::tempdir().unwrap();
+        let mut app = App::new(empty.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.language = Some(6);
+        app.codeql.collapsed.insert(Section::Databases);
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(Action::CreateQuery, _)
+                )
+            })
+            .expect("the welcome offers to create one");
+        app.codeql.selected = row;
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::CreateQuery))
+        );
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "hello");
+        press(&mut app, KeyCode::Enter);
+        let created = empty.path().join("hello.ql");
+        assert!(
+            std::fs::read_to_string(&created)
+                .unwrap()
+                .contains("import python"),
+            "{}",
+            app.status
+        );
+        let qlpack = std::fs::read_to_string(empty.path().join("qlpack.yml")).unwrap();
+        assert!(qlpack.contains("codeql/python-all"), "{qlpack}");
+        assert_eq!(app.editor.path.as_deref(), Some(created.as_path()));
+        assert!(
+            app.codeql
+                .queries
+                .iter()
+                .any(|p| p.queries.contains(&created)),
+            "{:?}",
+            app.codeql.queries
+        );
+        assert_eq!(
+            Command::from_id("codeql_create_query"),
+            Some(Command::CodeqlCreateQuery)
+        );
+        assert_eq!(Command::CodeqlCreateQuery.title(), "CodeQL: Create Query");
     });
 }
 
@@ -56629,8 +57177,12 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         app.poll_pr_gh();
         assert!(app.pr_gh.is_none());
         app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        // A due refresh runs gh. Not asserted through `pr_gh` straight after
+        // the poll: that poll also reads the answer, and under load the stub
+        // can answer before it does, leaving `pr_gh` already empty again.
+        // The checks turning from running to passed, below, is what only a
+        // gh run can do.
         app.poll_pr_gh();
-        assert!(app.pr_gh.is_some(), "a due refresh runs gh");
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the refresh", || {
             app.poll_pr_gh();
             !app.editor.pr_review.as_ref().unwrap().has_pending_checks()
