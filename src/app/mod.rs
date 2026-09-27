@@ -7491,6 +7491,8 @@ impl App {
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
             dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
+            // Reopening asks for its lenses again anyway.
+            self.code_lens_requested.remove(&p);
         }
         // A closed file's problems must leave the PROBLEMS panel too.
         // Under Open Files scope the panel also depends on WHICH buffers are
@@ -9354,13 +9356,7 @@ impl App {
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for u in updates {
             touched.insert(u.path.clone());
-            let by_server = self.lsp_diagnostics.entry(u.path).or_default();
-            // An empty batch is the server saying "all clear" for its findings.
-            if u.diagnostics.is_empty() {
-                by_server.remove(&u.server);
-            } else {
-                by_server.insert(u.server, u.diagnostics);
-            }
+            store_diagnostics_update(&mut self.lsp_diagnostics, u);
         }
         let mut changed = false;
         // The active editor re-decodes when its file was touched this tick OR
@@ -54070,6 +54066,33 @@ fn mcp_tool_trust(
     Err(format!(
         "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
     ))
+}
+
+/// File one server's diagnostics batch in the store. An empty batch is the
+/// server saying "all clear" for its findings; a path no server reports on
+/// any more leaves the store. Files never opened (a workspace pull, a
+/// flycheck) and deleted ones used to keep an empty entry each for the rest
+/// of the session (#694).
+fn store_diagnostics_update(
+    store: &mut std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+    >,
+    u: crate::lsp::manager::DiagnosticsUpdate,
+) {
+    if u.diagnostics.is_empty() {
+        if let Some(by_server) = store.get_mut(&u.path) {
+            by_server.remove(&u.server);
+            if by_server.is_empty() {
+                store.remove(&u.path);
+            }
+        }
+    } else {
+        store
+            .entry(u.path)
+            .or_default()
+            .insert(u.server, u.diagnostics);
+    }
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +

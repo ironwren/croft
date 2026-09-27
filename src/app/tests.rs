@@ -53467,3 +53467,33 @@ fn only_a_remote_launched_croft_polls_the_build_marker() {
         "the marker was read again within the second"
     );
 }
+
+/// #694: an "all clear" from the last server reporting on a path drops the
+/// path from the store instead of leaving an empty entry behind; another
+/// server's findings on it survive.
+#[test]
+fn an_all_clear_from_every_server_drops_the_path_from_the_store() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/gone.rs");
+    let update = |server: &str, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: server.to_string(),
+        diagnostics,
+    };
+    store_diagnostics_update(
+        &mut store,
+        update("ra", vec![diag(0, 1, DiagnosticSeverity::Error)]),
+    );
+    store_diagnostics_update(
+        &mut store,
+        update("clippy", vec![diag(2, 3, DiagnosticSeverity::Warning)]),
+    );
+    store_diagnostics_update(&mut store, update("ra", Vec::new()));
+    assert_eq!(store[&path].len(), 1, "clippy's findings stay");
+    store_diagnostics_update(&mut store, update("clippy", Vec::new()));
+    assert!(store.is_empty(), "{store:?}");
+    // An all-clear for a path never reported does not create one.
+    store_diagnostics_update(&mut store, update("ra", Vec::new()));
+    assert!(store.is_empty());
+}
