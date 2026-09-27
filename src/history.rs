@@ -537,17 +537,20 @@ mod tests {
             held,
             vec![b"v1 edited".to_vec(), b"v1".to_vec(), b"v2".to_vec()]
         );
-        use std::os::unix::fs::PermissionsExt;
-        let dir = dir_for(root, f);
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        let snap = &entries_in(root, f)[0].file;
-        assert_eq!(
-            std::fs::metadata(snap).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = dir_for(root, f);
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let snap = &entries_in(root, f)[0].file;
+            assert_eq!(
+                std::fs::metadata(snap).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     /// A restore keeps the bytes on disk, then records the restored ones,
@@ -575,6 +578,7 @@ mod tests {
 
     /// History an older build left world-readable is tightened on the next
     /// record, the snapshots already inside included.
+    #[cfg(unix)]
     #[test]
     fn history_left_open_by_an_older_build_becomes_owner_only() {
         use std::os::unix::fs::PermissionsExt;
