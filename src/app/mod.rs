@@ -3352,6 +3352,9 @@ pub struct App {
     hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
+    /// The language server's check of the proposal at the head of the
+    /// queue (#347): its diagnostics show in the popup before approval.
+    approval_check: Option<crate::agent_approval::ProposalCheck>,
     /// A proposal being edited before approval (#347): its token, and the
     /// scratch file whose save approves the edited text. The popup stays
     /// down while it lasts.
@@ -5422,6 +5425,7 @@ impl App {
             hook_listener,
             hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
+            approval_check: None,
             approval_ui: None,
             approval_edit: None,
             notebook_kernels: std::collections::HashMap::new(),
@@ -7780,6 +7784,15 @@ impl App {
             if !current.insert(path.clone()) {
                 continue;
             }
+            // The server holds a proposal's text for this file while it is
+            // checked (#347); the buffer goes back when the check ends.
+            if self
+                .approval_check
+                .as_ref()
+                .is_some_and(|c| &c.path == path)
+            {
+                continue;
+            }
             let seq = tab.edit_seq;
             let prev = self.lsp_last_seen.get(path).copied();
             match prev {
@@ -9856,12 +9869,30 @@ impl App {
                 updates.push(u);
             }
         }
+        self.apply_diagnostics_updates(updates)
+    }
+
+    /// Store a batch of servers' diagnostics and repaint what they touch:
+    /// the body of [`Self::drain_lsp_diagnostics`], apart from the drain.
+    fn apply_diagnostics_updates(
+        &mut self,
+        updates: Vec<crate::lsp::manager::DiagnosticsUpdate>,
+    ) -> bool {
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut changed = false;
         for u in updates {
+            // While a proposal is being checked (#347), what the servers say
+            // about its file is about the proposal, not the buffer.
+            if let Some(check) = self.approval_check.as_mut()
+                && check.path == u.path
+            {
+                check.by_server.insert(u.server, u.diagnostics);
+                changed = true;
+                continue;
+            }
             touched.insert(u.path.clone());
             store_diagnostics_update(&mut self.lsp_diagnostics, u);
         }
-        let mut changed = false;
         // The active editor re-decodes when its file was touched this tick OR
         // when it now shows a file whose stored diagnostics it hasn't applied
         // yet (a tab switch: diagnostics are pushed, never re-requested).
@@ -16028,6 +16059,70 @@ impl App {
         out
     }
 
+    /// Keep the language server's check in step with the proposal at the
+    /// head of the queue (#347): send a new head's text as its file's
+    /// content, and when a proposal leaves the head, give the file back:
+    /// an open buffer's text is resent, a file no tab has is closed.
+    pub fn sync_approval_check(&mut self) {
+        let head = self
+            .approvals
+            .front()
+            .map(|p| (p.arrived, p.proposal.path.clone(), p.proposal.after.clone()));
+        if let Some(check) = self.approval_check.as_ref()
+            && head.as_ref().map(|(arrived, ..)| *arrived) != Some(check.arrived)
+        {
+            self.end_approval_check();
+        }
+        let Some((arrived, path, after)) = head else {
+            return;
+        };
+        if self.approval_check.is_some() {
+            return;
+        }
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if crate::lsp::Language::from_extension(ext).is_none() {
+            return;
+        }
+        let opened = !self.lsp_last_seen.contains_key(&path);
+        if opened {
+            lsp.open_doc(path.clone(), after);
+        } else {
+            lsp.change_doc(path.clone(), after);
+        }
+        self.approval_check = Some(crate::agent_approval::ProposalCheck {
+            arrived,
+            started: std::time::Instant::now(),
+            path,
+            opened,
+            by_server: std::collections::HashMap::new(),
+        });
+    }
+
+    fn end_approval_check(&mut self) {
+        let Some(check) = self.approval_check.take() else {
+            return;
+        };
+        let tab_has_it = self
+            .editor
+            .iter_tabs()
+            .any(|t| t.path.as_deref() == Some(check.path.as_path()));
+        if tab_has_it && (!check.opened || !self.lsp_last_seen.contains_key(&check.path)) {
+            // A seq no tab has makes `sync_lsp` send the buffer's text next
+            // tick, over the proposal's. (A tab opened during a check of a
+            // file the check had opened needs the same: the server has it
+            // open already, with the proposal.)
+            self.lsp_last_seen.insert(check.path, u64::MAX);
+        } else if check.opened {
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.close_doc(check.path.clone());
+            }
+            self.lsp_last_seen.remove(&check.path);
+        }
+    }
+
     /// Take agent edit proposals off the hook socket and drop the ones
     /// whose hook has already given up, keeping the popup on the head of
     /// the queue.
@@ -16302,6 +16397,9 @@ impl App {
             ui,
             self.approvals.len(),
             self.workspace_root(),
+            self.approval_check
+                .as_ref()
+                .filter(|c| c.arrived == head.arrived),
         );
     }
 
@@ -61925,6 +62023,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.poll_pr_gh()
             | app.poll_pr_checkout()
             | app.poll_code_scanning();
+        app.sync_approval_check();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();

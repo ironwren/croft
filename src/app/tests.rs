@@ -53682,6 +53682,155 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
+/// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
+/// socket, as Claude Code's hook would; the returned stream is the hook's
+/// end, kept open for the answer.
+fn queue_edit_proposal(
+    app: &mut App,
+    dir: &Path,
+    file: &Path,
+    old: &str,
+    new: &str,
+) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    let sock = dir.join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": old, "new_string": new}),
+        cwd: dir.into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    hook
+}
+
+fn popup_screen(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut screen = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            screen.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// #347: what the language server says about a proposal's file while it is
+/// checked goes to the popup, against the proposed row it names, and not to
+/// the buffer's diagnostics; answering the proposal ends the check.
+#[test]
+fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.lsp = None;
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    app.sync_approval_check();
+    assert!(
+        app.approval_check.is_none(),
+        "no server, nothing to check with"
+    );
+    // As a server would once the proposal's text was sent as the file's.
+    app.approval_check = Some(crate::agent_approval::ProposalCheck {
+        arrived: app.approvals[0].arrived,
+        started: std::time::Instant::now(),
+        path: file.clone(),
+        opened: true,
+        by_server: Default::default(),
+    });
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(screen.contains("Checking the proposed file"), "{screen}");
+    app.apply_diagnostics_updates(vec![crate::lsp::manager::DiagnosticsUpdate {
+        path: file.clone(),
+        server: "ruff".into(),
+        diagnostics: vec![crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 18,
+            severity: crate::lsp::manager::DiagnosticSeverity::Error,
+            message: "Undefined name `nope_undefined`".into(),
+        }],
+    }]);
+    assert!(
+        !app.lsp_diagnostics.contains_key(&file),
+        "the buffer's diagnostics are the buffer's"
+    );
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(
+        screen.contains("1 error, 0 warnings in the proposed file"),
+        "{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("+ x = nope_undefined") && l.contains("\u{25c0} Undefined name")),
+        "the proposed row carries it: {screen}"
+    );
+    // Answered: the check ends with the proposal.
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approvals.is_empty());
+    app.sync_approval_check();
+    assert!(app.approval_check.is_none());
+}
+
+/// #347's criterion against a real server: a proposal that uses an
+/// undefined name shows the server's diagnostic in the popup before it is
+/// approved. Ignored by default: it needs a Python language server that
+/// publishes diagnostics for an open buffer (run it with `--ignored` where
+/// one does); `a_proposals_diagnostics_show_in_the_popup_not_the_buffer`
+/// covers the routing and rendering without one.
+#[test]
+#[ignore]
+fn a_real_server_flags_the_proposal_before_approval() {
+    if !["ruff", "pyright-langserver", "basedpyright-langserver"]
+        .iter()
+        .any(|b| crate::lsp::manager::is_on_path(b))
+    {
+        eprintln!("SKIPPED: no Python language server on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    if app.lsp.is_none() {
+        eprintln!("SKIPPED: no language server manager");
+        return;
+    }
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        app.sync_approval_check();
+        app.drain_lsp_diagnostics();
+        let found = app.approval_check.as_ref().is_some_and(|c| {
+            c.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("nope_undefined"))
+        });
+        if found {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no server flagged the proposal: {:?}",
+            app.approval_check
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!app.lsp_diagnostics.contains_key(&file));
+}
+
 /// An agent's edit proposal, end to end through the App: the hook's
 /// request opens the popup over everything, keys go to the popup and not
 /// to the editor under it, and the answer reaches the hook's connection.
