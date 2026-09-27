@@ -57120,3 +57120,30 @@ fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
     app.sync_config_to("user@dev-box.lan");
     assert_eq!(app.status, "Syncing config to user@dev-box.lan");
 }
+
+/// #694: Developer: Show Memory Usage opens a tab attributing memory to
+/// each subsystem, with the stored diagnostics counted per server.
+#[test]
+fn show_memory_usage_opens_a_per_subsystem_report() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("ruff"),
+        vec![
+            diag(0, 1, DiagnosticSeverity::Warning),
+            diag(2, 3, DiagnosticSeverity::Error),
+        ],
+    );
+    app.lsp_diagnostics
+        .insert(tmp.path().join("a.py"), by_server);
+    app.run_command(Command::DeveloperShowMemoryUsage);
+    assert_eq!(app.editor.path.as_deref(), Some(Path::new("Memory Usage")));
+    let text = app.editor.lines.join("\n");
+    for section in ["Terminal panes", "Undo history", "OUTPUT channels"] {
+        assert!(text.contains(section), "{text}");
+    }
+    assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+}

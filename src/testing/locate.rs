@@ -34,6 +34,11 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
     if full_name.contains(".py::") {
         return pytest_source(root, full_name);
     }
+    if let Some((pkg, _)) = full_name.split_once("::")
+        && (pkg == "." || pkg.starts_with("./"))
+    {
+        return go_source(root, full_name);
+    }
     if let Some((file, _)) = full_name.split_once("::")
         && crate::testing::parse::is_js_test_file(file)
     {
@@ -107,6 +112,37 @@ fn pytest_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
     Some((path, line1.saturating_sub(1) as u32))
 }
 
+/// Resolve a Go test id (`./pkg::TestName`, a subtest `TestName/sub`): the
+/// `func` of its top-level test in one of the package's `_test.go` files.
+fn go_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    let (pkg, test) = full_name.split_once("::")?;
+    let dir = super::gotest::package_dir(root, pkg)?;
+    let top = test.split('/').next()?;
+    let matcher = RegexMatcher::new(&format!(r"^func\s+{}\s*\(", super::regex_escape(top))).ok()?;
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .memory_map(MmapChoice::never())
+        .build();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_test.go"))
+        })
+        .collect();
+    files.sort();
+    files.into_iter().find_map(|path| {
+        let mut sink = FirstLine(None);
+        searcher.search_path(&matcher, &path, &mut sink).ok()?;
+        let line1 = sink.0?;
+        Some((path, line1.saturating_sub(1) as u32))
+    })
+}
+
 /// Resolve a JS node ID (`file::describe...::title`): the first segment is the
 /// test file, the last the title — an arbitrary string, so it is escaped and
 /// matched literally. The title alone can also live in a comment or fixture
@@ -168,6 +204,17 @@ pub fn test_fn_on_line(path: Option<&Path>, lines: &[String], idx: usize) -> Opt
         let collectable = file.starts_with("test_") || file.ends_with("_test.py");
         return (collectable && name.starts_with("test")).then_some(name);
     }
+    if file.ends_with("_test.go") {
+        // `go test` runs the top-level `func Test…`/`Example…`/`Fuzz…` of a
+        // `_test.go` file; a method (`func (s *S) TestX`) is not one.
+        let name = line
+            .strip_prefix("func ")
+            .and_then(|_| name_after(line, "func "))?;
+        let runnable = ["Test", "Example", "Fuzz"]
+            .iter()
+            .any(|p| name.starts_with(p));
+        return runnable.then_some(name);
+    }
     if !file.ends_with(".rs") {
         return None;
     }
@@ -203,11 +250,13 @@ fn attr_marks_test(attr_line: &str) -> bool {
 }
 
 /// Extract the identifier after a function keyword (`fn ` for Rust, `def ` for
-/// Python) in a single line, or `None`. Deliberately simple: it does not skip
+/// Python, `func ` for Go) in a single line, or `None`. Deliberately simple: it does not skip
 /// keywords inside comments or strings, which is a rare enough case for a
 /// run-at-cursor convenience that it isn't worth a parser.
 fn fn_name_in(line: &str) -> Option<String> {
-    ["fn ", "def "].iter().find_map(|kw| name_after(line, kw))
+    ["fn ", "def ", "func "]
+        .iter()
+        .find_map(|kw| name_after(line, kw))
 }
 
 fn name_after(line: &str, keyword: &str) -> Option<String> {
@@ -450,6 +499,56 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn something_else() {}\n").unwrap();
         assert!(find_test_source(tmp.path(), "m::nope").is_none());
+    }
+
+    #[test]
+    fn go_tests_get_beads_run_at_the_caret_and_locate_by_id() {
+        let lines: Vec<String> = [
+            "package foo",
+            "func TestAdd(t *testing.T) {",
+            "\tt.Run(\"x\", func(t *testing.T) {})",
+            "}",
+            "func (s *S) TestMethod() {}",
+            "func helper() {}",
+            "func ExampleAdd() {}",
+        ]
+        .map(String::from)
+        .to_vec();
+        let go = Some(Path::new("foo/foo_test.go"));
+        assert_eq!(test_fn_on_line(go, &lines, 1).as_deref(), Some("TestAdd"));
+        assert_eq!(
+            test_fn_on_line(go, &lines, 4),
+            None,
+            "a method is not a test"
+        );
+        assert_eq!(test_fn_on_line(go, &lines, 5), None);
+        assert_eq!(
+            test_fn_on_line(go, &lines, 6).as_deref(),
+            Some("ExampleAdd")
+        );
+        assert_eq!(
+            test_fn_on_line(Some(Path::new("foo/foo.go")), &lines, 1),
+            None,
+            "go test only runs _test.go files"
+        );
+        assert_eq!(enclosing_fn_name(&lines, 2).as_deref(), Some("TestAdd"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("foo")).unwrap();
+        std::fs::write(tmp.path().join("foo/foo_test.go"), lines.join("\n")).unwrap();
+        assert_eq!(
+            find_test_source(tmp.path(), "./foo::TestAdd/x"),
+            Some((tmp.path().join("foo/foo_test.go"), 1))
+        );
+        std::fs::write(
+            tmp.path().join("root_test.go"),
+            "package m\n\nfunc TestRoot(t *testing.T) {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_test_source(tmp.path(), ".::TestRoot"),
+            Some((tmp.path().join("root_test.go"), 2))
+        );
     }
 
     #[test]
