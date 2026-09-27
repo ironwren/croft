@@ -309,6 +309,18 @@ pub enum CliCommand {
         #[arg(long = "as")]
         as_ext: Option<String>,
     },
+    /// Serve this workspace's session to a browser over WebSocket (#341).
+    ///
+    /// Each WebSocket connection is one participant of the running session
+    /// (`croft attach` starts it). Loopback only; the printed URL carries a
+    /// per-run token every connection must present.
+    Web {
+        /// Workspace whose session to serve (default: the current directory).
+        workspace: Option<PathBuf>,
+        /// Address to listen on (default 127.0.0.1:7681). Loopback only.
+        #[arg(long)]
+        bind: Option<std::net::SocketAddr>,
+    },
     /// Open a file for editing in the croft that hosts this pane (#620).
     ///
     /// Like `croft view`, plus `--wait`: return only once the tab is
@@ -435,12 +447,27 @@ pub enum CliCommand {
     },
 }
 
+/// `--build-info`'s text: version, commit and build time, plus how the
+/// binary was installed when a package manager owns it (#375).
+fn build_info_line(source: crate::update_check::InstallSource) -> String {
+    match source {
+        crate::update_check::InstallSource::Homebrew => format!(
+            "{}, installed with Homebrew)",
+            VERBOSE_VERSION.trim_end_matches(')')
+        ),
+        crate::update_check::InstallSource::SelfManaged => VERBOSE_VERSION.to_string(),
+    }
+}
+
 impl Cli {
     pub fn run(self) -> Result<()> {
         // `--build-info` is a pure query: answer and exit before any setup,
         // exactly as clap does for `--version`.
         if self.build_info {
-            println!("croft {VERBOSE_VERSION}");
+            println!(
+                "croft {}",
+                build_info_line(crate::update_check::current_install_source())
+            );
             return Ok(());
         }
         // Pure liveness probes answer before anything else runs: the remote
@@ -570,6 +597,17 @@ impl Cli {
                 }
                 Ok(())
             }
+            Some(CliCommand::Web { workspace, bind }) => {
+                let workspace = match workspace {
+                    Some(w) => w,
+                    None => std::env::current_dir()?,
+                };
+                if let Err(e) = crate::web::run(&workspace, bind) {
+                    eprintln!("croft web: {e:#}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
             Some(CliCommand::Edit {
                 path,
                 wait,
@@ -601,7 +639,17 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::LocaleTemplate { lang }) => {
-                println!("{}", crate::i18n::template(&lang.to_ascii_lowercase(), &[]));
+                // The language croft loads for this locale: `de_DE.UTF-8` and
+                // `de-DE` both read `locales/de.json`, whose built-in catalog
+                // seeds the template.
+                let Some(code) = crate::i18n::language_of(&lang) else {
+                    eprintln!(
+                        "croft locale-template: {lang} names no language croft translates to (English is built in)"
+                    );
+                    std::process::exit(1);
+                };
+                eprintln!("Save this as locales/{code}.json in croft's config directory.");
+                println!("{}", crate::i18n::template(&code, &[]));
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
@@ -782,7 +830,10 @@ fn open_link(url: &str) -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(crate::deep_link::argv(&link));
+    cmd.args(crate::deep_link::argv(
+        &link,
+        std::env::var("HOME").ok().as_deref(),
+    ));
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
@@ -1792,6 +1843,20 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// #375: `--build-info` says when a package manager owns the binary, so a
+    /// bug report shows which upgrade path the user has.
+    #[test]
+    fn build_info_names_a_homebrew_install() {
+        use crate::update_check::InstallSource;
+        let brew = build_info_line(InstallSource::Homebrew);
+        assert!(
+            brew.starts_with(VERBOSE_VERSION.trim_end_matches(')')),
+            "{brew}"
+        );
+        assert!(brew.ends_with(", installed with Homebrew)"), "{brew}");
+        assert_eq!(build_info_line(InstallSource::SelfManaged), VERBOSE_VERSION);
+    }
+
     /// #282: `--version` is a plain `x.y.z`. The regression this guards is a
     /// well-meaning one — re-adding provenance "so bug reports carry it" is
     /// exactly how the hash got into the common path the first time.
@@ -1874,6 +1939,26 @@ mod tests {
         let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
+    }
+
+    #[test]
+    fn parses_web_with_and_without_a_bind() {
+        let cli = Cli::try_parse_from(["croft", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Web {
+                workspace: None,
+                bind: None
+            })
+        ));
+        let cli = Cli::try_parse_from(["croft", "web", "/w", "--bind", "127.0.0.1:9000"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Web { workspace, bind }) => {
+                assert_eq!(workspace.as_deref(), Some(std::path::Path::new("/w")));
+                assert_eq!(bind, Some("127.0.0.1:9000".parse().unwrap()));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

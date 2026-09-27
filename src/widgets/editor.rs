@@ -1938,13 +1938,33 @@ pub struct TextSpanEdit {
     pub start: (usize, usize),
     pub end: (usize, usize),
     pub new_text: String,
+    /// The columns are UTF-16 code units, as a language server sends them,
+    /// not chars. Converted against the lines at apply time: read as char
+    /// columns, every edit after an emoji on its line landed off by one per
+    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
+    pub utf16: bool,
 }
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
+    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
+    // against the lines as they are before any edit lands.
+    let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
+    let converted: Vec<TextSpanEdit> = edits
+        .iter()
+        .map(|e| match e.utf16 {
+            true => TextSpanEdit {
+                start: (e.start.0, col(e.start.0, e.start.1)),
+                end: (e.end.0, col(e.end.0, e.end.1)),
+                new_text: e.new_text.clone(),
+                utf16: false,
+            },
+            false => e.clone(),
+        })
+        .collect();
+    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut applied = 0;
     for e in order {
@@ -2363,6 +2383,9 @@ struct SnippetSession {
     anchor: (usize, usize),
     /// Placeholder length (chars) of the current stop, selected on landing.
     cur_len: usize,
+    /// The placeholder's text on landing, to tell an edit from a plain Tab
+    /// when the replacement happens to be the same length.
+    cur_text: String,
     /// Remaining stops to visit, in order: `(row, col, placeholder_len)`.
     stops: std::collections::VecDeque<(usize, usize, usize)>,
 }
@@ -2781,6 +2804,16 @@ pub struct Editor {
     /// Whether the file on disk began with a byte-order mark. `decode` strips
     /// it, so without remembering it every save silently dropped it.
     bom: bool,
+    /// Whether the file on disk ended with a line break. The buffer keeps
+    /// no line for it (a trailing newline is not a line of its own), so
+    /// without remembering it every save stripped it: `a\nb\n` came back
+    /// as `a\nb`.
+    final_newline: bool,
+    /// Whether decoding the file met bytes invalid in its encoding, now
+    /// shown as U+FFFD. Saving writes those as `EF BF BD`, destroying the
+    /// original bytes, so it takes the same explicit consent as an encoding
+    /// that cannot represent the text.
+    pub decode_lossy: bool,
     /// Indentation guides (VS Code `editor.guides.indentation`): dim vertical
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
@@ -3103,6 +3136,8 @@ impl Editor {
             eol: LineEnding::Lf,
             encoding: encoding_rs::UTF_8,
             bom: false,
+            final_newline: false,
+            decode_lossy: false,
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -3479,6 +3514,8 @@ impl Editor {
             Some((shadow_path, old)) if shadow_path == path => {
                 if old.len() != self.lines.len() {
                     *set = shift_bookmark_lines(set, &old, &self.lines);
+                } else {
+                    *set = follow_moved_bookmark_lines(set, &old, &self.lines);
                 }
                 old
             }
@@ -4614,7 +4651,10 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let text = enc.decode(&bytes).0.into_owned();
+        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let text = decoded.into_owned();
+        self.decode_lossy = decode_lossy;
+        self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
         // preserves it (and the status bar reports it). A single `\r\n` marks
         // the file CRLF, matching VS Code's "files.eol auto" heuristic.
@@ -5253,7 +5293,7 @@ impl Editor {
     /// provenance map to the text it describes (#349). `None` when the
     /// encoding cannot represent the text, since a save would refuse it too.
     pub fn bytes_for_disk(&self) -> Option<Vec<u8>> {
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         (!had_errors).then_some(encoded)
     }
@@ -5496,7 +5536,13 @@ impl Editor {
                     Some(d) => d,
                     None => anyhow::bail!("No worksheet"),
                 };
-                let bytes = crate::sheet::serialize_delimited(data, delim);
+                // The file's own line ending, read from its first line.
+                let crlf = std::fs::read(&path).is_ok_and(|b| {
+                    b.iter()
+                        .position(|&c| c == b'\n')
+                        .is_some_and(|i| i > 0 && b[i - 1] == b'\r')
+                });
+                let bytes = crate::sheet::serialize_delimited(data, delim, crlf);
                 std::fs::write(&path, &bytes)
                     .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
                 view.dirty = false;
@@ -6513,12 +6559,14 @@ impl Editor {
         // in when the file carries one, returning what it actually used. Take
         // that, or the buffer would hold text decoded one way while claiming to
         // be another — and the save would then re-encode it wrongly.
-        let (decoded, used, _) = enc.decode(&bytes);
+        let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
+        self.final_newline = text.ends_with(['\n', '\r']);
         self.eol = if text.contains("\r\n") {
             LineEnding::Crlf
         } else {
@@ -6604,7 +6652,10 @@ impl Editor {
         // One bookmark sync for the whole paste, diffed against the text
         // `push_undo` recorded above, not one per character.
         self.bookmark_sync_paused = true;
-        for c in s.chars() {
+        // CRLF and bare CR are line breaks too: only `\n` was, so a paste
+        // from Windows text (or a terminal sending CR) left a raw `\r` inside
+        // lines, which a save then wrote as `\r\r\n`.
+        for c in normalize_newlines(s).chars() {
             if c == '\n' {
                 self.insert_newline_raw();
             } else {
@@ -6713,6 +6764,7 @@ impl Editor {
             self.snippet = Some(SnippetSession {
                 anchor: (first.0, first.1),
                 cur_len: first.2,
+                cur_text: self.span_text(first.0, first.1, first.2),
                 stops: abs,
             });
         }
@@ -6731,6 +6783,17 @@ impl Editor {
         if self.cursor_row == sess.anchor.0 {
             let typed = self.cursor_col as isize - sess.anchor.1 as isize;
             let shift = typed - sess.cur_len as isize;
+            let now = self.span_text(sess.anchor.0, sess.anchor.1, typed.max(0) as usize);
+            if now != sess.cur_text {
+                // Stops nested inside the placeholder just replaced
+                // (`${1:foo(${2:x})}`) name text that is gone: drop them, or
+                // the next Tab selects whatever now sits at their offset,
+                // a same-length replacement included.
+                let after = sess.anchor.1 + sess.cur_len;
+                let anchor = sess.anchor;
+                sess.stops
+                    .retain(|s| !(s.0 == anchor.0 && s.1 >= anchor.1 && s.1 < after));
+            }
             if shift != 0 {
                 let after = sess.anchor.1 + sess.cur_len;
                 for s in sess.stops.iter_mut() {
@@ -6747,9 +6810,18 @@ impl Editor {
         if !sess.stops.is_empty() {
             sess.anchor = (next.0, next.1);
             sess.cur_len = next.2;
+            sess.cur_text = self.span_text(next.0, next.1, next.2);
             self.snippet = Some(sess);
         }
         true
+    }
+
+    /// `len` chars of row `row` from char column `col`, clamped to the line.
+    fn span_text(&self, row: usize, col: usize, len: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|l| l.chars().skip(col).take(len).collect())
+            .unwrap_or_default()
     }
 
     /// Move the caret to a resolved tab stop, selecting its placeholder text so
@@ -7121,8 +7193,12 @@ impl Editor {
         // Clear so the per-caret raw ops can't see stale carets.
         self.carets.clear();
 
-        let mut new_primary = (self.cursor_row, self.cursor_col);
-        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        // Each caret's place, kept as (rows from the bottom, chars from its
+        // line's end): the later edits happen above or to the left of it, and
+        // leave everything after it untouched, so those two stay true where a
+        // plain (row, col) goes stale on its row (`abcd` with carets at 1 and
+        // 3, typing X then Y, gave `aXYbcYXd`).
+        let mut placed: Vec<(bool, usize, usize)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -7133,19 +7209,38 @@ impl Editor {
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
             self.apply_caret_edit_raw(edit);
-            let pos = (self.cursor_row, self.cursor_col);
+            let from_bottom = self.lines.len().saturating_sub(1) - self.cursor_row;
+            let from_end = self
+                .line_char_len(self.cursor_row)
+                .saturating_sub(self.cursor_col);
+            placed.push((is_primary, from_bottom, from_end));
+        }
+
+        self.selection = None;
+        let last = self.lines.len().saturating_sub(1);
+        let resolve = |this: &Self, from_bottom: usize, from_end: usize| {
+            let row = last.saturating_sub(from_bottom);
+            (row, this.line_char_len(row).saturating_sub(from_end))
+        };
+        let mut new_primary = (self.cursor_row, self.cursor_col);
+        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, from_bottom, from_end) in placed {
+            let pos = resolve(self, from_bottom, from_end);
             if is_primary {
                 new_primary = pos;
             } else {
                 new_secondary.push(pos);
             }
         }
-
-        self.selection = None;
-        let last = self.lines.len().saturating_sub(1);
         self.cursor_row = new_primary.0.min(last);
         self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        // Carets an edit brought together are one caret from here on: kept
+        // apart, the next key edited the same spot twice (one Backspace
+        // deleting two line breaks).
+        let primary = (self.cursor_row, self.cursor_col);
         new_secondary.sort_unstable();
+        new_secondary.dedup();
+        new_secondary.retain(|&p| p != primary);
         self.carets = new_secondary
             .into_iter()
             .map(|(r, c)| EditorSelection::new(r, c))
@@ -8200,6 +8295,34 @@ impl Editor {
         self.hidden_ranges = out;
     }
 
+    /// Drop every fold that touches rows `start..=end`, before an edit that
+    /// reorders those rows without changing the line count. Folds are line
+    /// numbers and are only reset when the count changes, so after Move Line
+    /// or Sort Lines a fold kept hiding the same numbers over different text.
+    fn forget_folds_in(&mut self, start: usize, end: usize) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let touched: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&h| {
+                (start..=end).contains(&h)
+                    || self
+                        .fold_range(h)
+                        .is_some_and(|(s, e)| s <= end && e >= start)
+            })
+            .collect();
+        if touched.is_empty() {
+            return;
+        }
+        for h in touched {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
+    }
+
     /// Unfold whatever collapsed region the cursor is sitting inside. Movement
     /// is not the only way in — search, go-to-definition and goto-line all set
     /// `cursor_row` directly — and a caret on a hidden line cannot be painted
@@ -8677,6 +8800,16 @@ impl Editor {
         out
     }
 
+    /// The text a save writes: the lines joined with the file's EOL, and
+    /// the final newline the file had. An emptied buffer writes nothing.
+    fn content_for_disk(&self) -> String {
+        let mut content = self.lines.join(self.eol.sequence());
+        if self.final_newline && !content.is_empty() {
+            content.push_str(self.eol.sequence());
+        }
+        content
+    }
+
     fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
@@ -8692,16 +8825,20 @@ impl Editor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No file open"))?
             .clone();
-        let content = self.lines.join(self.eol.sequence());
+        let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         // The single choke point every save funnels through, so no caller can
         // route around the guard. The consent flag survives a failed write
         // (the user still consented) and is cleared only once the bytes land.
-        if had_errors && !self.lossy_save_armed {
+        // The decode's replacement characters are only a loss while they are
+        // still in the text: a buffer rewritten past them saves freely.
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        if (had_errors || writes_replacements) && !self.lossy_save_armed {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
         std::fs::write(&path, encoded)?;
+        self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
         self.dirty = false;
@@ -9072,6 +9209,17 @@ impl Editor {
                 self.selection = None;
             }
         }
+        // Extra carets follow the same rule as the selection.
+        self.carets.retain_mut(|c| {
+            let (lo, hi) = (c.anchor.0.min(c.head.0), c.anchor.0.max(c.head.0));
+            if lo >= old_end {
+                c.anchor.0 = shift(c.anchor.0);
+                c.head.0 = shift(c.head.0);
+                true
+            } else {
+                hi < prefix
+            }
+        });
         self.mirror_caret = Some(source_caret);
         self.lines
             .splice(prefix..old_end, new_lines[prefix..new_end].iter().cloned());
@@ -9177,6 +9325,9 @@ impl Editor {
     /// step via the dedicated `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        // A single-caret command: extra carets would be left pointing at
+        // rows and columns the edit moved.
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         let block_len = block.len();
@@ -9200,6 +9351,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
+        self.carets.clear();
         let (start_row, end_row) = self.selected_or_cursor_row_range();
         let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
         for (i, line) in block.into_iter().enumerate() {
@@ -9262,6 +9414,8 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start, end + 1);
         self.lines[start..=end + 1].rotate_right(1);
         self.cursor_row += 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9281,6 +9435,8 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::MoveLines);
+        self.carets.clear();
+        self.forget_folds_in(start - 1, end);
         self.lines[start - 1..=end].rotate_left(1);
         self.cursor_row -= 1;
         if let Some(sel) = self.selection.as_mut() {
@@ -9310,6 +9466,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let all_commented = non_blank
             .iter()
             .all(|&r| self.lines[r].trim_start().starts_with(token));
@@ -9365,6 +9522,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        self.carets.clear();
         let wrapped = trimmed.starts_with(open)
             && trimmed.ends_with(close)
             && trimmed.len() >= open.len() + close.len();
@@ -9375,10 +9533,26 @@ impl Editor {
         } else {
             format!("{open} {trimmed} {close}")
         };
-        self.replace_char_range(start, end, &new);
+        // Only the trimmed core is replaced: the whitespace around it (the
+        // line's indent, and the line break a whole-line selection ends
+        // with) stays as it was. Replacing the whole range joined the next
+        // line into this one and dropped the indent.
+        let lead = &text[..text.len() - text.trim_start().len()];
+        let trail = &text[text.trim_end().len()..];
+        let before = format!("{lead}{new}");
+        self.replace_char_range(start, end, &format!("{before}{trail}"));
         self.selection = None;
-        self.cursor_row = start.0;
-        self.cursor_col = self.line_char_len(start.0);
+        // The caret lands just after the (un)commented text.
+        match before.rsplit_once('\n') {
+            Some((head, tail)) => {
+                self.cursor_row = start.0 + head.matches('\n').count() + 1;
+                self.cursor_col = tail.chars().count();
+            }
+            None => {
+                self.cursor_row = start.0;
+                self.cursor_col = start.1 + before.chars().count();
+            }
+        }
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -9397,6 +9571,7 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::JoinLines);
+        self.carets.clear();
         let mut result = self.lines[start].trim_end().to_string();
         let cursor_col = result.chars().count();
         for line in &self.lines[start + 1..=last] {
@@ -9433,6 +9608,7 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::TransformCase);
+        self.carets.clear();
         let new = match kind {
             CaseTransform::Upper => text.to_uppercase(),
             CaseTransform::Lower => text.to_lowercase(),
@@ -9459,12 +9635,21 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::SortLines);
+        self.carets.clear();
         let mut block: Vec<String> = self.lines[start..=end].to_vec();
         block.sort();
         if !ascending {
             block.reverse();
         }
         self.lines.splice(start..=end, block);
+        // The rows changed under the cursor and selection: a column past the
+        // new line's end made the next word motion index out of bounds.
+        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        if let Some(sel) = self.selection.as_mut() {
+            sel.anchor.1 = sel.anchor.1.min(self.lines[sel.anchor.0].chars().count());
+            sel.head.1 = sel.head.1.min(self.lines[sel.head.0].chars().count());
+        }
+        self.forget_folds_in(start, end);
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -9481,6 +9666,7 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::TrimWhitespace);
+        self.carets.clear();
         for line in &mut self.lines {
             let trimmed_len = line.trim_end_matches([' ', '\t']).len();
             line.truncate(trimmed_len);
@@ -9536,7 +9722,10 @@ impl Editor {
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
             let empty_buffer = self.lines.len() == 1 && self.lines[0].is_empty();
-            if !empty_buffer && !self.lines.last().is_some_and(String::is_empty) {
+            if !empty_buffer
+                && !self.final_newline
+                && !self.lines.last().is_some_and(String::is_empty)
+            {
                 self.push_undo(EditKind::InsertFinalNewline);
                 self.lines.push(String::new());
                 self.mark_buffer_changed();
@@ -9804,6 +9993,7 @@ impl Editor {
         // open reuses it and the bump is lost with it.
         self.pin_on_edit();
         self.push_undo(EditKind::BumpNumber);
+        self.carets.clear();
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
         self.last_edit_kind = None;
@@ -10328,6 +10518,7 @@ impl Editor {
     pub fn move_word_left(&mut self) {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+            self.cursor_col = self.cursor_col.min(chars.len());
             while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
                 self.cursor_col -= 1;
             }
@@ -12191,6 +12382,43 @@ fn shift_bookmark_lines(
         .collect()
 }
 
+/// Marks after an edit that kept the line count: a marked line whose text
+/// now sits, once, elsewhere in the changed span moved there (Move Line
+/// Up/Down, a swap, undoing either); any other mark keeps its row, as a
+/// line edited in place does.
+fn follow_moved_bookmark_lines(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    let Some(first) = old.iter().zip(new).position(|(a, b)| a != b) else {
+        return marks.clone();
+    };
+    let last = old.len()
+        - 1
+        - old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+    marks
+        .iter()
+        .map(|&line| {
+            let row = line - 1;
+            if !(first..=last).contains(&row) || old.get(row) == new.get(row) {
+                return line;
+            }
+            let text = &old[row];
+            let mut hits = (first..=last).filter(|&j| &new[j] == text);
+            match (hits.next(), hits.next()) {
+                (Some(j), None) => j + 1,
+                _ => line,
+            }
+        })
+        .collect()
+}
+
 /// Shift highlight spans left by `byte_start`, dropping spans that fall
 /// entirely before the cut and clamping spans straddling the cut.
 /// Split file text into buffer lines the way the LSP spec / VS Code / Zed do:
@@ -13888,7 +14116,7 @@ impl Editor {
         if let Some(line) = md.scroll_to_source.take()
             && let Some(row) = md.row_for_source_line(line)
         {
-            md.scroll = (row as u16).min(max_scroll);
+            md.scroll = row.min(usize::from(max_scroll)) as u16;
         }
         md.last_area = text_area;
         para.scroll((md.scroll, 0)).render(text_area, buf);
@@ -14508,6 +14736,13 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if quote.is_some() || depth > 0 {
         return None;
     }
+    // Already closed: the `>` was deleted and is being retyped before an
+    // existing one (`<div|>`), or the end tag is already there on the line
+    // (`<div|</div>`). Closing again would double it.
+    let after = &line[byte..];
+    if after.trim_start().starts_with('>') || after.contains(&format!("</{name}>")) {
+        return None;
+    }
     // A `>` already inside means that `<` is closed and the caret is past
     // the tag (or inside an attribute value holding a `>`); either way this
     // keystroke is not closing THIS tag.
@@ -14893,8 +15128,21 @@ impl EditorTabs {
     /// path so subsequent saves and the tab label track the new name.
     pub fn rename_open_path(&mut self, old: &Path, new: &Path) {
         for e in &mut self.editors {
-            if e.path.as_deref() == Some(old) {
-                e.path = Some(new.to_path_buf());
+            // Under a moved folder too: a tab of `dir/a.rs` follows `dir` to
+            // its new place, or its next save recreates the old path.
+            let moved = e
+                .path
+                .as_deref()
+                .and_then(|p| p.strip_prefix(old).ok())
+                .map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        new.to_path_buf()
+                    } else {
+                        new.join(rest)
+                    }
+                });
+            if let Some(moved) = moved {
+                e.path = Some(moved);
                 // Re-anchor the disk stamp to the new path so the rename
                 // isn't mistaken for an external content change on the next
                 // FS-sync sweep.
@@ -14917,6 +15165,25 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// Insert a pinned tab for `path` without reading it (None: untitled),
+    /// reusing the blank initial tab. The caller fills the buffer: this is
+    /// for text whose only copy is in memory, like a session handoff's
+    /// unsaved edits to a file that can no longer be opened.
+    pub fn open_unreadable_tab(&mut self, path: Option<PathBuf>) -> &mut Editor {
+        if !self.is_blank_initial() {
+            let mut e = Editor::new();
+            e.focused = self.editors[self.active].focused;
+            let pos = self.active + 1;
+            self.editors.insert(pos, e);
+            self.editors[self.active].focused = false;
+            self.active = pos;
+        }
+        let e = &mut self.editors[self.active];
+        e.path = path;
+        e.preview = false;
+        e
+    }
+
     /// Test-only / disk-less helper: insert a tab whose path is set but
     /// whose contents are empty. Production code should call
     /// `open_in_new_tab` so the file is actually loaded from disk.
@@ -14934,6 +15201,28 @@ impl EditorTabs {
     /// tab remains — closing the last would leave the editor pane empty.
     pub fn close_active(&mut self) -> bool {
         self.close_tab(self.active)
+    }
+
+    /// Close every tab showing `path` or a file under it (a deleted file or
+    /// folder), except tabs with unsaved edits: those stay open, dirty, so
+    /// the edits can still be saved (recreating the file) or discarded.
+    /// Returns how many dirty tabs were kept.
+    pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
+        let mut kept = 0;
+        let mut i = self.editors.len();
+        while i > 0 {
+            i -= 1;
+            let e = &self.editors[i];
+            if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                continue;
+            }
+            if e.dirty {
+                kept += 1;
+            } else {
+                self.close_tab(i);
+            }
+        }
+        kept
     }
 
     /// Close the tab at `idx`. When more than one tab is open the tab is
@@ -16143,6 +16432,31 @@ mod tests {
         assert!(!e.snippet_active());
     }
 
+    #[test]
+    fn replacing_an_outer_placeholder_drops_the_stops_nested_in_it() {
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert_eq!(e.selection_text(), "foo(x)");
+        e.insert_str("bar");
+        assert!(e.snippet_next());
+        assert_eq!(
+            e.selection_text(),
+            "z",
+            "the nested $2 went with its placeholder"
+        );
+        // A same-length replacement is still a replacement.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        e.insert_str("barbaz");
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "z");
+        // A plain Tab through an untouched placeholder keeps the nested stop.
+        let mut e = editor_with("");
+        e.expand_snippet("${1:foo(${2:x})} ${3:z}", 0);
+        assert!(e.snippet_next());
+        assert_eq!(e.selection_text(), "x");
+    }
+
     /// On-type formatting (#254) keys off real keystrokes only: the typed
     /// paths (`insert_char`, auto-pairs included, and `insert_newline`)
     /// record the trigger, while paste/snippet insertion through
@@ -16409,6 +16723,26 @@ mod tests {
         assert!(
             e.current_line_blame_annotation().is_none(),
             "a.rs blame painted on b.rs while its own fetch was still in flight"
+        );
+    }
+
+    #[test]
+    fn deleting_closes_clean_tabs_under_the_path_and_keeps_dirty_ones() {
+        let mut tabs = EditorTabs::new();
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/a.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dir/sub/b.rs"));
+        tabs.editors[2].dirty = true;
+        tabs.add_tab_with_path(PathBuf::from("/w/other.rs"));
+        tabs.add_tab_with_path(PathBuf::from("/w/dirt.rs"));
+        assert_eq!(tabs.close_clean_tabs_under(Path::new("/w/dir")), 1);
+        let left: Vec<_> = tabs.editors.iter().filter_map(|e| e.path.clone()).collect();
+        assert_eq!(
+            left,
+            vec![
+                PathBuf::from("/w/dir/sub/b.rs"),
+                PathBuf::from("/w/other.rs"),
+                PathBuf::from("/w/dirt.rs"),
+            ]
         );
     }
 
@@ -16947,6 +17281,37 @@ mod tests {
         assert_eq!(e.bookmarked_lines(), vec![4]);
         assert_eq!(e.toggle_bookmark(), Some(false), "second toggle clears it");
         assert!(e.bookmarked_lines().is_empty());
+    }
+
+    #[test]
+    fn a_bookmark_moves_with_its_line_on_move_line_down_and_back() {
+        let (mut e, _f) = bookmark_editor(10);
+        e.cursor_row = 3;
+        e.toggle_bookmark();
+        e.move_lines_down();
+        assert_eq!(e.lines[4], "line 4");
+        assert_eq!(e.bookmarked_lines(), vec![5]);
+        e.move_lines_up();
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+        // An in-place edit keeps the mark on its row.
+        e.cursor_col = 0;
+        e.insert_char('x');
+        assert_eq!(e.bookmarked_lines(), vec![4]);
+    }
+
+    #[test]
+    fn mirrored_edits_above_move_the_extra_carets_too() {
+        let (mut e, _f) = bookmark_editor(5);
+        e.cursor_row = 4;
+        e.carets = vec![EditorSelection {
+            anchor: (3, 0),
+            head: (3, 0),
+        }];
+        let mut new = e.lines.clone();
+        new.drain(0..2);
+        assert!(e.mirror_lines_from(&new, 1, (0, 0)));
+        assert_eq!(e.cursor_row, 2);
+        assert_eq!(e.carets[0].head, (1, 0));
     }
 
     #[test]
@@ -20056,6 +20421,25 @@ mod tests {
     }
 
     #[test]
+    fn carets_on_one_line_keep_their_places_across_keystrokes() {
+        let mut e = editor_with("abcd");
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(0, 3)];
+        e.multi_insert_char('X');
+        e.multi_insert_char('Y');
+        assert_eq!(e.lines, vec!["aXYbcXYd".to_string()]);
+        // A backspace that joins lines moves the carets below it up.
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        e.multi_insert_char('X');
+        assert_eq!(e.lines, vec!["abXcd".to_string(), "Xf".to_string()]);
+    }
+
+    #[test]
     fn multi_backspace_deletes_at_every_caret() {
         let mut e = editor_with("ab ab ab");
         e.cursor_row = 0;
@@ -20085,11 +20469,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 3),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (0, 8),
                 end: (0, 11),
                 new_text: "baz".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
@@ -20111,6 +20497,7 @@ mod tests {
             start: (0, 0),
             end: (3, 9),
             new_text: "import logging\nimport re\nimport typing\n\nimport pandas".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(
@@ -20134,6 +20521,7 @@ mod tests {
             start: (0, 2),
             end: (0, 4),
             new_text: "C\nD".to_string(),
+            utf16: false,
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
@@ -20147,11 +20535,13 @@ mod tests {
                 start: (0, 0),
                 end: (0, 4),
                 new_text: "label".to_string(),
+                utf16: false,
             },
             TextSpanEdit {
                 start: (1, 6),
                 end: (1, 10),
                 new_text: "label".to_string(),
+                utf16: false,
             },
         ];
         assert_eq!(e.apply_span_edits(&edits), 2);
@@ -21407,8 +21797,8 @@ mod tests {
             .read_to_end(&mut raw)
             .unwrap();
         assert_eq!(
-            raw, b"alpha\r\nbeta",
-            "save re-applies CRLF, no trailing EOL"
+            raw, b"alpha\r\nbeta\r\n",
+            "save re-applies CRLF, final newline included"
         );
     }
 
@@ -21804,6 +22194,63 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_the_files_final_newline() {
+        for (disk, want) in [
+            ("a\nb\n", "xa\nb\n"),
+            ("a\r\nb\r\n", "xa\r\nb\r\n"),
+            ("a\n\n", "xa\n\n"),
+            ("a", "xa"),
+        ] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            e.insert_char('x');
+            e.save_to_disk().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path()).unwrap(),
+                want,
+                "from {disk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_over_invalid_bytes_asks_first() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"caf\xe9 ok\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert!(e.decode_lossy, "a lone 0xE9 is not UTF-8");
+        e.insert_char('x');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::EncodingLoss);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"caf\xe9 ok\n",
+            "untouched"
+        );
+        e.lossy_save_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(!e.decode_lossy);
+    }
+
+    #[test]
+    fn a_language_servers_utf16_columns_land_after_an_emoji() {
+        let mut lines = vec![String::from("let s = \"😀\"; x + 1")];
+        let n = apply_span_edits_to_lines(
+            &mut lines,
+            &[TextSpanEdit {
+                start: (0, 14),
+                end: (0, 15),
+                new_text: String::from("renamed"),
+                utf16: true,
+            }],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(lines[0], "let s = \"😀\"; renamed + 1");
+    }
+
+    #[test]
     fn save_round_trips_content() {
         let tmp = NamedTempFile::new().unwrap();
         let mut e = Editor::new();
@@ -22129,7 +22576,7 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(
             std::fs::read(tmp.path()).unwrap(),
-            b"&#26085;&#26412;&#35486; costs 5\x80",
+            b"&#26085;&#26412;&#35486; costs 5\x80\n",
             "consent writes encoding_rs' references, and € as the 0x80 byte"
         );
         assert!(!e.encoding_loss);
@@ -22147,7 +22594,7 @@ mod tests {
         e.reopen_with_encoding(encoding_rs::WINDOWS_1252).unwrap();
         e.lines = vec![String::from("café")];
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
-        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9");
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
         // The same text in UTF-8 is always representable.
         let mut u = Editor::new();
@@ -25514,6 +25961,79 @@ mod tests {
         assert_eq!(e.lines, vec!["x = 1"]);
     }
 
+    #[test]
+    fn toggle_block_comment_keeps_the_indent_and_the_next_line() {
+        let mut e = editor_with("    foo\nbar");
+        e.lang = Some(LangKind::Rust);
+        // A whole-line selection, as Shift+Down makes it.
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    /* foo */", "bar"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 13));
+        // No selection: the current line, indent kept, and back again.
+        e.cursor_row = 0;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines, vec!["    foo", "bar"]);
+    }
+
+    #[test]
+    fn carets_that_meet_merge_so_the_next_key_edits_once() {
+        let mut e = editor_with("ab\ncd\nef");
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.carets = vec![EditorSelection::new(2, 1)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd", ""]);
+        assert!(e.carets.is_empty(), "{:?}", e.carets);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn pasting_crlf_or_cr_text_splits_lines_without_stray_returns() {
+        let mut e = editor_with("");
+        e.insert_str_as("a\r\nb\rc", crate::provenance::Seat::Me);
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn moving_or_sorting_lines_drops_the_folds_over_them() {
+        let mut e = editor_with("let y = 1;\nfn a() {\n    body\n}\ntail");
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2));
+        e.cursor_row = 0;
+        e.move_lines_down();
+        assert_eq!(e.lines[0], "fn a() {");
+        assert!(
+            !e.is_line_hidden(2),
+            "the fold no longer hides `let y` 's neighbours"
+        );
+        let mut e = editor_with("b\n  b1\n  b2\na");
+        e.toggle_fold(0);
+        assert!(e.is_line_hidden(1));
+        e.sort_lines(true);
+        assert!((0..4).all(|r| !e.is_line_hidden(r)), "{:?}", e.lines);
+    }
+
+    #[test]
+    fn sorting_lines_clamps_the_cursor_so_word_motion_cannot_panic() {
+        let mut e = editor_with("zzzzzzzzzz\nb\na");
+        e.cursor_row = 0;
+        e.cursor_col = 10;
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["a", "b", "zzzzzzzzzz"]);
+        assert!(e.cursor_col <= 1);
+        e.selection = None;
+        e.move_word_left();
+    }
+
     // ---- Join Lines ----
 
     #[test]
@@ -28549,6 +29069,16 @@ mod tests {
         let mut e = tag_editor("<div></div", LangKind::Html);
         e.insert_char('>');
         assert_eq!(e.lines[0], "<div></div>");
+    }
+
+    #[test]
+    fn retyping_the_angle_of_an_already_closed_tag_adds_no_second_close() {
+        for (text, want) in [("<div</div>", "<div></div>"), ("<div>", "<div>>")] {
+            let mut e = tag_editor(text, LangKind::Html);
+            e.cursor_col = 4;
+            e.insert_char('>');
+            assert_eq!(e.lines[0], want);
+        }
     }
 
     #[test]
