@@ -57422,8 +57422,12 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         app.poll_pr_gh();
         assert!(app.pr_gh.is_none());
         app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        // A due refresh runs gh. Not asserted through `pr_gh` straight after
+        // the poll: that poll also reads the answer, and under load the stub
+        // can answer before it does, leaving `pr_gh` already empty again.
+        // The checks turning from running to passed, below, is what only a
+        // gh run can do.
         app.poll_pr_gh();
-        assert!(app.pr_gh.is_some(), "a due refresh runs gh");
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the refresh", || {
             app.poll_pr_gh();
             !app.editor.pr_review.as_ref().unwrap().has_pending_checks()
