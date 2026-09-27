@@ -46,7 +46,7 @@ fn socket_path(workspace: &Path) -> PathBuf {
 /// Socket for a mux (session-host) session. A distinct name from the legacy
 /// dtach socket, so a client never speaks croft's frame protocol at a live
 /// dtach server (which would feed the frames into the PTY as input).
-fn mux_socket_path(workspace: &Path) -> PathBuf {
+pub(crate) fn mux_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.mux.sock", socket_name(workspace)))
 }
 
@@ -55,6 +55,13 @@ fn mux_socket_path(workspace: &Path) -> PathBuf {
 /// keying (see docs/MULTIPLAYER.md).
 pub(crate) fn collab_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.collab.sock", socket_name(workspace)))
+}
+
+/// Socket a running croft answers agent edit approvals on (#346): `croft
+/// hook claude-code` connects here for the workspace enclosing its cwd.
+/// Same keying as the other workspace sockets.
+pub(crate) fn hook_socket_path(workspace: &Path) -> PathBuf {
+    sessions_dir().join(format!("{}.hook.sock", socket_name(workspace)))
 }
 
 fn meta_path(socket: &Path) -> PathBuf {

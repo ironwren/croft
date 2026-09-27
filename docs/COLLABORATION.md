@@ -28,8 +28,9 @@ observers, enforced by the host, with everyone's window sized to the smallest pa
 
 The status bar shows an "N attached" badge whenever someone else is on, and
 **Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control
-or disconnect a participant. When several people hold control and take turns typing, each keeps
-their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
+or disconnect a participant. **Session: Detach** (`Cmd+K Shift+Q`) leaves the session without
+ending it, from any client, read-only ones included. When several people hold control and take
+turns typing, each keeps their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
 everyone else's position as a colored ghost caret in the editor.
 
 ## Independent viewports (`--solo`)
@@ -59,6 +60,38 @@ The agent joins the running session as a guest with `collab_open` / `collab_read
 live, its caret shows up named (default `claude`, `--name` overrides), and it can never write
 your disk — the session owner persists what lands. Croft ships no LLM; any MCP-speaking agent
 can drive the seat.
+
+## Agents: edit approvals through croft
+
+Claude Code can hold every Edit, Write and MultiEdit until croft answers:
+
+```sh
+croft hook install            # this project: ./.claude/settings.json
+croft hook install --global   # every project: ~/.claude/settings.json
+croft hook install --uninstall
+```
+
+`install` prints the settings diff, then adds one `PreToolUse` entry that runs
+`croft hook claude-code`. Nothing else in the file changes. `--uninstall` takes
+out that entry and nothing else. If the file is still exactly what `install`
+wrote, uninstalling puts back the original bytes, and deletes the file if
+`install` created it.
+
+For each edit, the hook finds the croft whose workspace encloses Claude Code's
+working directory (socket `<hash>.hook.sock` beside the session sockets). It
+sends croft the tool name and input as one JSON line, and waits up to 120 s
+for `{"decision": "allow" | "deny" | "ask", "reason": ...}`.
+
+- **No croft open:** the hook prints nothing and exits at once. Claude Code's
+  own permission prompt decides, so a closed editor never stalls an agent and
+  never approves an edit nobody saw.
+- **No answer in time, or an unreadable one:** the hook answers `ask` and
+  Claude Code's prompt takes over.
+
+The request carries no Claude-specific fields, so another agent with a hook
+system needs only a settings writer and its own reply shape. The croft side
+that answers (a live diff of the proposed edit, approve or deny in place)
+is #347.
 
 ## The resident navigator
 
