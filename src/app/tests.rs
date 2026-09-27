@@ -59734,3 +59734,28 @@ fn leaving_the_tour_closes_the_samples_tabs_even_edited_ones() {
         assert!(left.is_empty(), "tabs naming the deleted sample: {left:?}");
     });
 }
+
+/// #356: a run of one colour stays one SGR run across the soft-wrap column
+/// and across a wide character. Both carry cell flags that are layout, not
+/// style, and keyed on those the run was reset and set again around them.
+#[test]
+fn a_colour_run_is_not_split_by_the_wrap_column_or_a_wide_char() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0].resize(20, 6);
+    let long = "y".repeat(30);
+    app.terminals[0].feed_bytes_for_test(
+        format!("\r\n\x1b[33m{long}\x1b[0m\r\n\x1b[32mab\u{4e2d}cd\x1b[0m\r\n").as_bytes(),
+    );
+    let (rows, _) = app.terminals[0].screen_ansi_wrapped();
+    let ansi: Vec<&str> = rows.iter().map(|(_, a, _)| a.as_str()).collect();
+    let first = format!("\x1b[33m{}\x1b[0m", "y".repeat(20));
+    assert!(
+        ansi.contains(&first.as_str()),
+        "the wrapped row is one run: {ansi:?}"
+    );
+    assert!(
+        ansi.contains(&"\x1b[32mab\u{4e2d}cd\x1b[0m"),
+        "the wide char sits inside its run: {ansi:?}"
+    );
+}
