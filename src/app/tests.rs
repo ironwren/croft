@@ -55973,3 +55973,59 @@ esac
         assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
     });
 }
+
+/// #345: clicking an unreviewed lane row's ● marks that file reviewed;
+/// clicking its name still opens the diff.
+#[test]
+fn clicking_a_lane_rows_dot_marks_the_file_reviewed() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    std::fs::write(&f, "a\n").unwrap();
+    app.agent_ledger.record_write(
+        &f,
+        crate::agent_lane::content_hash(b"a\n"),
+        &[String::from("claude")],
+    );
+    app.show_agent_lane_section();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let (x, y) = (0..buf.area.height)
+        .find_map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let at = row.find("● f.rs")?;
+            Some((row[..at].chars().count() as u16, y))
+        })
+        .expect("the unreviewed row is painted");
+    let unreviewed = |app: &mut App| {
+        app.agent_lane_panel_rows().into_iter().any(|r| {
+            matches!(
+                r,
+                LaneRow::File {
+                    unreviewed: true,
+                    ..
+                }
+            )
+        })
+    };
+    assert!(unreviewed(&mut app));
+    let click = |app: &mut App, column: u16| {
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    // The name opens the diff (refused here: never reviewed) and marks
+    // nothing.
+    click(&mut app, x + 3);
+    assert!(unreviewed(&mut app), "{}", app.status);
+    click(&mut app, x);
+    assert!(!unreviewed(&mut app), "{}", app.status);
+    assert!(app.status.contains("f.rs: reviewed"), "{}", app.status);
+}

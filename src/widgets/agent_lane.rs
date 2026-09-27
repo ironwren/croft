@@ -60,6 +60,8 @@ pub struct AgentLanePanel {
     last_header_x: u16,
     last_header_w: u16,
     first_row_y: u16,
+    /// Where rows start horizontally, for the dot's hit test.
+    first_row_x: u16,
     visible_rows: u16,
 }
 
@@ -77,6 +79,7 @@ impl AgentLanePanel {
             last_header_x: 0,
             last_header_w: 0,
             first_row_y: 0,
+            first_row_x: 0,
             visible_rows: 0,
         }
     }
@@ -123,6 +126,20 @@ impl AgentLanePanel {
         y == self.last_header_row
             && x >= self.last_header_x
             && x < self.last_header_x.saturating_add(self.last_header_w)
+    }
+
+    /// Whether a click at (`x`, `y`) lands on an unreviewed file row's dot,
+    /// which marks that file reviewed rather than opening its diff.
+    pub fn hit_dot(&self, x: u16, y: u16) -> bool {
+        let dot = self.first_row_x.saturating_add(2);
+        (dot..dot.saturating_add(2)).contains(&x)
+            && matches!(
+                self.row_at(y),
+                Some(LaneRow::File {
+                    unreviewed: true,
+                    ..
+                })
+            )
     }
 
     /// The row a click at `y` lands on.
@@ -210,6 +227,7 @@ impl Widget for &mut AgentLanePanel {
         let body_y = inner.y + 1;
         let body_h = inner.height - 1;
         self.first_row_y = body_y;
+        self.first_row_x = inner.x;
         if self.rows.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No agent has changed a file",

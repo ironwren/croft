@@ -44471,10 +44471,19 @@ impl App {
                     } else if let Some(crate::widgets::agent_lane::LaneRow::File {
                         agent,
                         path,
+                        label,
                         ..
                     }) = self.agent_lane_panel.row_at(m.row).cloned()
                     {
-                        self.diff_agent_lane_row(&agent, &path);
+                        // The ● marks the file reviewed; the rest of the row
+                        // opens its diff.
+                        if self.agent_lane_panel.hit_dot(m.column, m.row) {
+                            if self.mark_agent_file_reviewed(&agent, &path) {
+                                self.status = format!("{label}: reviewed");
+                            }
+                        } else {
+                            self.diff_agent_lane_row(&agent, &path);
+                        }
                     }
                     return;
                 }
