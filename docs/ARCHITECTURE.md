@@ -566,7 +566,7 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the file on disk. Both leave the scrubber.
 
-**The action keys are keys typing never needs.** Every key the scrubber does not use reaches the live buffer, so `o` or `d` would steal letters. Enter is taken only at a commit, where the live buffer is hidden under the historical view anyway. The diff is a palette command.
+**Enter opens here only at a commit.** There, the edit guard already refuses typing into the live buffer hidden under the historical view. At the working tree, Enter is ordinary typing. The diff is a palette command.
 
 **Leaving must restore the live buffer exactly, unsaved edits included.** Scrubbing is a way of looking, not of editing, and losing uncommitted work to answer a question about history would be worse than not having the feature. So the working tree is a *position* in the cursor rather than something the scrubber replaces — there is no state where the live buffer has been discarded and the scrubber owes it back.
 
