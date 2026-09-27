@@ -53886,6 +53886,37 @@ fn a_file_that_did_not_exist_yet_says_so() {
 }
 
 #[test]
+fn the_explorer_dims_files_missing_from_the_scrubbed_commit() {
+    // #371: at a commit, a file its tree lacks dims; the working tree and
+    // closing the scrubber clear it.
+    let repo = scrub_repo();
+    std::fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    let new = repo.path().join("new.txt");
+    let old = repo.path().join("a.txt");
+    app.scrub_history();
+    assert!(app.tree.scrub_tree.is_none(), "opening parks at the tree");
+    app.handle_scrubber_key(KeyCode::Left);
+    assert!(app.tree.is_absent_at_scrub(&new), "new.txt is not in HEAD");
+    assert!(!app.tree.is_absent_at_scrub(&old), "a.txt is");
+    app.handle_scrubber_key(KeyCode::Home);
+    assert!(
+        !app.tree.is_absent_at_scrub(&new),
+        "Home clears the dimming"
+    );
+    app.handle_scrubber_key(KeyCode::Left);
+    assert!(app.tree.is_absent_at_scrub(&new));
+    app.handle_scrubber_key(KeyCode::Right);
+    assert!(
+        !app.tree.is_absent_at_scrub(&new),
+        "stepping to the working tree clears it"
+    );
+    app.handle_scrubber_key(KeyCode::Left);
+    app.handle_scrubber_key(KeyCode::Esc);
+    assert!(app.tree.scrub_tree.is_none(), "closing clears it");
+}
+
+#[test]
 fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
     // #363: a DIFFERS row says what differs, line by line, not just that
     // something did; every row says how long the host took.
