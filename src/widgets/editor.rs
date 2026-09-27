@@ -2096,9 +2096,26 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
+    /// The text this step holds, each line's `String` header included,
+    /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
+    bytes: usize,
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
+
+/// Bytes of text the undo steps of one buffer may hold (#694). Every step is
+/// a whole copy of the buffer, so the 500-step cap alone let a 10 MB file
+/// keep 5 GB of history. The oldest steps go first; the newest
+/// [`UNDO_MIN_STEPS`] always stay, so a large file can still be undone.
+const UNDO_BYTES_LIMIT: usize = if cfg!(test) {
+    1024 * 1024
+} else {
+    256 * 1024 * 1024
+};
+
+/// Undo steps kept whatever their size (see [`UNDO_BYTES_LIMIT`]).
+const UNDO_MIN_STEPS: usize = 16;
+
 /// Max selected-text length that still drives occurrence highlighting, matching
 /// VS Code's default `editor.selectionHighlightMaxLength`.
 const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
@@ -8595,8 +8612,14 @@ impl Editor {
     }
 
     fn snapshot(&self) -> Snapshot {
+        let lines = self.lines.clone();
+        let bytes = lines
+            .iter()
+            .map(|l| l.capacity() + std::mem::size_of::<String>())
+            .sum();
         Snapshot {
-            lines: self.lines.clone(),
+            lines,
+            bytes,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
             selection: self.selection,
@@ -8605,6 +8628,20 @@ impl Editor {
             save_seq: self.save_seq,
             provenance: self.provenance.clone(),
         }
+    }
+
+    /// Drop the oldest undo steps past [`UNDO_STACK_LIMIT`] steps or
+    /// [`UNDO_BYTES_LIMIT`] bytes, keeping at least [`UNDO_MIN_STEPS`].
+    fn trim_undo_stack(&mut self) {
+        let mut total: usize = self.undo_stack.iter().map(|s| s.bytes).sum();
+        let mut drop = 0;
+        while self.undo_stack.len() - drop > UNDO_MIN_STEPS
+            && (self.undo_stack.len() - drop > UNDO_STACK_LIMIT || total > UNDO_BYTES_LIMIT)
+        {
+            total -= self.undo_stack[drop].bytes;
+            drop += 1;
+        }
+        self.undo_stack.drain(..drop);
     }
 
     /// Push an undo entry tagged with the kind of edit about to happen.
@@ -8623,9 +8660,7 @@ impl Editor {
             kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
         if !coalesce {
             self.undo_stack.push(self.snapshot());
-            if self.undo_stack.len() > UNDO_STACK_LIMIT {
-                self.undo_stack.remove(0);
-            }
+            self.trim_undo_stack();
             self.undo_step_id = next_undo_step_id();
             self.mirrored_step = None;
         }
@@ -21245,6 +21280,30 @@ mod tests {
         assert_eq!(e.lines, vec!["    pass".to_string()]);
         assert!(e.undo());
         assert_eq!(e.lines, vec!["        pass".to_string()]);
+    }
+
+    /// #694: undo history is bounded in bytes as well as steps, keeping the
+    /// newest steps (and at least `UNDO_MIN_STEPS` of them).
+    #[test]
+    fn undo_history_of_a_large_buffer_is_bounded_in_bytes() {
+        let big = vec!["x".repeat(255); 1024].join("\n");
+        let mut e = editor_with(&big);
+        for i in 0..40 {
+            e.push_undo(EditKind::Paste);
+            e.lines[0] = format!("edit {i}");
+        }
+        let held: usize = e.undo_stack.iter().map(|s| s.bytes).sum();
+        assert_eq!(e.undo_stack.len(), UNDO_MIN_STEPS, "held {held} bytes");
+        // The newest steps survive: one undo brings back the text before
+        // the last edit.
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "edit 38");
+        // A small buffer keeps its full step count.
+        let mut small = editor_with("a");
+        for _ in 0..40 {
+            small.push_undo(EditKind::Paste);
+        }
+        assert_eq!(small.undo_stack.len(), 40);
     }
 
     #[test]
