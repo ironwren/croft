@@ -255,6 +255,8 @@ pub enum Command {
     MarkAgentLaneReviewed,
     /// Summarise each agent's review queue (#345).
     ShowAgentLane,
+    /// Show the Explorer's AGENT LANE section, open (#345).
+    OpenAgentLaneSection,
     /// Diff the active file against the snapshot it was last reviewed
     /// against (#345).
     DiffAgentFileSinceReview,
@@ -496,6 +498,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::DiffWorktreeLane,
     Command::MarkAgentLaneReviewed,
     Command::ShowAgentLane,
+    Command::OpenAgentLaneSection,
     Command::MarkAgentFileReviewed,
     Command::DiffAgentFileSinceReview,
     Command::FixProblemWithNavigator,
@@ -725,6 +728,7 @@ impl Command {
             Command::DiffWorktreeLane => "Agent: Diff Lane Against Its Base",
             Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
             Command::ShowAgentLane => "Agents: Show Changed Files",
+            Command::OpenAgentLaneSection => "Agents: Open Agent Lane",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
             Command::DiffAgentFileSinceReview => "Agents: Diff This File Since Review",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
@@ -957,6 +961,7 @@ impl Command {
             Command::DiffWorktreeLane => "",
             Command::MarkAgentLaneReviewed => "",
             Command::ShowAgentLane => "",
+            Command::OpenAgentLaneSection => "",
             Command::MarkAgentFileReviewed => "",
             Command::DiffAgentFileSinceReview => "",
             Command::FixProblemWithNavigator => "",
@@ -1183,6 +1188,7 @@ impl Command {
             Command::DiffWorktreeLane => "agent_diff_worktree_lane",
             Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
             Command::ShowAgentLane => "agents_show_lane",
+            Command::OpenAgentLaneSection => "agents_open_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
             Command::DiffAgentFileSinceReview => "agents_diff_since_review",
             Command::FixProblemWithNavigator => "problems_fix_navigator",

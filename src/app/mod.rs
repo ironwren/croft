@@ -19445,11 +19445,6 @@ impl App {
             // Cmd+K B: show the Testing view (B for the beaker icon). Cmd+Shift+T
             // — VS Code's Testing-ish chord — is already croft's focus-Terminal
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
-            // Cmd+K V (#345): show the AGENT LANE section, open.
-            KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
-                self.show_agent_lane_section();
-                true
-            }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
                 self.open_testing_view();
                 true
@@ -38660,6 +38655,7 @@ impl App {
                     rows.join(" \u{b7} ")
                 };
             }
+            Cmd::OpenAgentLaneSection => self.show_agent_lane_section(),
             Cmd::DiffAgentFileSinceReview => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),

@@ -45024,16 +45024,17 @@ fn agent_lane_rows_list_each_agent_then_its_files_unreviewed_first() {
     );
 }
 
-/// #345: Cmd+K V shows the section, open, even after it was hidden from the
-/// ⋯ menu; with no agent activity it says so instead.
+/// #345: "Agents: Open Agent Lane" shows the section, open, even after it
+/// was hidden from the ⋯ menu; with no agent activity it says so instead.
 #[test]
-fn cmd_k_v_shows_the_agent_lane_section_open() {
+fn agents_open_agent_lane_shows_the_section_open() {
+    use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let f = root.join("x.rs");
     std::fs::write(&f, "x").unwrap();
     let mut app = App::new(root).unwrap();
-    app.show_agent_lane_section();
+    app.run_command(Command::OpenAgentLaneSection);
     assert!(app.status.contains("no agent"), "status: {}", app.status);
 
     app.agent_ledger
@@ -45042,7 +45043,7 @@ fn cmd_k_v_shows_the_agent_lane_section_open() {
         app.toggle_explorer_view(ExplorerView::AgentLane);
     }
     assert!(app.agent_lane_panel.collapsed);
-    app.show_agent_lane_section();
+    app.run_command(Command::OpenAgentLaneSection);
     assert!(app.explorer_views.is_visible(ExplorerView::AgentLane));
     assert!(!app.agent_lane_panel.collapsed);
     assert_eq!(app.sidebar_view, SidebarView::Explorer);
