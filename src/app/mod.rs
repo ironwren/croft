@@ -3302,6 +3302,10 @@ pub struct App {
     hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
+    /// A proposal being edited before approval (#347): its token, and the
+    /// scratch file whose save approves the edited text. The popup stays
+    /// down while it lasts.
+    approval_edit: Option<(String, PathBuf)>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
@@ -5332,6 +5336,7 @@ impl App {
             hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
+            approval_edit: None,
             notebook_kernels: std::collections::HashMap::new(),
             coverage_at: None,
             coverage_lens_path: None,
@@ -15900,9 +15905,10 @@ impl App {
         if self.approvals.front().map(|p| p.arrived) != head {
             self.approval_ui = None;
         }
+        changed |= self.check_approval_edit();
         if self.approvals.is_empty() {
             self.approval_ui = None;
-        } else if self.approval_ui.is_none() {
+        } else if self.approval_ui.is_none() && self.approval_edit.is_none() {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
             changed = true;
         }
@@ -15986,6 +15992,9 @@ impl App {
             return;
         };
         let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
+            if std::mem::take(&mut ui.edit_requested) {
+                self.start_approval_edit();
+            }
             return;
         };
         let approve_all = ui.approve_all;
@@ -16008,6 +16017,132 @@ impl App {
         }
         self.approval_ui = (!self.approvals.is_empty())
             .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
+    }
+
+    /// `e` in the approval popup (#347): open the head proposal's text as a
+    /// scratch file named like the real one (so it gets its language's
+    /// highlighting and server), with the popup put away. Saving it
+    /// approves the saved text; closing it unsaved brings the popup back.
+    fn start_approval_edit(&mut self) {
+        let Some(head) = self.approvals.front() else {
+            return;
+        };
+        // Refused up front rather than after the user has done the editing.
+        if let Err(why) = crate::agent_approval::edited_input(
+            &head.request.tool,
+            &head.request.input,
+            head.proposal.before.as_deref(),
+            &head.proposal.after,
+        ) {
+            self.status = why;
+            return;
+        }
+        let name = head
+            .proposal
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("proposal.txt"));
+        let dir = croft_cache_dir().join("approval-edits").join(&head.token);
+        let file = dir.join(name);
+        let token = head.token.clone();
+        let agent = head.request.agent.clone();
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&file, &head.proposal.after));
+        if let Err(e) = written {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        if let Err(e) = self.editor.open(&file) {
+            self.status = format!("Could not open the proposal to edit: {e}");
+            return;
+        }
+        self.approval_ui = None;
+        self.approval_edit = Some((token, file));
+        self.focus_pane(Pane::Editor);
+        self.status = format!(
+            "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+        );
+    }
+
+    /// Keep an in-progress proposal edit honest (#347): the proposal gone
+    /// (answered elsewhere, or the agent stopped waiting) ends it with a
+    /// note; its tab closed unsaved ends it quietly, and the popup returns.
+    fn check_approval_edit(&mut self) -> bool {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return false;
+        };
+        if !self.approvals.iter().any(|p| p.token == token) {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return true;
+        }
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let open = groups
+            .flat_map(|g| g.editors.iter())
+            .any(|e| e.path.as_deref() == Some(file.as_path()));
+        if !open {
+            self.approval_edit = None;
+            let _ = std::fs::remove_file(&file);
+            return true;
+        }
+        false
+    }
+
+    /// A save of the proposal being edited approves it with the saved text
+    /// as the tool's new input (#347), and closes the scratch tab.
+    fn approve_saved_edit(&mut self, saved: &std::path::Path) {
+        let Some((token, file)) = self.approval_edit.clone() else {
+            return;
+        };
+        if saved != file {
+            return;
+        }
+        let Some(idx) = self.approvals.iter().position(|p| p.token == token) else {
+            self.approval_edit = None;
+            self.status = String::from(
+                "The agent stopped waiting for that edit, so saving it approves nothing",
+            );
+            return;
+        };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Could not read the edited proposal: {e}");
+                return;
+            }
+        };
+        let pending = &self.approvals[idx];
+        let input = match crate::agent_approval::edited_input(
+            &pending.request.tool,
+            &pending.request.input,
+            pending.proposal.before.as_deref(),
+            &text,
+        ) {
+            Ok(input) => input,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let Some(pending) = self.approvals.remove(idx) else {
+            return;
+        };
+        let agent = pending.request.agent.clone();
+        pending.answer(&crate::agent_hook::Decision::AllowEdited { input });
+        self.approval_edit = None;
+        if self.editor.path.as_deref() == Some(file.as_path()) {
+            self.editor.close_active();
+        }
+        let _ = std::fs::remove_file(&file);
+        self.status = format!("Approved {agent}'s edit as you changed it");
+        if !self.approvals.is_empty() {
+            self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(
+                std::time::Instant::now(),
+            ));
+        }
     }
 
     fn render_approval_popup(&self, frame: &mut ratatui::Frame) {
@@ -49062,6 +49197,9 @@ impl App {
             return;
         };
         self.reload_config_for_path(&path);
+        // The explicit-save path's other follow-up: a save of an agent's
+        // proposal being edited approves it (#347).
+        self.approve_saved_edit(&path);
     }
 
     /// Reload whichever of croft's own config files `path` is, if any.

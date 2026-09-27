@@ -71,6 +71,47 @@ pub fn proposal_for(
     })
 }
 
+/// The tool input that makes the agent's own tool produce `edited`
+/// instead of what it proposed (#347, "edit then approve"), in the shape
+/// the tool already takes, so Claude Code's `updatedInput` needs nothing
+/// new from it. A `Write` writes `edited`; an `Edit` or `MultiEdit`
+/// becomes one replacement of the whole current file, whose text the
+/// proposal was computed from and so matches exactly once. A new or empty
+/// file has no text for an `Edit` to match, and is refused.
+pub fn edited_input(
+    tool: &str,
+    input: &Value,
+    before: Option<&str>,
+    edited: &str,
+) -> Result<Value, String> {
+    let file = input["file_path"].clone();
+    match tool {
+        "Write" => {
+            let mut out = input.clone();
+            out["content"] = Value::String(edited.to_string());
+            Ok(out)
+        }
+        "Edit" | "MultiEdit" => {
+            let before = before.filter(|b| !b.is_empty()).ok_or_else(|| {
+                format!("an {tool} of an empty file cannot carry an edited version; approve or deny it as proposed")
+            })?;
+            let one = serde_json::json!({
+                "old_string": before,
+                "new_string": edited,
+                "replace_all": false,
+            });
+            Ok(if tool == "Edit" {
+                let mut out = one;
+                out["file_path"] = file;
+                out
+            } else {
+                serde_json::json!({ "file_path": file, "edits": [one] })
+            })
+        }
+        other => Err(format!("{other} is not a file edit")),
+    }
+}
+
 /// One `old_string` -> `new_string` replacement, with the agent's own
 /// rules: the old text must be present, and exactly once unless
 /// `replace_all` is set.
@@ -336,6 +377,8 @@ pub struct ApprovalUi {
     /// Set by `a`: the approval also covers this agent's next proposals
     /// for [`AUTO_APPROVE_FOR`].
     pub approve_all: bool,
+    /// `e` was pressed: open the proposal to edit before approving (#347).
+    pub edit_requested: bool,
 }
 
 /// How long `a` in the popup keeps approving one agent's edits (#347).
@@ -348,6 +391,7 @@ impl ApprovalUi {
             reason: None,
             shown_at: now,
             approve_all: false,
+            edit_requested: false,
         }
     }
 
@@ -397,6 +441,7 @@ impl ApprovalUi {
                 });
             }
             KeyCode::Char('r') => self.reason = Some(String::new()),
+            KeyCode::Char('e') => self.edit_requested = true,
             KeyCode::Down | KeyCode::Char('j') => self.scroll = (self.scroll + 1).min(last),
             KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::PageDown => self.scroll = (self.scroll + 10).min(last),
@@ -441,6 +486,53 @@ pub fn diff_rows(p: &Proposal) -> Vec<(char, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edited_proposal_becomes_input_the_tool_already_takes() {
+        // #347: whatever the tool, running it with the new input yields
+        // exactly the edited text: checked by replaying it through
+        // `proposal_for`, the same apply the agent's tool does.
+        let before = "fn a() {}\nfn b() {}\n";
+        let edited = "fn a() {}\nfn c() {}\n";
+        let read = |_: &Path| Ok(before.to_string());
+        for (tool, input) in [
+            (
+                "Write",
+                serde_json::json!({"file_path": "x.rs", "content": "zzz"}),
+            ),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "x.rs", "old_string": "b", "new_string": "q"}),
+            ),
+            (
+                "MultiEdit",
+                serde_json::json!({"file_path": "x.rs", "edits": [{"old_string": "a", "new_string": "q"}]}),
+            ),
+        ] {
+            let out = edited_input(tool, &input, Some(before), edited).unwrap();
+            let replay = proposal_for(tool, &out, Path::new("/w"), &read).unwrap();
+            assert_eq!(replay.after, edited, "{tool}: {out}");
+            assert_eq!(out["file_path"], "x.rs");
+        }
+        let err = edited_input(
+            "Edit",
+            &serde_json::json!({"file_path": "x.rs"}),
+            Some(""),
+            edited,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty file"), "{err}");
+        // A Write of a new file is fine: it carries the whole text.
+        assert!(
+            edited_input(
+                "Write",
+                &serde_json::json!({"file_path": "n.rs", "content": ""}),
+                None,
+                "x"
+            )
+            .is_ok()
+        );
+    }
     use serde_json::json;
 
     fn disk(text: &'static str) -> impl Fn(&Path) -> std::io::Result<String> {

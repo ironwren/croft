@@ -57207,3 +57207,78 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
 }
+
+#[test]
+fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
+    // #347: `e` opens the proposal as a scratch file with the popup put
+    // away; closing it unsaved brings the popup back; saving it approves
+    // with input that makes the agent's own tool write the edited text.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "let x = 1;\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let input = serde_json::json!({"file_path": target, "old_string": "1", "new_string": "2"});
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Edit".into(),
+            input,
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        app.drain_hook_requests();
+        let arm = |app: &mut App| {
+            app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        };
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.approval_ui.is_none(), "the popup is put away");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        assert_eq!(app.editor.lines[0], "let x = 2;", "the proposal's text");
+        app.drain_hook_requests();
+        assert!(app.approval_ui.is_none(), "and stays away while editing");
+
+        // Closed unsaved: back to the popup, nothing answered.
+        app.editor.close_active();
+        app.drain_hook_requests();
+        assert!(app.approval_edit.is_none() && app.approval_ui.is_some());
+        assert_eq!(app.approvals.len(), 1);
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.editor.lines[0] = String::from("let x = 3;");
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("as you changed it"), "{}", app.status);
+        assert!(app.approvals.is_empty() && app.approval_edit.is_none());
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p);
+        let replay =
+            crate::agent_approval::proposal_for("Edit", &input, tmp.path(), &read).unwrap();
+        assert_eq!(
+            replay.after, "let x = 3;\n",
+            "the agent's Edit writes what was saved"
+        );
+    });
+}
