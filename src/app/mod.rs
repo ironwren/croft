@@ -22564,6 +22564,7 @@ impl App {
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
         self.refresh_codeql_queries();
+        self.refresh_codeql_variant();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
@@ -22577,15 +22578,28 @@ impl App {
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
     /// query in the pack; Esc then first cancels the ones still queued.
+    /// In the Variant Analysis Repositories section `a` adds a repository
+    /// (into the selected list), `l` a list, `o` an owner and `g` opens the
+    /// selected repository or owner on GitHub; Enter selects what a run
+    /// targets, Space folds a list, F2 renames a list and Delete removes an
+    /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
-        use crate::widgets::codeql::{Action, Hit};
+        use crate::codeql_variant::Item;
+        use crate::widgets::codeql::{Action, Hit, Section};
         let db = self.codeql.selected_database();
         let run = self.codeql.selected_history();
+        let va_item = self.codeql.selected_variant_item();
+        let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
+            KeyCode::Char(' ') if matches!(va_item, Some(Item::List(_))) => {
+                if let Some(Item::List(i)) = va_item {
+                    self.codeql.toggle_variant_list(i);
+                }
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(hit) = self.codeql.selected_hit() {
                     self.activate_codeql(hit);
@@ -22596,6 +22610,8 @@ impl App {
                     self.confirm_remove_codeql_database(i);
                 } else if let Some(i) = run {
                     self.confirm_remove_codeql_history(i);
+                } else if let Some(item) = va_item {
+                    self.remove_codeql_variant_item(item);
                 }
             }
             KeyCode::F(2) => {
@@ -22603,8 +22619,14 @@ impl App {
                     self.prompt_rename_codeql_database(i);
                 } else if let Some(i) = run {
                     self.prompt_rename_codeql_history(i);
+                } else if let Some(Item::List(i)) = va_item {
+                    self.prompt_rename_codeql_variant_list(i);
                 }
             }
+            KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
+            KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
+            KeyCode::Char('o') if in_va => self.prompt_add_codeql_variant_owner(),
+            KeyCode::Char('g') if in_va => self.open_codeql_variant_on_github(),
             KeyCode::Char('e') => {
                 if let Some(i) = db {
                     self.reveal_codeql_database(i);
@@ -22649,8 +22671,9 @@ impl App {
 
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
     /// the language and database lists select; a query row runs; "Create
-    /// one" asks for a query name; the actions still to come in #578 say so
-    /// rather than do nothing.
+    /// one" asks for a query name; a variant analysis entry becomes what a
+    /// run targets (a list already selected folds instead); the actions
+    /// still to come in #578 say so rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22753,15 +22776,398 @@ impl App {
                 }
             }
             Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
-            Hit::Action(action) => {
-                let what = match action {
-                    Action::SetUpControllerRepository => "Variant analysis",
-                    Action::ViewAst => "The AST viewer",
-                    _ => unreachable!("handled above"),
-                };
-                self.status = format!("{what} is not available yet (#578)");
+            Hit::Action(Action::SetUpControllerRepository) => self.prompt_codeql_controller(),
+            Hit::Action(Action::VariantList(i))
+                if self
+                    .codeql
+                    .variant
+                    .is_selected(crate::codeql_variant::Item::List(i)) =>
+            {
+                self.codeql.toggle_variant_list(i);
+            }
+            Hit::Action(Action::VariantList(i)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::List(i));
+            }
+            Hit::Action(Action::VariantRepo(list, j)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::Repo(list, j));
+            }
+            Hit::Action(Action::VariantOwner(i)) => {
+                self.select_codeql_variant_item(crate::codeql_variant::Item::Owner(i));
+            }
+            Hit::Action(Action::AddVariantRepo) => self.prompt_add_codeql_variant_repo(),
+            Hit::Action(Action::AddVariantList) => self.prompt_add_codeql_variant_list(),
+            Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
+            Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
+            Hit::Action(Action::ViewAst) => {
+                self.status = String::from("The AST viewer is not available yet (#578)");
             }
         }
+    }
+
+    fn codeql_variant_path() -> PathBuf {
+        croft_cache_dir().join("codeql-variant-analysis.json")
+    }
+
+    /// Reload the variant analysis config into the side bar. One that
+    /// cannot be read is reported, and the section says so rather than
+    /// showing it empty.
+    fn refresh_codeql_variant(&mut self) {
+        match crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path()) {
+            Ok(config) => {
+                self.codeql.variant = config;
+                self.codeql.variant_error = false;
+            }
+            Err(e) => {
+                self.codeql.variant = crate::codeql_variant::VariantConfig::default();
+                self.codeql.variant_error = true;
+                self.status = format!("Could not read the variant analysis config: {e}");
+            }
+        }
+    }
+
+    /// Change the variant analysis config with `edit` and save it, showing
+    /// `edit`'s message. A config that cannot be read is left as it is,
+    /// never saved over with an empty one. Returns whether it saved.
+    fn edit_codeql_variant(
+        &mut self,
+        edit: impl FnOnce(&mut crate::codeql_variant::VariantConfig) -> Result<String, String>,
+    ) -> bool {
+        let path = Self::codeql_variant_path();
+        let mut config = match crate::codeql_variant::VariantConfig::load(&path) {
+            Ok(config) => config,
+            Err(e) => {
+                self.codeql.variant_error = true;
+                self.status =
+                    format!("Could not read the variant analysis config, so it is unchanged: {e}");
+                return false;
+            }
+        };
+        let message = match edit(&mut config) {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = e;
+                return false;
+            }
+        };
+        if let Err(e) = config.save(&path) {
+            self.status = format!("Could not save the variant analysis config: {e}");
+            return false;
+        }
+        self.status = message;
+        self.codeql.variant = config;
+        self.codeql.variant_error = false;
+        true
+    }
+
+    /// Ask for the controller repository variant analysis runs from (#578,
+    /// VS Code's "Set up controller repository"), starting from the current
+    /// one.
+    fn prompt_codeql_controller(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        // From the file: the palette can ask before the side bar loaded it.
+        let current = crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path())
+            .ok()
+            .and_then(|c| c.controller_repo);
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlControllerRepository,
+                String::from("Set Up Controller Repository"),
+                "owner/repo or its GitHub URL",
+            )
+            .with_value(current.unwrap_or_default()),
+        );
+    }
+
+    fn submit_codeql_controller(&mut self, value: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            c.set_controller(value)
+                .map(|nwo| format!("Variant analysis controller repository: {nwo}"))
+        });
+        if saved {
+            self.codeql
+                .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
+        }
+    }
+
+    /// Ask for a repository to add for variant analysis, into the list whose
+    /// line (or one of whose repositories) is selected in the side bar.
+    fn prompt_add_codeql_variant_repo(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let list = self
+            .codeql
+            .selected_variant_list()
+            .and_then(|i| self.codeql.variant.lists.get(i))
+            .map(|l| l.name.clone());
+        let title = match &list {
+            Some(name) => format!("Add Repository to {name}"),
+            None => String::from("Add Variant Analysis Repository"),
+        };
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantRepo { list },
+            title,
+            "owner/repo or its GitHub URL",
+        ));
+    }
+
+    fn submit_add_codeql_variant_repo(&mut self, list: Option<&str>, value: &str) {
+        use crate::codeql_variant::Item;
+        let mut added = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let index = match list {
+                Some(name) => Some(
+                    c.list_index(name)
+                        .ok_or_else(|| format!("The list {name} is no longer there"))?,
+                ),
+                None => None,
+            };
+            let nwo = c.add_repo(index, value)?;
+            let len = match index {
+                Some(i) => c.lists[i].repos.len(),
+                None => c.repos.len(),
+            };
+            added = Some(Item::Repo(index, len - 1));
+            Ok(match list {
+                Some(name) => format!("Added {nwo} to {name}"),
+                None => format!("Added {nwo} for variant analysis"),
+            })
+        });
+        if let (true, Some(item)) = (saved, added) {
+            if let Some(name) = list {
+                self.codeql.folded_lists.remove(name);
+            }
+            self.codeql.select_variant_item(item);
+        }
+    }
+
+    fn prompt_add_codeql_variant_list(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantList,
+            String::from("Add Repository List"),
+            "the list's name",
+        ));
+    }
+
+    fn submit_add_codeql_variant_list(&mut self, value: &str) {
+        let mut added = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c.add_list(value)?;
+            added = Some(i);
+            Ok(format!("Added repository list {}", c.lists[i].name))
+        });
+        if let (true, Some(i)) = (saved, added) {
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::List(i));
+        }
+    }
+
+    fn prompt_add_codeql_variant_owner(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlAddVariantOwner,
+            String::from("Add Variant Analysis Owner"),
+            "a user or organisation, or its GitHub URL",
+        ));
+    }
+
+    fn submit_add_codeql_variant_owner(&mut self, value: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            c.add_owner(value)
+                .map(|o| format!("Added every repository of {o} for variant analysis"))
+        });
+        if saved {
+            let last = self.codeql.variant.owners.len().saturating_sub(1);
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::Owner(last));
+        }
+    }
+
+    fn prompt_rename_codeql_variant_list(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(name) = self.codeql.variant.lists.get(index).map(|l| l.name.clone()) else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRenameVariantList { name: name.clone() },
+                String::from("Rename Repository List"),
+                "the list's name",
+            )
+            .with_value(name),
+        );
+    }
+
+    fn submit_rename_codeql_variant_list(&mut self, name: &str, value: &str) {
+        let mut renamed = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c
+                .list_index(name)
+                .ok_or_else(|| format!("The list {name} is no longer there"))?;
+            c.rename_list(i, value)?;
+            renamed = Some(i);
+            Ok(format!("Renamed repository list to {}", c.lists[i].name))
+        });
+        if let (true, Some(i)) = (saved, renamed) {
+            // A fold is kept by name; it follows the list.
+            if self.codeql.folded_lists.remove(name) {
+                self.codeql.folded_lists.insert(value.trim().to_string());
+            }
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::List(i));
+        }
+    }
+
+    /// Remove a variant analysis entry: a repository or owner at once, a
+    /// list (with its repositories) after asking.
+    fn remove_codeql_variant_item(&mut self, item: crate::codeql_variant::Item) {
+        use crate::codeql_variant::Item;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some(name) = self.codeql.variant.name_of(item).map(str::to_string) else {
+            return;
+        };
+        if let Item::List(i) = item {
+            let n = self.codeql.variant.lists[i].repos.len();
+            let what = match n {
+                0 => String::new(),
+                1 => String::from(" and its 1 repository"),
+                n => format!(" and its {n} repositories"),
+            };
+            self.open_input_prompt(
+                InputPrompt::new(
+                    InputPurpose::CodeqlRemoveVariantList { name: name.clone() },
+                    format!("Remove repository list '{name}'{what}?"),
+                    "Enter to remove · Esc to keep",
+                )
+                .with_value("remove"),
+            );
+            return;
+        }
+        let saved = self.edit_codeql_variant(|c| {
+            // The side bar names the entry by position; make sure the file
+            // still has it there before removing anything.
+            if c.name_of(item) != Some(name.as_str()) {
+                return Err(String::from(
+                    "The variant analysis config changed on disk; look again",
+                ));
+            }
+            c.remove(item)?;
+            Ok(format!("Removed {name}"))
+        });
+        if saved {
+            self.keep_codeql_selection_on_a_row();
+        }
+    }
+
+    fn perform_remove_codeql_variant_list(&mut self, name: &str) {
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c
+                .list_index(name)
+                .ok_or_else(|| format!("The list {name} is no longer there"))?;
+            c.remove(crate::codeql_variant::Item::List(i))?;
+            Ok(format!("Removed repository list {name}"))
+        });
+        if saved {
+            self.codeql.folded_lists.remove(name);
+            self.keep_codeql_selection_on_a_row();
+        }
+    }
+
+    /// After a row went away, keep the selection on a row rather than on
+    /// the welcome text that moved up under it.
+    fn keep_codeql_selection_on_a_row(&mut self) {
+        let last = self.codeql.lines().len().saturating_sub(1);
+        self.codeql.selected = self.codeql.selected.min(last);
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
+    /// Make `item` what a variant analysis runs against (VS Code's "Select").
+    fn select_codeql_variant_item(&mut self, item: crate::codeql_variant::Item) {
+        let Some(name) = self.codeql.variant.name_of(item).map(str::to_string) else {
+            return;
+        };
+        let saved = self.edit_codeql_variant(|c| {
+            if c.name_of(item) != Some(name.as_str()) {
+                return Err(String::from(
+                    "The variant analysis config changed on disk; look again",
+                ));
+            }
+            c.select(item)?;
+            Ok(format!("Variant analysis runs against {name}"))
+        });
+        if saved {
+            self.codeql.select_variant_item(item);
+        }
+    }
+
+    /// Open the variant analysis config in an editor tab, writing an empty
+    /// one first when there is none. One that cannot be parsed opens as it
+    /// is, to be fixed.
+    fn open_codeql_variant_config(&mut self) {
+        let path = Self::codeql_variant_path();
+        if !path.exists()
+            && let Err(e) = crate::codeql_variant::VariantConfig::default().save(&path)
+        {
+            self.status = format!("Could not create {}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    /// The GitHub page of the variant analysis repository or owner selected
+    /// in the side bar (the controller on its row), else of the one a run
+    /// targets.
+    fn codeql_variant_github_url(&self) -> Option<String> {
+        use crate::codeql_variant::{Item, Selection};
+        use crate::widgets::codeql::{Action, Hit};
+        let v = &self.codeql.variant;
+        let name = match self.codeql.selected_variant_item() {
+            Some(item @ (Item::Repo(..) | Item::Owner(_))) => v.name_of(item)?.to_string(),
+            Some(Item::List(_)) => return None,
+            None if self.codeql.selected_hit()
+                == Some(Hit::Action(Action::SetUpControllerRepository)) =>
+            {
+                v.controller_repo.clone()?
+            }
+            None => match v.selected.as_ref()? {
+                Selection::Repo { nwo, .. } => nwo.clone(),
+                Selection::Owner { owner } => owner.clone(),
+                Selection::List { .. } => return None,
+            },
+        };
+        Some(format!("https://github.com/{name}"))
+    }
+
+    /// Open the selected variant analysis repository or owner on GitHub
+    /// (VS Code's "Open on GitHub"). Where no browser can be reached the
+    /// status line shows the address instead.
+    fn open_codeql_variant_on_github(&mut self) {
+        let Some(url) = self.codeql_variant_github_url() else {
+            self.status = String::from(
+                "Select a variant analysis repository or owner in the CodeQL side bar first",
+            );
+            return;
+        };
+        if cfg!(test) {
+            // Tests never start a browser.
+            self.status = format!("Open {url}");
+            return;
+        }
+        if self.drop_relay_active() || is_remote_session() {
+            self.open_detected_url(&url);
+            return;
+        }
+        self.status = match open_url(&url) {
+            Ok(()) => format!("Opened {url}"),
+            Err(e) => format!("Could not open a browser ({e}): {url}"),
+        };
     }
 
     /// The store index of the current database, for the palette commands
@@ -27748,6 +28154,30 @@ impl App {
             InputPurpose::CodeqlCreateQuery { dir, language } => {
                 self.close_input_prompt();
                 self.submit_create_codeql_query(&dir, language.as_deref(), &value);
+            }
+            InputPurpose::CodeqlControllerRepository => {
+                self.close_input_prompt();
+                self.submit_codeql_controller(&value);
+            }
+            InputPurpose::CodeqlAddVariantRepo { list } => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_repo(list.as_deref(), &value);
+            }
+            InputPurpose::CodeqlAddVariantList => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_list(&value);
+            }
+            InputPurpose::CodeqlAddVariantOwner => {
+                self.close_input_prompt();
+                self.submit_add_codeql_variant_owner(&value);
+            }
+            InputPurpose::CodeqlRenameVariantList { name } => {
+                self.close_input_prompt();
+                self.submit_rename_codeql_variant_list(&name, &value);
+            }
+            InputPurpose::CodeqlRemoveVariantList { name } => {
+                self.close_input_prompt();
+                self.perform_remove_codeql_variant_list(&name);
             }
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
@@ -42761,6 +43191,16 @@ impl App {
                 }
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
+            Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
+            Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
+            Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
+            Cmd::CodeqlAddVariantOwner => self.prompt_add_codeql_variant_owner(),
+            Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
+            Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
+            Cmd::CodeqlRunVariantAnalysis => {
+                self.status =
+                    String::from("Running a variant analysis is not available yet (#578)");
+            }
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),

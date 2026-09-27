@@ -58619,3 +58619,177 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
 }
+
+#[test]
+fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: VS Code's Variant Analysis Repositories view: a controller
+    // repository, then lists, repositories and owners to run against.
+    use crate::codeql_variant::{Item, Selection, VariantConfig};
+    use crate::widgets::codeql::{Action, Line};
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
+
+        // The welcome row asks for the controller and refuses a bad one.
+        app.codeql.select_action(Action::SetUpControllerRepository);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(&crate::widgets::input_prompt::InputPurpose::CodeqlControllerRepository)
+        );
+        type_in(&mut app, "not a repo");
+        assert!(
+            app.status.contains("is not a GitHub repository"),
+            "{}",
+            app.status
+        );
+        assert!(!App::codeql_variant_path().exists(), "nothing saved");
+        press(&mut app, KeyCode::Enter);
+        type_in(&mut app, "https://github.com/me/ctl.git");
+        assert_eq!(saved().controller_repo.as_deref(), Some("me/ctl"));
+        assert!(app.codeql.lines().contains(&Line::Action(
+            Action::SetUpControllerRepository,
+            "Controller: me/ctl".into()
+        )));
+
+        // `l` adds a list, `a` a repository into the selected list.
+        press(&mut app, KeyCode::Char('l'));
+        type_in(&mut app, "top");
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().title,
+            "Add Repository to top"
+        );
+        type_in(&mut app, "github/codeql");
+        assert_eq!(saved().lists[0].repos, ["github/codeql"]);
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(Some(0), 0))
+        );
+        press(&mut app, KeyCode::Char('a'));
+        type_in(&mut app, "GitHub/CodeQL");
+        assert!(app.status.contains("already in list top"), "{}", app.status);
+
+        // `o` adds an owner; the palette adds a single repository.
+        press(&mut app, KeyCode::Char('o'));
+        type_in(&mut app, "octo-org");
+        assert_eq!(saved().owners, ["octo-org"]);
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::Owner(0)));
+        app.run_command(Command::CodeqlAddVariantRepo);
+        type_in(&mut app, "https://github.com/e/f/tree/main");
+        assert_eq!(saved().repos, ["e/f"]);
+
+        // Enter selects what a run targets, marked in the side bar.
+        assert_eq!(
+            app.codeql.selected_variant_item(),
+            Some(Item::Repo(None, 0))
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            saved().selected,
+            Some(Selection::Repo {
+                nwo: "e/f".into(),
+                list: None
+            })
+        );
+        assert!(
+            app.codeql
+                .lines()
+                .contains(&Line::Action(Action::VariantRepo(None, 0), "● e/f".into()))
+        );
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.status, "Open https://github.com/e/f");
+
+        // It persists for the next session.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.variant, saved());
+
+        // F2 renames a list; Space folds it.
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.input_prompt.as_ref().unwrap().value, "top");
+        for _ in 0.."top".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_in(&mut app, "best");
+        assert_eq!(saved().lists[0].name, "best", "{}", app.status);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            !app.codeql
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::VariantRepo(Some(_), _), _)))
+        );
+        assert_eq!(app.codeql.selected_variant_item(), Some(Item::List(0)));
+
+        // Delete removes an owner at once and asks before a list.
+        app.codeql.select_variant_item(Item::Owner(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(saved().owners.is_empty(), "{}", app.status);
+        app.codeql.select_variant_item(Item::List(0));
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.input_prompt
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("and its 1 repository"),
+            "{}",
+            app.input_prompt.as_ref().unwrap().title
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(saved().lists.len(), 1, "Esc keeps it");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert!(saved().lists.is_empty(), "{}", app.status);
+        assert!(app.codeql.selected_hit().is_some(), "still on a row");
+
+        // Submission is still to come.
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(app.status.contains("not available yet"), "{}", app.status);
+
+        // The config file opens in a tab.
+        app.run_command(Command::CodeqlOpenVariantConfig);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(App::codeql_variant_path().as_path())
+        );
+
+        // A corrupt file is reported and never saved over.
+        std::fs::write(App::codeql_variant_path(), "{ broken").unwrap();
+        app.run_command(Command::CodeqlAddVariantList);
+        type_in(&mut app, "x");
+        assert!(app.status.contains("unchanged"), "{}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(App::codeql_variant_path()).unwrap(),
+            "{ broken"
+        );
+        app.open_codeql_view();
+        assert!(app.codeql.variant_error);
+        assert_eq!(
+            Command::from_id("codeql_set_up_controller_repository"),
+            Some(Command::CodeqlSetUpController)
+        );
+    });
+}
