@@ -3893,6 +3893,10 @@ pub struct App {
     /// rebuilds the view for the new file rather than showing the old one's
     /// history over it.
     scrub_for: Option<PathBuf>,
+    /// The file and commit the OUTLINE currently shows while scrubbing
+    /// (#371), so it is recomputed once per step, and so leaving the
+    /// scrubber knows to bring the live file's outline back.
+    outline_scrub_key: Option<(PathBuf, String)>,
     /// `a` in the approval popup (#347): the agent whose edits are
     /// approved without asking, until when.
     auto_approve: Option<(String, std::time::Instant)>,
@@ -5696,6 +5700,7 @@ impl App {
             scrubber: None,
             scrub_view: None,
             scrub_for: None,
+            outline_scrub_key: None,
             auto_approve: None,
             scrub_slider: Rect::default(),
             scrub_dragging: false,
@@ -10041,7 +10046,12 @@ impl App {
         // Symbol scope chain, only when the outline belongs to this file so a
         // stale outline from the previous tab never leaks into the bar.
         if self.outline.path() == Some(path) {
-            let line = self.editor.cursor_row as u32;
+            // While scrubbing (#371) the outline is the commit's, so the
+            // chain follows the historical view's caret.
+            let line = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let symbols = self.outline.symbols();
             for i in breadcrumb_symbol_chain(symbols, line) {
                 let s = &symbols[i];
@@ -10091,6 +10101,33 @@ impl App {
             self.outline_synced = None;
             return false;
         };
+        // A tab switch while scrubbing is noticed by render, which runs
+        // after this: rebuild here first, or the new file's key would be
+        // paired with the previous file's historical text.
+        if self.scrubber.is_some() && self.scrub_for.as_ref() != Some(&path) {
+            self.rebuild_scrub_view();
+        }
+        // Scrubbing (#371): the outline is the file as it was at the commit
+        // on screen, from its own syntax tree; no language server knows that
+        // text. Leaving drops the key, so the live outline is recomputed.
+        let commit = self
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if let (Some(view), Some(commit)) = (self.scrub_view.as_ref(), commit) {
+            let key = (path.clone(), commit);
+            if self.outline_scrub_key.as_ref() != Some(&key) {
+                let symbols = syntax_outline_for(&path, &view.lines);
+                self.outline.set_syntax_symbols(path, symbols, false);
+                self.outline_scrub_key = Some(key);
+                self.outline_synced = None;
+            }
+            return self.outline.follow_caret(view.cursor_row as u32);
+        }
+        if self.outline_scrub_key.take().is_some() {
+            self.outline_synced = None;
+        }
         // `lsp_last_seen` carries the edit seq the manager last saw for an open
         // doc; absent means no language server tracks this file.
         let seq = self.lsp_last_seen.get(&path).copied();
@@ -10470,12 +10507,7 @@ impl App {
         &self,
         path: &std::path::Path,
     ) -> Vec<crate::lsp::manager::OutlineSymbol> {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let Some(kind) = crate::highlight::lang_for_extension(ext) else {
-            return Vec::new();
-        };
-        let text = self.editor.lines.join("\n");
-        crate::outline_syntax::symbols_for(kind, text.as_bytes())
+        syntax_outline_for(path, &self.editor.lines)
     }
 
     /// Drain pending `documentSymbol` replies and offer every one to
@@ -17557,7 +17589,8 @@ impl App {
                 editor_area
             };
             // The history scrubber's view stands in for the live editor's
-            // text (#371); the tab strip and breadcrumbs stay the live ones.
+            // text (#371); the tab strip stays the live one, while the breadcrumbs
+            // and Outline follow the commit (see `sync_outline`).
             if paint_history
                 && let Some(view) = self.scrub_view.as_mut()
                 && self.editor.last_body.width > 0
@@ -33168,6 +33201,21 @@ impl App {
         self.scrub_slider = track;
     }
 
+    /// While a commit is on screen (#371), an Outline or breadcrumb jump
+    /// lands in the historical view, whose symbols they list, not in the
+    /// hidden live buffer. Returns whether it did.
+    fn jump_in_scrub_view(&mut self, line: u32) -> bool {
+        let Some(view) = self.scrub_view.as_mut() else {
+            return false;
+        };
+        let line = (line as usize).min(view.lines.len().saturating_sub(1));
+        view.cursor_row = line;
+        view.cursor_col = 0;
+        let rows = (self.editor.last_body.height as usize).max(1);
+        view.scroll = line.saturating_sub(rows / 3);
+        true
+    }
+
     /// Point the Explorer's dimming at the scrubber's commit (#371), or
     /// clear it at the working tree and once the scrubber closes. The tree
     /// listing is cached per commit like the file text, so stepping back
@@ -33231,12 +33279,17 @@ impl App {
                 Vec::new(),
             ),
         };
-        // Look at the same stretch of the file the live buffer shows.
-        view.scroll = self.editor.scroll.min(view.lines.len().saturating_sub(1));
-        view.cursor_row = self
-            .editor
-            .cursor_row
-            .min(view.lines.len().saturating_sub(1));
+        // Look at the same stretch of the file: where the last step was
+        // looking (a symbol jump moves it), else where the live buffer is.
+        let (scroll, row) = match self.scrub_view.as_ref() {
+            Some(prev) if prev.path.as_deref() == Some(path.as_path()) => {
+                (prev.scroll, prev.cursor_row)
+            }
+            _ => (self.editor.scroll, self.editor.cursor_row),
+        };
+        let last = view.lines.len().saturating_sub(1);
+        view.scroll = scroll.min(last);
+        view.cursor_row = row.min(last);
         self.scrub_view = Some(view);
     }
 
@@ -46408,6 +46461,7 @@ impl App {
                         self.outline.toggle_collapse();
                     } else if let Some(idx) = self.outline.row_at(m.row)
                         && let Some((path, line, col)) = self.outline.jump_target(idx)
+                        && !self.jump_in_scrub_view(line)
                     {
                         self.go_to_definition(path, line, col);
                     }
@@ -47177,7 +47231,9 @@ impl App {
                         // A click on a symbol crumb jumps to that symbol (same
                         // file); path crumbs return None and fall through.
                         self.focus_pane(Pane::Editor);
-                        if let Some(path) = self.editor.path.clone() {
+                        if !self.jump_in_scrub_view(line)
+                            && let Some(path) = self.editor.path.clone()
+                        {
                             self.go_to_definition(path, line, col);
                         }
                         self.poke_cursor();
@@ -56941,6 +56997,19 @@ fn is_format_document_key(key: KeyEvent) -> bool {
 /// on its own chord.
 fn is_emmet_expand_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'e')
+}
+
+/// The outline of `lines` as the file at `path` from its own syntax tree,
+/// empty for a language croft has no grammar for.
+fn syntax_outline_for(
+    path: &std::path::Path,
+    lines: &[String],
+) -> Vec<crate::lsp::manager::OutlineSymbol> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(kind) = crate::highlight::lang_for_extension(ext) else {
+        return Vec::new();
+    };
+    crate::outline_syntax::symbols_for(kind, lines.join("\n").as_bytes())
 }
 
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
