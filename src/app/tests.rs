@@ -55155,6 +55155,885 @@ fn an_approval_notifies_once_and_its_approve_token_answers_the_hook() {
         crate::agent_hook::Decision::Allow
     );
 }
+/// A log whose one result carries a two-step code flow, a stack and rule help.
+fn sarif_flow_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/api.rs"),
+        "fn a() {}\nlet input = read();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/db.rs"),
+        "one\ntwo\nthree\nrun(input);\n",
+    )
+    .unwrap();
+    let log = tmp.path().join("flow.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint","rules":[{"id":"R1","name":"Taint",
+            "help":{"text":"Use parameters instead."},"properties":{"tags":["security"]}}]}},
+          "results":[{"ruleId":"R1","level":"error",
+            "message":{"text":"Tainted by [the input](1)."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":4,"startColumn":1}}}],
+            "relatedLocations":[{"id":1,"physicalLocation":{"artifactLocation":{"uri":"src/api.rs"},"region":{"startLine":2,"startColumn":5}}}],
+            "codeFlows":[{"threadFlows":[{"locations":[
+              {"location":{"message":{"text":"source"},"physicalLocation":{"artifactLocation":{"uri":"src/api.rs"},"region":{"startLine":2,"startColumn":5}}}},
+              {"location":{"message":{"text":"sink"},"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":4,"startColumn":5}}}}]}]}],
+            "stacks":[{"frames":[{"location":{"message":{"text":"frame zero"},"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":3,"startColumn":2}}}}]}]
+          }]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+fn draw_screen(app: &mut App) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    screen_text(&term)
+}
+
+#[test]
+fn sarif_info_tab_shows_rule_help_tags_and_related_locations() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let screen = draw_screen(&mut app);
+    assert!(
+        screen.contains("Use parameters instead."),
+        "rule help:\n{screen}"
+    );
+    assert!(screen.contains("security"), "tags:\n{screen}");
+    assert!(
+        screen.contains("src/api.rs:2:5"),
+        "related location:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_steps_tab_walks_the_code_flow_in_the_editor() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("Steps"), "{screen}");
+    assert!(
+        screen.contains("source") && screen.contains("sink"),
+        "{screen}"
+    );
+    app.handle_sarif_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/api.rs").as_path()),
+        "step 1 opened: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+    // Back to the viewer tab and on to step 2.
+    let viewer = (0..app.editor.tab_count())
+        .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+        .expect("the viewer tab stayed open");
+    app.editor.select(viewer);
+    app.handle_sarif_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/db.rs").as_path())
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 4));
+}
+
+#[test]
+fn sarif_stacks_and_raw_tabs() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("frame zero"), "stacks tab:\n{screen}");
+    assert!(
+        screen.contains("src/db.rs:3:2"),
+        "frame location with its column:\n{screen}"
+    );
+    app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("\"ruleId\": \"R1\""), "raw tab:\n{screen}");
+    app.handle_sarif_key(key(KeyCode::Char('D'), KeyModifiers::NONE));
+    let screen = draw_screen(&mut app);
+    assert!(
+        screen.contains("frame zero"),
+        "D goes back a tab:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_message_link_opens_its_related_location() {
+    let (tmp, log) = sarif_flow_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('L'), KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/api.rs").as_path()),
+        "[the input](1) followed: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
+}
+
+#[test]
+fn an_open_sarif_log_publishes_its_results_as_diagnostics() {
+    // #577: results reach the editor through the ordinary diagnostics store
+    // under "SARIF: <tool>", so squiggles, hover and Problems all see them.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    assert!(app.sync_sarif_diagnostics(), "publishing is a change");
+    let target = tmp.path().join("src/a.rs");
+    let by_source = app
+        .lsp_diagnostics
+        .get(&target)
+        .expect("the result's file has diagnostics");
+    let diags = by_source.get("SARIF: lint").expect("keyed by the tool");
+    assert_eq!(diags.len(), 1);
+    let d = &diags[0];
+    assert_eq!((d.start_line, d.start_char), (1, 8));
+    assert_eq!(d.end_line, 1);
+    assert_eq!(
+        d.end_char as usize,
+        "    let q = format!(\"{}\", id);".encode_utf16().count(),
+        "no endColumn: the range runs to the end of the start line"
+    );
+    assert_eq!(d.severity, crate::lsp::manager::DiagnosticSeverity::Error);
+    assert_eq!(d.message, "[R1] Query built from user input.");
+    assert!(
+        !app.sync_sarif_diagnostics(),
+        "an unchanged log is not a change"
+    );
+
+    // The file's own tab gets them as squiggles. The viewer is pinned first,
+    // as opening a result does, so the preview open does not replace it.
+    app.editor.pin_active();
+    app.editor.open_preview(&target).unwrap();
+    app.sync_sarif_diagnostics();
+    let merged = app.merged_diagnostics(&target);
+    assert!(merged.iter().any(|d| d.message.contains("[R1]")));
+}
+
+#[test]
+fn closing_the_sarif_tab_withdraws_its_diagnostics() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.sync_sarif_diagnostics();
+    let target = tmp.path().join("src/a.rs");
+    assert!(app.lsp_diagnostics.contains_key(&target));
+    // Replace the log's tab with an ordinary file: no SARIF view is open.
+    app.editor.open(&target).unwrap();
+    assert!(app.sync_sarif_diagnostics(), "withdrawing is a change");
+    assert!(
+        app.lsp_diagnostics
+            .get(&target)
+            .is_none_or(|m| !m.contains_key("SARIF: lint")),
+        "nothing left behind"
+    );
+}
+
+#[test]
+fn sarif_levels_map_to_editor_severities() {
+    use crate::lsp::manager::DiagnosticSeverity as S;
+    use crate::sarif::semantics::Level;
+    assert_eq!(crate::sarif::diagnostics::severity(Level::Error), S::Error);
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::Warning),
+        S::Warning
+    );
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::Note),
+        S::Information
+    );
+    assert_eq!(
+        crate::sarif::diagnostics::severity(Level::None),
+        S::Information
+    );
+}
+
+/// A log whose one result carries a fix for the line it reports.
+fn sarif_fix_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("q.rs"), "let q = format!(\"{}\", id);\n").unwrap();
+    let log = tmp.path().join("fix.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint"}},"columnKind":"unicodeCodePoints",
+          "results":[{"ruleId":"R9","level":"warning","message":{"text":"Unsanitised id."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"q.rs"},"region":{"startLine":1,"startColumn":23}}}],
+            "fixes":[{"description":{"text":"Sanitise it"},"artifactChanges":[{"artifactLocation":{"uri":"q.rs"},
+              "replacements":[{"deletedRegion":{"startLine":1,"startColumn":23,"endColumn":25},"insertedContent":{"text":"clean(id)"}}]}]}]}]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+#[test]
+fn sarif_fix_tab_previews_and_f_applies_the_fix_as_an_unsaved_edit() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let (tmp, log) = sarif_fix_fixture();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        // The Fix tab is the fifth: Info, Steps, Stacks, Raw, Fix.
+        for _ in 0..4 {
+            app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+        }
+        let screen = draw_screen(&mut app);
+        assert!(
+            screen.contains("Sanitise it"),
+            "the fix's description:\n{screen}"
+        );
+        assert!(
+            screen.contains("+ let q = format!(\"{}\", clean(id));"),
+            "its preview:\n{screen}"
+        );
+        app.handle_sarif_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("q.rs").as_path()),
+            "the fixed file is open: {}",
+            app.status
+        );
+        assert_eq!(app.editor.lines[0], "let q = format!(\"{}\", clean(id));");
+        assert!(
+            app.editor.dirty,
+            "applied to the buffer, not saved behind the user's back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("q.rs")).unwrap(),
+            "let q = format!(\"{}\", id);\n",
+            "the disk is untouched"
+        );
+        // The result is marked fixed, and that survives reopening the log.
+        let viewer = (0..app.editor.tab_count())
+            .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+            .unwrap();
+        app.editor.select(viewer);
+        assert!(app.editor.sarif.as_ref().unwrap().entries[0].fixed);
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.editor.open(&log).unwrap();
+        assert!(
+            again.editor.sarif.as_ref().unwrap().entries[0].fixed,
+            "persisted"
+        );
+        // A fixed result no longer squiggles.
+        again.sync_sarif_diagnostics();
+        assert!(
+            again
+                .lsp_diagnostics
+                .get(&tmp.path().join("q.rs"))
+                .is_none_or(|m| m.values().all(|v| v.is_empty())),
+            "fixed results are withdrawn from the editor"
+        );
+    });
+}
+
+/// Two results in one file and one in another, for navigation.
+fn sarif_nav_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.rs"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+    std::fs::write(tmp.path().join("b.rs"), "m1\nm2\n").unwrap();
+    let log = tmp.path().join("nav.sarif");
+    let r = |uri: &str, line: u32, msg: &str| {
+        format!(
+            r#"{{"message":{{"text":"{msg}"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"{uri}"}},"region":{{"startLine":{line},"startColumn":1}}}}}}]}}"#
+        )
+    };
+    std::fs::write(
+        &log,
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"lint"}}}},"results":[{},{},{}]}}]}}"#,
+            r("a.rs", 2, "first"),
+            r("a.rs", 5, "second"),
+            r("b.rs", 1, "third")
+        ),
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+#[test]
+fn next_and_previous_sarif_result_walk_locations_across_files() {
+    let (tmp, log) = sarif_nav_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.pin_active();
+    app.open_at(&tmp.path().join("a.rs"), 0, 0).unwrap();
+    use crate::widgets::command_palette::Command;
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        (app.editor.cursor_row, app.status.contains("first")),
+        (1, true),
+        "{}",
+        app.status
+    );
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(app.editor.cursor_row, 4);
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.rs").as_path()),
+        "on to the next file"
+    );
+    app.run_command(Command::SarifNextResult);
+    assert_eq!(
+        (app.editor.path.as_deref(), app.editor.cursor_row),
+        (Some(tmp.path().join("a.rs").as_path()), 1),
+        "wraps to the first"
+    );
+    app.run_command(Command::SarifPreviousResult);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.rs").as_path())
+    );
+    assert_eq!(Command::SarifNextResult.title(), "SARIF: Next Result");
+}
+
+#[test]
+fn moving_the_cursor_onto_a_result_selects_it_in_the_viewer() {
+    let (tmp, log) = sarif_nav_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.pin_active();
+    app.open_at(&tmp.path().join("a.rs"), 4, 0).unwrap();
+    app.sync_sarif_selection_to_cursor();
+    let viewer = (0..app.editor.tab_count())
+        .find(|&i| app.editor.tab_path(i).as_deref() == Some(log.as_path()))
+        .unwrap();
+    let view = app.editor.editors[viewer].sarif.as_ref().unwrap();
+    assert_eq!(view.selected_entry().unwrap().message, "second");
+}
+
+#[test]
+fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
+    // #577: VS Code's Locate… prompt, with the learned prefix remembered.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "a1\na2\n").unwrap();
+        std::fs::write(tmp.path().join("lib/b.rs"), "b1\nb2\nb3\n").unwrap();
+        let log = tmp.path().join("ci.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ci"}},"results":[
+                {"message":{"text":"in a"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///home/runner/work/app/src/a.rs"},"region":{"startLine":2}}}]},
+                {"message":{"text":"in b"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///home/runner/work/app/lib/b.rs"},"region":{"startLine":3}}}]}
+            ]}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        // The first result's file is not here: Enter asks where it is.
+        app.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                app.input_prompt.as_ref().map(|p| &p.purpose),
+                Some(crate::widgets::input_prompt::InputPurpose::SarifLocate { .. })
+            ),
+            "a Locate prompt: {}",
+            app.status
+        );
+        // Groups of equal size sort by path, so `lib/b.rs` is selected first.
+        assert_eq!(
+            app.editor
+                .sarif
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .map(|e| e.message.clone())
+                .as_deref(),
+            Some("in b")
+        );
+        // A file with another name is refused.
+        app.submit_sarif_locate(&tmp.path().join("src/a.rs").display().to_string());
+        assert!(app.status.contains("names must match"), "{}", app.status);
+        // The right file opens, and the mapping is learned.
+        app.submit_sarif_locate(&tmp.path().join("lib/b.rs").display().to_string());
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("lib/b.rs").as_path())
+        );
+        assert_eq!(app.editor.cursor_row, 2);
+        // The other result now resolves on its own, in the next session too.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.editor.open_preview(&log).unwrap();
+        let rows = again.editor.sarif.as_ref().unwrap().rows();
+        let a_row = rows
+            .iter()
+            .position(|r| match r {
+                crate::sarif::view::Row::Item { entry } => {
+                    again.editor.sarif.as_ref().unwrap().entries[*entry].message == "in a"
+                }
+                _ => false,
+            })
+            .unwrap();
+        again.editor.sarif.as_mut().unwrap().selected = a_row;
+        again.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            again.editor.path.as_deref(),
+            Some(tmp.path().join("src/a.rs").as_path()),
+            "resolved through the saved prefix: {}",
+            again.status
+        );
+        assert_eq!(again.editor.cursor_row, 1);
+    });
+}
+
+#[test]
+fn a_second_log_joins_the_viewer_and_delete_closes_it_from_the_logs_tab() {
+    // #577: VS Code merges several logs in one panel; its Logs tab closes one.
+    let (tmp, log) = sarif_fixture();
+    let second = tmp.path().join("second.sarif");
+    std::fs::write(
+        &second,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"other"}},"results":[
+            {"ruleId":"Z1","message":{"text":"From the second log."}}]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::SarifAddLog)
+        ),
+        "o asks for a log"
+    );
+    app.submit_sarif_add_log(&second.display().to_string());
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 2);
+    assert_eq!(view.entries.len(), 2);
+    assert!(
+        view.entries
+            .iter()
+            .any(|e| e.message == "From the second log.")
+    );
+    // Adding the same log again does nothing.
+    app.submit_sarif_add_log(&second.display().to_string());
+    assert_eq!(app.editor.sarif.as_ref().unwrap().logs.len(), 2);
+    // Logs tab: select the second log's group and close it.
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_mut().unwrap();
+    assert_eq!(view.tab, crate::sarif::view::Tab::Logs);
+    let rows = view.rows();
+    let second_header = rows
+        .iter()
+        .position(|r| matches!(r, crate::sarif::view::Row::Group { label, .. } if label == "second.sarif"))
+        .unwrap();
+    view.selected = second_header;
+    app.handle_sarif_key(key(KeyCode::Delete, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 1);
+    assert!(
+        view.entries
+            .iter()
+            .all(|e| e.message != "From the second log.")
+    );
+    // The last log is not closed this way: that is closing the tab.
+    app.handle_sarif_key(key(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().logs.len(),
+        1,
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn the_run_tab_shows_the_tool_its_invocation_and_notifications() {
+    // #577, beyond VS Code: run.tool, invocations and notifications.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("run.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{
+          "tool":{"driver":{"name":"CodeQL","semanticVersion":"2.19.3","informationUri":"https://codeql.github.com"}},
+          "invocations":[{"commandLine":"codeql database analyze db --format=sarif-latest","executionSuccessful":true,"exitCode":0,
+            "startTimeUtc":"2026-09-24T10:00:00Z","endTimeUtc":"2026-09-24T10:03:12Z",
+            "toolExecutionNotifications":[{"level":"warning","message":{"text":"Skipped vendor/huge.js: too large"}}]}],
+          "results":[]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    for _ in 0..3 {
+        app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().tab,
+        crate::sarif::view::Tab::Run
+    );
+    let screen = draw_screen(&mut app);
+    for want in [
+        "CodeQL 2.19.3",
+        "https://codeql.github.com",
+        "codeql database analyze db --format=sarif-latest",
+        "exit 0",
+        "Skipped vendor/huge.js: too large",
+    ] {
+        assert!(screen.contains(want), "{want:?} on the Run tab:\n{screen}");
+    }
+    // Back round to Locations.
+    app.handle_sarif_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.sarif.as_ref().unwrap().tab,
+        crate::sarif::view::Tab::Locations
+    );
+}
+
+#[test]
+fn a_baseline_log_marks_results_new_or_unchanged_and_lists_what_disappeared() {
+    // #577: logs without baselineState are compared against a chosen baseline.
+    let tmp = tempfile::tempdir().unwrap();
+    let result = |rule: &str, file: &str, line: i64| {
+        format!(
+            r#"{{"ruleId":"{rule}","message":{{"text":"{rule} here"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"{file}"}},"region":{{"startLine":{line}}}}}}}]}}"#
+        )
+    };
+    let write_log = |name: &str, results: Vec<String>| {
+        let p = tmp.path().join(name);
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"T"}}}},"results":[{}]}}]}}"#,
+                results.join(",")
+            ),
+        )
+        .unwrap();
+        p
+    };
+    for f in ["a.js", "c.js", "d.js"] {
+        std::fs::write(tmp.path().join(f), "one\ntwo\nthree\n").unwrap();
+    }
+    let now = write_log(
+        "now.sarif",
+        vec![result("kept", "a.js", 3), result("fresh", "d.js", 2)],
+    );
+    let before = write_log(
+        "before.sarif",
+        vec![result("kept", "a.js", 3), result("gone", "c.js", 1)],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&now).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::SarifBaseline)
+        ),
+        "b asks for a baseline"
+    );
+    app.submit_sarif_baseline(&before.display().to_string());
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.baseline, Some(1));
+    let state = |rule: &str| {
+        view.entries
+            .iter()
+            .find(|e| e.rule_id == rule)
+            .map(|e| e.baseline)
+    };
+    use crate::sarif::semantics::BaselineState;
+    assert_eq!(state("kept"), Some(BaselineState::Unchanged));
+    assert_eq!(state("fresh"), Some(BaselineState::New));
+    assert_eq!(state("gone"), Some(BaselineState::Absent));
+    // The baseline contributes only what disappeared, never a second "kept".
+    assert_eq!(view.entries.len(), 3);
+    // What disappeared is not a problem in today's code.
+    app.sync_sarif_diagnostics();
+    let c = tmp.path().join("c.js");
+    assert!(
+        app.lsp_diagnostics
+            .get(&c)
+            .is_none_or(|m| m.values().all(Vec::is_empty)),
+        "absent results publish no diagnostics"
+    );
+    assert!(
+        app.lsp_diagnostics
+            .get(&tmp.path().join("d.js"))
+            .is_some_and(|m| m.values().any(|v| !v.is_empty()))
+    );
+}
+
+#[test]
+fn e_exports_the_visible_sarif_results_to_a_csv_file() {
+    // #577: the filtered list leaves the editor as a spreadsheet.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+    let prompt = app.input_prompt.as_ref().expect("E asks where to write");
+    assert!(matches!(
+        prompt.purpose,
+        crate::widgets::input_prompt::InputPurpose::SarifExport
+    ));
+    assert_eq!(
+        prompt.value, "sarif-results.csv",
+        "a default name is offered"
+    );
+    app.submit_sarif_export("out/results.csv");
+    let written = std::fs::read_to_string(tmp.path().join("out/results.csv"))
+        .expect("written relative to the workspace, creating the folder");
+    assert!(
+        written.starts_with("rule,level,file,line,column,message"),
+        "{written}"
+    );
+    assert_eq!(
+        written.lines().count(),
+        2,
+        "one result plus the header: {written}"
+    );
+    assert!(app.status.contains("1 result"), "{}", app.status);
+}
+
+#[test]
+fn the_sarif_key_legend_names_the_fix_log_baseline_and_export_keys() {
+    // #577: every viewer key is discoverable from its footer at a common width.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let screen = draw_screen(&mut app);
+    for want in ["f fix", "o add log", "b baseline", "E export"] {
+        assert!(screen.contains(want), "{want} missing:\n{screen}");
+    }
+}
+
+/// A stand-in `gh` answering from canned files: each rule maps a substring
+/// of the arguments to the file whose contents it prints.
+#[cfg(unix)]
+fn fake_gh(dir: &std::path::Path, rules: &[(&str, &str)]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let mut script = String::from(
+        "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/gh-calls.log\"\ncase \"$*\" in\n",
+    );
+    for (i, (pattern, body)) in rules.iter().enumerate() {
+        let file = dir.join(format!("gh-reply-{i}"));
+        std::fs::write(&file, body).unwrap();
+        script.push_str(&format!("  *'{pattern}'*) cat '{}' ;;\n", file.display()));
+    }
+    script.push_str("  *) echo '{\"message\":\"unexpected call\"}' >&2; exit 1 ;;\nesac\n");
+    let gh = dir.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+#[cfg(unix)]
+#[test]
+fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
+    // #577: VS Code's SARIF viewer pulls a repository's code scanning
+    // analyses; croft lists them and opens the chosen one as a log.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let gh = fake_gh(
+            bin.path(),
+            &[
+                (
+                    "analyses?per_page=30",
+                    r#"[{"id":201,"ref":"refs/heads/main","commit_sha":"abc","error":"","category":"",
+                        "created_at":"2026-09-20T10:00:00Z","results_count":1,"tool":{"name":"CodeQL","version":"2.19.3"}}]"#,
+                ),
+                (
+                    "analyses/201",
+                    r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},
+                        "results":[{"ruleId":"rust/sql-injection","message":{"text":"From GitHub."}}]}]}"#,
+                ),
+            ],
+        );
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh;
+        app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+        let picker = app.list_picker.as_ref().expect("the analyses are offered");
+        assert_eq!(
+            picker.purpose,
+            crate::widgets::list_picker::ListPurpose::CodeScanningAnalysis
+        );
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].id, "201");
+        assert!(
+            picker.rows[0].label.contains("CodeQL 2.19.3"),
+            "{}",
+            picker.rows[0].label
+        );
+        app.confirm_list_picker();
+        let view = app
+            .editor
+            .sarif
+            .as_ref()
+            .expect("the analysis opens in the viewer");
+        assert!(view.entries.iter().any(|e| e.message == "From GitHub."));
+        let calls = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap();
+        assert!(calls.contains("Accept: application/sarif+json"), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn code_scanning_reports_githubs_own_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = fake_gh(bin.path(), &[]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    assert!(app.list_picker.is_none());
+    assert!(app.status.contains("unexpected call"), "{}", app.status);
+}
+
+#[cfg(unix)]
+#[test]
+fn x_dismisses_the_selected_results_code_scanning_alert_with_a_reason() {
+    // #577: VS Code's SARIF viewer dismisses GitHub alerts from the list.
+    // This result carries no alert number, so it is matched to the alerts
+    // list by rule, path and line.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/db.rs"), "a\nb\nc\n").unwrap();
+    let log = tmp.path().join("scan.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[
+            {"ruleId":"rust/sql-injection","message":{"text":"Tainted."},
+             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":2}}}]}]}]}"#,
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        bin.path(),
+        &[
+            (
+                "code-scanning/alerts?per_page=100",
+                r#"[{"number":8,"state":"open","rule":{"id":"rust/sql-injection"},
+                     "most_recent_instance":{"location":{"path":"src/db.rs","start_line":2}}}]"#,
+            ),
+            ("PATCH", r#"{"number":8,"state":"dismissed"}"#),
+        ],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.editor.open(&log).unwrap();
+    app.editor.sarif.as_mut().unwrap().selected = 1;
+    app.handle_sarif_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+    let picker = app.list_picker.as_ref().expect("X asks why");
+    assert_eq!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::DismissAlert
+    );
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["False positive", "Won't fix", "Used in tests"]);
+    // Pick "Won't fix", then give a comment.
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(
+            crate::widgets::input_prompt::InputPurpose::DismissAlertComment {
+                number: 8,
+                reason: 1
+            }
+        )
+    ));
+    app.dismiss_code_scanning_alert(8, 1, "tracked elsewhere");
+    let calls = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap();
+    assert!(
+        calls.contains("PATCH repos/{owner}/{repo}/code-scanning/alerts/8 -f state=dismissed -f dismissed_reason=won't fix -f dismissed_comment=tracked elsewhere"),
+        "{calls}"
+    );
+    assert!(app.status.contains("#8"), "{}", app.status);
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(
+        view.entries[0].suppression,
+        crate::sarif::semantics::SuppressionState::Suppressed,
+        "the dismissed result leaves the default list"
+    );
+}
+
+#[test]
+fn the_info_tab_lists_the_results_taxa() {
+    // #577: CWE / OWASP entries a result names, resolved through taxonomies.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("t.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T"}},
+            "taxonomies":[{"name":"CWE","taxa":[{"id":"CWE-89","name":"SqlInjection"}]}],
+            "results":[{"ruleId":"R1","message":{"text":"m"},
+              "taxa":[{"id":"CWE-89","toolComponent":{"name":"CWE"}}]}]}]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.editor.sarif.as_mut().unwrap().selected = 1;
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("CWE CWE-89: SqlInjection"), "{screen}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
+    // #577: like VS Code's viewer, the analyses of the branch being worked
+    // on come first; a branch with none shows the repository's.
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let one = |id: u64, git_ref: &str| {
+        format!(
+            r#"[{{"id":{id},"ref":"{git_ref}","commit_sha":"c","error":"","category":"","created_at":"2026-09-20T10:00:00Z","results_count":0,"tool":{{"name":"CodeQL"}}}}]"#
+        )
+    };
+    let on_branch = one(301, "refs/heads/feat/x");
+    let everything = one(300, "refs/heads/main");
+    let gh = fake_gh(
+        bin.path(),
+        &[
+            ("ref=refs%2Fheads%2Ffeat%2Fx", &on_branch),
+            ("ref=refs%2Fheads%2Fempty", "[]"),
+            ("analyses?per_page=30", &everything),
+        ],
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = gh;
+    app.source_control.status.branch = Some(String::from("feat/x"));
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    let picker = app.list_picker.take().expect("offered");
+    assert_eq!(
+        picker
+            .rows
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["301"]
+    );
+    assert!(picker.title.contains("feat/x"), "{}", picker.title);
+    app.source_control.status.branch = Some(String::from("empty"));
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    let picker = app.list_picker.take().expect("offered");
+    assert_eq!(
+        picker
+            .rows
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["300"]
+    );
+}
 
 /// Starting the tour while it runs keeps the first one: a second start
 /// would record the first tour's scratch project as the way home, and the

@@ -72,6 +72,12 @@ pub enum ListPurpose {
     /// `"processId": "${command:pickProcess}"` (#250): the rows are the
     /// user's processes; `id` is the pid the parked attach launches against.
     AttachProcess,
+    /// GitHub code scanning (#577): the rows are the repository's recent
+    /// analyses; `id` is the analysis id, opened as a SARIF log.
+    CodeScanningAnalysis,
+    /// Why a code scanning alert is dismissed: `id` is `<alert>:<reason>`,
+    /// the reason an index into `DismissReason::ALL`.
+    DismissAlert,
 }
 
 /// One selectable row: a stable `id` the App acts on (a stash index, a
