@@ -57453,7 +57453,8 @@ fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
         assert!(app.approval_ui.as_ref().unwrap().target_dirty);
 
         app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(app.approvals.len(), 1, "Enter approved over unsaved edits");
         let scratch = app.approval_edit.as_ref().unwrap().1.clone();
         assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
@@ -57476,7 +57477,11 @@ fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
         app.merge_apply(crate::merge_editor::ConflictState::Incoming);
         app.write_current_to_disk();
         assert!(app.approvals.is_empty(), "{}", app.status);
-        assert!(app.status.contains("your tab holds the same text"), "{}", app.status);
+        assert!(
+            app.status.contains("your tab holds the same text"),
+            "{}",
+            app.status
+        );
 
         hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .unwrap();

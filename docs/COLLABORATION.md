@@ -111,6 +111,15 @@ An edited approval goes back as Claude Code's `updatedInput`, in the shape the
 tool already takes. A `Write` carries your text as its content. An `Edit` becomes
 one replacement of the file's current text with yours. An `Edit` of an empty
 file cannot carry an edited version, so `e` refuses it.
+
+**When the file has unsaved edits in croft.** An agent's proposal is computed
+from the file on disk, so it knows nothing of your unsaved edits. Approving it
+as proposed would put the agent's write under them. For such a file the popup
+says so, and `Enter` or `e` opens a three-way merge instead: the disk text both
+started from, your edits as Current, and the agent's as Incoming. Changes
+only one side made are applied automatically. Saving approves the result once
+no conflict is left, and your tab takes the same text, one Undo away from your
+edits. Approve-all (`a`) never auto-approves such a file.
 If an edit can't be worked out against the file on disk (its text is missing,
 or ambiguous without `replace_all`), croft answers `ask` without showing the
 popup. A proposal still waiting when the hook's 120 s run out leaves the

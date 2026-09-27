@@ -112,7 +112,10 @@ pub fn render(
         None if ui.target_dirty => Line::from(vec![
             Span::styled("Unsaved edits here: ", key),
             Span::styled("Enter", key),
-            Span::styled(" merge them with the agent's (disk · yours · agent's)   ", dim),
+            Span::styled(
+                " merge them with the agent's (disk · yours · agent's)   ",
+                dim,
+            ),
             Span::styled("Esc", key),
             Span::styled(" deny   ", dim),
             Span::styled("r", key),
