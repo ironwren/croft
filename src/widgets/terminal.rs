@@ -1344,6 +1344,17 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // A pane's shell must count characters the way the terminal draws them.
+    // macOS forwards `LC_CTYPE=UTF-8` over ssh, which Linux does not know, so
+    // a remote shell fell back to ASCII and counted a 3-byte prompt glyph
+    // (`❯`, a Nerd Font icon) as 3 columns: every redraw landed 2 columns
+    // off and left 2-character coloured tails behind (#537).
+    if cfg!(target_os = "linux") {
+        let var = |k: &str| std::env::var(k).ok();
+        if let Some((key, value)) = utf8_ctype_fix(var("LC_ALL"), var("LC_CTYPE"), var("LANG")) {
+            cmd.env(key, value);
+        }
+    }
     // `git rebase -i` opens its plan in this croft (#620), unless the user
     // chose their own sequence editor, which always wins: an exported
     // GIT_SEQUENCE_EDITOR here, or `sequence.editor` in git config, which
@@ -1365,6 +1376,40 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // promises ("panes then see no CROFT_VIEW_SOCK and the client says so
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
+    }
+}
+
+/// The locale variable to set so a Linux shell reads its text as UTF-8, or
+/// None when the inherited locale already does (or the user pinned another
+/// with `LC_ALL`, which wins over anything set here). The bare name `UTF-8`
+/// is what macOS sends and no Linux locale is called that.
+fn utf8_ctype_fix(
+    lc_all: Option<String>,
+    lc_ctype: Option<String>,
+    lang: Option<String>,
+) -> Option<(&'static str, &'static str)> {
+    let is_utf8 = |v: &str| {
+        let codeset = v
+            .split('@')
+            .next()
+            .unwrap_or(v)
+            .rsplit('.')
+            .next()
+            .unwrap_or("");
+        v.contains('.') && matches!(codeset.to_ascii_lowercase().as_str(), "utf-8" | "utf8")
+    };
+    let bare = |v: &str| v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8");
+    match lc_all.filter(|v| !v.is_empty()) {
+        Some(v) if bare(&v) => return Some(("LC_ALL", "C.UTF-8")),
+        Some(_) => return None,
+        None => {}
+    }
+    let effective = lc_ctype
+        .filter(|v| !v.is_empty())
+        .or(lang.filter(|v| !v.is_empty()));
+    match effective {
+        Some(v) if is_utf8(&v) => None,
+        _ => Some(("LC_CTYPE", "C.UTF-8")),
     }
 }
 
@@ -1943,9 +1988,26 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
-        let rewind = Arc::new(std::sync::Mutex::new(crate::rewind::RewindBuffer::new(
-            crate::rewind::DEFAULT_CAPACITY_BYTES,
-        )));
+        // Shutdown pipe + master fd for the reader's poll gate: the reader
+        // must be wakeable without depending on the pty ever reaching EOF.
+        let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
+        let pty_fd = pair
+            .master
+            .as_raw_fd()
+            .context("pty master has no raw fd")?;
+        // Taken BEFORE the rewind registration below, which has no `?` after
+        // it: an early return past a registered buffer would leave every
+        // other pane trimmed to a share nobody is using.
+        // One budget shared by every pane (#694), re-read per spawn like the
+        // scrollback so a settings edit applies without a relaunch. Setting
+        // it re-splits the budget over the panes already open; registering
+        // then trims them to the smaller share before this pane records.
+        let rewind_budget = crate::rewind::budget();
+        rewind_budget.set_total(crate::rewind::configured_budget_bytes(
+            crate::prefs::Prefs::load_or_default().terminal_rewind_mb,
+            crate::remote::running_over_ssh(),
+        ));
+        let rewind = rewind_budget.register();
         let rewind_for_thread = rewind.clone();
         // MONOTONIC, not the wall clock. Every read the buffer offers —
         // `span_ms`, `replay_from`, the orphan-keyframe sweep — assumes the
@@ -1990,13 +2052,6 @@ impl PtyTerminal {
             Vec<crate::build_matchers::BuildDiag>,
         )>();
 
-        // Shutdown pipe + master fd for the reader's poll gate: the reader
-        // must be wakeable without depending on the pty ever reaching EOF.
-        let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
-        let pty_fd = pair
-            .master
-            .as_raw_fd()
-            .context("pty master has no raw fd")?;
         let reader_thread = std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut port_sniffer = crate::port_detect::PortSniffer::new();
@@ -4063,6 +4118,10 @@ impl Drop for PtyTerminal {
         // `self.term` (holding its channel sender) drops with this struct.
         let _ = self._child.kill();
         let _ = self._child.wait();
+        // Free the rewind buffer now and hand its share of the budget back
+        // to the other panes (#694). Not left to the Arc: the reader thread
+        // holds a clone until it is joined below.
+        crate::rewind::budget().release(&self.rewind);
         // Wake the reader (POLLHUP on its shutdown fd) and join it. EOF alone
         // is not a reliable wake: see `wait_pty_readable`.
         drop(self.reader_shutdown.take());
@@ -5835,6 +5894,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_gets_a_utf8_ctype_when_the_inherited_one_is_not() {
+        let s = |v: &str| Some(v.to_string());
+        // What macOS forwards over ssh, and no locale at all.
+        assert_eq!(
+            utf8_ctype_fix(None, s("UTF-8"), None),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(None, None, None),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(None, None, s("C")),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_ctype_fix(s("UTF-8"), None, None),
+            Some(("LC_ALL", "C.UTF-8"))
+        );
+        // Already UTF-8, or pinned by the user: untouched.
+        assert_eq!(utf8_ctype_fix(None, None, s("en_US.UTF-8")), None);
+        assert_eq!(utf8_ctype_fix(None, s("de_DE.utf8@euro"), None), None);
+        assert_eq!(utf8_ctype_fix(s("POSIX"), None, None), None);
+    }
+
+    #[test]
     fn a_paste_cannot_close_its_own_brackets() {
         let tmp = tempfile::tempdir().unwrap();
         let mut term = PtyTerminal::new(tmp.path()).unwrap();
@@ -5913,6 +5998,34 @@ mod tests {
             "the reader thread parsed output without recording it: {} bytes held",
             rb.bytes()
         );
+    }
+
+    /// #694: closing a pane frees its rewind buffer at once and leaves the
+    /// shared budget, rather than waiting on the last handle to drop.
+    ///
+    /// Asserted on a clone of the handle, standing in for the reader thread's
+    /// copy: that clone is exactly what kept a closed pane's buffer alive.
+    #[test]
+    fn closing_a_pane_frees_its_rewind_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        term.write_input(b"echo FREED_$(echo soon)\n");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(2000),
+            "the shell to print the needle",
+            || term.visible_text().contains("FREED_soon"),
+        );
+        let handle = term.rewind().clone();
+        assert!(
+            !handle.lock().unwrap().is_empty(),
+            "precondition: the pane recorded output"
+        );
+        assert!(handle.lock().unwrap().capacity() > 0);
+
+        drop(term);
+        let rb = handle.lock().unwrap();
+        assert!(rb.is_empty(), "a closed pane kept {} bytes", rb.bytes());
+        assert_eq!(rb.capacity(), 0, "a closed pane kept its share");
     }
 
     /// Output arriving BEFORE an OSC 133 mark must be recorded too.

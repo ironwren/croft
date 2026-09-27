@@ -48,6 +48,66 @@ impl UpdateWatch {
     }
 }
 
+/// The prefix of the markers the remote source build writes while it
+/// compiles (#694), under `~/.cache/croft`: one `building.<shell pid>` per
+/// build, holding the pid of the compile once it has started.
+pub const BUILD_MARKER_PREFIX: &str = "building.";
+
+/// True while a source build of croft is compiling on this host.
+///
+/// A build counts while its marker names a live pid (`alive` is the caller's
+/// probe, so tests need no real process). The build removes its marker when
+/// it ends, but a shell killed outright never runs its trap, so a marker
+/// naming a dead pid is stale and ignored: it must not keep croft's language
+/// servers stopped for good. So is one written before `booted` — a reboot
+/// mid-build leaves the file, and after it the pid may belong to anything.
+/// A marker without a usable pid counts as none.
+pub fn source_build_running(
+    cache_dir: &std::path::Path,
+    booted: Option<std::time::SystemTime>,
+    alive: impl Fn(u32) -> bool,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(BUILD_MARKER_PREFIX)
+        {
+            return false;
+        }
+        if let (Some(booted), Ok(modified)) = (booted, entry.metadata().and_then(|m| m.modified()))
+            && modified < booted
+        {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            return false;
+        };
+        match text.trim().parse::<u32>() {
+            // 0 would probe the caller's own process group, and anything
+            // past i32::MAX is not a pid at all.
+            Ok(pid) if pid != 0 && i32::try_from(pid).is_ok() => alive(pid),
+            _ => false,
+        }
+    })
+}
+
+/// When this host last booted, from `btime` in `/proc/stat`. `None` where
+/// there is no `/proc`; markers are then judged by their pid alone.
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let secs: u64 = stat
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
 /// One-shot background probe answering: does the repo this binary was
 /// installed from now sit at a different commit/dirty state than the binary
 /// has baked in? The local half of the deploy-verification story (#242) —
@@ -663,6 +723,62 @@ mod tests {
         assert!(wait_for(&watch, UpdateEvent::InProgress));
         std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
         assert!(wait_for(&watch, UpdateEvent::Failed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #694: a build marker pauses language servers only while the build
+    /// it names is alive, and only if it was written since boot.
+    #[test]
+    fn a_build_marker_counts_only_while_its_pid_is_alive() {
+        let dir = scratch_dir("build-marker");
+        let alive = |pid: u32| pid == 4242;
+        let marker = |name: &str| dir.join(format!("{BUILD_MARKER_PREFIX}{name}"));
+        assert!(
+            !source_build_running(&dir, None, alive),
+            "no marker means no build"
+        );
+
+        std::fs::write(marker("100"), "4242\n").unwrap();
+        assert!(
+            source_build_running(&dir, None, alive),
+            "a live build must count"
+        );
+
+        // A second build's marker, already dead, must not hide the first.
+        std::fs::write(marker("200"), "999").unwrap();
+        assert!(source_build_running(&dir, None, alive));
+
+        // Only dead markers left: stale, so no build.
+        std::fs::remove_file(marker("100")).unwrap();
+        assert!(
+            !source_build_running(&dir, None, alive),
+            "a stale marker must not keep the servers stopped"
+        );
+
+        // Written before the last boot: stale whatever its pid says.
+        std::fs::write(marker("300"), "4242").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(!source_build_running(&dir, Some(later), alive));
+        assert!(source_build_running(
+            &dir,
+            Some(std::time::UNIX_EPOCH),
+            alive
+        ));
+        std::fs::remove_file(marker("300")).unwrap();
+        std::fs::remove_file(marker("200")).unwrap();
+
+        // Junk, 0 (the caller's process group) and non-pids never count,
+        // and are never even probed. Nor does a file without the prefix.
+        for junk in ["", "abc", "0", "4294967295"] {
+            std::fs::write(marker("400"), junk).unwrap();
+            assert!(
+                !source_build_running(&dir, None, |_| true),
+                "marker {junk:?} must not count as a build"
+            );
+        }
+        std::fs::remove_file(marker("400")).unwrap();
+        std::fs::write(dir.join("building"), "4242").unwrap();
+        assert!(!source_build_running(&dir, None, |_| true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
