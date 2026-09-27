@@ -86,7 +86,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
-Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `lane_agent`,
+Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `locale`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
@@ -138,6 +138,26 @@ which must be granted per machine. Two user-layer settings opt out:
 ```
 
 The connect output says what was pushed, what was skipped and why.
+
+## GitHub code scanning
+
+`code_scanning` controls whether croft loads the repository's GitHub code
+scanning results into the SARIF viewer by itself, through `gh`:
+
+```jsonc
+{
+  // "off" (default): only when asked. "on": load the current branch's
+  // results, and again after checking out another branch or a detached
+  // HEAD. "prompt": say they are there and wait.
+  "code_scanning": "prompt"
+}
+```
+
+It loads the newest analysis per tool at the nearest scanned commit in the
+branch's history, so a branch whose latest commits are not scanned yet still
+gets results. **SARIF: Load Code Scanning Results for This Branch** loads them
+whatever the setting. **SARIF: Open GitHub Code Scanning Analysis** picks any
+one analysis by hand.
 
 ## Notification sinks
 

@@ -1586,6 +1586,15 @@ type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
 /// How often an open review tab with running checks re-reads them (#365).
 const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A code scanning lookup in flight (#577).
+struct CodeScanList {
+    branch: String,
+    /// Load what it finds (`on`, or the palette command), rather than only
+    /// saying it is there (`prompt`).
+    load: bool,
+    rx: std::sync::mpsc::Receiver<Result<Vec<crate::sarif::github::Analysis>, String>>,
+}
+
 /// What a pull request review tab's `gh` call is fetching (#365).
 enum PrGhJob {
     /// The PR itself (`gh pr view`), by number or URL.
@@ -3233,6 +3242,16 @@ pub struct App {
     /// `fleet_groups` from prefs (#363): named host sets a fleet run can
     /// expand, so a fleet is named once rather than retyped per run.
     fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
+    /// The `code_scanning` setting (#577).
+    code_scanning: crate::sarif::github::CodeScanningMode,
+    /// The branch (or detached HEAD) code scanning last looked at, so a
+    /// checkout of another one is noticed.
+    code_scan_seen: Option<String>,
+    /// A code scanning lookup in flight: the branch it is for, whether to
+    /// load what it finds, and where the chosen analyses arrive.
+    code_scan_list: Option<CodeScanList>,
+    /// Chosen analyses fetching as SARIF: where their saved files arrive.
+    code_scan_fetch: Option<std::sync::mpsc::Receiver<Vec<Result<PathBuf, String>>>>,
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
     remote_offer_refused: crate::remote::RefusedHosts,
@@ -5309,6 +5328,10 @@ impl App {
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
             fleet_groups: loaded_prefs.fleet_groups.clone(),
+            code_scanning: loaded_prefs.code_scanning,
+            code_scan_seen: None,
+            code_scan_list: None,
+            code_scan_fetch: None,
             remote_offer_refused: crate::remote::load_refused_hosts(
                 &crate::remote::refused_hosts_path(&croft_cache_dir()),
                 std::time::SystemTime::now(),
@@ -41257,6 +41280,10 @@ impl App {
             Cmd::SarifNextResult => self.step_sarif_result(true),
             Cmd::SarifPreviousResult => self.step_sarif_result(false),
             Cmd::SarifOpenCodeScanning => self.open_code_scanning_picker(),
+            Cmd::SarifLoadCodeScanning => match self.code_scan_branch() {
+                Some(branch) => self.start_code_scan_lookup(branch, true),
+                None => self.status = String::from("Code scanning: not in a git repository"),
+            },
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -49047,6 +49074,7 @@ impl App {
         // Live like every other pref here (#363): editing a group in
         // config.json takes effect on the next fleet run without a restart.
         self.fleet_groups = p.fleet_groups.clone();
+        self.code_scanning = p.code_scanning;
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),
@@ -52829,6 +52857,166 @@ impl App {
             ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
             "This repository has no code scanning analyses",
         );
+    }
+
+    /// The branch code scanning follows (#577): its name, or `HEAD <oid>`
+    /// when detached, from the git status the worker keeps current, which
+    /// reads refs through git itself (packed refs included).
+    fn code_scan_branch(&self) -> Option<String> {
+        let st = &self.source_control.status;
+        if !st.in_repo {
+            return None;
+        }
+        st.branch
+            .clone()
+            .or_else(|| st.detached_hash.as_ref().map(|h| format!("HEAD {h}")))
+    }
+
+    /// Look up `branch`'s code scanning analyses off the UI thread: its own
+    /// ref's (the repository's when detached or when it has none), narrowed
+    /// to the nearest scanned commit in the local history, one per tool.
+    fn start_code_scan_lookup(&mut self, branch: String, load: bool) {
+        use crate::sarif::github;
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let git_ref = (!branch.starts_with("HEAD ")).then(|| format!("refs/heads/{branch}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
+                let out = std::process::Command::new(&gh)
+                    .args(github::analyses_args(git_ref))
+                    .current_dir(&root)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .map_err(|e| format!("could not run gh: {e}"))?;
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            };
+            let result = (|| {
+                let mut analyses = match git_ref.as_deref() {
+                    Some(r) => github::parse_analyses(&gh_json(Some(r))?)?,
+                    None => Vec::new(),
+                };
+                if analyses.is_empty() {
+                    analyses = github::parse_analyses(&gh_json(None)?)?;
+                }
+                let history: Vec<String> = crate::git::branch_history(&root, 200)
+                    .into_iter()
+                    .map(|c| c.hash)
+                    .collect();
+                Ok(github::nearest_per_tool(&analyses, &history))
+            })();
+            let _ = tx.send(result);
+        });
+        self.code_scan_list = Some(CodeScanList { branch, load, rx });
+    }
+
+    /// Notice a checkout of another branch and act on the `code_scanning`
+    /// setting, then drain finished lookups and fetches. Returns true when
+    /// something on screen changed.
+    fn poll_code_scanning(&mut self) -> bool {
+        use crate::sarif::github::CodeScanningMode;
+        let mut changed = false;
+        if self.code_scanning != CodeScanningMode::Off
+            && self.code_scan_list.is_none()
+            && let Some(branch) = self.code_scan_branch()
+            && self.code_scan_seen.as_deref() != Some(branch.as_str())
+        {
+            self.code_scan_seen = Some(branch.clone());
+            self.start_code_scan_lookup(branch, self.code_scanning == CodeScanningMode::On);
+        }
+        if let Some(list) = self.code_scan_list.as_ref() {
+            let result = match list.rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(String::from("the lookup stopped without answering")))
+                }
+            };
+            if let Some(result) = result
+                && let Some(CodeScanList { branch, load, .. }) = self.code_scan_list.take()
+            {
+                changed = true;
+                let shown = branch.strip_prefix("HEAD ").map_or(branch.clone(), |h| {
+                    format!("detached HEAD {}", h.chars().take(8).collect::<String>())
+                });
+                match result {
+                    Ok(chosen) if chosen.is_empty() => {
+                        if load {
+                            self.status = format!("Code scanning: no analyses for {shown}");
+                        }
+                    }
+                    Ok(chosen) if load => self.fetch_code_scan_analyses(chosen, &shown),
+                    Ok(chosen) => {
+                        self.status = format!(
+                            "Code scanning has {} analys{} for {shown} (SARIF: Load Code Scanning Results for This Branch)",
+                            chosen.len(),
+                            if chosen.len() == 1 { "is" } else { "es" }
+                        );
+                    }
+                    Err(e) => self.status = format!("Code scanning: {e}"),
+                }
+            }
+        }
+        if let Some(rx) = self.code_scan_fetch.as_ref()
+            && let Ok(files) = rx.try_recv()
+        {
+            self.code_scan_fetch = None;
+            changed = true;
+            let mut opened = 0;
+            let mut errors = Vec::new();
+            for file in files {
+                match file.and_then(|p| self.editor.open(&p).map_err(|e| e.to_string())) {
+                    Ok(()) => opened += 1,
+                    Err(e) => errors.push(e),
+                }
+            }
+            self.sync_open_file_poll_mtime();
+            self.status = match errors.first() {
+                None => format!(
+                    "Loaded {opened} code scanning analys{}",
+                    if opened == 1 { "is" } else { "es" }
+                ),
+                Some(e) => format!("Loaded {opened} code scanning analyses; {e}"),
+            };
+        }
+        changed
+    }
+
+    /// Download `chosen` as SARIF into croft's cache off the UI thread, to
+    /// open when they arrive.
+    fn fetch_code_scan_analyses(
+        &mut self,
+        chosen: Vec<crate::sarif::github::Analysis>,
+        shown: &str,
+    ) {
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let dir = croft_cache_dir().join("code-scanning");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let files = chosen
+                .iter()
+                .map(|a| {
+                    let out = std::process::Command::new(&gh)
+                        .args(crate::sarif::github::sarif_args(a.id))
+                        .current_dir(&root)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .map_err(|e| format!("could not run gh: {e}"))?;
+                    if !out.status.success() {
+                        return Err(format!("analysis #{} could not be downloaded", a.id));
+                    }
+                    let path = dir.join(format!("analysis-{}.sarif", a.id));
+                    std::fs::create_dir_all(&dir)
+                        .and_then(|()| std::fs::write(&path, &out.stdout))
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    Ok(path)
+                })
+                .collect();
+            let _ = tx.send(files);
+        });
+        self.code_scan_fetch = Some(rx);
+        self.status = format!("Loading code scanning results for {shown}…");
     }
 
     /// Dismiss the selected result's code scanning alert (#577): the alert
@@ -59373,7 +59561,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh();
+        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_code_scanning();
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();
