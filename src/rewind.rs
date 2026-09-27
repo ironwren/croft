@@ -26,7 +26,8 @@
 //! about memory. `yes` produces millions of tiny frames and a `cat` of a
 //! large file produces a few enormous ones, and a frame-capped buffer is
 //! either useless for the first or unbounded for the second. The cap here is
-//! the summed payload length, and eviction is by age until the total fits.
+//! on bytes held — each frame's payload and its bookkeeping (below) — and
+//! eviction is by age until the total fits.
 //!
 //! A single frame larger than the whole budget is truncated rather than
 //! dropped: losing the tail of one enormous write is recoverable, while
@@ -34,7 +35,12 @@
 //! explain.
 //!
 //! Everything held counts against the cap (#694): each frame's slot as well
-//! as its payload, and keyframes as well as frames. Nothing stores keyframes
+//! as its payload, and keyframes as well as frames. The charge is the worst
+//! case (#735): two slots per frame, since a `VecDeque`'s slot array can be
+//! up to twice its length (and is shrunk back whenever eviction leaves it
+//! more than that), and the payload's allocation rounded up the way malloc
+//! rounds it, never under 32 bytes. What the allocator's own free lists and
+//! the keyframe deque's slots cost is not counted. Nothing stores keyframes
 //! yet (the reader drops the request until the replay overlay lands), so
 //! charging them is a guard for that caller, not a saving today.
 //!
@@ -151,17 +157,34 @@ fn keyframe_cost(screen: &[String]) -> usize {
         .sum()
 }
 
-/// What one frame costs beyond its payload: its slot in the deque. The
-/// payload's own allocation header is left out, as allocator detail.
-const FRAME_OVERHEAD: usize = std::mem::size_of::<Frame>();
+/// What one frame's slot costs: two `Frame`s, since the deque's slot array
+/// holds up to twice as many slots as frames ([`RewindBuffer::shrink_slots`]
+/// keeps it there).
+const FRAME_OVERHEAD: usize = 2 * std::mem::size_of::<Frame>();
 
-/// A frame's charge against the byte budget: its payload plus its slot.
+/// The smallest heap chunk a payload's allocation takes: glibc's minimum,
+/// and at least musl's.
+const MIN_ALLOCATION: usize = 32;
+
+/// What a payload of `len` bytes costs to allocate: malloc's header and
+/// 16-byte rounding, and never under [`MIN_ALLOCATION`].
+fn allocation_cost(len: usize) -> usize {
+    (len + 16).next_multiple_of(16).max(MIN_ALLOCATION)
+}
+
+/// The longest payload whose [`allocation_cost`] fits in `room`, if any.
+fn largest_payload(room: usize) -> Option<usize> {
+    (room >= MIN_ALLOCATION).then(|| room / 16 * 16 - 16)
+}
+
+/// A frame's charge against the byte budget: its payload's allocation plus
+/// its slots.
 ///
-/// Payload alone undercounts badly where it matters most (#694 review): the
-/// reader records one frame per `read()`, and output that trickles in a byte
-/// at a time costs some 40 real bytes per byte counted.
+/// Payload alone undercounts badly where it matters most (#694 review, and
+/// #735): the reader records one frame per `read()`, and output that
+/// trickles in a byte at a time costs about 110 real bytes per byte counted.
 fn frame_cost(payload: usize) -> usize {
-    payload + FRAME_OVERHEAD
+    allocation_cost(payload) + FRAME_OVERHEAD
 }
 
 /// The session's recent output, bounded by total bytes held.
@@ -198,18 +221,22 @@ impl RewindBuffer {
         if self.capacity == 0 {
             return false;
         }
-        // An empty write records nothing. `bytes` sums payload lengths and
-        // `evict` runs while `bytes > capacity`, so a zero-length frame adds
-        // an entry while adding nothing to the figure that would evict it —
-        // repeated empty pushes would grow `frames` without bound, in the one
-        // structure here whose purpose is to stay bounded. The reader cannot
-        // emit one today (`Ok(0)` ends its loop), but this is public and the
-        // replay half will add callers.
+        // An empty write records nothing: a frame with no output replays as
+        // nothing, and would still cost its slots and a minimum allocation
+        // (`frame_cost(0)`). When `bytes` summed payload alone, it also cost
+        // nothing, and repeated empty pushes grew `frames` without bound.
+        // The reader cannot emit one today (`Ok(0)` ends its loop), but this
+        // is public and the replay half will add callers.
         if data.is_empty() {
             return false;
         }
         // A cap too small to hold even one frame's bookkeeping holds nothing.
-        let Some(room) = self.capacity.checked_sub(FRAME_OVERHEAD).filter(|&r| r > 0) else {
+        let Some(room) = self
+            .capacity
+            .checked_sub(FRAME_OVERHEAD)
+            .and_then(largest_payload)
+            .filter(|&r| r > 0)
+        else {
             return false;
         };
         // One frame bigger than the whole budget is truncated to the budget
@@ -286,8 +313,20 @@ impl RewindBuffer {
         self.evict();
         // A smaller share leaves the slot array sized for the old one; give
         // back what is well past what the new share holds.
-        self.frames.shrink_to(self.frames.len() * 2);
+        self.shrink_slots();
         self.keyframes.shrink_to(self.keyframes.len() * 2);
+    }
+
+    /// Keep the frame deque's slot array within twice its length, the most
+    /// [`FRAME_OVERHEAD`] pays for. A deque never shrinks by itself, so a
+    /// burst of tiny frames that larger ones then evict would otherwise
+    /// leave its slots allocated and uncharged. Shrinking to the length
+    /// makes the next shrink wait until half of it is evicted, so the cost
+    /// stays amortised.
+    fn shrink_slots(&mut self) {
+        if self.frames.capacity() > 2 * self.frames.len() {
+            self.frames.shrink_to(self.frames.len());
+        }
     }
 
     /// The cap currently in force.
@@ -328,6 +367,7 @@ impl RewindBuffer {
             }
         }
         self.drop_orphan_keyframes();
+        self.shrink_slots();
     }
 
     /// Drop the oldest keyframe and its cost; false when there was none.
@@ -1022,11 +1062,11 @@ mod tests {
 
     /// Empty writes must not accumulate frames the cap can never evict.
     ///
-    /// `bytes` sums payload lengths, and `evict` runs `while bytes > capacity`
-    /// — so a zero-length write adds a `Frame` while adding nothing to the
-    /// figure that triggers eviction. Repeated empty pushes therefore grew
-    /// `frames` without bound, in a buffer whose entire purpose is to be
-    /// bounded. The reader cannot emit one today (`Ok(0) => break` ends the
+    /// When `bytes` summed payload lengths alone, a zero-length write added
+    /// a `Frame` while adding nothing to the figure that triggers eviction,
+    /// so repeated empty pushes grew `frames` without bound, in a buffer
+    /// whose entire purpose is to be bounded. Every frame is now charged its
+    /// slots too, but an empty one is still refused: it records nothing. The reader cannot emit one today (`Ok(0) => break` ends the
     /// loop), but `push` is public and the replay half will add callers.
     #[test]
     fn empty_writes_do_not_accumulate_unevictable_frames() {
@@ -1180,7 +1220,7 @@ mod tests {
     /// cost of every frame.
     #[test]
     fn a_keyframe_larger_than_the_budget_is_not_stored() {
-        let mut b = RewindBuffer::new(100);
+        let mut b = RewindBuffer::new(200);
         b.push(1, b"output worth keeping");
         b.push_keyframe(2, screen(10, 80));
         assert_eq!(b.keyframe_count(), 0, "an oversized keyframe was stored");
@@ -1319,7 +1359,7 @@ mod tests {
         assert_eq!(configured_budget_bytes(Some(32), true), 32 << 20);
         assert_eq!(
             configured_budget_bytes(Some(usize::MAX), false),
-            MAX_BUDGET_MB << 20,
+            MAX_BUDGET_MB.saturating_mul(1 << 20),
             "an absurd value must clamp, not overflow"
         );
     }
@@ -1332,28 +1372,85 @@ mod tests {
     /// slots actually held, not on `bytes()`, which is what was wrong.
     #[test]
     fn one_byte_frames_are_charged_their_slot() {
+        // #735: what is really held, measured rather than restated from the
+        // charging formula: the slot array's CAPACITY, and each payload's
+        // allocation at no less than malloc's minimum chunk.
+        let held = |b: &RewindBuffer| {
+            b.frames.capacity() * std::mem::size_of::<Frame>()
+                + b.frames
+                    .iter()
+                    .map(|f| f.data.capacity().max(MIN_ALLOCATION))
+                    .sum::<usize>()
+        };
         let cap = 1 << 20;
         let mut b = RewindBuffer::new(cap);
         for i in 0..(4u64 << 20) {
             b.push(i, b".");
+            if i % 4096 == 0 {
+                assert!(
+                    held(&b) <= cap,
+                    "{} held against {cap} at push {i}",
+                    held(&b)
+                );
+            }
         }
-        let slots = b.frames.len() * std::mem::size_of::<Frame>();
-        let payload: usize = b.frames.iter().map(|f| f.data.len()).sum();
         assert!(
-            slots + payload <= cap,
-            "{} frames hold {} bytes of slots and payload against a {cap} cap",
+            held(&b) <= cap,
+            "{} frames hold {} bytes against a {cap} cap",
             b.frames.len(),
-            slots + payload
+            held(&b)
         );
         assert_eq!(b.bytes(), recount(&b));
         // PRESENCE: the buffer still keeps the recent past.
         assert!(b.frames.len() > 1000, "only {} frames kept", b.frames.len());
+
+        // Big writes evicting the trickle give its slots back rather than
+        // leaving thousands of empty ones uncharged.
+        let slots_before = b.frames.capacity();
+        for i in 0..8u64 {
+            b.push((4 << 20) + i, &vec![b'x'; cap / 8]);
+        }
+        assert!(
+            b.frames.capacity() < slots_before / 100,
+            "{}",
+            b.frames.capacity()
+        );
+        assert!(held(&b) <= cap, "{} held after big writes", held(&b));
+
+        // So does a shrinking share, and turning rewind off.
+        let mut b = RewindBuffer::new(cap);
+        for i in 0..20_000u64 {
+            b.push(i, b".");
+        }
+        let full = b.frames.capacity();
+        b.set_capacity(cap / 16);
+        assert!(
+            b.frames.capacity() <= full / 8,
+            "{} of {full}",
+            b.frames.capacity()
+        );
+        assert!(held(&b) <= cap / 16);
+        b.set_capacity(0);
+        assert_eq!(b.frames.capacity(), 0, "turning rewind off frees the slots");
     }
 
     /// A cap smaller than one frame's bookkeeping records nothing, rather
     /// than a frame whose payload is truncated to nothing.
     #[test]
     fn a_cap_below_one_frame_records_nothing() {
+        // #735: the payload limit is exact — the largest payload whose
+        // charge fits, never one byte more.
+        for cap in 0..600 {
+            let mut b = RewindBuffer::new(cap);
+            b.push(1, &[b'x'; 1000]);
+            assert!(b.bytes() <= cap, "cap {cap}: charged {}", b.bytes());
+            if let Some(len) = b.frames.front().map(|f| f.data.len()) {
+                assert!(
+                    frame_cost(len + 1) > cap,
+                    "cap {cap}: {len} bytes kept, one more fits"
+                );
+            }
+        }
         let mut b = RewindBuffer::new(FRAME_OVERHEAD);
         assert!(!b.push(1, b"x"));
         assert!(b.is_empty());

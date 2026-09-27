@@ -4080,7 +4080,33 @@ impl Editor {
         e.set_git_head_lines(path.to_path_buf(), Some(baseline));
         // Never edited, so the marks are computed once, here.
         e.refresh_git_marks();
+        e.warm_render_caches();
         e
+    }
+
+    /// [`Self::historical`] without the expensive parts: the text alone, no
+    /// highlighting and no gutter marks. What the history scrubber shows for
+    /// the frame or two until the full view is built off the UI thread
+    /// (#371); cheap enough for every step of a held arrow key.
+    pub fn historical_plain(path: &Path, text: &str) -> Editor {
+        let mut e = Editor::new();
+        e.path = Some(path.to_path_buf());
+        e.lines = split_into_lines(text);
+        if e.lines.is_empty() {
+            e.lines.push(String::new());
+        }
+        e.highlights = vec![Vec::new(); e.lines.len()];
+        e.warm_render_caches();
+        e
+    }
+
+    /// Fill the whole-buffer caches a first paint would otherwise compute
+    /// (fold tables, conflict markers, the widest line), so a view built on
+    /// another thread (#371) costs the UI thread only its visible rows.
+    fn warm_render_caches(&mut self) {
+        self.refresh_fold_tables();
+        self.conflicts();
+        self.content_cols();
     }
 
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
@@ -11764,7 +11790,8 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Tsx)
         | Some(LangKind::Go)
         | Some(LangKind::C)
-        | Some(LangKind::Cpp) => Some("//"),
+        | Some(LangKind::Cpp)
+        | Some(LangKind::Ql) => Some("//"),
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
@@ -11787,7 +11814,8 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Go)
         | Some(LangKind::C)
         | Some(LangKind::Cpp)
-        | Some(LangKind::Css) => Some(("/*", "*/")),
+        | Some(LangKind::Css)
+        | Some(LangKind::Ql) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         // Python has no true block comment; VS Code's language config maps
@@ -12392,6 +12420,7 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "C",
         Some(LangKind::Cpp) => "C++",
         Some(LangKind::Lua) => "Lua",
+        Some(LangKind::Ql) => "CodeQL",
     }
 }
 
@@ -12418,6 +12447,7 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::C) => "c",
         Some(LangKind::Cpp) => "cpp",
         Some(LangKind::Lua) => "lua",
+        Some(LangKind::Ql) => "ql",
     }
 }
 
@@ -12440,6 +12470,7 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::C,
     LangKind::Cpp,
     LangKind::Lua,
+    LangKind::Ql,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -12477,7 +12508,8 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Json)
         | Some(LangKind::Go)
         | Some(LangKind::Css)
-        | Some(LangKind::Lua) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Lua)
+        | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
 }
@@ -12494,6 +12526,7 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Go)
             | Some(LangKind::Css)
             | Some(LangKind::Lua)
+            | Some(LangKind::Ql)
     );
     if !bracket_aware {
         return false;
@@ -12805,6 +12838,11 @@ fn follow_moved_bookmark_lines(
 /// would then resolve one row off. Normalizing first keeps the two in lockstep
 /// and is a no-op for clean `\n`-only files.
 pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
+    // Most text has no `\r` at all; skip the two whole-text copies that
+    // normalising would make (#371 splits a 35k-line file per scrub step).
+    if !text.contains('\r') {
+        return text.lines().map(str::to_string).collect();
+    }
     normalize_newlines(text)
         .lines()
         .map(|s| s.to_string())
@@ -26486,6 +26524,16 @@ mod tests {
         e.cursor_row = 0;
         assert!(e.toggle_line_comment());
         assert_eq!(e.lines, vec!["# x = 1"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_codeql_uses_slashes() {
+        let mut e = editor_with("select 1");
+        e.lang = crate::highlight::lang_for_extension("ql");
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// select 1"]);
+        assert_eq!(language_label(e.lang), "CodeQL");
     }
 
     #[test]

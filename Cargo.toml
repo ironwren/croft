@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.1.1117"
+version = "0.1.1142"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -69,6 +69,9 @@ tree-sitter-xml = "0.7"
 tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-lua = "0.5"
+# CodeQL `.ql` / `.qll` highlighting and outline (#578). MIT, same
+# `LanguageFn` shape as the other 0.23+ grammars.
+tree-sitter-ql = "0.23"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.

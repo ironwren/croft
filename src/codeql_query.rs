@@ -7,6 +7,9 @@
 //! produces alerts, so it runs through `database analyze` into SARIF and
 //! opens in the SARIF viewer. Any other query produces a table, which runs
 //! through `query run` and is decoded to CSV.
+//!
+//! "CodeQL: Create Query" starts a new query from [`query_template`],
+//! with a pack file beside it when it has none.
 
 use std::path::{Path, PathBuf};
 
@@ -78,6 +81,12 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
         format!("--output={}", path(out)),
         path(bqrs),
     ]
+}
+
+/// `codeql` arguments upgrading `db` to the CLI's current schema (VS Code's
+/// "CodeQL: Upgrade Database").
+pub fn upgrade_args(db: &Path) -> Vec<String> {
+    vec![String::from("database"), String::from("upgrade"), path(db)]
 }
 
 /// The queries in one CodeQL pack, as the side bar's Queries section groups
@@ -221,6 +230,118 @@ pub fn discover(root: &Path) -> Vec<QueryPack> {
     out
 }
 
+/// The CodeQL library for a language id, which is also what `import` names
+/// and what `codeql/<id>-all` depends on. The ids a database or a pack file
+/// may use for a language the library covers (`typescript`, `kotlin`, `c`)
+/// map to it; anything else is `None`.
+pub fn language_module(lang: &str) -> Option<&'static str> {
+    Some(match lang.trim().to_ascii_lowercase().as_str() {
+        "cpp" | "c" | "c++" => "cpp",
+        "csharp" | "c#" => "csharp",
+        "go" => "go",
+        "java" | "kotlin" => "java",
+        "javascript" | "typescript" => "javascript",
+        "python" => "python",
+        "ruby" => "ruby",
+        "rust" => "rust",
+        "swift" => "swift",
+        "actions" => "actions",
+        _ => return None,
+    })
+}
+
+/// `name` in lower-case words joined by hyphens, as a query `@id` or a pack
+/// name wants it: "Find SQL_injection" is `find-sql-injection`.
+fn kebab(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A starter query called `name`, as VS Code's "Create Query" writes one: a
+/// problem query reporting every file, which runs as soon as it is saved.
+/// With no known language there is no library to import, so it is a plain
+/// `select` of a string and says no `@kind`.
+pub fn query_template(lang: Option<&str>, name: &str) -> String {
+    let id = match kebab(name) {
+        k if k.is_empty() => String::from("query"),
+        k => k,
+    };
+    match lang.and_then(language_module) {
+        Some(module) => format!(
+            "/**\n * @name {name}\n * @description Describe what this query finds.\n * @kind problem\n * @problem.severity warning\n * @id {module}/{id}\n */\n\nimport {module}\n\nfrom File f\nselect f, \"Hello, world!\"\n"
+        ),
+        None => format!(
+            "/**\n * @name {name}\n * @description Describe what this query finds.\n * @id {id}\n */\n\nselect \"Hello, world!\"\n"
+        ),
+    }
+}
+
+/// The file name a typed query name becomes: trimmed, with a `.ql` the
+/// user typed dropped and put back. Empty names, names with a path in them
+/// and names that are only dots are refused.
+pub fn query_file_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let stem = name.strip_suffix(".ql").unwrap_or(name).trim_end();
+    if stem.is_empty() {
+        return Err(String::from("A query name cannot be empty"));
+    }
+    if stem.contains(['/', '\\', '\0']) || stem.chars().all(|c| c == '.') {
+        return Err(format!("'{name}' is not a file name"));
+    }
+    Ok(format!("{stem}.ql"))
+}
+
+/// Write a starter query called `name` into `dir` (#578) and return its
+/// path. An existing file is never overwritten. When `lang` is known and
+/// neither `dir` nor a folder above it (up to `root`) holds a pack file, a
+/// minimal `qlpack.yml` depending on that language's library goes beside
+/// it, so the query compiles.
+pub fn scaffold_query(
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    lang: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    let file = query_file_name(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(&file);
+    let stem = file.strip_suffix(".ql").unwrap_or(&file);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| match e.kind() {
+            ErrorKind::AlreadyExists => {
+                Error::new(ErrorKind::AlreadyExists, format!("{file} already exists"))
+            }
+            _ => e,
+        })?;
+    out.write_all(query_template(lang, stem).as_bytes())?;
+    let module = lang.and_then(language_module);
+    let in_pack = dir
+        .ancestors()
+        .take_while(|d| d.starts_with(root) || *d == dir)
+        .any(|d| d.join("qlpack.yml").is_file() || d.join("codeql-pack.yml").is_file());
+    if let (Some(module), false) = (module, in_pack) {
+        let scope = dir
+            .file_name()
+            .map(|n| kebab(&n.to_string_lossy()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| String::from("local"));
+        std::fs::write(
+            dir.join("qlpack.yml"),
+            format!(
+                "name: {scope}/queries\nversion: 0.0.1\ndependencies:\n  codeql/{module}-all: \"*\"\n"
+            ),
+        )?;
+    }
+    Ok(path)
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunStatus {
@@ -235,6 +356,11 @@ pub enum RunStatus {
 pub struct HistoryEntry {
     pub query: PathBuf,
     pub database: String,
+    /// The database's folder, so "Delete Unused Databases" can tell which
+    /// ones a run refers to after a rename. History saved before this
+    /// field existed reads as `None` and falls back to the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<PathBuf>,
     /// Seconds since the Unix epoch.
     pub started: u64,
     pub seconds: u64,
@@ -255,6 +381,19 @@ impl HistoryEntry {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// Whether this run was on the database at `path` that goes, or went,
+    /// by one of `names`: by canonical path when the entry recorded one,
+    /// else by name.
+    pub fn refers_to(&self, path: &Path, names: &[&str]) -> bool {
+        match &self.database_path {
+            Some(p) => {
+                let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(p) == canon(path)
+            }
+            None => names.contains(&self.database.as_str()),
+        }
     }
 
     /// What the entry is called: the user's label, else the query's file
@@ -350,6 +489,20 @@ impl History {
         }
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, text)
+    }
+
+    /// Pin older entries that only recorded the database's `name` to its
+    /// `path`, so renaming the database does not orphan them (#578).
+    /// Returns whether anything changed.
+    pub fn adopt_legacy(&mut self, name: &str, path: &Path) -> bool {
+        let mut changed = false;
+        for e in &mut self.entries {
+            if e.database_path.is_none() && e.database == name {
+                e.database_path = Some(path.to_path_buf());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Record a new run, dropping the oldest past the cap. It goes at the
@@ -490,6 +643,46 @@ mod tests {
                 "/out/r.bqrs"
             ]
         );
+        assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+    }
+
+    #[test]
+    fn a_run_refers_to_its_database_by_path_else_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("app");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::create_dir_all(tmp.path().join("x")).unwrap();
+        let mut e = entry(RunStatus::Succeeded);
+        assert!(e.refers_to(&db, &["app"]), "an old entry goes by name");
+        assert!(!e.refers_to(&db, &["renamed"]));
+        assert!(
+            e.refers_to(&db, &["renamed", "app"]),
+            "or by a name the database had before a rename"
+        );
+        e.database_path = Some(tmp.path().join("x/../app"));
+        assert!(e.refers_to(&db, &["renamed"]), "a path survives a rename");
+        assert!(!e.refers_to(&tmp.path().join("other"), &["app"]));
+    }
+
+    /// #578: runs that only named their database get its path before a
+    /// rename, and runs that already have a path are left alone.
+    #[test]
+    fn legacy_runs_are_pinned_to_a_database_path() {
+        let mut history = History::default();
+        let mut pinned = entry(RunStatus::Succeeded);
+        pinned.database_path = Some(PathBuf::from("/dbs/elsewhere"));
+        history.entries = vec![entry(RunStatus::Succeeded), pinned.clone()];
+        let name = history.entries[0].database.clone();
+        assert!(history.adopt_legacy(&name, Path::new("/dbs/app")));
+        assert_eq!(
+            history.entries[0].database_path.as_deref(),
+            Some(Path::new("/dbs/app"))
+        );
+        assert_eq!(history.entries[1], pinned);
+        assert!(
+            !history.adopt_legacy(&name, Path::new("/dbs/app")),
+            "idempotent"
+        );
     }
 
     #[test]
@@ -570,6 +763,7 @@ mod tests {
         HistoryEntry {
             query: PathBuf::from("/w/sql.ql"),
             database: String::from("app"),
+            database_path: None,
             started: 1,
             seconds: 12,
             status,
@@ -713,5 +907,106 @@ mod tests {
         assert_eq!(h.entries.len(), History::CAP);
         assert!(h.entries.iter().all(|e| e.started != 1), "the oldest went");
         assert_eq!(h.entries[0].started, 1000);
+    }
+
+    #[test]
+    fn a_template_imports_each_languages_library() {
+        for (lang, module) in [
+            ("python", "python"),
+            ("cpp", "cpp"),
+            ("java", "java"),
+            ("kotlin", "java"),
+            ("javascript", "javascript"),
+            ("typescript", "javascript"),
+            ("csharp", "csharp"),
+            ("go", "go"),
+            ("ruby", "ruby"),
+            ("rust", "rust"),
+            ("swift", "swift"),
+            ("actions", "actions"),
+        ] {
+            let q = query_template(Some(lang), "Find SQL_injection");
+            assert!(q.starts_with("/**\n * @name Find SQL_injection\n"), "{q}");
+            assert!(q.contains(&format!("\nimport {module}\n")), "{lang}: {q}");
+            assert!(
+                q.contains(&format!(" * @id {module}/find-sql-injection\n")),
+                "{q}"
+            );
+            assert!(q.contains(" * @problem.severity warning\n"), "{q}");
+            assert!(q.contains("\nfrom File f\nselect f, "), "{q}");
+            assert_eq!(query_kind(&q).as_deref(), Some("problem"));
+            assert_eq!(output_for(&q), Output::Sarif);
+        }
+    }
+
+    #[test]
+    fn a_template_in_no_known_language_imports_nothing() {
+        for lang in [None, Some("cobol")] {
+            let q = query_template(lang, "hello");
+            assert!(!q.contains("import"), "{q}");
+            assert!(q.contains(" * @id hello\n"), "{q}");
+            assert!(q.ends_with("select \"Hello, world!\"\n"), "{q}");
+            assert_eq!(query_kind(&q), None);
+        }
+    }
+
+    #[test]
+    fn query_names_become_file_names_or_are_refused() {
+        assert_eq!(query_file_name(" sqli ").as_deref(), Ok("sqli.ql"));
+        assert_eq!(query_file_name("sqli.ql").as_deref(), Ok("sqli.ql"));
+        assert_eq!(query_file_name("a.b").as_deref(), Ok("a.b.ql"));
+        for bad in ["", "  ", ".ql", "a/b", "..\\x", "..", "."] {
+            assert!(query_file_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn scaffolding_writes_the_query_and_never_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "pack/qlpack.yml",
+            "name: acme/py\nextractor: python\n",
+        );
+        let dir = root.join("pack/sub");
+        let path = scaffold_query(root, &dir, "sqli.ql", Some("python")).unwrap();
+        assert_eq!(path, dir.join("sqli.ql"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, query_template(Some("python"), "sqli"));
+        assert!(
+            !dir.join("qlpack.yml").exists(),
+            "the pack above already covers it"
+        );
+        std::fs::write(&path, "mine").unwrap();
+        let e = scaffold_query(root, &dir, "sqli", Some("python")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        let e = scaffold_query(root, &dir, "a/b", Some("python")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(scaffold_query(root, &dir, " ", None).is_err());
+    }
+
+    #[test]
+    fn scaffolding_adds_a_pack_file_only_when_one_is_needed_and_possible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("My App");
+        scaffold_query(&root, &root, "loose", None).unwrap();
+        assert!(!root.join("qlpack.yml").exists(), "no language, no pack");
+        let path = scaffold_query(&root, &root, "hello", Some("go")).unwrap();
+        let pack = std::fs::read_to_string(root.join("qlpack.yml")).unwrap();
+        assert_eq!(
+            pack,
+            "name: my-app/queries\nversion: 0.0.1\ndependencies:\n  codeql/go-all: \"*\"\n"
+        );
+        assert_eq!(pack_language(&pack).as_deref(), Some("go"));
+        let packs = discover(&root);
+        assert_eq!(packs[0].name, "my-app/queries");
+        assert!(packs[0].queries.contains(&path));
+        // A pack file above the workspace root does not count.
+        write(tmp.path(), "outer/codeql-pack.yml", "name: x/y\n");
+        let inner = tmp.path().join("outer/ws");
+        scaffold_query(&inner, &inner, "q", Some("ruby")).unwrap();
+        assert!(inner.join("qlpack.yml").is_file());
     }
 }
