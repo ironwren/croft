@@ -1558,6 +1558,66 @@ pub fn branch_history_range(root: &Path, revspec: &str, limit: usize) -> Vec<Gra
     parse_commit_graph(&String::from_utf8_lossy(&output.stdout), now)
 }
 
+/// Commit `rev`'s tree under a workspace root, as [`tree_paths`] lists it
+/// for the Explorer's dimming while the scrubber sits on a commit (#371).
+#[derive(Debug, Default)]
+pub struct CommitTree {
+    /// Every path in the tree, absolute, directories included.
+    pub paths: HashSet<PathBuf>,
+    /// Submodule (gitlink) paths. `ls-tree` never lists their contents, so
+    /// anything beneath one counts as present rather than dimming a whole
+    /// submodule checkout.
+    pub submodules: Vec<PathBuf>,
+}
+
+impl CommitTree {
+    /// Whether `path` existed in the commit: listed, or inside a submodule.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path) || self.submodules.iter().any(|s| path.starts_with(s))
+    }
+}
+
+/// Every path in commit `rev`'s tree under `root`, absolute (`root`
+/// joined), directories included — what the Explorer dims against while
+/// the scrubber sits on a commit (#371).
+///
+/// `ls-tree` run with `-C root` and no `--full-tree` lists only the
+/// entries under `root` and prints them relative to it, the same base
+/// [`read_file_at_rev`]'s `./` gives, so a workspace opened in a
+/// subdirectory of a repo joins onto its own root rather than the
+/// toplevel. `-t` emits each directory on the way down, so a folder that
+/// existed keeps its normal colour without deriving ancestors here.
+///
+/// `None` on any failure (no repo, unknown revision), so a caller dims
+/// nothing rather than everything.
+pub fn tree_paths(root: &Path, rev: &str) -> Option<CommitTree> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-tree", "-r", "-t", "-z", rev])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut tree = CommitTree::default();
+    // Each entry is `<mode> <type> <object>\t<path>`.
+    for entry in output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let path = join_raw(root, &entry[tab + 1..]);
+        if entry[..tab].split(|b| *b == b' ').nth(1) == Some(b"commit") {
+            tree.submodules.push(path.clone());
+        }
+        tree.paths.insert(path);
+    }
+    Some(tree)
+}
+
 /// Parse the `%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct` lines emitted by
 /// [`commit_graph`], computing each commit's age relative to `now`.
 pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
@@ -3705,6 +3765,61 @@ mod tests {
             graph.iter().any(|c| c.summary == "sibling-future"),
             "control: commit_graph should see every branch"
         );
+    }
+
+    /// #371: a file added in HEAD is absent from HEAD~1's tree and present
+    /// in HEAD's — the positive control, so an absence is about the commit
+    /// rather than about the listing being empty. Directories are listed,
+    /// and a workspace in a repo subdirectory gets paths joined onto itself.
+    #[test]
+    fn tree_paths_lists_a_commits_files_and_folders_under_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+        };
+        std::fs::create_dir_all(p.join("sub/deep")).unwrap();
+        std::fs::write(p.join("sub/deep/new.txt"), "n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add new"]);
+
+        let before = tree_paths(p, "HEAD~1").expect("HEAD~1 lists");
+        assert!(before.contains(&p.join("seed.txt")));
+        assert!(!before.contains(&p.join("sub/deep/new.txt")));
+        assert!(!before.contains(&p.join("sub")));
+
+        let head = tree_paths(p, "HEAD").expect("HEAD lists");
+        assert!(head.contains(&p.join("sub/deep/new.txt")));
+        assert!(head.contains(&p.join("sub")), "folders are listed too");
+        assert!(head.contains(&p.join("sub/deep")));
+
+        // Opened in a subdirectory: only its entries, joined onto it.
+        let sub = p.join("sub");
+        let nested = tree_paths(&sub, "HEAD").expect("subdir lists");
+        assert!(nested.contains(&sub.join("deep/new.txt")));
+        assert!(!nested.paths.iter().any(|q| q.ends_with("seed.txt")));
+
+        assert!(tree_paths(p, "no-such-rev").is_none());
+
+        // A submodule's contents are never listed, so they count as present.
+        let head_sha = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let cacheinfo = format!("160000,{},vendored", head_sha.trim());
+        git(&["update-index", "--add", "--cacheinfo", &cacheinfo]);
+        git(&["commit", "-q", "-m", "add submodule"]);
+        let with_sub = tree_paths(p, "HEAD").expect("HEAD lists");
+        assert_eq!(with_sub.submodules, vec![p.join("vendored")]);
+        assert!(with_sub.contains(&p.join("vendored/src/lib.rs")));
+        assert!(!with_sub.contains(&p.join("vendoredx")));
     }
 
     /// What plain `--porcelain` (no `--ignored`) reports, as the positive
