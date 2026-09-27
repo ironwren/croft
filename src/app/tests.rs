@@ -53886,6 +53886,37 @@ fn a_file_that_did_not_exist_yet_says_so() {
 }
 
 #[test]
+fn the_explorer_dims_files_missing_from_the_scrubbed_commit() {
+    // #371: at a commit, a file its tree lacks dims; the working tree and
+    // closing the scrubber clear it.
+    let repo = scrub_repo();
+    std::fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    let new = repo.path().join("new.txt");
+    let old = repo.path().join("a.txt");
+    app.scrub_history();
+    assert!(app.tree.scrub_tree.is_none(), "opening parks at the tree");
+    app.handle_scrubber_key(KeyCode::Left);
+    assert!(app.tree.is_absent_at_scrub(&new), "new.txt is not in HEAD");
+    assert!(!app.tree.is_absent_at_scrub(&old), "a.txt is");
+    app.handle_scrubber_key(KeyCode::Home);
+    assert!(
+        !app.tree.is_absent_at_scrub(&new),
+        "Home clears the dimming"
+    );
+    app.handle_scrubber_key(KeyCode::Left);
+    assert!(app.tree.is_absent_at_scrub(&new));
+    app.handle_scrubber_key(KeyCode::Right);
+    assert!(
+        !app.tree.is_absent_at_scrub(&new),
+        "stepping to the working tree clears it"
+    );
+    app.handle_scrubber_key(KeyCode::Left);
+    app.handle_scrubber_key(KeyCode::Esc);
+    assert!(app.tree.scrub_tree.is_none(), "closing clears it");
+}
+
+#[test]
 fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
     // #363: a DIFFERS row says what differs, line by line, not just that
     // something did; every row says how long the host took.
@@ -55028,6 +55059,62 @@ fn a_query_history_entry_reopens_its_results() {
             crate::widgets::codeql::Action::OpenHistory(0),
         ));
         assert_eq!(app.editor.path.as_deref(), Some(results.as_path()));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
+    // #578: the Queries section lists the workspace's queries by pack, and
+    // Enter on one runs it from disk on the current database, whatever the
+    // editor has open.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("pack")).unwrap();
+        std::fs::write(
+            tmp.path().join("pack/qlpack.yml"),
+            "name: acme/rust\nextractor: rust\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("pack/r.ql"),
+            "/** @kind problem */ select 1",
+        )
+        .unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        app.open_codeql_view();
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/rust", crate::codeql_query::NO_PACK]);
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(l, crate::widgets::codeql::Line::Action(
+                    crate::widgets::codeql::Action::RunQuery(0, 0),
+                    label,
+                ) if label.trim() == "r.ql")
+            })
+            .expect("the pack's query is listed");
+        app.codeql.selected = row;
+        app.focus = Pane::Tree;
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("Running r.ql on app"), "{}", app.status);
+        wait_for_codeql(&mut app);
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} r.ql \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.starts_with("database analyze ") && calls.contains("pack/r.ql"),
+            "the saved file's @kind picks SARIF: {calls}"
+        );
     });
 }
 

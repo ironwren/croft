@@ -80,6 +80,147 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// The queries in one CodeQL pack, as the side bar's Queries section groups
+/// them (#578).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPack {
+    /// The pack's `name:`, its folder's name when it has none, or
+    /// [`NO_PACK`] for queries outside any pack.
+    pub name: String,
+    /// The extractor id (`python`, `cpp`, …) the pack targets, when it says.
+    pub language: Option<String>,
+    /// The pack's folder; the workspace root for [`NO_PACK`]. Query rows are
+    /// shown relative to it.
+    pub dir: PathBuf,
+    /// Its `.ql` files, sorted.
+    pub queries: Vec<PathBuf>,
+}
+
+/// The group for queries with no `qlpack.yml` above them.
+pub const NO_PACK: &str = "(no pack)";
+
+/// Files [`discover`] looks at before it stops, so a huge tree cannot stall
+/// opening the side bar.
+pub const DISCOVER_CAP: usize = 50_000;
+
+fn is_pack_file(name: &std::ffi::OsStr) -> bool {
+    name == "qlpack.yml" || name == "codeql-pack.yml"
+}
+
+/// A pack file's top-level `name:`, unquoted. A line scan, not YAML: the
+/// key is a plain scalar in every pack file the CLI writes.
+pub fn pack_name(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let v = l.strip_prefix("name:")?.trim();
+        let v = v.trim_matches(|c| c == '"' || c == '\'');
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// The language a pack file targets: its `extractor:`, else the `<lang>`
+/// of a `codeql/<lang>-all` dependency.
+pub fn pack_language(text: &str) -> Option<String> {
+    let extractor = text.lines().find_map(|l| {
+        let v = l.strip_prefix("extractor:")?.trim();
+        let v = v.trim_matches(|c| c == '"' || c == '\'');
+        (!v.is_empty()).then(|| v.to_string())
+    });
+    extractor.or_else(|| {
+        text.lines().find_map(|l| {
+            let rest = &l[l.find("codeql/")? + "codeql/".len()..];
+            rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .next()?
+                .strip_suffix("-all")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+/// Every `.ql` under `root`, each grouped under its nearest ancestor pack
+/// file (#578). Ignored files and noise folders are skipped, as the file
+/// finder skips them. Packs sort by name then folder, with [`NO_PACK`] last.
+pub fn discover(root: &Path) -> Vec<QueryPack> {
+    use std::collections::BTreeMap;
+    let mut packs: BTreeMap<PathBuf, (String, Option<String>)> = BTreeMap::new();
+    let mut queries = Vec::new();
+    let mut seen = 0usize;
+    for entry in ignore::WalkBuilder::new(root)
+        .git_ignore(true)
+        .require_git(false)
+        .hidden(false)
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e.file_type().is_some_and(|t| t.is_dir())
+                || !crate::widgets::file_finder::is_noise_dir(e.file_name())
+        })
+        .build()
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        seen += 1;
+        if seen > DISCOVER_CAP {
+            break;
+        }
+        let path = entry.into_path();
+        if path.file_name().is_some_and(is_pack_file) {
+            let Some(dir) = path.parent() else { continue };
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let name = pack_name(&text).unwrap_or_else(|| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+            // Both files in one folder: the first read wins, as either names
+            // the same pack.
+            packs
+                .entry(dir.to_path_buf())
+                .or_insert((name, pack_language(&text)));
+        } else if path.extension().is_some_and(|e| e == "ql") {
+            queries.push(path);
+        }
+    }
+    let mut grouped: BTreeMap<Option<PathBuf>, Vec<PathBuf>> = BTreeMap::new();
+    for q in queries {
+        let pack = q
+            .ancestors()
+            .skip(1)
+            .take_while(|d| d.starts_with(root))
+            .find(|d| packs.contains_key(*d))
+            .map(Path::to_path_buf);
+        grouped.entry(pack).or_default().push(q);
+    }
+    let mut out: Vec<QueryPack> = grouped
+        .into_iter()
+        .map(|(dir, mut queries)| {
+            queries.sort();
+            match dir {
+                Some(dir) => {
+                    let (name, language) = packs[&dir].clone();
+                    QueryPack {
+                        name,
+                        language,
+                        dir,
+                        queries,
+                    }
+                }
+                None => QueryPack {
+                    name: NO_PACK.to_string(),
+                    language: None,
+                    dir: root.to_path_buf(),
+                    queries,
+                },
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (a.name == NO_PACK, &a.name, &a.dir).cmp(&(b.name == NO_PACK, &b.name, &b.dir))
+    });
+    out
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunStatus {
@@ -220,6 +361,80 @@ mod tests {
                 "/out/r.bqrs"
             ]
         );
+    }
+
+    #[test]
+    fn pack_files_give_a_name_and_a_language() {
+        let text = "name: \"acme/py-queries\"\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n";
+        assert_eq!(pack_name(text).as_deref(), Some("acme/py-queries"));
+        assert_eq!(pack_language(text).as_deref(), Some("python"));
+        let lib = "name: acme/lib\nextractor: cpp\nlibraryPathDependencies: codeql/go-all\n";
+        assert_eq!(pack_language(lib).as_deref(), Some("cpp"), "extractor wins");
+        // An indented `name:` belongs to something else.
+        assert_eq!(pack_name("deps:\n  name: x\n"), None);
+        assert_eq!(pack_language("name: x\n"), None);
+        assert_eq!(
+            pack_language("dependencies:\n  - codeql/javascript-queries\n"),
+            None,
+            "only the -all library names a language"
+        );
+    }
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn discover_groups_queries_under_their_nearest_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "outer/qlpack.yml", "name: acme/outer\nextractor: go\n");
+        write(r, "outer/a.ql", "select 1");
+        write(
+            r,
+            "outer/inner/codeql-pack.yml",
+            "name: acme/inner\ndependencies:\n  codeql/rust-all: '*'\n",
+        );
+        write(r, "outer/inner/deep/b.ql", "select 1");
+        write(r, "unnamed/qlpack.yml", "version: 1.0.0\n");
+        write(r, "unnamed/c.ql", "select 1");
+        write(r, "loose.ql", "select 1");
+        write(r, "scratch/d.ql", "select 1");
+        write(r, "lib.qll", "predicate p() { any() }");
+        // Noise folders are never searched.
+        write(r, "node_modules/pkg/e.ql", "select 1");
+        write(r, "target/f.ql", "select 1");
+        let packs = discover(r);
+        let summary: Vec<(&str, Option<&str>, Vec<String>)> = packs
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.language.as_deref(),
+                    p.queries
+                        .iter()
+                        .map(|q| q.strip_prefix(&p.dir).unwrap().display().to_string())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("acme/inner", Some("rust"), vec![String::from("deep/b.ql")]),
+                ("acme/outer", Some("go"), vec![String::from("a.ql")]),
+                ("unnamed", None, vec![String::from("c.ql")]),
+                (
+                    NO_PACK,
+                    None,
+                    vec![String::from("loose.ql"), String::from("scratch/d.ql")]
+                ),
+            ]
+        );
+        assert_eq!(packs[3].dir, r);
+        assert!(discover(&r.join("missing")).is_empty());
     }
 
     fn entry(status: RunStatus) -> HistoryEntry {
