@@ -77,6 +77,51 @@ fn with_ref(mut url: String, git_ref: Option<&str>) -> String {
     url
 }
 
+/// Whether croft loads GitHub code scanning results by itself (#577): the
+/// `code_scanning` setting. `On` loads the current branch's analyses, and
+/// again whenever the branch changes; `Prompt` says they are there and
+/// waits for "SARIF: Load Code Scanning Results"; `Off` (the default) never
+/// calls GitHub unasked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeScanningMode {
+    #[default]
+    Off,
+    On,
+    Prompt,
+}
+
+/// The analyses to load for a checkout (#577): those at the nearest
+/// scanned commit, walking `history` (the local first-parent history, HEAD
+/// first), newest per tool and category. When none of the history was
+/// scanned, the newest analysis per tool and category instead.
+pub fn nearest_per_tool(analyses: &[Analysis], history: &[String]) -> Vec<Analysis> {
+    let usable: Vec<&Analysis> = analyses.iter().filter(|a| a.error.is_empty()).collect();
+    let at_nearest: Vec<&Analysis> = history
+        .iter()
+        .map(|sha| {
+            usable
+                .iter()
+                .copied()
+                .filter(|a| &a.commit_sha == sha)
+                .collect::<Vec<_>>()
+        })
+        .find(|found| !found.is_empty())
+        .unwrap_or(usable);
+    let mut newest: std::collections::BTreeMap<(String, String), &Analysis> =
+        std::collections::BTreeMap::new();
+    for a in at_nearest {
+        let key = (a.tool.clone(), a.category.clone());
+        match newest.get(&key) {
+            Some(b) if b.created_at >= a.created_at => {}
+            _ => {
+                newest.insert(key, a);
+            }
+        }
+    }
+    newest.into_values().cloned().collect()
+}
+
 /// `gh` arguments listing the most recent analyses, optionally for one ref.
 /// One page only: the newest analyses are the ones worth opening.
 pub fn analyses_args(git_ref: Option<&str>) -> Vec<String> {
@@ -248,6 +293,57 @@ pub fn dismiss_args(number: u64, reason: DismissReason, comment: &str) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn analysis(id: u64, sha: &str, tool: &str, created: &str) -> Analysis {
+        Analysis {
+            id,
+            git_ref: String::from("refs/heads/main"),
+            commit_sha: sha.into(),
+            tool: tool.into(),
+            category: String::new(),
+            created_at: created.into(),
+            results_count: 0,
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_nearest_scanned_commit_gives_one_analysis_per_tool() {
+        let list = vec![
+            analysis(1, "c3", "CodeQL", "2026-09-03"),
+            analysis(2, "c2", "CodeQL", "2026-09-02"),
+            analysis(3, "c2", "Semgrep", "2026-09-02"),
+            analysis(4, "c2", "CodeQL", "2026-09-02T10"),
+        ];
+        // HEAD (c9) was never scanned; its parent c2 was, twice by CodeQL.
+        let history: Vec<String> = ["c9", "c2", "c3"].map(String::from).to_vec();
+        let ids: Vec<u64> = nearest_per_tool(&list, &history)
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, [4, 3], "newest CodeQL at c2, and Semgrep");
+        // Nothing in the history scanned: the newest per tool anywhere.
+        let ids: Vec<u64> = nearest_per_tool(&list, &[String::from("zz")])
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, [1, 3]);
+        // A failed analysis is never chosen.
+        let mut failed = analysis(5, "c9", "CodeQL", "2026-09-09");
+        failed.error = String::from("boom");
+        let mut with_failed = list.clone();
+        with_failed.push(failed);
+        assert!(
+            nearest_per_tool(&with_failed, &history)
+                .iter()
+                .all(|a| a.id != 5)
+        );
+        assert_eq!(
+            serde_json::from_str::<CodeScanningMode>("\"prompt\"").unwrap(),
+            CodeScanningMode::Prompt
+        );
+        assert_eq!(CodeScanningMode::default(), CodeScanningMode::Off);
+    }
 
     const ANALYSES: &str = r#"[
       {"id":201,"ref":"refs/heads/main","commit_sha":"abc123","analysis_key":".github/workflows/codeql.yml:analyze",

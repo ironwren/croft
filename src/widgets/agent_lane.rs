@@ -50,6 +50,8 @@ pub enum LaneRow {
 pub struct AgentLanePanel {
     pub collapsed: bool,
     rows: Vec<LaneRow>,
+    /// Agents whose files are folded away under their row (#345).
+    collapsed_agents: std::collections::BTreeSet<String>,
     scroll: usize,
     pub theme: Theme,
     pub focused: bool,
@@ -70,6 +72,7 @@ impl AgentLanePanel {
         Self {
             collapsed: true,
             rows: Vec::new(),
+            collapsed_agents: std::collections::BTreeSet::new(),
             scroll: 0,
             theme: Theme::default(),
             focused: false,
@@ -87,11 +90,30 @@ impl AgentLanePanel {
     /// Replace the rows (the ledger changed), keeping the scroll in range.
     pub fn set_rows(&mut self, rows: Vec<LaneRow>) {
         self.rows = rows;
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.shown().len().saturating_sub(1));
     }
 
     pub fn rows(&self) -> &[LaneRow] {
         &self.rows
+    }
+
+    /// Fold `agent`'s files away under its row, or unfold them.
+    pub fn toggle_agent(&mut self, agent: &str) {
+        if !self.collapsed_agents.remove(agent) {
+            self.collapsed_agents.insert(agent.to_string());
+        }
+        self.scroll = self.scroll.min(self.shown().len().saturating_sub(1));
+    }
+
+    /// The rows on show: every agent, and the files of the unfolded ones.
+    fn shown(&self) -> Vec<&LaneRow> {
+        self.rows
+            .iter()
+            .filter(|r| match r {
+                LaneRow::Agent { .. } => true,
+                LaneRow::File { agent, .. } => !self.collapsed_agents.contains(agent),
+            })
+            .collect()
     }
 
     pub fn toggle_collapse(&mut self) {
@@ -99,7 +121,7 @@ impl AgentLanePanel {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = (self.scroll + n).min(self.rows.len().saturating_sub(1));
+        self.scroll = (self.scroll + n).min(self.shown().len().saturating_sub(1));
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -117,7 +139,7 @@ impl AgentLanePanel {
         if self.collapsed {
             return floor.min(available);
         }
-        let content = (self.rows.len() as u16).max(1);
+        let content = (self.shown().len() as u16).max(1);
         let half = (available / 2).max(floor);
         (1 + content + BORDER).min(half)
     }
@@ -151,7 +173,7 @@ impl AgentLanePanel {
         if offset >= self.visible_rows as usize {
             return None;
         }
-        self.rows.get(self.scroll + offset)
+        self.shown().get(self.scroll + offset).copied()
     }
 }
 
@@ -244,10 +266,9 @@ impl Widget for &mut AgentLanePanel {
             );
             return;
         }
-        self.scroll = self
-            .scroll
-            .min(self.rows.len().saturating_sub(body_h as usize));
-        let shown = (body_h as usize).min(self.rows.len() - self.scroll);
+        let rows: Vec<LaneRow> = self.shown().into_iter().cloned().collect();
+        self.scroll = self.scroll.min(rows.len().saturating_sub(body_h as usize));
+        let shown = (body_h as usize).min(rows.len() - self.scroll);
         self.visible_rows = shown as u16;
         for i in 0..shown {
             let y = body_y + i as u16;
@@ -262,10 +283,15 @@ impl Widget for &mut AgentLanePanel {
             {
                 buf.set_style(rect, Style::default().bg(bg));
             }
-            let line = match &self.rows[self.scroll + i] {
+            let line = match &rows[self.scroll + i] {
                 LaneRow::Agent { name, unreviewed } => {
+                    let fold = if self.collapsed_agents.contains(name) {
+                        crate::icons::CHEVRON_CLOSED
+                    } else {
+                        crate::icons::CHEVRON_OPEN
+                    };
                     let mut spans = vec![Span::styled(
-                        format!("\u{25c6} {name}"),
+                        format!("{fold} \u{25c6} {name}"),
                         Style::default()
                             .fg(self.theme.ui(COLOR_AGENT))
                             .add_modifier(Modifier::BOLD),
@@ -389,5 +415,52 @@ mod tests {
         p.toggle_collapse();
         assert_eq!(p.desired_height(40), 5, "header, three rows, border");
         assert_eq!(p.desired_height(6), 3, "capped at half the region");
+    }
+
+    #[test]
+    fn an_agents_row_folds_its_files_away_and_back() {
+        // #345: one agent folds; the other's rows stay put.
+        let mut p = AgentLanePanel::new();
+        p.collapsed = false;
+        let mut all = rows();
+        all.push(LaneRow::Agent {
+            name: "codex".into(),
+            unreviewed: 1,
+        });
+        all.push(LaneRow::File {
+            agent: "codex".into(),
+            path: PathBuf::from("/w/src/c.rs"),
+            label: "src/c.rs".into(),
+            unreviewed: true,
+            changes: None,
+        });
+        p.set_rows(all);
+        let area = Rect::new(0, 0, 40, 12);
+        let render = |p: &mut AgentLanePanel| {
+            let mut buf = Buffer::empty(area);
+            p.render(area, &mut buf);
+        };
+        render(&mut p);
+        let first = p.first_row_y;
+        assert_eq!(p.desired_height(40), 1 + 5 + 1);
+        p.toggle_agent("claude");
+        render(&mut p);
+        assert_eq!(
+            p.desired_height(40),
+            1 + 3 + 1,
+            "claude's two files folded away"
+        );
+        assert!(matches!(p.row_at(first), Some(LaneRow::Agent { name, .. }) if name == "claude"));
+        assert!(
+            matches!(p.row_at(first + 1), Some(LaneRow::Agent { name, .. }) if name == "codex")
+        );
+        assert!(
+            matches!(p.row_at(first + 2), Some(LaneRow::File { agent, .. }) if agent == "codex")
+        );
+        p.toggle_agent("claude");
+        render(&mut p);
+        assert!(
+            matches!(p.row_at(first + 1), Some(LaneRow::File { agent, .. }) if agent == "claude")
+        );
     }
 }
