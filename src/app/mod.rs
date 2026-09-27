@@ -16076,7 +16076,9 @@ impl App {
             self.status = format!("Could not open the proposal to edit: {e}");
             return;
         }
-        if let Err(e) = self.editor.open(&file) {
+        // A tab of its own: `open` on the strip's deref would load the
+        // scratch file INTO the current tab, over whatever it held.
+        if let Err(e) = self.editor.open_pinned(&file) {
             self.status = format!("Could not open the proposal to edit: {e}");
             return;
         }
