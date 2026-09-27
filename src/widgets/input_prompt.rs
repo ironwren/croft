@@ -81,6 +81,27 @@ pub enum InputPurpose {
         dir: PathBuf,
         language: Option<String>,
     },
+    /// The controller repository variant analysis runs from (#578):
+    /// `owner/repo` or its GitHub URL.
+    CodeqlControllerRepository,
+    /// A repository to add for variant analysis (#578), into the list
+    /// called `list` when there is one.
+    CodeqlAddVariantRepo {
+        list: Option<String>,
+    },
+    /// The name of a new variant analysis repository list (#578).
+    CodeqlAddVariantList,
+    /// A GitHub user or organisation to add for variant analysis (#578).
+    CodeqlAddVariantOwner,
+    /// A new name for the variant analysis list called `name` (#578).
+    CodeqlRenameVariantList {
+        name: String,
+    },
+    /// Confirm removing the variant analysis list called `name` (#578).
+    /// Submitting (Enter) removes it; Esc keeps it. The value is a sentinel.
+    CodeqlRemoveVariantList {
+        name: String,
+    },
     /// Where a SARIF result's file lives on this machine (#577): the value
     /// is a path; `uri` is the location the log named.
     SarifLocate {
