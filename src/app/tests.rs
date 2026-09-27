@@ -53884,6 +53884,71 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// Wait for the OUTLINE to show the scrubbed commit's own symbols (#371),
+/// which the builder parses on its own thread with the finished view.
+fn settle_scrub_outline(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.drain_scrub_views();
+        app.sync_outline();
+        let commit = app
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .map(|c| c.hash.clone());
+        if commit.is_some() && app.outline_scrub_key.as_ref().map(|(_, c)| c.clone()) == commit {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubbed commit's outline was never built"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait for the history scrubber's finished view of where it stands to
+/// replace the plain stand-in (#371); the builder runs on its own thread.
+fn settle_scrub_view(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !matches!(app.scrub_view_key, Some((_, true))) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubber's view was never built"
+        );
+        app.drain_scrub_views();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stepping_back_to_a_finished_scrub_view_reuses_it() {
+    // #371: a step never waits on highlighting, and a commit whose view was
+    // already built shows it at once rather than building it again.
+    let repo = scrub_repo();
+    let mut app = App::new(repo.path().to_path_buf()).unwrap();
+    app.editor.open(&repo.path().join("a.txt")).unwrap();
+    app.scrub_history();
+    assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
+    assert!(app.handle_scrubber_key(KeyCode::Right), "back to HEAD");
+    assert!(
+        matches!(app.scrub_view_key, Some((_, true))),
+        "HEAD's finished view was kept"
+    );
+    assert_eq!(
+        app.scrub_view.as_ref().unwrap().lines,
+        vec!["v1", "v2", "v3"]
+    );
+    // Home drops the view; Esc drops the kept ones with the builder.
+    assert!(app.handle_scrubber_key(KeyCode::Home));
+    assert!(app.scrub_view.is_none() && app.scrub_view_key.is_none());
+    assert!(app.handle_scrubber_key(KeyCode::Esc));
+    assert!(app.scrub_views.is_empty() && app.scrub_builder.is_none());
+}
+
 #[test]
 fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     // #371: at each position the editor shows the file at that commit, and
@@ -53893,6 +53958,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     app.editor.open(&repo.path().join("a.txt")).unwrap();
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
     assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
     assert_eq!(
@@ -53901,6 +53967,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     );
     assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
     assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1", "v2"]);
     assert_eq!(
@@ -53908,6 +53975,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         Some(crate::widgets::editor::GitMark::Added)
     );
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
+    settle_scrub_view(&mut app);
     let view = app.scrub_view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1"]);
     assert_eq!(
@@ -58382,7 +58450,7 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "HEAD");
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
-    app.sync_outline();
+    settle_scrub_outline(&mut app);
     assert_eq!(names(&app), ["alpha"], "the commit's outline");
 
     // A jump to `alpha` lands in the historical view, where it is line 0,
@@ -58567,6 +58635,140 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
         assert!(text.contains(section), "{text}");
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+}
+
+#[test]
+fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
+    // #347: `e` opens the proposal as a scratch file with the popup put
+    // away; closing it unsaved brings the popup back; saving it approves
+    // with input that makes the agent's own tool write the edited text.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "let x = 1;\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let input = serde_json::json!({"file_path": target, "old_string": "1", "new_string": "2"});
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Edit".into(),
+            input,
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // A tab with unsaved work, which opening the proposal must not
+        // replace.
+        let other = tmp.path().join("b.rs");
+        std::fs::write(&other, "fn b() {}\n").unwrap();
+        app.editor.open_pinned(&other).unwrap();
+        app.editor.lines[0] = String::from("fn b() { unsaved }");
+        app.editor.dirty = true;
+        app.drain_hook_requests();
+        let arm = |app: &mut App| {
+            app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        };
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.approval_ui.is_none(), "the popup is put away");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        assert_eq!(app.editor.lines[0], "let x = 2;", "the proposal's text");
+        app.drain_hook_requests();
+        assert!(app.approval_ui.is_none(), "and stays away while editing");
+
+        // Closed unsaved: back to the popup, nothing answered.
+        app.editor.close_active();
+        app.drain_hook_requests();
+        assert!(app.approval_edit.is_none() && app.approval_ui.is_some());
+        assert_eq!(app.approvals.len(), 1);
+
+        arm(&mut app);
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .unwrap();
+        app.editor.lines[0] = String::from("let x = 3;");
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("as you changed it"), "{}", app.status);
+        assert!(app.approvals.is_empty() && app.approval_edit.is_none());
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p);
+        let replay =
+            crate::agent_approval::proposal_for("Edit", &input, tmp.path(), &read).unwrap();
+        assert_eq!(
+            replay.after, "let x = 3;\n",
+            "the agent's Edit writes what was saved"
+        );
+        app.editor.open_pinned(&other).unwrap();
+        assert!(app.editor.dirty, "the other tab kept its unsaved work");
+        assert_eq!(app.editor.lines[0], "fn b() { unsaved }");
+    });
+}
+
+/// #371's criterion, measured: after a warm-up pass, holding an arrow key
+/// back across up to 200 commits of this repository's own
+/// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
+/// frame it paints. Highlighting that file takes over half a second, so a
+/// step shows the plain text the builder already split and swaps the
+/// finished view in behind it. Needs this checkout's history, so it is
+/// ignored by default.
+#[test]
+#[ignore]
+fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/app/mod.rs")).unwrap();
+    app.scrub_history();
+    let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
+    assert!(steps > 20, "only {steps} commits to scrub");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // A held arrow key repeats about 30 times a second; between repeats the
+    // main loop takes in what the builder produced.
+    let repeat = std::time::Duration::from_millis(33);
+    // Warm-up, as the criterion allows: one pass reads every version.
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        app.handle_scrubber_key(KeyCode::Left);
+        app.sync_outline();
+    }
+    app.handle_scrubber_key(KeyCode::Home);
+    let mut times = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        std::thread::sleep(repeat);
+        app.drain_scrub_views();
+        let t = std::time::Instant::now();
+        app.handle_scrubber_key(KeyCode::Left);
+        // What the main loop runs between the key and the frame: the
+        // Outline follows the commit on screen.
+        app.sync_outline();
+        term.draw(|f| app.render(f)).unwrap();
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let p95 = times[times.len() * 95 / 100];
+    let max = *times.last().unwrap();
+    eprintln!("{steps} steps: p50 {p50:?} p95 {p95:?} max {max:?}");
+    assert!(p95 < std::time::Duration::from_millis(16), "p95 {p95:?}");
 }
 
 #[test]
