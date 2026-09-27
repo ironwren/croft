@@ -18844,6 +18844,35 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// A second click on the same forwarded loopback link reuses the tunnel
+/// instead of asking for another (each one was a new tunnel on a random port
+/// and a new browser tab, #648); a click while one is in flight asks nothing.
+#[test]
+fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
+    use crate::widgets::ports::PortOrigin;
+    let _guard = relay_test_lock().lock().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(workspace.path().to_path_buf()).unwrap();
+    let log = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        app.request_remote_forward(3000, true);
+        app.request_remote_forward(3000, true);
+        let first = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(first.matches("forward\t").count(), 1, "{first:?}");
+        // Once forwarded, a click opens the existing tunnel.
+        app.pending_remote_pulls.clear();
+        app.ports
+            .upsert(3000, None, None, PortOrigin::Remote("box".into()));
+        app.ports.mark_forwarded(3000, 3001);
+        app.request_remote_forward(3000, true);
+        log
+    });
+    let all = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(all.matches("forward\t").count(), 1, "{all:?}");
+    assert!(all.contains("http://127.0.0.1:3001/"), "{all:?}");
+}
+
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
     let _guard = relay_test_lock().lock().unwrap();

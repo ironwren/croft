@@ -36659,6 +36659,27 @@ impl App {
     /// Ask the local launcher (via the drop relay) to forward `port` home over
     /// the live SSH master, optionally opening the local browser once it's up.
     fn request_remote_forward(&mut self, port: u16, open: bool) {
+        // Forwarded already: reuse the tunnel. Asking again found the remote
+        // port held locally by croft's own first tunnel and fell back to a
+        // random one, so every click on the same link opened one more tunnel
+        // and one more browser tab at a new 127.0.0.1 address (#648).
+        if let Some(local) = self.ports.forwarded_local_port(port) {
+            if open {
+                self.request_remote_url_open(format!("http://127.0.0.1:{local}/"));
+                self.status = format!("Opening port {port} (forwarded to {local})");
+            } else {
+                self.status = format!("Port {port} is already forwarded to {local}");
+            }
+            return;
+        }
+        // And one request per port at a time: a second click before the
+        // first forward answered sent a duplicate.
+        if self.pending_remote_pulls.iter().any(
+            |p| matches!(p.kind, RemotePullKind::Forward { remote_port } if remote_port == port),
+        ) {
+            self.status = format!("Port {port} is already being forwarded");
+            return;
+        }
         let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Forward port: drop relay vanished");
             return;
