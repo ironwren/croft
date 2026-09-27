@@ -22461,7 +22461,10 @@ impl App {
 
     /// CodeQL view keys: arrows move between headers and actions, Enter or
     /// Space folds a section or runs an action, Esc returns to the Explorer.
+    /// On a database row, Delete removes it, F2 renames it and `e` shows its
+    /// folder in the Explorer; `s` anywhere steps the databases' sort order.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
+        let db = self.codeql.selected_database();
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
@@ -22471,6 +22474,22 @@ impl App {
                     self.activate_codeql(hit);
                 }
             }
+            KeyCode::Delete => {
+                if let Some(i) = db {
+                    self.confirm_remove_codeql_database(i);
+                }
+            }
+            KeyCode::F(2) => {
+                if let Some(i) = db {
+                    self.prompt_rename_codeql_database(i);
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(i) = db {
+                    self.reveal_codeql_database(i);
+                }
+            }
+            KeyCode::Char('s') => self.sort_codeql_databases(),
             _ => {}
         }
     }
@@ -22503,6 +22522,7 @@ impl App {
                 }
                 self.refresh_codeql_databases();
             }
+            Hit::Action(Action::SortDatabases) => self.sort_codeql_databases(),
             Hit::Action(
                 action @ (Action::AddDatabaseFromFolder
                 | Action::AddDatabaseFromArchive
@@ -22586,6 +22606,169 @@ impl App {
                 };
                 self.status = format!("{what} is not available yet (#578)");
             }
+        }
+    }
+
+    /// The store index of the current database, for the palette commands
+    /// that act on it; says what to do when there is none.
+    fn current_codeql_database(&mut self) -> Option<usize> {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let current = store.current.filter(|&i| i < store.databases.len());
+        if current.is_none() {
+            self.status = String::from("Select a CodeQL database first");
+        }
+        current
+    }
+
+    /// Ask before removing database `index` (#578), saying whether its
+    /// files go too: only a copy croft made in its own cache is deleted.
+    fn confirm_remove_codeql_database(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index) else {
+            return;
+        };
+        let what = if Self::codeql_cached_copy(&db.path).is_some() {
+            "Its downloaded files are deleted."
+        } else {
+            "Its folder stays on disk."
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRemoveDatabase {
+                    path: db.path.clone(),
+                },
+                format!("Remove CodeQL database '{}'?  {what}", db.name),
+                "Enter to remove · Esc to keep",
+            )
+            .with_value("remove"),
+        );
+    }
+
+    /// The folder to delete with the database at `path`: the entry under
+    /// croft's database cache that holds it (an extracted archive keeps the
+    /// database one level down). `None` for a database the user pointed at
+    /// elsewhere, which croft only forgets. Both sides are canonicalised so
+    /// a `..` in a hand-edited list cannot walk out of the cache.
+    fn codeql_cached_copy(path: &Path) -> Option<PathBuf> {
+        let cache = Self::codeql_db_cache_dir().canonicalize().ok()?;
+        let path = path.canonicalize().ok()?;
+        let first = path.strip_prefix(&cache).ok()?.components().next()?;
+        Some(cache.join(first))
+    }
+
+    /// Remove the database at `path` from the list, deleting its files when
+    /// croft made them, and save.
+    fn perform_remove_codeql_database(&mut self, path: &Path) {
+        let store_path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
+        let Some(i) = store.position(path) else {
+            self.status = String::from("That CodeQL database is no longer listed");
+            return;
+        };
+        let name = store.databases[i].name.clone();
+        let cached = Self::codeql_cached_copy(path);
+        store.remove(i);
+        if let Err(e) = store.save(&store_path) {
+            self.status = format!("Could not save the CodeQL database list: {e}");
+            return;
+        }
+        self.status = match cached.map(std::fs::remove_dir_all) {
+            Some(Err(e)) => format!("Removed CodeQL database {name}, but not its files: {e}"),
+            _ => format!("Removed CodeQL database {name}"),
+        };
+        self.refresh_codeql_databases();
+        // Stay in the list: on the row that took its place, else the one
+        // above, never on the welcome text below it.
+        let n = self.codeql.databases.len();
+        if n > 0 {
+            self.codeql.select_database(i.min(n - 1));
+        }
+        if self.codeql.selected_hit().is_none() {
+            self.codeql.move_selection(false);
+        }
+    }
+
+    fn prompt_rename_codeql_database(&mut self, index: usize) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.databases.get(index) else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlRenameDatabase {
+                    path: db.path.clone(),
+                },
+                String::from("Rename CodeQL Database"),
+                "the name shown in the side bar",
+            )
+            .with_value(db.name.clone()),
+        );
+    }
+
+    fn submit_rename_codeql_database(&mut self, path: &Path, value: &str) {
+        let store_path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
+        let Some(i) = store.position(path) else {
+            self.status = String::from("That CodeQL database is no longer listed");
+            return;
+        };
+        if let Err(e) = store.rename(i, value) {
+            self.status = e;
+            return;
+        }
+        // Renaming can move it in a name-sorted list.
+        if let Some(by) = store.sort_by {
+            store.sort(by);
+        }
+        self.status = match store.save(&store_path) {
+            Ok(()) => format!("Renamed CodeQL database to {}", value.trim()),
+            Err(e) => format!("Could not save the CodeQL database list: {e}"),
+        };
+        self.refresh_codeql_databases();
+        if let Some(i) = store.position(path) {
+            self.codeql.select_database(i);
+        }
+    }
+
+    /// Step the databases to the next sort order (name, language, date
+    /// added), keeping the selection on the same database.
+    fn sort_codeql_databases(&mut self) {
+        let store_path = Self::codeql_db_store_path();
+        let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
+        let selected = self
+            .codeql
+            .selected_database()
+            .and_then(|i| store.databases.get(i))
+            .map(|d| d.path.clone());
+        let by = store
+            .sort_by
+            .map_or(crate::codeql_db::DbSort::Name, |b| b.next());
+        store.sort(by);
+        self.status = match store.save(&store_path) {
+            Ok(()) => format!("CodeQL databases sorted by {}", by.label()),
+            Err(e) => format!("Could not save the CodeQL database list: {e}"),
+        };
+        self.refresh_codeql_databases();
+        if let Some(i) = selected.and_then(|p| store.position(&p)) {
+            self.codeql.select_database(i);
+        }
+    }
+
+    /// Show database `index`'s folder in the Explorer (VS Code's "Show
+    /// Database Directory").
+    fn reveal_codeql_database(&mut self, index: usize) {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(path) = store.databases.get(index).map(|d| d.path.clone()) else {
+            return;
+        };
+        self.reveal_in_explorer(path.clone());
+        if !self.tree.nodes.iter().any(|n| n.path == path) {
+            self.status = format!(
+                "{} is outside the workspace; add its folder to the workspace to browse it",
+                path.display()
+            );
         }
     }
 
@@ -22762,6 +22945,7 @@ impl App {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         self.codeql.databases = store.databases;
         self.codeql.current_db = store.current;
+        self.codeql.db_sort = store.sort_by;
     }
 
     /// A path as typed: `~` expanded, relative to the workspace root.
@@ -26780,6 +26964,14 @@ impl App {
             InputPurpose::CodeqlDatabase { source } => {
                 self.close_input_prompt();
                 self.submit_codeql_database(source, &value);
+            }
+            InputPurpose::CodeqlRemoveDatabase { path } => {
+                self.close_input_prompt();
+                self.perform_remove_codeql_database(&path);
+            }
+            InputPurpose::CodeqlRenameDatabase { path } => {
+                self.close_input_prompt();
+                self.submit_rename_codeql_database(&path, &value);
             }
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
@@ -41740,6 +41932,22 @@ impl App {
             Cmd::CompareExtensionsWithVscode => self.compare_extensions_with_vscode(),
             Cmd::ShowTesting => self.open_testing_view(),
             Cmd::CodeqlRunQuery => self.run_codeql_query(),
+            Cmd::CodeqlRemoveDatabase => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.confirm_remove_codeql_database(i);
+                }
+            }
+            Cmd::CodeqlRenameDatabase => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.prompt_rename_codeql_database(i);
+                }
+            }
+            Cmd::CodeqlSortDatabases => self.sort_codeql_databases(),
+            Cmd::CodeqlRevealDatabase => {
+                if let Some(i) = self.current_codeql_database() {
+                    self.reveal_codeql_database(i);
+                }
+            }
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
