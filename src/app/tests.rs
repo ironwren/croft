@@ -60039,3 +60039,50 @@ fn a_save_of_an_ignored_file_does_not_rerun_watched_tests() {
         "a source save reruns"
     );
 }
+
+/// #263 against a real cargo-llvm-cov: "Run All Tests with Coverage" on a
+/// crate marks the lines its test ran green and a function no test calls
+/// red, with a percentage between. Needs `cargo llvm-cov` (and the
+/// `llvm-tools-preview` component it drives).
+#[test]
+#[ignore = "needs cargo-llvm-cov"]
+fn a_real_cargo_llvm_cov_run_marks_the_covered_file() {
+    use crate::testing::coverage::LineCov;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn unused() -> i32 {\n    0\n}\n\n\
+         #[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/lib.rs")).unwrap();
+    app.run_all_tests_with_coverage();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while app.editor.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let lens = app.editor.coverage.clone().unwrap();
+    assert_eq!(lens.lines.get(&1), Some(&LineCov::Covered), "`a + b` ran");
+    assert_eq!(
+        lens.lines.get(&5),
+        Some(&LineCov::Uncovered),
+        "`unused`'s body never ran: {:?}",
+        lens.lines
+    );
+    assert!(
+        lens.percent.is_some_and(|p| p > 0.0 && p < 100.0),
+        "{:?}",
+        lens.percent
+    );
+}
