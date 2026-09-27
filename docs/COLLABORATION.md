@@ -96,6 +96,16 @@ In croft, each proposal opens a popup over everything else. The title reads
 unified diff against the file on disk. More than one proposal queues in
 arrival order, and the title counts the ones waiting (`· 2 pending`).
 
+When the file's language has a server, croft sends it the proposed text as
+the file's content while the popup is up, so problems the edit introduces show
+before you approve. A line above the diff says what the servers found (still
+checking, nothing, or how many errors and warnings with the first one), and a
+proposed row a problem names carries it at its end. Those diagnostics belong to
+the proposal: the editor and PROBLEMS keep the buffer's own. When the proposal
+is answered or leaves, the server gets the file back: an open tab's text is
+sent again, and a file no tab holds is closed. Edits to that tab meanwhile are
+sent once the check ends.
+
 | Key | Does |
 |---|---|
 | `Enter` | approve |
@@ -111,6 +121,15 @@ An edited approval goes back as Claude Code's `updatedInput`, in the shape the
 tool already takes. A `Write` carries your text as its content. An `Edit` becomes
 one replacement of the file's current text with yours. An `Edit` of an empty
 file cannot carry an edited version, so `e` refuses it.
+
+**When the file has unsaved edits in croft.** An agent's proposal is computed
+from the file on disk, so it knows nothing of your unsaved edits. Approving it
+as proposed would put the agent's write under them. For such a file the popup
+says so, and `Enter` or `e` opens a three-way merge instead: the disk text both
+started from, your edits as Current, and the agent's as Incoming. Changes
+only one side made are applied automatically. Saving approves the result once
+no conflict is left, and your tab takes the same text, one Undo away from your
+edits. Approve-all (`a`) never auto-approves such a file.
 If an edit can't be worked out against the file on disk (its text is missing,
 or ambiguous without `replace_all`), croft answers `ask` without showing the
 popup. A proposal still waiting when the hook's 120 s run out leaves the

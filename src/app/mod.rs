@@ -1596,6 +1596,15 @@ type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
 /// How often an open review tab with running checks re-reads them (#365).
 const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A code scanning lookup in flight (#577).
+struct CodeScanList {
+    branch: String,
+    /// Load what it finds (`on`, or the palette command), rather than only
+    /// saying it is there (`prompt`).
+    load: bool,
+    rx: std::sync::mpsc::Receiver<Result<Vec<crate::sarif::github::Analysis>, String>>,
+}
+
 /// Where a pull request checkout's worktree path and commit, or git's
 /// refusal, arrive (#365).
 type PrCheckoutRx = std::sync::mpsc::Receiver<Result<(PathBuf, crate::git::PrWorktree), String>>;
@@ -3265,6 +3274,16 @@ pub struct App {
     /// `fleet_groups` from prefs (#363): named host sets a fleet run can
     /// expand, so a fleet is named once rather than retyped per run.
     fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
+    /// The `code_scanning` setting (#577).
+    code_scanning: crate::sarif::github::CodeScanningMode,
+    /// The branch (or detached HEAD) code scanning last looked at, so a
+    /// checkout of another one is noticed.
+    code_scan_seen: Option<String>,
+    /// A code scanning lookup in flight: the branch it is for, whether to
+    /// load what it finds, and where the chosen analyses arrive.
+    code_scan_list: Option<CodeScanList>,
+    /// Chosen analyses fetching as SARIF: where their saved files arrive.
+    code_scan_fetch: Option<std::sync::mpsc::Receiver<Vec<Result<PathBuf, String>>>>,
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
     remote_offer_refused: crate::remote::RefusedHosts,
@@ -3333,10 +3352,16 @@ pub struct App {
     hook_root: PathBuf,
     approvals: std::collections::VecDeque<crate::agent_approval::Pending>,
     approval_ui: Option<crate::agent_approval::ApprovalUi>,
+    /// The language server's check of the proposal at the head of the
+    /// queue (#347): its diagnostics show in the popup before approval.
+    approval_check: Option<crate::agent_approval::ProposalCheck>,
     /// A proposal being edited before approval (#347): its token, and the
     /// scratch file whose save approves the edited text. The popup stays
     /// down while it lasts.
     approval_edit: Option<(String, PathBuf)>,
+    /// When that edit is a three-way merge with a dirty tab's unsaved
+    /// edits, the tab's file: once approved, the tab takes the merged text.
+    approval_merge_into: Option<PathBuf>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
@@ -3972,6 +3997,13 @@ pub struct App {
     /// and the review baselines that decide which of them still need a
     /// look.
     pub agent_ledger: crate::agent_lane::AgentLedger,
+    /// Where the ledger is saved per workspace (#345); `None` keeps it in
+    /// memory only (tests, unless one sets it).
+    agent_ledger_store: Option<PathBuf>,
+    /// The ledger generation last saved, and when.
+    agent_ledger_saved: (u64, std::time::Instant),
+    /// The (agent, file) behind each row of the lane-file picker.
+    pending_lane_picks: Vec<(String, PathBuf)>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -5381,6 +5413,10 @@ impl App {
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
             fleet_groups: loaded_prefs.fleet_groups.clone(),
+            code_scanning: loaded_prefs.code_scanning,
+            code_scan_seen: None,
+            code_scan_list: None,
+            code_scan_fetch: None,
             remote_offer_refused: crate::remote::load_refused_hosts(
                 &crate::remote::refused_hosts_path(&croft_cache_dir()),
                 std::time::SystemTime::now(),
@@ -5399,8 +5435,10 @@ impl App {
             hook_listener,
             hook_root: root.clone(),
             approvals: std::collections::VecDeque::new(),
+            approval_check: None,
             approval_ui: None,
             approval_edit: None,
+            approval_merge_into: None,
             notebook_kernels: std::collections::HashMap::new(),
             coverage_at: None,
             coverage_lens_path: None,
@@ -5754,6 +5792,9 @@ impl App {
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
+            agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
+            agent_ledger_saved: (0, std::time::Instant::now()),
+            pending_lane_picks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             pending_color_presentations: Vec::new(),
@@ -5815,6 +5856,10 @@ impl App {
         if let Some(lsp) = app.lsp.as_ref() {
             lsp.prewarm_workspace();
         }
+        // The agent review queue as this workspace last left it (#345).
+        let root = app.workspace_root().to_path_buf();
+        app.agent_ledger = app.load_agent_ledger(&root);
+        app.sync_agent_lane_decorations();
         Ok(app)
     }
 
@@ -7755,6 +7800,15 @@ impl App {
                 continue;
             }
             if !current.insert(path.clone()) {
+                continue;
+            }
+            // The server holds a proposal's text for this file while it is
+            // checked (#347); the buffer goes back when the check ends.
+            if self
+                .approval_check
+                .as_ref()
+                .is_some_and(|c| &c.path == path)
+            {
                 continue;
             }
             let seq = tab.edit_seq;
@@ -9833,12 +9887,30 @@ impl App {
                 updates.push(u);
             }
         }
+        self.apply_diagnostics_updates(updates)
+    }
+
+    /// Store a batch of servers' diagnostics and repaint what they touch:
+    /// the body of [`Self::drain_lsp_diagnostics`], apart from the drain.
+    fn apply_diagnostics_updates(
+        &mut self,
+        updates: Vec<crate::lsp::manager::DiagnosticsUpdate>,
+    ) -> bool {
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut changed = false;
         for u in updates {
+            // While a proposal is being checked (#347), what the servers say
+            // about its file is about the proposal, not the buffer.
+            if let Some(check) = self.approval_check.as_mut()
+                && check.path == u.path
+            {
+                check.by_server.insert(u.server, u.diagnostics);
+                changed = true;
+                continue;
+            }
             touched.insert(u.path.clone());
             store_diagnostics_update(&mut self.lsp_diagnostics, u);
         }
-        let mut changed = false;
         // The active editor re-decodes when its file was touched this tick OR
         // when it now shows a file whose stored diagnostics it hasn't applied
         // yet (a tab switch: diagnostics are pushed, never re-requested).
@@ -16005,6 +16077,70 @@ impl App {
         out
     }
 
+    /// Keep the language server's check in step with the proposal at the
+    /// head of the queue (#347): send a new head's text as its file's
+    /// content, and when a proposal leaves the head, give the file back:
+    /// an open buffer's text is resent, a file no tab has is closed.
+    pub fn sync_approval_check(&mut self) {
+        let head = self
+            .approvals
+            .front()
+            .map(|p| (p.arrived, p.proposal.path.clone(), p.proposal.after.clone()));
+        if let Some(check) = self.approval_check.as_ref()
+            && head.as_ref().map(|(arrived, ..)| *arrived) != Some(check.arrived)
+        {
+            self.end_approval_check();
+        }
+        let Some((arrived, path, after)) = head else {
+            return;
+        };
+        if self.approval_check.is_some() {
+            return;
+        }
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if crate::lsp::Language::from_extension(ext).is_none() {
+            return;
+        }
+        let opened = !self.lsp_last_seen.contains_key(&path);
+        if opened {
+            lsp.open_doc(path.clone(), after);
+        } else {
+            lsp.change_doc(path.clone(), after);
+        }
+        self.approval_check = Some(crate::agent_approval::ProposalCheck {
+            arrived,
+            started: std::time::Instant::now(),
+            path,
+            opened,
+            by_server: std::collections::HashMap::new(),
+        });
+    }
+
+    fn end_approval_check(&mut self) {
+        let Some(check) = self.approval_check.take() else {
+            return;
+        };
+        let tab_has_it = self
+            .editor
+            .iter_tabs()
+            .any(|t| t.path.as_deref() == Some(check.path.as_path()));
+        if tab_has_it && (!check.opened || !self.lsp_last_seen.contains_key(&check.path)) {
+            // A seq no tab has makes `sync_lsp` send the buffer's text next
+            // tick, over the proposal's. (A tab opened during a check of a
+            // file the check had opened needs the same: the server has it
+            // open already, with the proposal.)
+            self.lsp_last_seen.insert(check.path, u64::MAX);
+        } else if check.opened {
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.close_doc(check.path.clone());
+            }
+            self.lsp_last_seen.remove(&check.path);
+        }
+    }
+
     /// Take agent edit proposals off the hook socket and drop the ones
     /// whose hook has already given up, keeping the popup on the head of
     /// the queue.
@@ -16031,7 +16167,33 @@ impl App {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
             changed = true;
         }
+        self.refresh_approval_target_dirty();
         changed
+    }
+
+    /// The unsaved text of `path`'s tab, if croft has it open and dirty in
+    /// any editor group. An agent's proposal is computed from disk, so it
+    /// knows nothing of these edits (#347).
+    fn dirty_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canon(path);
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        groups
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.dirty && e.path.as_deref().is_some_and(|p| canon(p) == want))
+            .map(|e| e.lines.clone())
+    }
+
+    /// Keep the popup's dirty-target flag current: the tab may be saved or
+    /// edited while the proposal waits.
+    fn refresh_approval_target_dirty(&mut self) {
+        let dirty = self
+            .approvals
+            .front()
+            .is_some_and(|p| self.dirty_tab_lines(&p.proposal.path).is_some());
+        if let Some(ui) = self.approval_ui.as_mut() {
+            ui.target_dirty = dirty;
+        }
     }
 
     /// Tell the notification sinks about each proposal that arrived since
@@ -16074,8 +16236,16 @@ impl App {
         }
         let mut approved = Vec::new();
         let mut kept = std::collections::VecDeque::new();
-        for p in std::mem::take(&mut self.approvals) {
-            if p.request.agent == agent {
+        // A file with unsaved edits in croft is never approved unseen: the
+        // agent's edit would land under them. It waits for the popup, which
+        // offers the merge (#347).
+        let dirty: Vec<bool> = self
+            .approvals
+            .iter()
+            .map(|p| self.dirty_tab_lines(&p.proposal.path).is_some())
+            .collect();
+        for (p, dirty) in std::mem::take(&mut self.approvals).into_iter().zip(dirty) {
+            if p.request.agent == agent && !dirty {
                 approved.push(p.proposal.path.display().to_string());
                 p.answer(&crate::agent_hook::Decision::Allow);
             } else {
@@ -16116,6 +16286,13 @@ impl App {
             }
             return;
         };
+        // Approving over unsaved edits would have the agent's write land
+        // under them: merge instead, and approve what the merge saves.
+        if matches!(decision, crate::agent_hook::Decision::Allow) && ui.target_dirty {
+            ui.approve_all = false;
+            self.start_approval_edit();
+            return;
+        }
         let approve_all = ui.approve_all;
         if let Some(head) = self.approvals.pop_front() {
             if approve_all {
@@ -16172,6 +16349,17 @@ impl App {
             self.status = format!("Could not open the proposal to edit: {e}");
             return;
         }
+        let target = head.proposal.path.clone();
+        let base: Vec<String> = head
+            .proposal
+            .before
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let theirs: Vec<String> = head.proposal.after.lines().map(str::to_string).collect();
+        let yours = self.dirty_tab_lines(&target);
         // A tab of its own: `open` on the strip's deref would load the
         // scratch file INTO the current tab, over whatever it held.
         if let Err(e) = self.editor.open_pinned(&file) {
@@ -16180,9 +16368,33 @@ impl App {
         }
         self.approval_ui = None;
         self.approval_edit = Some((token, file));
+        self.approval_merge_into = None;
         self.focus_pane(Pane::Editor);
+        let Some(yours) = yours else {
+            self.status = format!(
+                "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+            );
+            return;
+        };
+        // Three-way: the disk text both started from, your unsaved edits
+        // as Current, the agent's proposal as Incoming. What is saved is
+        // what the agent writes, and your tab takes it too.
+        let (mut mv, result) = crate::merge_editor::MergeView::new(base, yours, theirs, false);
+        let end = self.editor.lines.len();
+        self.editor.splice_result_rows(0, end, result);
+        mv.synced_len = self.editor.lines.len();
+        mv.synced_seq = self.editor.edit_seq;
+        mv.anchor_panes_on(0);
+        let n = mv.conflicts.len();
+        if let Some(row) = mv.conflicts.first().map(|c| c.result_start) {
+            self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
+            self.editor.cursor_col = 0;
+        }
+        self.editor.merge = Some(mv);
+        self.approval_merge_into = Some(target);
         self.status = format!(
-            "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+            "Merging {agent}'s proposal with your unsaved edits ({n} conflict{}): save to approve the result, close the tab unsaved to go back",
+            if n == 1 { "" } else { "s" }
         );
     }
 
@@ -16228,6 +16440,20 @@ impl App {
             );
             return;
         };
+        let unresolved = self
+            .editor
+            .merge
+            .as_ref()
+            .filter(|_| self.editor.path.as_deref() == Some(file.as_path()))
+            .map_or(0, |mv| mv.unresolved_count());
+        if unresolved > 0 {
+            self.status = format!(
+                "{unresolved} conflict{} left: resolve {} and save again; nothing approved yet",
+                if unresolved == 1 { "" } else { "s" },
+                if unresolved == 1 { "it" } else { "them" }
+            );
+            return;
+        }
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
             Err(e) => {
@@ -16259,6 +16485,26 @@ impl App {
         }
         let _ = std::fs::remove_file(&file);
         self.status = format!("Approved {agent}'s edit as you changed it");
+        if let Some(target) = self.approval_merge_into.take() {
+            // Your tab takes the merged text, one Undo from your edits, so
+            // the agent's write lands on what the buffer already holds.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let want = canon(&target);
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            let mut groups = self.editor_layout.inactive_groups_mut();
+            groups.push(&mut self.editor);
+            for tab in groups
+                .into_iter()
+                .flat_map(|g| g.editors.iter_mut())
+                .filter(|e| e.path.as_deref().is_some_and(|p| canon(p) == want))
+            {
+                let end = tab.lines.len();
+                tab.splice_result_rows(0, end, lines.clone());
+            }
+            self.status = format!(
+                "Approved the merge of your edits and {agent}'s; your tab holds the same text"
+            );
+        }
         if !self.approvals.is_empty() {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(
                 std::time::Instant::now(),
@@ -16279,6 +16525,9 @@ impl App {
             ui,
             self.approvals.len(),
             self.workspace_root(),
+            self.approval_check
+                .as_ref()
+                .filter(|c| c.arrived == head.arrived),
         );
     }
 
@@ -22426,9 +22675,36 @@ impl App {
             .run_coverage_scoped(crate::testing::worker::CoverageScope {
                 name: run.clone(),
                 exact,
+                suite: false,
             });
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run} with coverage");
+    }
+
+    /// A Testing-tree row's coverage glyph (#263): that test, or that whole
+    /// suite, under the coverage tool, marked in the tree as a plain run of
+    /// it would be. The report replaces the last one.
+    fn run_scope_with_coverage(&mut self, name: String, suite: bool) {
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        if suite {
+            self.testing
+                .start_filter(&crate::testing::suite_pattern(&name));
+        } else {
+            self.testing.start_single(&name);
+        }
+        self.test_worker
+            .run_coverage_scoped(crate::testing::worker::CoverageScope {
+                name: name.clone(),
+                exact: !suite,
+                suite,
+            });
+        self.status = if suite {
+            format!("Running suite {name} with coverage")
+        } else {
+            format!("Running test {name} with coverage")
+        };
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
@@ -30601,6 +30877,11 @@ impl App {
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
+            ListPurpose::AgentLaneFile => {
+                if let Some((agent, path)) = self.pending_lane_picks.get(index).cloned() {
+                    self.diff_agent_lane_row(&agent, &path);
+                }
+            }
             ListPurpose::StashApply => {
                 let r = crate::git::stash_apply(&self.scm_root(), index);
                 self.run_scm_op("stash apply", r, "Applied stash");
@@ -34591,7 +34872,8 @@ impl App {
         self.build_marker_checked = Some(now);
         let building = crate::update_watch::source_build_running(
             &croft_cache_dir(),
-            crate::update_watch::boot_time(),
+            crate::update_watch::boot_id,
+            crate::update_watch::boot_time,
             process_is_alive,
         );
         self.apply_source_build_state(building)
@@ -34665,7 +34947,11 @@ impl App {
                 self.semantic_generation_seen.clear();
                 // A tab closed during the pause was never in `lsp_last_seen`
                 // again, so nothing would drop its diagnostics: drop what no
-                // open buffer owns, and let the new servers publish the rest.
+                // open buffer owns. That includes workspace-scope diagnostics
+                // for files never opened, which the old servers published
+                // unasked; the new servers publish those again as they index,
+                // and until then keeping them would show findings nothing can
+                // retract.
                 let open = self.open_buffer_paths();
                 self.lsp_diagnostics.retain(|p, _| open.contains(p));
                 self.rebuild_problems();
@@ -40479,6 +40765,46 @@ impl App {
             .map(|s| s.millis)
     }
 
+    /// Agents: Review a Changed File (#345): every lane's files in a picker,
+    /// labelled as the AGENT LANE section labels them; Enter opens the
+    /// chosen file's diff since review, as a click on its row does.
+    fn pick_agent_lane_file(&mut self) {
+        use crate::widgets::agent_lane::LaneRow;
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let mut rows = Vec::new();
+        self.pending_lane_picks.clear();
+        for row in self.agent_lane_panel_rows() {
+            if let LaneRow::File {
+                agent,
+                path,
+                label,
+                unreviewed,
+                changes,
+            } = row
+            {
+                let mark = if unreviewed { "\u{25cf}" } else { " " };
+                let counts = changes
+                    .filter(|&(a, r)| a + r > 0)
+                    .map(|(a, r)| format!("  +{a} \u{2212}{r}"))
+                    .unwrap_or_default();
+                rows.push(ListRow {
+                    id: self.pending_lane_picks.len().to_string(),
+                    label: format!("{mark} {label}  ({agent}){counts}"),
+                });
+                self.pending_lane_picks.push((agent, path));
+            }
+        }
+        if rows.is_empty() {
+            self.status = String::from("No agent has changed a file");
+            return;
+        }
+        self.list_picker = Some(ListPicker::new(
+            ListPurpose::AgentLaneFile,
+            String::from("Review a file an agent changed"),
+            rows,
+        ));
+    }
+
     /// Diff one agent-lane row against the snapshot that was its baseline
     /// when the user last marked it reviewed (#345), rather than against
     /// HEAD.
@@ -43358,6 +43684,10 @@ impl App {
             Cmd::SarifNextResult => self.step_sarif_result(true),
             Cmd::SarifPreviousResult => self.step_sarif_result(false),
             Cmd::SarifOpenCodeScanning => self.open_code_scanning_picker(),
+            Cmd::SarifLoadCodeScanning => match self.code_scan_branch() {
+                Some(branch) => self.start_code_scan_lookup(branch, true),
+                None => self.status = String::from("Code scanning: not in a git repository"),
+            },
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -43911,6 +44241,7 @@ impl App {
                 };
             }
             Cmd::OpenAgentLaneSection => self.show_agent_lane_section(),
+            Cmd::PickAgentLaneFile => self.pick_agent_lane_file(),
             Cmd::DiffAgentFileSinceReview => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
@@ -47544,6 +47875,12 @@ impl App {
                 if rect_contains(self.agent_lane_panel.last_area, m.column, m.row) {
                     if self.agent_lane_panel.hit_header(m.column, m.row) {
                         self.agent_lane_panel.toggle_collapse();
+                    } else if let Some(crate::widgets::agent_lane::LaneRow::Agent {
+                        name, ..
+                    }) = self.agent_lane_panel.row_at(m.row).cloned()
+                    {
+                        // An agent's row folds its files away, or back.
+                        self.agent_lane_panel.toggle_agent(&name);
                     } else if let Some(crate::widgets::agent_lane::LaneRow::File {
                         agent,
                         path,
@@ -48143,6 +48480,8 @@ impl App {
                         self.testing_scrollbar_drag = true;
                     } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
                         self.toggle_test_watch(crate::testing::watch::WatchScope::All);
+                    } else if rect_contains(self.testing.last_cover_all, m.column, m.row) {
+                        self.run_all_tests_with_coverage();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
@@ -48156,6 +48495,12 @@ impl App {
                             }
                             Some(crate::widgets::testing::RowHit::RunSuite(suite)) => {
                                 self.run_suite(suite)
+                            }
+                            Some(crate::widgets::testing::RowHit::CoverCase(name)) => {
+                                self.run_scope_with_coverage(name, false)
+                            }
+                            Some(crate::widgets::testing::RowHit::CoverSuite(suite)) => {
+                                self.run_scope_with_coverage(suite, true)
                             }
                             None => {}
                         }
@@ -51226,6 +51571,7 @@ impl App {
         // Live like every other pref here (#363): editing a group in
         // config.json takes effect on the next fleet run without a restart.
         self.fleet_groups = p.fleet_groups.clone();
+        self.code_scanning = p.code_scanning;
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),
@@ -51974,6 +52320,59 @@ impl App {
         }
     }
 
+    /// `root`'s saved agent review queue (#345), less files deleted while
+    /// croft was closed; an empty one when nothing is saved or there is no
+    /// store.
+    fn load_agent_ledger(&self, root: &Path) -> crate::agent_lane::AgentLedger {
+        let Some(store) = self.agent_ledger_store.as_ref() else {
+            return crate::agent_lane::AgentLedger::new();
+        };
+        let map: std::collections::HashMap<String, crate::agent_lane::AgentLedger> =
+            std::fs::read_to_string(store)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+        map.get(&agent_ledger_key(root))
+            .cloned()
+            .map(|l| l.restored(Path::exists))
+            .unwrap_or_default()
+    }
+
+    /// Save the agent review queue under this workspace's key when it has
+    /// changed since the last save: at most once a second from the frame
+    /// loop, or at once when `now` (leaving the workspace). An emptied
+    /// queue removes the key rather than keeping an empty entry.
+    fn persist_agent_ledger(&mut self, now: bool) {
+        let Some(store) = self.agent_ledger_store.clone() else {
+            return;
+        };
+        let generation = self.agent_ledger.generation();
+        let (saved, at) = self.agent_ledger_saved;
+        if generation == saved || (!now && at.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        let key = agent_ledger_key(self.workspace_root());
+        let ledger = self.agent_ledger.clone();
+        let result = crate::workspace::update_json_store::<crate::agent_lane::AgentLedger, _>(
+            &store,
+            |map| {
+                if ledger.is_empty() {
+                    map.remove(&key);
+                } else {
+                    map.insert(key.clone(), ledger.clone());
+                }
+            },
+        );
+        if let Err(e) = result {
+            crate::output::push(
+                "Agents",
+                crate::output::OutputLevel::Error,
+                &format!("Could not save the agent review queue: {e}"),
+            );
+        }
+        self.agent_ledger_saved = (generation, std::time::Instant::now());
+    }
+
     /// Re-root the workspace at `new_root`. Resets the file tree, updates
     /// `workspace_root`, refreshes git status and the source-control
     /// panel, and respawns the FS watcher off-thread (a recursive stat
@@ -51986,6 +52385,8 @@ impl App {
     /// Compare anchor / clipboard / marks are reset because they point
     /// into the old workspace.
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
+        // The review queue being left is saved under its own root first.
+        self.persist_agent_ledger(true);
         let display = new_root.display().to_string();
         // The remembered task belongs to the old workspace; Rerun Last Task
         // must rediscover, not rerun the old project's command here.
@@ -52025,8 +52426,9 @@ impl App {
         // into a child repo left rust-analyzer running `cargo metadata` against
         // the parent, which has no Cargo.toml, so every opened .rs came back as
         // an `unlinked-file` with no hover / completion / semantic tokens.
-        // Spawn a fresh manager rooted at new_root; assigning over the Option
-        // drops the old manager, whose Drop shuts its servers down. Clearing
+        // Spawn a fresh manager rooted at new_root. The old one's Drop shuts
+        // its servers down and waits up to 3 s for them, so it is dropped
+        // off the UI thread, as the build pause does (#737). Clearing
         // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
         // against the new servers; the stale diagnostics / progress from the
         // old root are dropped with it.
@@ -52035,6 +52437,9 @@ impl App {
         // starting them now would put rust-analyzer back beside the compile.
         // The manager drops either way, and the end of the build starts one
         // at the new root, since the resume reads `workspace_root()`.
+        if let Some(old) = self.lsp.take() {
+            fs_watch::offload_drop(old);
+        }
         self.lsp = match self.lsp_paused_for_build {
             true => None,
             false => match crate::lsp::LspManager::new(new_root.clone()) {
@@ -52080,8 +52485,9 @@ impl App {
         // The agent review queue belongs to the workspace that was left
         // (#345). `set_root` has just cleared the Explorer's copy; this
         // clears the ledger it is drawn from, so the two cannot come back
-        // apart the moment an agent writes under the new root.
-        self.agent_ledger = crate::agent_lane::AgentLedger::new();
+        // apart the moment an agent writes under the new root. The new
+        // root's own saved queue comes back in its place.
+        self.agent_ledger = self.load_agent_ledger(&new_root);
         self.fs_watch.rebind(&new_root, &self.tree);
         // A re-root collapses the workspace to one folder: the secondary
         // watchers go with their roots (#147).
@@ -55172,6 +55578,166 @@ impl App {
             ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
             "This repository has no code scanning analyses",
         );
+    }
+
+    /// The branch code scanning follows (#577): its name, or `HEAD <oid>`
+    /// when detached, from the git status the worker keeps current, which
+    /// reads refs through git itself (packed refs included).
+    fn code_scan_branch(&self) -> Option<String> {
+        let st = &self.source_control.status;
+        if !st.in_repo {
+            return None;
+        }
+        st.branch
+            .clone()
+            .or_else(|| st.detached_hash.as_ref().map(|h| format!("HEAD {h}")))
+    }
+
+    /// Look up `branch`'s code scanning analyses off the UI thread: its own
+    /// ref's (the repository's when detached or when it has none), narrowed
+    /// to the nearest scanned commit in the local history, one per tool.
+    fn start_code_scan_lookup(&mut self, branch: String, load: bool) {
+        use crate::sarif::github;
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let git_ref = (!branch.starts_with("HEAD ")).then(|| format!("refs/heads/{branch}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
+                let out = std::process::Command::new(&gh)
+                    .args(github::analyses_args(git_ref))
+                    .current_dir(&root)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .map_err(|e| format!("could not run gh: {e}"))?;
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            };
+            let result = (|| {
+                let mut analyses = match git_ref.as_deref() {
+                    Some(r) => github::parse_analyses(&gh_json(Some(r))?)?,
+                    None => Vec::new(),
+                };
+                if analyses.is_empty() {
+                    analyses = github::parse_analyses(&gh_json(None)?)?;
+                }
+                let history: Vec<String> = crate::git::branch_history(&root, 200)
+                    .into_iter()
+                    .map(|c| c.hash)
+                    .collect();
+                Ok(github::nearest_per_tool(&analyses, &history))
+            })();
+            let _ = tx.send(result);
+        });
+        self.code_scan_list = Some(CodeScanList { branch, load, rx });
+    }
+
+    /// Notice a checkout of another branch and act on the `code_scanning`
+    /// setting, then drain finished lookups and fetches. Returns true when
+    /// something on screen changed.
+    fn poll_code_scanning(&mut self) -> bool {
+        use crate::sarif::github::CodeScanningMode;
+        let mut changed = false;
+        if self.code_scanning != CodeScanningMode::Off
+            && self.code_scan_list.is_none()
+            && let Some(branch) = self.code_scan_branch()
+            && self.code_scan_seen.as_deref() != Some(branch.as_str())
+        {
+            self.code_scan_seen = Some(branch.clone());
+            self.start_code_scan_lookup(branch, self.code_scanning == CodeScanningMode::On);
+        }
+        if let Some(list) = self.code_scan_list.as_ref() {
+            let result = match list.rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(String::from("the lookup stopped without answering")))
+                }
+            };
+            if let Some(result) = result
+                && let Some(CodeScanList { branch, load, .. }) = self.code_scan_list.take()
+            {
+                changed = true;
+                let shown = branch.strip_prefix("HEAD ").map_or(branch.clone(), |h| {
+                    format!("detached HEAD {}", h.chars().take(8).collect::<String>())
+                });
+                match result {
+                    Ok(chosen) if chosen.is_empty() => {
+                        if load {
+                            self.status = format!("Code scanning: no analyses for {shown}");
+                        }
+                    }
+                    Ok(chosen) if load => self.fetch_code_scan_analyses(chosen, &shown),
+                    Ok(chosen) => {
+                        self.status = format!(
+                            "Code scanning has {} analys{} for {shown} (SARIF: Load Code Scanning Results for This Branch)",
+                            chosen.len(),
+                            if chosen.len() == 1 { "is" } else { "es" }
+                        );
+                    }
+                    Err(e) => self.status = format!("Code scanning: {e}"),
+                }
+            }
+        }
+        if let Some(rx) = self.code_scan_fetch.as_ref()
+            && let Ok(files) = rx.try_recv()
+        {
+            self.code_scan_fetch = None;
+            changed = true;
+            let mut opened = 0;
+            let mut errors = Vec::new();
+            for file in files {
+                match file.and_then(|p| self.editor.open(&p).map_err(|e| e.to_string())) {
+                    Ok(()) => opened += 1,
+                    Err(e) => errors.push(e),
+                }
+            }
+            self.sync_open_file_poll_mtime();
+            self.status = match errors.first() {
+                None => format!(
+                    "Loaded {opened} code scanning analys{}",
+                    if opened == 1 { "is" } else { "es" }
+                ),
+                Some(e) => format!("Loaded {opened} code scanning analyses; {e}"),
+            };
+        }
+        changed
+    }
+
+    /// Download `chosen` as SARIF into croft's cache off the UI thread, to
+    /// open when they arrive.
+    fn fetch_code_scan_analyses(
+        &mut self,
+        chosen: Vec<crate::sarif::github::Analysis>,
+        shown: &str,
+    ) {
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let dir = croft_cache_dir().join("code-scanning");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let files = chosen
+                .iter()
+                .map(|a| {
+                    let out = std::process::Command::new(&gh)
+                        .args(crate::sarif::github::sarif_args(a.id))
+                        .current_dir(&root)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .map_err(|e| format!("could not run gh: {e}"))?;
+                    if !out.status.success() {
+                        return Err(format!("analysis #{} could not be downloaded", a.id));
+                    }
+                    let path = dir.join(format!("analysis-{}.sarif", a.id));
+                    std::fs::create_dir_all(&dir)
+                        .and_then(|()| std::fs::write(&path, &out.stdout))
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    Ok(path)
+                })
+                .collect();
+            let _ = tx.send(files);
+        });
+        self.code_scan_fetch = Some(rx);
+        self.status = format!("Loading code scanning results for {shown}…");
     }
 
     /// Dismiss the selected result's code scanning alert (#577): the alert
@@ -60279,6 +60845,21 @@ fn sweep_staged_stdin(dir: &Path) {
 /// when the user next looks at the status bar.
 const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// The per-workspace agent review queues (#345), keyed by
+/// [`agent_ledger_key`].
+fn agent_ledger_store_path() -> PathBuf {
+    croft_cache_dir().join("agent_lane.json")
+}
+
+/// A workspace's key in the agent review store: its canonical root, so the
+/// save and the load agree however the root was spelled.
+fn agent_ledger_key(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// A CodeQL database upgrade in flight (#578): where its outcome arrives,
 /// and the database's name and folder.
 type CodeqlUpgrade = (
@@ -61733,7 +62314,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_pr_checkout();
+        let hook_changed = app.drain_hook_requests()
+            | app.poll_pr_gh()
+            | app.poll_pr_checkout()
+            | app.poll_code_scanning();
+        app.sync_approval_check();
+        app.persist_agent_ledger(false);
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();

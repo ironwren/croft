@@ -115,6 +115,9 @@ pub enum Command {
     SarifNextResult,
     SarifPreviousResult,
     SarifOpenCodeScanning,
+    /// SARIF: Load Code Scanning Results (#577): the current branch's
+    /// newest analyses per tool, at the nearest scanned commit.
+    SarifLoadCodeScanning,
     GoToSymbol,
     GoToWorkspaceSymbol,
     /// VS Code "Go Back" (Ctrl+-): return to the location before the last
@@ -306,6 +309,9 @@ pub enum Command {
     /// Diff the active file against the snapshot it was last reviewed
     /// against (#345).
     DiffAgentFileSinceReview,
+    /// Pick any file an agent changed and open its diff since review, from
+    /// the keyboard (#345).
+    PickAgentLaneFile,
     /// Mark the active file reviewed in every agent lane holding it (#345).
     MarkAgentFileReviewed,
     /// Have the navigator fix the diagnostic under the caret as a streamed,
@@ -429,6 +435,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SarifNextResult,
     Command::SarifPreviousResult,
     Command::SarifOpenCodeScanning,
+    Command::SarifLoadCodeScanning,
     Command::GoToSymbol,
     Command::GoToWorkspaceSymbol,
     Command::NavigateBack,
@@ -592,6 +599,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenAgentLaneSection,
     Command::MarkAgentFileReviewed,
     Command::DiffAgentFileSinceReview,
+    Command::PickAgentLaneFile,
     Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
@@ -700,6 +708,7 @@ impl Command {
             Command::SarifNextResult => "SARIF: Next Result",
             Command::SarifPreviousResult => "SARIF: Previous Result",
             Command::SarifOpenCodeScanning => "SARIF: Open GitHub Code Scanning Analysis",
+            Command::SarifLoadCodeScanning => "SARIF: Load Code Scanning Results for This Branch",
             Command::GoToSymbol => "Go to Symbol in Editor",
             Command::GoToWorkspaceSymbol => "Go to Symbol in Workspace",
             Command::NavigateBack => "Go Back",
@@ -869,6 +878,7 @@ impl Command {
             Command::OpenAgentLaneSection => "Agents: Open Agent Lane",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
             Command::DiffAgentFileSinceReview => "Agents: Diff This File Since Review",
+            Command::PickAgentLaneFile => "Agents: Review a Changed File…",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
@@ -978,6 +988,7 @@ impl Command {
             Command::SarifNextResult => "",
             Command::SarifPreviousResult => "",
             Command::SarifOpenCodeScanning => "",
+            Command::SarifLoadCodeScanning => "",
             Command::GoToSymbol => "Cmd+Shift+O",
             Command::GoToWorkspaceSymbol => "Cmd+P #",
             Command::NavigateBack => "Ctrl+-",
@@ -1147,6 +1158,7 @@ impl Command {
             Command::OpenAgentLaneSection => "",
             Command::MarkAgentFileReviewed => "",
             Command::DiffAgentFileSinceReview => "",
+            Command::PickAgentLaneFile => "",
             Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
@@ -1259,6 +1271,7 @@ impl Command {
             Command::SarifNextResult => "sarif_next_result",
             Command::SarifPreviousResult => "sarif_previous_result",
             Command::SarifOpenCodeScanning => "sarif_open_code_scanning",
+            Command::SarifLoadCodeScanning => "sarif_load_code_scanning",
             Command::GoToSymbol => "go_to_symbol",
             Command::GoToWorkspaceSymbol => "go_to_workspace_symbol",
             Command::NavigateBack => "navigate_back",
@@ -1419,6 +1432,7 @@ impl Command {
             Command::OpenAgentLaneSection => "agents_open_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
             Command::DiffAgentFileSinceReview => "agents_diff_since_review",
+            Command::PickAgentLaneFile => "agents_pick_changed_file",
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",
