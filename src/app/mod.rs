@@ -25113,6 +25113,12 @@ impl App {
                     .focused_name()
                     .unwrap_or("the session")
                     .to_string();
+                // The adapter refused to start the program (#264): its reason
+                // is the message, not "Debug session ended".
+                let launch_error = self
+                    .debug_sessions
+                    .focused()
+                    .and_then(|s| s.launch_error.clone());
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
                     gone.session.disconnect();
                 }
@@ -25136,9 +25142,20 @@ impl App {
                     REAPER_TEARDOWN_GRACE_MS,
                 ));
                 let had_breakpoints = !self.editor.breakpoints.is_empty();
-                self.run_debug.feedback =
-                    Some(debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string());
-                self.run_debug.feedback_is_error = false;
+                match launch_error {
+                    Some(reason) => {
+                        let msg = format!("Could not start debugging: {reason}");
+                        self.status = msg.clone();
+                        self.run_debug.feedback = Some(msg);
+                        self.run_debug.feedback_is_error = true;
+                    }
+                    None => {
+                        self.run_debug.feedback = Some(
+                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string(),
+                        );
+                        self.run_debug.feedback_is_error = false;
+                    }
+                }
                 // Keep `debug_console` so its output stays visible after the run;
                 // the panel renders it until the next session starts.
                 self.run_debug.session_ended = true;
