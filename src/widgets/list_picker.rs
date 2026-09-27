@@ -22,6 +22,9 @@ pub enum ListPurpose {
     /// Source Control: Review Pull Request (#365): the open PRs, `id` the
     /// PR's URL, or [`PR_BY_NUMBER`] for the typed-number prompt.
     ReviewPullRequest,
+    /// Agents: Review a Changed File (#345): the agent lanes' files, `id`
+    /// an index into the App's pending lane picks.
+    AgentLaneFile,
     StashApply,
     StashPop,
     StashDrop,
