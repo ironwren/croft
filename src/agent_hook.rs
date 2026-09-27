@@ -439,7 +439,7 @@ pub struct EditRequest {
 
 /// The croft listening for `cwd`: the socket of the nearest enclosing
 /// workspace that accepts a connection.
-fn connect_croft(cwd: &Path) -> Option<std::os::unix::net::UnixStream> {
+pub(crate) fn connect_croft(cwd: &Path) -> Option<std::os::unix::net::UnixStream> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     cwd.ancestors().find_map(|dir| {
         std::os::unix::net::UnixStream::connect(crate::session::hook_socket_path(dir)).ok()

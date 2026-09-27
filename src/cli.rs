@@ -461,7 +461,20 @@ pub enum CliCommand {
     },
     /// Open a `croft://attach?host=…&path=…&focus=…` link (#359): attach to
     /// the session it names. The host must be an alias in ~/.ssh/config.
+    /// A `croft://decide?…` link answers a pending agent edit instead.
     OpenLink { url: String },
+    /// Approve or deny an agent's pending edit by the one-time token its
+    /// notification carried (#359), without attaching to the session.
+    #[command(hide = true)]
+    Decide {
+        token: String,
+        #[arg(value_parser = ["allow", "deny"])]
+        decision: String,
+        /// The workspace whose croft holds the edit (default: the current
+        /// directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Make `croft://` links open croft: an xdg handler on Linux, Termux's
     /// URL opener on Android. On macOS the launcher (install-launcher)
     /// registers the scheme.
@@ -856,6 +869,30 @@ impl Cli {
                 }
                 Ok(())
             }
+            Some(CliCommand::Decide {
+                token,
+                decision,
+                path,
+            }) => {
+                let cwd = match path {
+                    Some(p) => p,
+                    None => std::env::current_dir()?,
+                };
+                let decision = crate::agent_approval::RemoteDecision {
+                    token,
+                    allow: decision == "allow",
+                };
+                match crate::agent_approval::send_decision(&cwd, &decision) {
+                    Ok(message) => {
+                        println!("{message}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Some(CliCommand::InstallLinkHandler) => install_link_handler(),
             Some(CliCommand::InstallLauncher { path, user, yes }) => {
                 install_launcher(path, user, yes)
@@ -894,12 +931,27 @@ fn open_link(url: &str) -> Result<()> {
             .collect();
         link.host = crate::deep_link::resolve_host(&host, &local_hostname(), &targets)?;
     }
+    let home = std::env::var("HOME").ok();
+    if let Some(args) = crate::deep_link::decide_argv(&link, home.as_deref()) {
+        // Answer where the edit waits, then report: nothing to attach to.
+        let status = match &link.host {
+            Some(alias) => std::process::Command::new("ssh")
+                .arg("--")
+                .arg(alias)
+                .arg(crate::deep_link::remote_shell_command(&args))
+                .status()?,
+            None => std::process::Command::new(std::env::current_exe()?)
+                .args(&args)
+                .status()?,
+        };
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        return Ok(());
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(crate::deep_link::argv(
-        &link,
-        std::env::var("HOME").ok().as_deref(),
-    ));
+    cmd.args(crate::deep_link::argv(&link, home.as_deref()));
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
