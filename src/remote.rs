@@ -3094,10 +3094,11 @@ fi
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
 # The subshell marks the build (and every rustc under it) as the kernel's
-# first choice when memory runs out, without touching this shell (#694).
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile's own pid.
 (
   echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
-  eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
 ) &
 CROFT_BUILD_PID=$!
 printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
@@ -4427,7 +4428,7 @@ Host !blocked *.internal
         before("CROFT_MARK=\"$HOME/.cache/croft/building.$$\"");
         before("trap '");
         assert!(
-            command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            command.contains(r#"eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
             "the memory cap must wrap the compile itself"
         );
         // Little memory FREE drops to one job too, not just a small total:
