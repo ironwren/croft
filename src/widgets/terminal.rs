@@ -4161,7 +4161,11 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
                 continue;
             }
             let ch = if cell.c == '\0' { ' ' } else { cell.c };
-            cells.push((ch, (cell.fg, cell.bg, cell.flags)));
+            // Only the flags an SGR carries: the soft-wrap mark on a row's
+            // last cell and a wide char's own flag are not styles, and keyed
+            // on them a run of one colour was reset and set again around them
+            // (a cast wrote `w\e[0m\e[33mr` at the wrap column, #356).
+            cells.push((ch, (cell.fg, cell.bg, cell.flags & SGR_FLAGS)));
         }
         let wraps_on = l < bottom && row_wraps(term, l);
         let plain: String = cells.iter().map(|(ch, _)| *ch).collect::<String>();
@@ -4635,6 +4639,19 @@ pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
     out.push(0x07);
     out
 }
+
+/// The cell flags [`cell_sgr`] writes as SGR: everything else a cell carries
+/// (wrap marks, wide-char spacers) is layout, not style.
+const SGR_FLAGS: Flags = Flags::BOLD
+    .union(Flags::DIM)
+    .union(Flags::ITALIC)
+    .union(Flags::UNDERLINE)
+    .union(Flags::DOUBLE_UNDERLINE)
+    .union(Flags::UNDERCURL)
+    .union(Flags::DOTTED_UNDERLINE)
+    .union(Flags::DASHED_UNDERLINE)
+    .union(Flags::INVERSE)
+    .union(Flags::STRIKEOUT);
 
 /// The SGR sequence that reproduces a cell's colours and attributes, or an
 /// empty string for a default cell (#257). Named and low-indexed colours go
