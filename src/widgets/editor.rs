@@ -2982,6 +2982,9 @@ pub struct Editor {
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
     pub archive: Option<crate::archive::ArchiveView>,
+    /// A pull request under review (#365): its files, checks and viewed
+    /// marks. Read-only; the tab has no file behind it.
+    pub pr_review: Option<crate::widgets::pr_review::PrReviewView>,
     /// Three-way merge editor (#253). UNLIKE the other view kinds this is
     /// not read-only and not in `has_non_text_view`: `lines` holds the
     /// editable Result and keeps the whole text path (LSP, undo, save);
@@ -3182,6 +3185,7 @@ impl Editor {
             hex: None,
             log: None,
             archive: None,
+            pr_review: None,
             merge: None,
             merge_edit_row: 0,
             force_text: false,
@@ -4776,6 +4780,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         // A real file supersedes any diff view this editor was showing —
         // without this a restore-then-reload keeps rendering the stale diff.
         self.diff = None;
@@ -4884,6 +4889,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -4938,6 +4944,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -5014,6 +5021,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -5131,6 +5139,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.markdown_preview = None;
         self.image = Some(ImageView {
             bytes: png,
@@ -5188,6 +5197,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -5266,6 +5276,7 @@ impl Editor {
         self.hex = None;
         self.log = None;
         self.archive = None;
+        self.pr_review = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -5281,6 +5292,7 @@ impl Editor {
             || self.image.is_some()
             || self.hex.is_some()
             || self.archive.is_some()
+            || self.pr_review.is_some()
             // A rendered log's text side is an empty stub, so a save would
             // write one blank line over the file — the #185 truncation class.
             || self.log.is_some()
@@ -5372,6 +5384,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
         self.hex = None;
         self.log = Some(view);
         self.status = format!("Opened {} as a rendered log", path.display());
@@ -5474,6 +5487,7 @@ impl Editor {
         self.sheet = None;
         self.markdown_preview = None;
         self.archive = None;
+        self.pr_review = None;
         // The render dispatch checks `log` BEFORE `hex`, so a stale log would
         // keep painting after "Reopen as Hex" reported success.
         self.log = None;
@@ -12676,6 +12690,10 @@ impl Widget for &mut Editor {
             render_archive(view, self.path.as_deref(), inner, buf, cbg, self.theme);
             return;
         }
+        if let Some(view) = self.pr_review.as_mut() {
+            crate::widgets::pr_review::render(view, inner, buf, cbg, self.theme);
+            return;
+        }
         if let Some(view) = self.log.as_mut() {
             let search = self
                 .search_highlight
@@ -15823,6 +15841,30 @@ impl EditorTabs {
         self.editors[self.active].focused = false;
         self.active = pos;
         Ok(())
+    }
+
+    /// Open a pull request for review in a fresh tab labelled `PR #n`
+    /// (#365), or re-select the tab already showing it.
+    pub fn open_pr_review(&mut self, view: crate::widgets::pr_review::PrReviewView) {
+        let label = PathBuf::from(format!("PR #{}", view.pr.number));
+        if let Some(idx) = self.find_tab_with_path(&label) {
+            self.editors[idx].pr_review = Some(view);
+            self.select(idx);
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.preview = false;
+        e.path = Some(label);
+        e.pr_review = Some(view);
+        if self.is_blank_initial() {
+            self.editors[self.active] = e;
+            return;
+        }
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
     }
 
     /// Open arbitrary text in a scratch tab labelled `label` (no file on
