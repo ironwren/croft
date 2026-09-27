@@ -3877,6 +3877,9 @@ pub struct App {
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
     scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
+    /// Each scrubbed commit's tree under the workspace root, for the
+    /// Explorer's dimming (#371); `None` records that the listing failed.
+    scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
     /// The running `croft demo` tour (#377), with its scratch project and
     /// the workspace to return to.
     pub tour: Option<TourRun>,
@@ -5663,6 +5666,7 @@ impl App {
             scrub_slider: Rect::default(),
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
+            scrub_trees: std::collections::HashMap::new(),
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
@@ -30691,6 +30695,7 @@ impl App {
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
         self.scrub_view = None;
+        self.tree.scrub_tree = None;
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -32131,6 +32136,7 @@ impl App {
                 // back and no path where unsaved edits could be lost.
                 self.scrubber = None;
                 self.scrub_view = None;
+                self.sync_scrub_tree();
                 self.status = String::from("Left the history scrubber");
                 return true;
             }
@@ -32182,6 +32188,7 @@ impl App {
     fn close_scrubber_for_tab(&mut self) {
         self.scrubber = None;
         self.scrub_view = None;
+        self.sync_scrub_tree();
         self.focus_pane(Pane::Editor);
     }
 
@@ -32321,11 +32328,30 @@ impl App {
         self.scrub_slider = track;
     }
 
+    /// Point the Explorer's dimming at the scrubber's commit (#371), or
+    /// clear it at the working tree and once the scrubber closes. The tree
+    /// listing is cached per commit like the file text, so stepping back
+    /// over a visited commit costs no git process.
+    fn sync_scrub_tree(&mut self) {
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()) else {
+            self.tree.scrub_tree = None;
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let present = self
+            .scrub_trees
+            .entry(commit.hash.clone())
+            .or_insert_with(|| crate::git::tree_paths(&root, &commit.hash).map(std::sync::Arc::new))
+            .clone();
+        self.tree.scrub_tree = present.map(|set| (root, set));
+    }
+
     /// Build the read-only view of the active file at the scrubber's commit
     /// (#371), or drop it at the working tree. File text is cached per
     /// (commit, path), so stepping back and forth after the first visit
     /// costs no git process.
     fn rebuild_scrub_view(&mut self) {
+        self.sync_scrub_tree();
         self.scrub_for = self.editor.path.clone();
         let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
             self.scrub_view = None;
