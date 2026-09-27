@@ -55346,3 +55346,33 @@ fn an_all_clear_from_every_server_drops_the_path_from_the_store() {
     store_diagnostics_update(&mut store, update("ra", Vec::new()));
     assert!(store.is_empty());
 }
+
+/// #262: a config file croft did not write itself (one that arrived by
+/// config sync) is applied within the watch interval, not on next launch;
+/// a macro croft records itself is not reloaded behind its back.
+#[test]
+fn a_macros_file_written_outside_croft_is_reloaded_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let store = tmp.path().join("macros.json");
+    app.macros_path = store.clone();
+    app.config_watch = crate::config_sync::ConfigWatch::new(vec![store.clone()]);
+    app.macro_registers.clear();
+    let mut mac = crate::macros::Macro::default();
+    mac.push_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    crate::macros::save_register(&store, "q", mac).unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(!app.tick_config_watch_at(t0), "not before the interval");
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert!(
+        app.macro_registers.contains_key("q"),
+        "{:?}",
+        app.macro_registers.keys()
+    );
+    assert!(app.status.starts_with("Macros reloaded"), "{}", app.status);
+    // Nothing more changed: the next check reloads nothing.
+    assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
+}
