@@ -22159,6 +22159,9 @@ impl App {
                 let source = self.editor.path.clone();
                 self.start_test_binary_build(root, name, source);
             }
+            Some(crate::testing::worker::Runner::Go) => {
+                self.start_delve_test_session(&root, &name, breakpoints);
+            }
             Some(crate::testing::worker::Runner::Vitest | crate::testing::worker::Runner::Jest) => {
                 // No session will start, so the armed breakpoint has nothing
                 // to be cleaned up by (#373).
@@ -24602,6 +24605,58 @@ impl App {
             Err(e) => {
                 self.debug_error(format!("Failed to start debugger: {e}"));
             }
+        }
+    }
+
+    /// Debug one Go test under delve's `test` mode (#264), scoped to it
+    /// with `-test.run`. `name` is a tree id (`./pkg::TestName`), or a bare
+    /// function name from the caret, whose package is the open file's.
+    fn start_delve_test_session(
+        &mut self,
+        root: &Path,
+        name: &str,
+        breakpoints: std::collections::BTreeMap<
+            PathBuf,
+            Vec<crate::dap::session::SourceBreakpoint>,
+        >,
+    ) {
+        let dir = match name.split_once("::") {
+            Some((pkg, _)) => crate::testing::gotest::package_dir(root, pkg),
+            None => self
+                .editor
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        let Some(dir) = dir else {
+            self.disarm_failure_breakpoint();
+            self.status = format!("Debug Test: no package directory for {name}");
+            return;
+        };
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.disarm_failure_breakpoint();
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let request = crate::dap::session::delve_test_request(
+            &dir,
+            &crate::testing::gotest::test_binary_args(name),
+        );
+        match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
+            Ok(session) => {
+                self.debug_sessions.replace_with(name.to_string(), session);
+                self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                ));
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
         }
     }
 

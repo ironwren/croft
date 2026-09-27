@@ -28,6 +28,7 @@ fn kind_of(decl: RunnerKindDecl) -> Runner {
         RunnerKindDecl::Pytest => Runner::Pytest,
         RunnerKindDecl::Vitest => Runner::Vitest,
         RunnerKindDecl::Jest => Runner::Jest,
+        RunnerKindDecl::Go => Runner::Go,
     }
 }
 
@@ -166,6 +167,16 @@ mod tests {
         std::fs::write(jest_cfg.path().join("package.json"), "{}").unwrap();
         std::fs::write(jest_cfg.path().join("jest.config.js"), "").unwrap();
         assert_eq!(resolve(&s, &none(), jest_cfg.path()), Some(Runner::Jest));
+    }
+
+    #[test]
+    fn a_go_module_routes_to_go_test() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/m\n").unwrap();
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Go));
+        let off: BTreeSet<String> = [String::from("test-go")].into();
+        assert_eq!(resolve(&s, &off, tmp.path()), None);
     }
 
     #[test]
