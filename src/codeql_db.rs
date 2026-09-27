@@ -110,6 +110,43 @@ pub fn language_label(id: &str) -> Option<&'static str> {
     Some(crate::widgets::codeql::LANGUAGES[i])
 }
 
+/// Where a database keeps the source it was extracted from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbSource {
+    /// A `src` folder, ready to browse.
+    Folder(PathBuf),
+    /// The `src.zip` the CLI writes by default, to extract first.
+    Zip(PathBuf),
+}
+
+/// The database's source: its `src` folder when it has one, else its
+/// `src.zip`, else `None`.
+pub fn database_source(dir: &Path) -> Option<DbSource> {
+    let folder = dir.join("src");
+    if folder.is_dir() {
+        return Some(DbSource::Folder(folder));
+    }
+    let zip = dir.join("src.zip");
+    zip.is_file().then_some(DbSource::Zip(zip))
+}
+
+/// The folder name a database's extracted `src.zip` gets in croft's cache:
+/// its folder name and a short hash of its canonical path, so two
+/// databases with the same name never share one.
+pub fn source_cache_name(db: &Path) -> String {
+    use sha2::Digest;
+    let canon = db.canonicalize().unwrap_or_else(|_| db.to_path_buf());
+    let digest = format!(
+        "{:x}",
+        sha2::Sha256::digest(canon.to_string_lossy().as_bytes())
+    );
+    let name = canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("database"));
+    format!("{name}-{}", &digest[..12])
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -480,6 +517,29 @@ mod tests {
             !tmp.path().join("escaped.txt").exists(),
             "nothing written outside"
         );
+    }
+
+    #[test]
+    fn a_databases_source_is_its_src_folder_else_its_src_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path(), "app", "go");
+        assert_eq!(database_source(&db), None);
+        std::fs::write(db.join("src.zip"), b"").unwrap();
+        assert_eq!(
+            database_source(&db),
+            Some(DbSource::Zip(db.join("src.zip")))
+        );
+        std::fs::create_dir(db.join("src")).unwrap();
+        assert_eq!(
+            database_source(&db),
+            Some(DbSource::Folder(db.join("src"))),
+            "the folder wins"
+        );
+        let other = make_db(&tmp.path().join("elsewhere"), "app", "go");
+        let name = source_cache_name(&db);
+        assert!(name.starts_with("app-") && name.len() == 16, "{name}");
+        assert_ne!(name, source_cache_name(&other), "same name, other path");
+        assert_eq!(name, source_cache_name(&db), "stable");
     }
 
     #[test]

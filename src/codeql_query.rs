@@ -83,6 +83,12 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments upgrading `db` to the CLI's current schema (VS Code's
+/// "CodeQL: Upgrade Database").
+pub fn upgrade_args(db: &Path) -> Vec<String> {
+    vec![String::from("database"), String::from("upgrade"), path(db)]
+}
+
 /// The queries in one CodeQL pack, as the side bar's Queries section groups
 /// them (#578).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +356,11 @@ pub enum RunStatus {
 pub struct HistoryEntry {
     pub query: PathBuf,
     pub database: String,
+    /// The database's folder, so "Delete Unused Databases" can tell which
+    /// ones a run refers to after a rename. History saved before this
+    /// field existed reads as `None` and falls back to the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<PathBuf>,
     /// Seconds since the Unix epoch.
     pub started: u64,
     pub seconds: u64,
@@ -370,6 +381,18 @@ impl HistoryEntry {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// Whether this run was on the database at `path` named `name`: by
+    /// canonical path when the entry recorded one, else by name.
+    pub fn refers_to(&self, path: &Path, name: &str) -> bool {
+        match &self.database_path {
+            Some(p) => {
+                let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(p) == canon(path)
+            }
+            None => self.database == name,
+        }
     }
 
     /// What the entry is called: the user's label, else the query's file
@@ -605,6 +628,21 @@ mod tests {
                 "/out/r.bqrs"
             ]
         );
+        assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+    }
+
+    #[test]
+    fn a_run_refers_to_its_database_by_path_else_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("app");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::create_dir_all(tmp.path().join("x")).unwrap();
+        let mut e = entry(RunStatus::Succeeded);
+        assert!(e.refers_to(&db, "app"), "an old entry goes by name");
+        assert!(!e.refers_to(&db, "renamed"));
+        e.database_path = Some(tmp.path().join("x/../app"));
+        assert!(e.refers_to(&db, "renamed"), "a path survives a rename");
+        assert!(!e.refers_to(&tmp.path().join("other"), "app"));
     }
 
     #[test]
@@ -685,6 +723,7 @@ mod tests {
         HistoryEntry {
             query: PathBuf::from("/w/sql.ql"),
             database: String::from("app"),
+            database_path: None,
             started: 1,
             seconds: 12,
             status,
