@@ -21984,6 +21984,44 @@ impl App {
         }
     }
 
+    /// Remote: Sync Config Now (#262): run `croft sync-config <host>` in a
+    /// terminal pane, where ssh can ask for a password and the report of
+    /// what was pushed, kept or left for the user to settle stays readable.
+    fn sync_config_to(&mut self, host: &str) {
+        let host = host.trim();
+        // Typed into a shell below: an alias is plain, so anything else is
+        // refused rather than quoted.
+        let plain = !host.is_empty()
+            && !host.starts_with('-')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._@-".contains(c));
+        if !plain {
+            self.status = format!("{host:?} is not an ssh host alias");
+            return;
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| String::from("croft"));
+        match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(format!("config sync: {host}")));
+                term.write_input(
+                    format!(
+                        "{} sync-config {host}\r",
+                        crate::remote::shell_quote_for_e_arg(std::path::Path::new(&exe))
+                    )
+                    .as_bytes(),
+                );
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Syncing config to {host}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
+    }
+
     /// Watch `scope`, or stop watching it (#263).
     fn toggle_test_watch(&mut self, scope: crate::testing::watch::WatchScope) {
         use crate::testing::watch::WatchScope;
@@ -26704,6 +26742,10 @@ impl App {
             InputPurpose::NewWorktreeLane => {
                 self.close_input_prompt();
                 self.create_worktree_lane(&value);
+            }
+            InputPurpose::SyncConfigHost => {
+                self.close_input_prompt();
+                self.sync_config_to(&value);
             }
             InputPurpose::PullRequestNumber => {
                 self.close_input_prompt();
@@ -41813,6 +41855,13 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::DebugInstallDelve => self.install_delve(),
+            Cmd::RemoteSyncConfigNow => {
+                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                    crate::widgets::input_prompt::InputPurpose::SyncConfigHost,
+                    String::from("Sync config to host"),
+                    String::from("an ssh host alias"),
+                ))
+            }
             Cmd::StopAutoApprove => self.stop_auto_approve(),
             Cmd::ScrubOpenHere => self.scrub_open_here(),
             Cmd::ScrubDiffToWorkingTree => self.scrub_diff_to_working_tree(),
