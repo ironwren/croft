@@ -333,6 +333,12 @@ pub struct Prefs {
     /// read by scanning down the list.
     #[serde(default)]
     pub fleet_groups: std::collections::BTreeMap<String, Vec<String>>,
+    /// Whether GitHub code scanning results load by themselves (#577):
+    /// `"off"` (default), `"on"` for the current branch and again on every
+    /// branch change, or `"prompt"` to say so and wait. User layers only:
+    /// a repository must not decide that croft calls GitHub for it.
+    #[serde(default)]
+    pub code_scanning: crate::sarif::github::CodeScanningMode,
     /// The agent a new worktree lane starts in its pane (#348): the name of
     /// an `agents.json` row (built in: claude, codex, aider, gemini), whose
     /// `launch` line is typed into the lane's fresh shell. Unset, a lane

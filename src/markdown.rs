@@ -723,6 +723,7 @@ fn lang_for_fence(info: &str) -> Option<LangKind> {
         "typescript" => LangKind::TypeScript,
         "golang" => LangKind::Go,
         "shell" | "console" | "terminal" => LangKind::Bash,
+        "codeql" => LangKind::Ql,
         other => return lang_for_extension(other),
     })
 }
@@ -1755,6 +1756,12 @@ mod tests {
                 .contains(Modifier::CROSSED_OUT)
         );
         assert_eq!(span_with("code()").style.fg, Some(CODE));
+    }
+
+    #[test]
+    fn codeql_fences_resolve_by_name_and_extension() {
+        assert_eq!(lang_for_fence("codeql"), Some(LangKind::Ql));
+        assert_eq!(lang_for_fence("ql"), Some(LangKind::Ql));
     }
 
     /// #353: shell fences wear the play glyph and are recorded with their

@@ -51,6 +51,11 @@ pub enum ListPurpose {
     /// compounds, or a bare index into its discovered-config list. Compounds
     /// carry their own id prefix so the two index spaces cannot collide.
     DebugConfig,
+    /// Debug: Add Configuration… (#250), first step: the adapter, `id` a
+    /// type from `dap::configs::DRAFT_TYPES`.
+    DebugConfigType,
+    /// Second step: `id` is `launch` or `attach`.
+    DebugConfigRequest,
     /// The searchable Settings hub (Preferences: Open Settings). Rows toggle a
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).
