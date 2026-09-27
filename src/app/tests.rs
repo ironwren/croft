@@ -57350,6 +57350,13 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
             cwd: tmp.path().into(),
         };
         writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // A tab with unsaved work, which opening the proposal must not
+        // replace.
+        let other = tmp.path().join("b.rs");
+        std::fs::write(&other, "fn b() {}\n").unwrap();
+        app.editor.open_pinned(&other).unwrap();
+        app.editor.lines[0] = String::from("fn b() { unsaved }");
+        app.editor.dirty = true;
         app.drain_hook_requests();
         let arm = |app: &mut App| {
             app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
@@ -57396,6 +57403,9 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
             replay.after, "let x = 3;\n",
             "the agent's Edit writes what was saved"
         );
+        app.editor.open_pinned(&other).unwrap();
+        assert!(app.editor.dirty, "the other tab kept its unsaved work");
+        assert_eq!(app.editor.lines[0], "fn b() { unsaved }");
     });
 }
 
