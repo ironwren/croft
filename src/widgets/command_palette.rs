@@ -288,6 +288,9 @@ pub enum Command {
     /// Diff the active file against the snapshot it was last reviewed
     /// against (#345).
     DiffAgentFileSinceReview,
+    /// Pick any file an agent changed and open its diff since review, from
+    /// the keyboard (#345).
+    PickAgentLaneFile,
     /// Mark the active file reviewed in every agent lane holding it (#345).
     MarkAgentFileReviewed,
     /// Have the navigator fix the diagnostic under the caret as a streamed,
@@ -556,6 +559,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenAgentLaneSection,
     Command::MarkAgentFileReviewed,
     Command::DiffAgentFileSinceReview,
+    Command::PickAgentLaneFile,
     Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
@@ -813,6 +817,7 @@ impl Command {
             Command::OpenAgentLaneSection => "Agents: Open Agent Lane",
             Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
             Command::DiffAgentFileSinceReview => "Agents: Diff This File Since Review",
+            Command::PickAgentLaneFile => "Agents: Review a Changed File…",
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
@@ -1073,6 +1078,7 @@ impl Command {
             Command::OpenAgentLaneSection => "",
             Command::MarkAgentFileReviewed => "",
             Command::DiffAgentFileSinceReview => "",
+            Command::PickAgentLaneFile => "",
             Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
@@ -1327,6 +1333,7 @@ impl Command {
             Command::OpenAgentLaneSection => "agents_open_lane",
             Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
             Command::DiffAgentFileSinceReview => "agents_diff_since_review",
+            Command::PickAgentLaneFile => "agents_pick_changed_file",
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",

@@ -3931,6 +3931,13 @@ pub struct App {
     /// and the review baselines that decide which of them still need a
     /// look.
     pub agent_ledger: crate::agent_lane::AgentLedger,
+    /// Where the ledger is saved per workspace (#345); `None` keeps it in
+    /// memory only (tests, unless one sets it).
+    agent_ledger_store: Option<PathBuf>,
+    /// The ledger generation last saved, and when.
+    agent_ledger_saved: (u64, std::time::Instant),
+    /// The (agent, file) behind each row of the lane-file picker.
+    pending_lane_picks: Vec<(String, PathBuf)>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -5699,6 +5706,9 @@ impl App {
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
+            agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
+            agent_ledger_saved: (0, std::time::Instant::now()),
+            pending_lane_picks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             pending_color_presentations: Vec::new(),
@@ -5760,6 +5770,10 @@ impl App {
         if let Some(lsp) = app.lsp.as_ref() {
             lsp.prewarm_workspace();
         }
+        // The agent review queue as this workspace last left it (#345).
+        let root = app.workspace_root().to_path_buf();
+        app.agent_ledger = app.load_agent_ledger(&root);
+        app.sync_agent_lane_decorations();
         Ok(app)
     }
 
@@ -29173,6 +29187,11 @@ impl App {
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
+            ListPurpose::AgentLaneFile => {
+                if let Some((agent, path)) = self.pending_lane_picks.get(index).cloned() {
+                    self.diff_agent_lane_row(&agent, &path);
+                }
+            }
             ListPurpose::StashApply => {
                 let r = crate::git::stash_apply(&self.scm_root(), index);
                 self.run_scm_op("stash apply", r, "Applied stash");
@@ -38772,6 +38791,46 @@ impl App {
     /// only a legacy one — both say so. A diff against a baseline other than
     /// the one claimed is worse than no diff, because the user cannot see
     /// which one they got.
+    /// Agents: Review a Changed File (#345): every lane's files in a picker,
+    /// labelled as the AGENT LANE section labels them; Enter opens the
+    /// chosen file's diff since review, as a click on its row does.
+    fn pick_agent_lane_file(&mut self) {
+        use crate::widgets::agent_lane::LaneRow;
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let mut rows = Vec::new();
+        self.pending_lane_picks.clear();
+        for row in self.agent_lane_panel_rows() {
+            if let LaneRow::File {
+                agent,
+                path,
+                label,
+                unreviewed,
+                changes,
+            } = row
+            {
+                let mark = if unreviewed { "\u{25cf}" } else { " " };
+                let counts = changes
+                    .filter(|&(a, r)| a + r > 0)
+                    .map(|(a, r)| format!("  +{a} \u{2212}{r}"))
+                    .unwrap_or_default();
+                rows.push(ListRow {
+                    id: self.pending_lane_picks.len().to_string(),
+                    label: format!("{mark} {label}  ({agent}){counts}"),
+                });
+                self.pending_lane_picks.push((agent, path));
+            }
+        }
+        if rows.is_empty() {
+            self.status = String::from("No agent has changed a file");
+            return;
+        }
+        self.list_picker = Some(ListPicker::new(
+            ListPurpose::AgentLaneFile,
+            String::from("Review a file an agent changed"),
+            rows,
+        ));
+    }
+
     pub(crate) fn diff_agent_lane_row(&mut self, agent: &str, path: &Path) {
         // "Restore Snapshot" writes to the path recorded here, and only
         // `open_timeline_diff` cleared it. Browsing a.txt's timeline and then
@@ -42145,6 +42204,7 @@ impl App {
                 };
             }
             Cmd::OpenAgentLaneSection => self.show_agent_lane_section(),
+            Cmd::PickAgentLaneFile => self.pick_agent_lane_file(),
             Cmd::DiffAgentFileSinceReview => {
                 match self.editor.path.clone() {
                     None => self.status = String::from("No file open"),
@@ -45778,6 +45838,12 @@ impl App {
                 if rect_contains(self.agent_lane_panel.last_area, m.column, m.row) {
                     if self.agent_lane_panel.hit_header(m.column, m.row) {
                         self.agent_lane_panel.toggle_collapse();
+                    } else if let Some(crate::widgets::agent_lane::LaneRow::Agent {
+                        name, ..
+                    }) = self.agent_lane_panel.row_at(m.row).cloned()
+                    {
+                        // An agent's row folds its files away, or back.
+                        self.agent_lane_panel.toggle_agent(&name);
                     } else if let Some(crate::widgets::agent_lane::LaneRow::File {
                         agent,
                         path,
@@ -50213,7 +50279,62 @@ impl App {
     /// still resolves on disk and the user may want to keep it open.
     /// Compare anchor / clipboard / marks are reset because they point
     /// into the old workspace.
+    /// `root`'s saved agent review queue (#345), less files deleted while
+    /// croft was closed; an empty one when nothing is saved or there is no
+    /// store.
+    fn load_agent_ledger(&self, root: &Path) -> crate::agent_lane::AgentLedger {
+        let Some(store) = self.agent_ledger_store.as_ref() else {
+            return crate::agent_lane::AgentLedger::new();
+        };
+        let map: std::collections::HashMap<String, crate::agent_lane::AgentLedger> =
+            std::fs::read_to_string(store)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+        map.get(&agent_ledger_key(root))
+            .cloned()
+            .map(|l| l.restored(Path::exists))
+            .unwrap_or_default()
+    }
+
+    /// Save the agent review queue under this workspace's key when it has
+    /// changed since the last save: at most once a second from the frame
+    /// loop, or at once when `now` (leaving the workspace). An emptied
+    /// queue removes the key rather than keeping an empty entry.
+    fn persist_agent_ledger(&mut self, now: bool) {
+        let Some(store) = self.agent_ledger_store.clone() else {
+            return;
+        };
+        let generation = self.agent_ledger.generation();
+        let (saved, at) = self.agent_ledger_saved;
+        if generation == saved || (!now && at.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        let key = agent_ledger_key(self.workspace_root());
+        let ledger = self.agent_ledger.clone();
+        let result = crate::workspace::update_json_store::<crate::agent_lane::AgentLedger, _>(
+            &store,
+            |map| {
+                if ledger.is_empty() {
+                    map.remove(&key);
+                } else {
+                    map.insert(key.clone(), ledger.clone());
+                }
+            },
+        );
+        if let Err(e) = result {
+            crate::output::push(
+                "Agents",
+                crate::output::OutputLevel::Error,
+                &format!("Could not save the agent review queue: {e}"),
+            );
+        }
+        self.agent_ledger_saved = (generation, std::time::Instant::now());
+    }
+
     pub fn change_workspace_root(&mut self, new_root: PathBuf) {
+        // The review queue being left is saved under its own root first.
+        self.persist_agent_ledger(true);
         let display = new_root.display().to_string();
         // The remembered task belongs to the old workspace; Rerun Last Task
         // must rediscover, not rerun the old project's command here.
@@ -50308,8 +50429,9 @@ impl App {
         // The agent review queue belongs to the workspace that was left
         // (#345). `set_root` has just cleared the Explorer's copy; this
         // clears the ledger it is drawn from, so the two cannot come back
-        // apart the moment an agent writes under the new root.
-        self.agent_ledger = crate::agent_lane::AgentLedger::new();
+        // apart the moment an agent writes under the new root. The new
+        // root's own saved queue comes back in its place.
+        self.agent_ledger = self.load_agent_ledger(&new_root);
         self.fs_watch.rebind(&new_root, &self.tree);
         // A re-root collapses the workspace to one folder: the secondary
         // watchers go with their roots (#147).
@@ -58498,6 +58620,21 @@ fn sweep_staged_stdin(dir: &Path) {
 /// when the user next looks at the status bar.
 const SSH_OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// The per-workspace agent review queues (#345), keyed by
+/// [`agent_ledger_key`].
+fn agent_ledger_store_path() -> PathBuf {
+    croft_cache_dir().join("agent_lane.json")
+}
+
+/// A workspace's key in the agent review store: its canonical root, so the
+/// save and the load agree however the root was spelled.
+fn agent_ledger_key(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
+}
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -59945,6 +60082,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pulls_changed = app.drain_remote_pulls();
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests() | app.poll_pr_gh() | app.poll_pr_checkout();
+        app.persist_agent_ledger(false);
         let kernel_changed = app.poll_notebook_kernels();
         let ports_changed = app.drain_ports_and_poll();
         let session_presence_changed = app.poll_session_presence();

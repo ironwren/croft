@@ -57495,3 +57495,80 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
 }
+
+/// #345: the agent review queue, and what was marked reviewed, survive a
+/// restart and a re-root away and back; the Explorer's dots come back too.
+#[test]
+fn the_agent_review_queue_survives_a_restart_and_a_reroot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap().keep().join("agent_lane.json");
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let working = [String::from("claude")];
+    let root = tmp.path().canonicalize().unwrap();
+    let (a, b) = (root.join("a.rs"), root.join("b.rs"));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.agent_ledger_store = Some(store.clone());
+    app.agent_ledger.record_write(&a, 1, &working);
+    app.agent_ledger.record_write(&b, 2, &working);
+    app.agent_ledger.mark_reviewed("claude", &b, 2, None);
+    app.persist_agent_ledger(true);
+    drop(app);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.agent_ledger_store = Some(store.clone());
+    app.agent_ledger = app.load_agent_ledger(&root);
+    app.sync_agent_lane_decorations();
+    assert!(app.agent_ledger.is_unreviewed(&a), "the queue came back");
+    assert!(!app.agent_ledger.is_unreviewed(&b), "and b stays reviewed");
+    assert!(app.tree.agent_touched.contains(&a), "the Explorer's dot");
+
+    // Away and back: each workspace keeps its own queue.
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(app.agent_ledger.is_empty());
+    app.change_workspace_root(tmp.path().to_path_buf());
+    assert!(app.agent_ledger.is_unreviewed(&a));
+
+    // Reviewing everything empties the queue and drops its saved entry.
+    app.agent_ledger.mark_reviewed("claude", &a, 1, None);
+    app.agent_ledger.forget("claude");
+    app.persist_agent_ledger(true);
+    let saved = std::fs::read_to_string(&store).unwrap();
+    assert!(!saved.contains(&root.display().to_string()), "{saved}");
+}
+
+/// #345: the lane is reachable from the keyboard: "Agents: Review a Changed
+/// File" lists every lane's files, and Enter opens the chosen one's diff.
+#[test]
+fn the_lane_file_picker_opens_the_chosen_files_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let a = root.join("a.rs");
+    std::fs::write(&a, "a\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::PickAgentLaneFile);
+    assert_eq!(app.status, "No agent has changed a file");
+    assert!(app.list_picker.is_none());
+
+    app.agent_ledger
+        .record_write(&a, 1, &[String::from("claude")]);
+    app.run_command(crate::widgets::command_palette::Command::PickAgentLaneFile);
+    let picker = app.list_picker.as_ref().expect("a picker");
+    assert_eq!(picker.rows.len(), 1);
+    assert!(
+        picker.rows[0].label.contains("a.rs"),
+        "{}",
+        picker.rows[0].label
+    );
+    assert!(picker.rows[0].label.contains("(claude)"));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    // Never reviewed, so the diff is refused with the reason, as a click on
+    // the row is: the pick reached `diff_agent_lane_row`.
+    assert!(app.status.contains("review"), "{}", app.status);
+}
