@@ -4486,8 +4486,11 @@ Host !blocked *.internal
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("home/.cache/croft");
         std::fs::create_dir_all(&cache).unwrap();
-        // pid 1 is always alive; a pid past pid_max never is.
-        std::fs::write(cache.join("building.1"), "1").unwrap();
+        // This test process is alive and ours, as a real build's compile
+        // is: `kill -0` on another user's pid (pid 1, say) fails with EPERM
+        // for a non-root user and would read as dead. A pid past pid_max is
+        // never alive.
+        std::fs::write(cache.join("building.1"), std::process::id().to_string()).unwrap();
         std::fs::write(cache.join("building.2"), "2147483646").unwrap();
         let (ok, _) = run_install_script(tmp.path(), 0);
         assert!(ok);
