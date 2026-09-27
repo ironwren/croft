@@ -58610,6 +58610,118 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     });
 }
 
+#[test]
+fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
+    // #577: `code_scanning = on` loads the branch's newest analysis per
+    // tool at the nearest scanned commit, and again after a checkout of
+    // another branch; `prompt` names them and waits; `off` never asks.
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "scanned"]);
+        let scanned = git(&["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), "b").unwrap();
+        git(&["commit", "-q", "-am", "not scanned yet"]);
+
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *sarif+json*) echo '{{"version": "2.1.0", "runs": []}}' ;;
+  *) echo '[{{"id": 7, "ref": "refs/heads/main", "commit_sha": "{scanned}", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-01T00:00:00Z", "results_count": 0}}, {{"id": 6, "ref": "refs/heads/main", "commit_sha": "0000", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-02T00:00:00Z", "results_count": 0}}]' ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh.clone();
+        app.source_control.status.in_repo = true;
+        app.source_control.status.branch = Some(String::from("main"));
+
+        // Off: nothing is asked.
+        app.poll_code_scanning();
+        assert!(
+            app.code_scan_list.is_none() && !log.exists(),
+            "off never calls gh"
+        );
+
+        app.code_scanning = crate::sarif::github::CodeScanningMode::On;
+        let settle = |app: &mut App| {
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_secs(10),
+                "code scanning",
+                || {
+                    app.poll_code_scanning();
+                    app.code_scan_list.is_none() && app.code_scan_fetch.is_none()
+                },
+            );
+        };
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert_eq!(app.status, "Loaded 1 code scanning analysis");
+        assert!(
+            app.editor.sarif.is_some(),
+            "the analysis opened in the viewer"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("ref=refs%2Fheads%2Fmain") || calls.contains("ref=refs/heads/main"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("analyses/7"),
+            "the one at the nearest scanned commit: {calls}"
+        );
+        assert!(!calls.contains("analyses/6"), "{calls}");
+
+        // The same branch is not looked up again; another one is.
+        std::fs::remove_file(&log).unwrap();
+        app.poll_code_scanning();
+        assert!(app.code_scan_list.is_none() && !log.exists());
+        app.code_scanning = crate::sarif::github::CodeScanningMode::Prompt;
+        app.source_control.status.branch = None;
+        app.source_control.status.detached_hash = Some(scanned.clone());
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert!(
+            app.status
+                .starts_with("Code scanning has 1 analysis for detached HEAD"),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("sarif+json"),
+            "prompt downloads nothing: {calls}"
+        );
+    });
+}
+
 /// #694: Developer: Show Memory Usage opens a tab attributing memory to
 /// each subsystem, with the stored diagnostics counted per server.
 #[test]
