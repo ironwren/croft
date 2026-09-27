@@ -64,11 +64,9 @@ pub const SYNCABLE: &[Syncable] = &[
         name: "matchers.json",
         hot_reloads: true,
     },
-    // Has a path function but no arm in `reload_config_for_path`, so it
-    // takes effect on the remote's next launch rather than on arrival.
     Syncable {
         name: "macros.json",
-        hot_reloads: false,
+        hot_reloads: true,
     },
 ];
 
@@ -214,10 +212,9 @@ mod tests {
 
     #[test]
     fn the_hot_reload_flag_matches_what_croft_actually_reloads_on_save() {
-        // `reload_config_for_path` has arms for keybindings, snippets,
-        // triggers and matchers, but none for macros. The flag records that
-        // and nothing more: a SYNCED file is not reloaded either way, because
-        // nothing watches the config directory.
+        // `reload_config_for_path` has an arm for each of these. The flag
+        // records that and nothing more: a SYNCED file is not reloaded
+        // either way, because nothing watches the config directory.
         let hot: Vec<&str> = SYNCABLE
             .iter()
             .filter(|s| s.hot_reloads)
@@ -229,14 +226,9 @@ mod tests {
                 "keybindings.json",
                 "snippets.json",
                 "triggers.json",
-                "matchers.json"
+                "matchers.json",
+                "macros.json"
             ]
-        );
-        assert!(
-            SYNCABLE
-                .iter()
-                .any(|s| s.name == "macros.json" && !s.hot_reloads),
-            "macros.json has no reload arm, so it must not claim one"
         );
     }
 

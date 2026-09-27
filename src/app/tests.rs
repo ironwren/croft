@@ -56732,3 +56732,19 @@ fn approve_all_lets_one_agent_through_until_stopped() {
     app.drain_hook_requests();
     assert!(app.auto_approve.is_none());
 }
+
+/// #262: macros.json has a reload arm, as its sync entry now claims: a
+/// save of it replaces the registers rather than waiting for a relaunch.
+/// Read-only against the real path (whatever it holds), since the config
+/// directory has no test override.
+#[test]
+fn saving_macros_json_reloads_the_registers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.reload_config_for_path(&crate::macros::macros_path());
+    assert!(
+        app.status.starts_with("Macros reloaded ("),
+        "{}",
+        app.status
+    );
+}

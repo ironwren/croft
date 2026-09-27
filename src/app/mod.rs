@@ -48630,6 +48630,13 @@ impl App {
         } else if path == crate::snippets::snippets_path() {
             self.snippets = crate::snippets::SnippetSet::load(path);
             self.status = String::from("Snippets reloaded");
+        } else if path == crate::macros::macros_path() {
+            self.macro_registers = crate::macros::load(path);
+            let n = self.macro_registers.len();
+            self.status = format!(
+                "Macros reloaded ({n} register{})",
+                if n == 1 { "" } else { "s" }
+            );
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
