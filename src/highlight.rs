@@ -601,6 +601,7 @@ pub enum LangKind {
     C,
     Cpp,
     Lua,
+    Ql,
 }
 
 /// The bare tree-sitter grammar handle for `kind` — the parser the
@@ -626,6 +627,7 @@ pub fn language_for(kind: LangKind) -> tree_sitter::Language {
         LangKind::C => tree_sitter_c::LANGUAGE.into(),
         LangKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         LangKind::Lua => tree_sitter_lua::LANGUAGE.into(),
+        LangKind::Ql => tree_sitter_ql::LANGUAGE.into(),
     }
 }
 
@@ -648,6 +650,8 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "c" | "h" => LangKind::C,
         "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
         "lua" => LangKind::Lua,
+        // CodeQL queries and libraries (#578).
+        "ql" | "qll" => LangKind::Ql,
         _ => return None,
     })
 }
@@ -892,6 +896,16 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             )
             .ok()?
         }
+        // Every capture in the bundled query is already one of
+        // HIGHLIGHT_NAMES, so it needs no overlay.
+        LangKind::Ql => HighlightConfiguration::new(
+            tree_sitter_ql::LANGUAGE.into(),
+            "ql",
+            tree_sitter_ql::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
     };
     cfg.configure(HIGHLIGHT_NAMES);
     Some(cfg)
@@ -2314,5 +2328,26 @@ def f() -> Config:\n\
         assert!(span_at(&h[3], lines[3], "return").is_some());
         assert!(span_at(&h[3], lines[3], "42").is_some());
         assert_eq!(lang_for_extension("lua"), Some(LangKind::Lua));
+    }
+
+    #[test]
+    fn codeql_keywords_classes_and_comments_get_distinct_styles() {
+        let mut reg = LangRegistry::new();
+        let src = "// finds calls\nclass Call extends Expr {\n  Call() { this = this }\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        // An explicit palette, so a concurrent theme-switch test cannot
+        // repaint the global one mid-assert.
+        let p = SyntaxPalette::BASE16;
+        let h = highlight_text_with_palette(&mut reg, LangKind::Ql, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let comment = span_at(&h[0], lines[0], "// finds calls").expect("comment span");
+        let keyword = span_at(&h[1], lines[1], "class").expect("keyword span");
+        let class = span_at(&h[1], lines[1], "Call").expect("class-name span");
+        assert_eq!(comment.style, palette_style_for_name(&p, "comment"));
+        assert_eq!(keyword.style, palette_style_for_name(&p, "keyword"));
+        assert_eq!(class.style, palette_style_for_name(&p, "type"));
+        assert_ne!(keyword.style, class.style);
+        assert_eq!(lang_for_extension("ql"), Some(LangKind::Ql));
+        assert_eq!(lang_for_extension("qll"), Some(LangKind::Ql));
     }
 }
