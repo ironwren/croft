@@ -55478,6 +55478,215 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
     });
 }
 
+/// A workspace whose pack `acme/rust` holds `a.ql`, `b.ql` and `c.ql`,
+/// database "app" current, the CodeQL view open on the pack's line, and a
+/// stand-in `codeql` in `bin` that fails whatever runs `b.ql`.
+#[cfg(unix)]
+fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
+    use std::os::unix::fs::PermissionsExt;
+    let pack = tmp.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        "name: acme/rust\nextractor: rust\n",
+    )
+    .unwrap();
+    for q in ["a", "b", "c"] {
+        std::fs::write(pack.join(format!("{q}.ql")), "select 1").unwrap();
+    }
+    let mut app = codeql_query_fixture(tmp, "select 1");
+    let reply = bin.join("codeql-reply");
+    std::fs::write(&reply, "col0\n1\n").unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in *b.ql*) echo 'ERROR: b is broken' >&2; exit 1 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; esac; done\nexit 0\n",
+        log = bin.join("codeql-calls.log").display(),
+        reply = reply.display(),
+    );
+    let program = bin.join("codeql");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    app.codeql_program = program;
+    app.open_codeql_view();
+    app.focus = Pane::Tree;
+    let row = app
+        .codeql
+        .lines()
+        .iter()
+        .position(|l| {
+            matches!(
+                l,
+                crate::widgets::codeql::Line::Action(
+                    crate::widgets::codeql::Action::TogglePack(0),
+                    _
+                )
+            )
+        })
+        .expect("the pack is listed");
+    app.codeql.selected = row;
+    app
+}
+
+/// Drain until one query run lands (the next of a pack run may start).
+fn drain_one_codeql_run(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_run() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query run never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
+    // #578: `r` on a pack line queues every query in it; each run lands in
+    // the query history in order and a failing one doesn't stop the rest.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        let pack = tmp.path().join("pack");
+        assert_eq!(
+            app.codeql.queries[0].queries,
+            vec![pack.join("a.ql"), pack.join("b.ql"), pack.join("c.ql")]
+        );
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/3: a.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/3: b.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 3/3: c.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(app.status, "Ran 3 CodeQL queries, 1 failed");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        // Newest first: one entry per query, in the order they ran.
+        assert_eq!(app.codeql.history.len(), 3, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[2].starts_with("\u{2713} a.ql \u{b7} app"));
+        assert_eq!(
+            app.codeql.history[1],
+            "\u{2717} b.ql \u{b7} app \u{b7} failed: ERROR: b is broken"
+        );
+        assert!(app.codeql.history[0].starts_with("\u{2713} c.ql \u{b7} app"));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let at = |q: &str| calls.find(&format!("pack/{q}.ql")).unwrap();
+        assert!(at("a") < at("b") && at("b") < at("c"), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_codeql_queries_are_cancelled_from_the_palette_or_with_esc() {
+    // #578: cancelling drops the queries still waiting; the one running
+    // finishes and is recorded.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("1/3"), "{}", app.status);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1, "{:?}", app.codeql.history);
+        assert!(app.codeql.history[0].starts_with("\u{2713} a.ql"));
+
+        // Esc in the side bar cancels first and leaves the view only after.
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.status, "Cancelled 2 queued CodeQL queries");
+        assert!(app.sidebar_view == SidebarView::CodeQL);
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 2, "{:?}", app.codeql.history);
+        app.run_command(Command::CodeqlCancelQueue);
+        assert_eq!(app.status, "No CodeQL queries are queued");
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.sidebar_view == SidebarView::Explorer);
+        assert_eq!(
+            Command::from_id("codeql_run_pack"),
+            Some(Command::CodeqlRunPack)
+        );
+        assert_eq!(
+            Command::CodeqlRunPack.title(),
+            "CodeQL: Run Queries in Pack"
+        );
+        assert_eq!(
+            Command::CodeqlCancelQueue.title(),
+            "CodeQL: Cancel Queued Queries"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        // A single query is running: the pack run is refused, not mixed in.
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(app.codeql_run.is_some());
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.status, "A CodeQL query is already running");
+        assert!(app.codeql_run_queue.is_empty());
+        wait_for_codeql(&mut app);
+        assert_eq!(app.codeql.history.len(), 1);
+
+        // Nothing selected in the Queries section.
+        app.codeql.selected = 0;
+        app.run_command(Command::CodeqlRunPack);
+        assert!(app.status.contains("Select a query pack"), "{}", app.status);
+
+        // No current database: nothing is queued or recorded.
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.current = None;
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.open_codeql_view();
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(
+                        crate::widgets::codeql::Action::RunQuery(0, 1),
+                        _
+                    )
+                )
+            })
+            .expect("b.ql is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlRunPack);
+        assert_eq!(app.status, "Add a CodeQL database and select it first");
+        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_run_queue.is_empty());
+        assert_eq!(app.codeql.history.len(), 1);
+    });
+}
+
 #[test]
 fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
     // #578: "CodeQL: Create Query" asks for a name and writes a starter
