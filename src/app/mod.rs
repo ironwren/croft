@@ -2688,6 +2688,15 @@ pub struct App {
     pub timeline: TimelinePanel,
     /// The Explorer's AGENT LANE section (#345).
     pub agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel,
+    /// Per lane file, the `+n −m` its row shows and what it was counted
+    /// from: (reviewed snapshot, last agent write, disk mtime).
+    lane_change_counts: std::collections::HashMap<
+        PathBuf,
+        (
+            (u64, u64, Option<std::time::SystemTime>),
+            Option<(usize, usize)>,
+        ),
+    >,
     /// The Explorer's DEPENDENCIES section: the workspace's packages, resolved
     /// off-thread per detected ecosystem. See [`DependenciesPanel`].
     pub dependencies: DependenciesPanel,
@@ -5048,6 +5057,7 @@ impl App {
             open_editors,
             timeline,
             agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel::new(),
+            lane_change_counts: std::collections::HashMap::new(),
             dependencies,
             dep_ecosystems,
             explorer_views,
@@ -11647,31 +11657,96 @@ impl App {
     /// The AGENT LANE rows (#345): each agent that changed files, then those
     /// files as the ledger orders them (unreviewed first), labelled relative
     /// to their workspace root.
-    fn agent_lane_panel_rows(&self) -> Vec<crate::widgets::agent_lane::LaneRow> {
+    fn agent_lane_panel_rows(&mut self) -> Vec<crate::widgets::agent_lane::LaneRow> {
         use crate::widgets::agent_lane::LaneRow;
         let mut rows = Vec::new();
-        for agent in self.agent_ledger.agents() {
+        let agents: Vec<String> = self
+            .agent_ledger
+            .agents()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for agent in agents {
             rows.push(LaneRow::Agent {
-                name: agent.to_string(),
-                unreviewed: self.agent_ledger.unreviewed_count(agent),
+                name: agent.clone(),
+                unreviewed: self.agent_ledger.unreviewed_count(&agent),
             });
-            for file in self.agent_ledger.lane(agent) {
+            let files: Vec<_> = self
+                .agent_ledger
+                .lane(&agent)
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        f.reviewed_millis,
+                        f.current_hash,
+                        f.unreviewed(),
+                    )
+                })
+                .collect();
+            for (path, reviewed_millis, current_hash, unreviewed) in files {
+                let changes = reviewed_millis
+                    .and_then(|millis| self.lane_changes(&path, millis, current_hash));
                 let label = self
                     .roots
-                    .owning_root(&file.path)
-                    .and_then(|root| file.path.strip_prefix(root).ok())
-                    .unwrap_or(&file.path)
+                    .owning_root(&path)
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(&path)
                     .display()
                     .to_string();
                 rows.push(LaneRow::File {
-                    agent: agent.to_string(),
-                    path: file.path.clone(),
+                    agent: agent.clone(),
+                    path,
                     label,
-                    unreviewed: file.unreviewed(),
+                    unreviewed,
+                    changes,
                 });
             }
         }
         rows
+    }
+
+    /// Lines added and removed in `path` since the snapshot it was reviewed
+    /// against (#345), for its lane row. Rows render every frame, so the
+    /// count is kept until the snapshot, the agent's last write or the file
+    /// on disk changes. `None` when the snapshot or the file can't be read.
+    fn lane_changes(
+        &mut self,
+        path: &Path,
+        millis: u64,
+        current_hash: u64,
+    ) -> Option<(usize, usize)> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = (millis, current_hash, mtime);
+        if let Some((k, counts)) = self.lane_change_counts.get(path)
+            && *k == key
+        {
+            return *counts;
+        }
+        let counts = (|| {
+            let snap = crate::history::snapshot_file_in(&self.history_root, path, millis)?;
+            let decode = |bytes: Vec<u8>| {
+                let enc = encoding_rs::Encoding::for_bom(&bytes)
+                    .map(|(e, _)| e)
+                    .unwrap_or(encoding_rs::UTF_8);
+                enc.decode(&bytes).0.into_owned()
+            };
+            let before = decode(std::fs::read(snap).ok()?);
+            let after = decode(std::fs::read(path).ok()?);
+            let diff = similar::TextDiff::from_lines(&before, &after);
+            let (mut added, mut removed) = (0, 0);
+            for change in diff.iter_all_changes() {
+                match change.tag() {
+                    similar::ChangeTag::Insert => added += 1,
+                    similar::ChangeTag::Delete => removed += 1,
+                    similar::ChangeTag::Equal => {}
+                }
+            }
+            Some((added, removed))
+        })();
+        self.lane_change_counts
+            .insert(path.to_path_buf(), (key, counts));
+        counts
     }
 
     /// Cmd+K V (#345): make the AGENT LANE section visible and open, on the

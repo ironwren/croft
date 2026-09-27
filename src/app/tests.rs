@@ -55796,3 +55796,69 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     app.run_command(crate::widgets::command_palette::Command::ScrubOpenHere);
     assert!(app.status.contains("Step the scrubber"), "{}", app.status);
 }
+
+/// #345: a lane row counts the lines added and removed since the content
+/// the user reviewed, follows later writes, and shows nothing for a row
+/// with no review to count against.
+#[test]
+fn a_lane_row_counts_lines_added_and_removed_since_the_review() {
+    use crate::widgets::agent_lane::LaneRow;
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.rs");
+    let g = tmp.path().join("g.rs");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    let working = vec![String::from("claude")];
+    let write = |app: &mut App, path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        app.agent_ledger.record_write(
+            path,
+            crate::agent_lane::content_hash(text.as_bytes()),
+            &working,
+        );
+    };
+    let changes_of = |app: &mut App, path: &Path| {
+        app.agent_lane_panel_rows()
+            .into_iter()
+            .find_map(|r| match r {
+                LaneRow::File {
+                    path: p, changes, ..
+                } if p == path => Some(changes),
+                _ => None,
+            })
+            .expect("the file has a row")
+    };
+
+    write(&mut app, &f, "a\nb\nc\n");
+    write(&mut app, &g, "new\n");
+    assert_eq!(
+        changes_of(&mut app, &g),
+        None,
+        "never reviewed: no baseline"
+    );
+    assert!(app.mark_agent_file_reviewed("claude", &f));
+    assert_eq!(changes_of(&mut app, &f), Some((0, 0)));
+
+    // Replace one line and add two.
+    write(&mut app, &f, "a\nB\nc\nd\ne\n");
+    assert_eq!(changes_of(&mut app, &f), Some((3, 1)));
+    // A later write is counted afresh, not served from the cache.
+    write(&mut app, &f, "a\n");
+    assert_eq!(changes_of(&mut app, &f), Some((0, 2)));
+
+    // Painted beside the label.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    app.show_agent_lane_section();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(screen.contains("f.rs  +0 −2"), "{screen}");
+}
