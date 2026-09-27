@@ -379,6 +379,10 @@ pub struct ApprovalUi {
     pub approve_all: bool,
     /// `e` was pressed: open the proposal to edit before approving (#347).
     pub edit_requested: bool,
+    /// The proposal's file is open in croft with unsaved edits, which the
+    /// agent's proposal (computed from disk) knows nothing of. Approving
+    /// then goes through a three-way merge instead (#347).
+    pub target_dirty: bool,
 }
 
 /// How long `a` in the popup keeps approving one agent's edits (#347).
@@ -392,6 +396,7 @@ impl ApprovalUi {
             shown_at: now,
             approve_all: false,
             edit_requested: false,
+            target_dirty: false,
         }
     }
 

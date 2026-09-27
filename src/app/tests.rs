@@ -57398,3 +57398,89 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
         );
     });
 }
+
+#[test]
+fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
+    // #347: the proposal is computed from disk, so approving it over a tab
+    // with unsaved edits would put the agent's write under them. Enter
+    // opens a merge (disk, yours, the agent's) instead; auto-approve never
+    // lets it through; saving with conflicts left approves nothing; the
+    // resolved result is what the agent writes, and the tab holds it too.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&target).unwrap();
+        app.editor.lines[0] = String::from("ONE"); // yours: line 1
+        app.editor.lines[2] = String::from("mine"); // yours: line 3, in conflict
+        app.editor.dirty = true;
+        app.editor.pin_active(); // as any real edit does
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        // The agent's: lines 3 and 5 (Write, so the whole text).
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Write".into(),
+            input: serde_json::json!({"file_path": target, "content": "one\ntwo\ntheirs\nfour\nFIVE\n"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // Auto-approving this agent does not approve an edit under unsaved text.
+        app.auto_approve = Some((
+            String::from("claude-code"),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        app.drain_hook_requests();
+        assert_eq!(app.approvals.len(), 1, "auto-approved over unsaved edits");
+        app.auto_approve = None;
+        assert!(app.approval_ui.as_ref().unwrap().target_dirty);
+
+        app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.approvals.len(), 1, "Enter approved over unsaved edits");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        let mv = app.editor.merge.as_ref().expect("a merge view");
+        assert_eq!(mv.conflicts.len(), 1, "line 3 changed on both sides");
+        let conflict_row = mv.conflicts[0].result_start;
+        assert_eq!(
+            app.editor.lines,
+            ["ONE", "two", "three", "four", "FIVE"],
+            "each side's own change applied, the conflict holding the base"
+        );
+
+        // Saving with the conflict open approves nothing.
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("1 conflict left"), "{}", app.status);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.editor.cursor_row = conflict_row;
+        app.merge_apply(crate::merge_editor::ConflictState::Incoming);
+        app.write_current_to_disk();
+        assert!(app.approvals.is_empty(), "{}", app.status);
+        assert!(app.status.contains("your tab holds the same text"), "{}", app.status);
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        assert_eq!(input["content"], "ONE\ntwo\ntheirs\nfour\nFIVE\n");
+        // The user's tab is still there, and holds what the agent is about
+        // to write.
+        app.editor.open_pinned(&target).unwrap();
+        assert_eq!(app.editor.lines, ["ONE", "two", "theirs", "four", "FIVE"]);
+    });
+}

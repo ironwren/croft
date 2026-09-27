@@ -3321,6 +3321,9 @@ pub struct App {
     /// scratch file whose save approves the edited text. The popup stays
     /// down while it lasts.
     approval_edit: Option<(String, PathBuf)>,
+    /// When that edit is a three-way merge with a dirty tab's unsaved
+    /// edits, the tab's file: once approved, the tab takes the merged text.
+    approval_merge_into: Option<PathBuf>,
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
@@ -5358,6 +5361,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
             approval_edit: None,
+            approval_merge_into: None,
             notebook_kernels: std::collections::HashMap::new(),
             coverage_at: None,
             coverage_lens_path: None,
@@ -15935,7 +15939,33 @@ impl App {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(now));
             changed = true;
         }
+        self.refresh_approval_target_dirty();
         changed
+    }
+
+    /// The unsaved text of `path`'s tab, if croft has it open and dirty in
+    /// any editor group. An agent's proposal is computed from disk, so it
+    /// knows nothing of these edits (#347).
+    fn dirty_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canon(path);
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        groups
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.dirty && e.path.as_deref().is_some_and(|p| canon(p) == want))
+            .map(|e| e.lines.clone())
+    }
+
+    /// Keep the popup's dirty-target flag current: the tab may be saved or
+    /// edited while the proposal waits.
+    fn refresh_approval_target_dirty(&mut self) {
+        let dirty = self
+            .approvals
+            .front()
+            .is_some_and(|p| self.dirty_tab_lines(&p.proposal.path).is_some());
+        if let Some(ui) = self.approval_ui.as_mut() {
+            ui.target_dirty = dirty;
+        }
     }
 
     /// Tell the notification sinks about each proposal that arrived since
@@ -15978,8 +16008,16 @@ impl App {
         }
         let mut approved = Vec::new();
         let mut kept = std::collections::VecDeque::new();
-        for p in std::mem::take(&mut self.approvals) {
-            if p.request.agent == agent {
+        // A file with unsaved edits in croft is never approved unseen: the
+        // agent's edit would land under them. It waits for the popup, which
+        // offers the merge (#347).
+        let dirty: Vec<bool> = self
+            .approvals
+            .iter()
+            .map(|p| self.dirty_tab_lines(&p.proposal.path).is_some())
+            .collect();
+        for (p, dirty) in std::mem::take(&mut self.approvals).into_iter().zip(dirty) {
+            if p.request.agent == agent && !dirty {
                 approved.push(p.proposal.path.display().to_string());
                 p.answer(&crate::agent_hook::Decision::Allow);
             } else {
@@ -16020,6 +16058,13 @@ impl App {
             }
             return;
         };
+        // Approving over unsaved edits would have the agent's write land
+        // under them: merge instead, and approve what the merge saves.
+        if matches!(decision, crate::agent_hook::Decision::Allow) && ui.target_dirty {
+            ui.approve_all = false;
+            self.start_approval_edit();
+            return;
+        }
         let approve_all = ui.approve_all;
         if let Some(head) = self.approvals.pop_front() {
             if approve_all {
@@ -16076,15 +16121,52 @@ impl App {
             self.status = format!("Could not open the proposal to edit: {e}");
             return;
         }
-        if let Err(e) = self.editor.open(&file) {
+        let target = head.proposal.path.clone();
+        let base: Vec<String> = head
+            .proposal
+            .before
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let theirs: Vec<String> = head.proposal.after.lines().map(str::to_string).collect();
+        let yours = self.dirty_tab_lines(&target);
+        // A tab of its own: `open` on the strip's deref would load the
+        // scratch file INTO the current tab, over whatever it held.
+        if let Err(e) = self.editor.open_pinned(&file) {
             self.status = format!("Could not open the proposal to edit: {e}");
             return;
         }
         self.approval_ui = None;
         self.approval_edit = Some((token, file));
+        self.approval_merge_into = None;
         self.focus_pane(Pane::Editor);
+        let Some(yours) = yours else {
+            self.status = format!(
+                "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+            );
+            return;
+        };
+        // Three-way: the disk text both started from, your unsaved edits
+        // as Current, the agent's proposal as Incoming. What is saved is
+        // what the agent writes, and your tab takes it too.
+        let (mut mv, result) = crate::merge_editor::MergeView::new(base, yours, theirs, false);
+        let end = self.editor.lines.len();
+        self.editor.splice_result_rows(0, end, result);
+        mv.synced_len = self.editor.lines.len();
+        mv.synced_seq = self.editor.edit_seq;
+        mv.anchor_panes_on(0);
+        let n = mv.conflicts.len();
+        if let Some(row) = mv.conflicts.first().map(|c| c.result_start) {
+            self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
+            self.editor.cursor_col = 0;
+        }
+        self.editor.merge = Some(mv);
+        self.approval_merge_into = Some(target);
         self.status = format!(
-            "Editing {agent}'s proposal: save to approve it as edited, close the tab unsaved to go back"
+            "Merging {agent}'s proposal with your unsaved edits ({n} conflict{}): save to approve the result, close the tab unsaved to go back",
+            if n == 1 { "" } else { "s" }
         );
     }
 
@@ -16130,6 +16212,20 @@ impl App {
             );
             return;
         };
+        let unresolved = self
+            .editor
+            .merge
+            .as_ref()
+            .filter(|_| self.editor.path.as_deref() == Some(file.as_path()))
+            .map_or(0, |mv| mv.unresolved_count());
+        if unresolved > 0 {
+            self.status = format!(
+                "{unresolved} conflict{} left: resolve {} and save again; nothing approved yet",
+                if unresolved == 1 { "" } else { "s" },
+                if unresolved == 1 { "it" } else { "them" }
+            );
+            return;
+        }
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
             Err(e) => {
@@ -16161,6 +16257,26 @@ impl App {
         }
         let _ = std::fs::remove_file(&file);
         self.status = format!("Approved {agent}'s edit as you changed it");
+        if let Some(target) = self.approval_merge_into.take() {
+            // Your tab takes the merged text, one Undo from your edits, so
+            // the agent's write lands on what the buffer already holds.
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let want = canon(&target);
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            let mut groups = self.editor_layout.inactive_groups_mut();
+            groups.push(&mut self.editor);
+            for tab in groups
+                .into_iter()
+                .flat_map(|g| g.editors.iter_mut())
+                .filter(|e| e.path.as_deref().is_some_and(|p| canon(p) == want))
+            {
+                let end = tab.lines.len();
+                tab.splice_result_rows(0, end, lines.clone());
+            }
+            self.status = format!(
+                "Approved the merge of your edits and {agent}'s; your tab holds the same text"
+            );
+        }
         if !self.approvals.is_empty() {
             self.approval_ui = Some(crate::agent_approval::ApprovalUi::new(
                 std::time::Instant::now(),

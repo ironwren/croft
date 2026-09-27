@@ -109,6 +109,17 @@ pub fn render(
             Span::raw(format!("{reason}\u{258f}")),
             Span::styled("   Enter send · Esc back", dim),
         ]),
+        None if ui.target_dirty => Line::from(vec![
+            Span::styled("Unsaved edits here: ", key),
+            Span::styled("Enter", key),
+            Span::styled(" merge them with the agent's (disk · yours · agent's)   ", dim),
+            Span::styled("Esc", key),
+            Span::styled(" deny   ", dim),
+            Span::styled("r", key),
+            Span::styled(" deny with a reason   ", dim),
+            Span::styled("↑↓", key),
+            Span::styled(" scroll", dim),
+        ]),
         None => Line::from(vec![
             Span::styled("Enter", key),
             Span::styled(" approve   ", dim),
