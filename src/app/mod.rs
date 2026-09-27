@@ -3612,6 +3612,12 @@ pub struct App {
         crate::search_editor::Header,
         std::sync::mpsc::Receiver<Vec<crate::widgets::search::SearchHit>>,
     )>,
+    /// The open SARIF logs (path, disk stamp) the published diagnostics were
+    /// built from (#577); a different set means publish again.
+    sarif_diag_signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// Every (file, source key) SARIF diagnostics were published under, so a
+    /// closed log's results can be withdrawn exactly.
+    sarif_published: Vec<(PathBuf, String)>,
     /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
     /// -> "Indexing 112/340 33%"). An entry exists only while that server has
     /// an active task; the status bar surfaces it so a busy-priming server is
@@ -3838,6 +3844,14 @@ pub struct App {
     pub tour_done: bool,
     /// The welcome panel's Take the Tour button, from the last frame.
     pub welcome_tour_button: Rect,
+    /// The `gh` executable GitHub features run; tests point it at a stand-in.
+    gh_program: PathBuf,
+    /// The SARIF result a code scanning dismissal is for (#577): its log's
+    /// path and its run and result indices, marked suppressed on success.
+    dismiss_target: Option<(PathBuf, usize, usize)>,
+    /// The SARIF location a Locate prompt is open for (#577): its URI and
+    /// the 1-based line and column to land on.
+    sarif_locate_pending: Option<(String, i64, i64)>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -5381,6 +5395,8 @@ impl App {
             },
             search_editor_job: None,
             code_lens_requested: std::collections::HashMap::new(),
+            sarif_diag_signature: Vec::new(),
+            sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
@@ -5603,6 +5619,9 @@ impl App {
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
+            gh_program: PathBuf::from("gh"),
+            dismiss_target: None,
+            sarif_locate_pending: None,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -7829,6 +7848,135 @@ impl App {
             self.refresh_problems_badge();
         }
         changed
+    }
+
+    /// Publish every open SARIF log's results as diagnostics (#577), and
+    /// withdraw what a closed log published. Recomputed only when the set of
+    /// open logs, or one of them on disk, changes; returns whether anything
+    /// did.
+    pub fn sync_sarif_diagnostics(&mut self) -> bool {
+        let inactive: Vec<&crate::widgets::editor::Editor> = self
+            .editor_layout
+            .inactive_groups()
+            .into_iter()
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        let mut signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> = self
+            .editor
+            .iter_tabs()
+            .chain(inactive)
+            .filter(|t| t.sarif.is_some())
+            .filter_map(|t| Some((t.path.clone()?, t.disk_stamp())))
+            .collect();
+        signature.sort();
+        signature.dedup_by(|a, b| a.0 == b.0);
+        if signature == self.sarif_diag_signature {
+            return false;
+        }
+        self.sarif_diag_signature = signature.clone();
+        // Withdraw everything published before, then publish afresh.
+        let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (target, key) in std::mem::take(&mut self.sarif_published) {
+            if let Some(by_source) = self.lsp_diagnostics.get_mut(&target) {
+                by_source.remove(&key);
+                if by_source.is_empty() {
+                    self.lsp_diagnostics.remove(&target);
+                }
+            }
+            touched.insert(target);
+        }
+        let root = self.workspace_root().to_path_buf();
+        let mut file_lines: std::collections::HashMap<PathBuf, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut line_of = |p: &std::path::Path, n: usize| -> Option<String> {
+            file_lines
+                .entry(p.to_path_buf())
+                .or_insert_with(|| {
+                    std::fs::read_to_string(p)
+                        .map(|t| t.lines().map(str::to_string).collect())
+                        .unwrap_or_default()
+                })
+                .get(n)
+                .cloned()
+        };
+        let mut published: std::collections::HashMap<
+            (PathBuf, String),
+            Vec<crate::lsp::manager::Diagnostic>,
+        > = std::collections::HashMap::new();
+        let views: Vec<&crate::sarif::view::SarifView> = self
+            .editor
+            .iter_tabs()
+            .chain(
+                self.editor_layout
+                    .inactive_groups()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter()),
+            )
+            .filter_map(|t| t.sarif.as_ref())
+            .collect();
+        let mut seen_logs = std::collections::HashSet::new();
+        for view in views {
+            for (index, loaded) in view.logs.iter().enumerate() {
+                // What the baseline reported is history, not today's code.
+                if view.baseline == Some(index) || !seen_logs.insert(loaded.path.clone()) {
+                    continue;
+                }
+                let mut roots = vec![root.clone()];
+                if let Some(dir) = loaded.path.parent() {
+                    roots.push(dir.to_path_buf());
+                }
+                let resolver = crate::sarif::resolve::Resolver {
+                    roots,
+                    learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                    ..Default::default()
+                };
+                let log_index = view.logs.iter().position(|l| l.path == loaded.path);
+                for (run_i, run) in loaded.log.runs.iter().enumerate() {
+                    let key = crate::sarif::diagnostics::source_key(run);
+                    for (result_i, result) in run.results.iter().flatten().enumerate() {
+                        // A fixed result no longer squiggles.
+                        if view.entries.iter().any(|e| {
+                            Some(e.log) == log_index
+                                && e.run == run_i
+                                && e.result == result_i
+                                && e.fixed
+                        }) {
+                            continue;
+                        }
+                        if let Some((target, d)) = crate::sarif::diagnostics::diagnostic_for(
+                            run,
+                            result,
+                            &resolver,
+                            &mut line_of,
+                        ) {
+                            published.entry((target, key.clone())).or_default().push(d);
+                        }
+                    }
+                }
+            }
+        }
+        for ((target, key), diags) in published {
+            self.lsp_diagnostics
+                .entry(target.clone())
+                .or_default()
+                .insert(key.clone(), diags);
+            self.sarif_published.push((target.clone(), key));
+            touched.insert(target);
+        }
+        for path in touched {
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
+                }
+            }
+        }
+        self.rebuild_problems();
+        self.refresh_problems_badge();
+        true
     }
 
     /// The repository toplevel owning the workspace, from the git worker's
@@ -26056,6 +26204,26 @@ impl App {
                 self.close_input_prompt();
                 self.submit_codeql_database(source, &value);
             }
+            InputPurpose::SarifAddLog => {
+                self.close_input_prompt();
+                self.submit_sarif_add_log(&value);
+            }
+            InputPurpose::SarifBaseline => {
+                self.close_input_prompt();
+                self.submit_sarif_baseline(&value);
+            }
+            InputPurpose::SarifExport => {
+                self.close_input_prompt();
+                self.submit_sarif_export(&value);
+            }
+            InputPurpose::DismissAlertComment { number, reason } => {
+                self.close_input_prompt();
+                self.dismiss_code_scanning_alert(number, reason, &value);
+            }
+            InputPurpose::SarifLocate { .. } => {
+                self.close_input_prompt();
+                self.submit_sarif_locate(&value);
+            }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
                 // the status line the run writes, so the user cannot see the
@@ -28347,6 +28515,23 @@ impl App {
                         String::from("The buffer changed — re-run Change Color Presentation");
                 }
                 self.pending_color_presentations.clear();
+            }
+            ListPurpose::DismissAlert => {
+                if let Some((number, reason)) = row.id.split_once(':') {
+                    let number = number.parse().unwrap_or(0);
+                    let reason = reason.parse().unwrap_or(0);
+                    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                    self.open_input_prompt(InputPrompt::new(
+                        InputPurpose::DismissAlertComment { number, reason },
+                        format!("Dismiss Alert #{number}"),
+                        String::from("comment (optional)"),
+                    ));
+                }
+            }
+            ListPurpose::CodeScanningAnalysis => {
+                if let Ok(id) = row.id.parse::<u64>() {
+                    self.open_code_scanning_analysis(id);
+                }
             }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
@@ -40405,6 +40590,9 @@ impl App {
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
+            Cmd::SarifNextResult => self.step_sarif_result(true),
+            Cmd::SarifPreviousResult => self.step_sarif_result(false),
+            Cmd::SarifOpenCodeScanning => self.open_code_scanning_picker(),
             Cmd::GoToSymbol => self.open_go_to_symbol(),
             Cmd::GoToWorkspaceSymbol => self.open_workspace_symbols(""),
             Cmd::NavigateBack => self.nav_back(),
@@ -51483,7 +51671,7 @@ impl App {
             KeyCode::Char('/') => view.editing_query = true,
             KeyCode::Esc => view.set_query(""),
             KeyCode::Tab | KeyCode::BackTab => {
-                let order = [Tab::Locations, Tab::Rules, Tab::Logs];
+                let order = [Tab::Locations, Tab::Rules, Tab::Logs, Tab::Run];
                 let i = order.iter().position(|t| *t == view.tab).unwrap_or(0);
                 let step = if key.code == KeyCode::BackTab { 2 } else { 1 };
                 view.set_tab(order[(i + step) % order.len()]);
@@ -51523,6 +51711,69 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('f') => self.apply_sarif_fix(0),
+            KeyCode::Char('o') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::SarifAddLog,
+                    String::from("Open SARIF Log"),
+                    String::from("path to a .sarif file to add to this view"),
+                ));
+            }
+            KeyCode::Char('b') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(InputPrompt::new(
+                    InputPurpose::SarifBaseline,
+                    String::from("Compare with Baseline"),
+                    String::from("path to an earlier .sarif log of the same code"),
+                ));
+            }
+            KeyCode::Char('X') => self.start_dismiss_code_scanning_alert(),
+            KeyCode::Char('E') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::SarifExport,
+                        String::from("Export Results as CSV"),
+                        String::from("file to write the visible results to"),
+                    )
+                    .with_value("sarif-results.csv"),
+                );
+            }
+            KeyCode::Delete | KeyCode::Backspace if view.tab == Tab::Logs => {
+                match view.selected_log() {
+                    Some(i) if view.remove_log(i) => {
+                        self.sarif_diag_signature.clear();
+                        self.status = String::from("Closed that log");
+                    }
+                    Some(_) => {
+                        self.status = String::from("The last log closes with its tab (Cmd+W)");
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Char('d') => view.detail_tab = view.detail_tab.step(true),
+            // Scroll the details pane half a page; the renderer clamps.
+            KeyCode::Char(']') => {
+                view.detail_scroll += (view.rows_visible as usize / 2).max(1);
+            }
+            KeyCode::Char('[') => {
+                view.detail_scroll = view
+                    .detail_scroll
+                    .saturating_sub((view.rows_visible as usize / 2).max(1));
+            }
+            KeyCode::Char('D') => view.detail_tab = view.detail_tab.step(false),
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let forward = key.code == KeyCode::Char('n');
+                match view.step_nav(forward) {
+                    Some(target) => self.open_sarif_loc(&target),
+                    None => self.status = String::from("Nothing to step through on this tab"),
+                }
+            }
+            KeyCode::Char('L') => match view.next_link() {
+                Some(target) => self.open_sarif_loc(&target),
+                None => self.status = String::from("This message has no location links"),
+            },
             KeyCode::Enter => {
                 if view.selected_entry().is_some() {
                     self.open_selected_sarif_result();
@@ -51626,6 +51877,7 @@ impl App {
             }
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
+                learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
                 ..Default::default()
             };
             let found = resolver.resolve(run, artifact, &|p| p.is_file());
@@ -51638,9 +51890,637 @@ impl App {
             return;
         };
         let Some(path) = path else {
-            self.status = format!("Cannot find {uri} on this machine");
+            // VS Code's Locate…: ask where the file is.
+            let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+            self.sarif_locate_pending = Some((uri.clone(), line + 1, column + 1));
+            self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                crate::widgets::input_prompt::InputPurpose::SarifLocate { uri: uri.clone() },
+                format!("Locate {name}"),
+                format!("path to {name} on this machine"),
+            ));
+            self.status = format!("Cannot find {uri} on this machine: where is it?");
             return;
         };
+        self.editor.pin_active();
+        let opened = match kind {
+            ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
+            ColumnKind::UnicodeCodePoints => self.open_at(&path, line as usize, column as usize),
+        };
+        self.status = match opened {
+            Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
+            Err(e) => format!("Open failed: {e}"),
+        };
+    }
+
+    /// Every located result of the first open SARIF viewer as
+    /// `(tab, entry, file, line, column)`, sorted by file then position.
+    /// Paths are worked out without touching the disk (a relative URI
+    /// against the workspace root, else the log's folder), so this is cheap
+    /// enough to run every tick.
+    fn sarif_targets(&self) -> Vec<(usize, usize, PathBuf, i64, i64)> {
+        let root = self.workspace_root().to_path_buf();
+        let Some((tab, view)) = self
+            .editor
+            .editors
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| t.sarif.as_ref().map(|v| (i, v)))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, e) in view.entries.iter().enumerate() {
+            if e.uri.is_empty() || e.line <= 0 {
+                continue;
+            }
+            let Some(p) = crate::sarif::resolve::uri_to_path(&e.uri) else {
+                continue;
+            };
+            let path = if p.is_absolute() {
+                p
+            } else {
+                let in_root = root.join(&p);
+                let log_dir = view
+                    .logs
+                    .get(e.log)
+                    .and_then(|l| l.path.parent())
+                    .map(|d| d.join(&p));
+                match log_dir {
+                    Some(d) if !in_root.exists() => d,
+                    _ => in_root,
+                }
+            };
+            out.push((tab, i, path, e.line, e.column.max(1)));
+        }
+        out.sort_by(|a, b| (&a.2, a.3, a.4).cmp(&(&b.2, b.3, b.4)));
+        out
+    }
+
+    /// Run `gh` with `args` in the active workspace root. Its stdout, or
+    /// the first line of what it said went wrong: GitHub's own message when
+    /// the API sent one, else gh's.
+    fn run_gh(&self, args: &[String]) -> Result<String, String> {
+        let out = std::process::Command::new(&self.gh_program)
+            .args(args)
+            .current_dir(self.active_workspace_root())
+            .output()
+            .map_err(|e| format!("could not run gh: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() {
+            return Ok(stdout);
+        }
+        let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
+            .ok()
+            .and_then(|v| v.get("message")?.as_str().map(str::to_string));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = |s: &str| s.trim().lines().next().map(str::to_string);
+        Err(api_message
+            .or_else(|| {
+                let s = stderr.trim();
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+                    .or_else(|| first(s))
+            })
+            .unwrap_or_else(|| String::from("gh failed")))
+    }
+
+    /// List recent code scanning analyses to open one (#577): the current
+    /// branch's when it has any, else the repository's.
+    fn open_code_scanning_picker(&mut self) {
+        use crate::sarif::github;
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let fetch = |app: &Self, git_ref: Option<&str>| {
+            app.run_gh(&github::analyses_args(git_ref))
+                .and_then(|json| github::parse_analyses(&json))
+        };
+        let branch = self.source_control.status.branch.clone();
+        let on_branch = match &branch {
+            Some(b) => match fetch(self, Some(&format!("refs/heads/{b}"))) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.status = format!("Code scanning: {e}");
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        let (analyses, title) = if on_branch.is_empty() {
+            match fetch(self, None) {
+                Ok(a) => (a, String::from("Open Code Scanning Analysis")),
+                Err(e) => {
+                    self.status = format!("Code scanning: {e}");
+                    return;
+                }
+            }
+        } else {
+            let b = branch.unwrap_or_default();
+            (on_branch, format!("Open Code Scanning Analysis \u{b7} {b}"))
+        };
+        let rows = analyses
+            .iter()
+            .map(|a| ListRow {
+                id: a.id.to_string(),
+                label: github::label(a),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
+            "This repository has no code scanning analyses",
+        );
+    }
+
+    /// Dismiss the selected result's code scanning alert (#577): the alert
+    /// number GitHub stamped on the result, or else the open alert with the
+    /// same rule, path and line; then ask why.
+    fn start_dismiss_code_scanning_alert(&mut self) {
+        use crate::sarif::github::{self, DismissReason};
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(view) = self.editor.sarif.as_ref() else {
+            return;
+        };
+        let Some(e) = view.selected_entry().cloned() else {
+            self.status = String::from("Select a result to dismiss its alert");
+            return;
+        };
+        let Some(loaded) = view.logs.get(e.log) else {
+            return;
+        };
+        let log_path = loaded.path.clone();
+        let Some(run) = loaded.log.runs.get(e.run) else {
+            return;
+        };
+        let Some(result) = run.results.as_ref().and_then(|r| r.get(e.result)) else {
+            return;
+        };
+        let stamped = github::alert_number(result);
+        // The location as the log wrote it: code scanning paths are
+        // repository-relative, like the URIs GitHub's own logs carry.
+        let path = result
+            .locations
+            .first()
+            .and_then(|l| l.physical_location.as_ref())
+            .and_then(|p| p.artifact_location.as_ref())
+            .and_then(|a| crate::sarif::resolve::location_parts(run, a))
+            .map(|(uri, _)| uri)
+            .unwrap_or_default();
+        let number = match stamped {
+            Some(n) => n,
+            None => {
+                let alerts = match self
+                    .run_gh(&github::alerts_args(None))
+                    .and_then(|json| github::parse_alerts(&json))
+                {
+                    Ok(a) => a,
+                    Err(err) => {
+                        self.status = format!("Code scanning alerts: {err}");
+                        return;
+                    }
+                };
+                match github::match_alert(&alerts, &e.rule_id, &path, e.line) {
+                    Some(n) => n,
+                    None => {
+                        self.status = String::from("No code scanning alert matches this result");
+                        return;
+                    }
+                }
+            }
+        };
+        self.dismiss_target = Some((log_path, e.run, e.result));
+        let rows = DismissReason::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let api = r.api();
+                let mut label = api[..1].to_uppercase();
+                label.push_str(&api[1..]);
+                ListRow {
+                    id: format!("{number}:{i}"),
+                    label,
+                }
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DismissAlert,
+                format!("Dismiss Alert #{number}"),
+                rows,
+            ),
+            "",
+        );
+    }
+
+    /// Send the dismissal of alert `number` (#577); on success the result
+    /// it came from is marked suppressed, which the default filter hides.
+    fn dismiss_code_scanning_alert(&mut self, number: u64, reason: usize, comment: &str) {
+        use crate::sarif::github::{self, DismissReason};
+        let reason = DismissReason::ALL
+            .get(reason)
+            .copied()
+            .unwrap_or(DismissReason::FalsePositive);
+        if let Err(e) = self.run_gh(&github::dismiss_args(number, reason, comment)) {
+            self.status = format!("Alert #{number} was not dismissed: {e}");
+            return;
+        }
+        if let (Some((log_path, run, result)), Some(view)) =
+            (self.dismiss_target.take(), self.editor.sarif.as_mut())
+        {
+            let log = view.logs.iter().position(|l| l.path == log_path);
+            for e in &mut view.entries {
+                if Some(e.log) == log && e.run == run && e.result == result {
+                    e.suppression = crate::sarif::semantics::SuppressionState::Suppressed;
+                }
+            }
+        }
+        self.status = format!("Dismissed alert #{number} as {}", reason.api());
+    }
+
+    /// Download code scanning analysis `id` as SARIF and open it (#577).
+    fn open_code_scanning_analysis(&mut self, id: u64) {
+        let text = match self.run_gh(&crate::sarif::github::sarif_args(id)) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Code scanning analysis #{id}: {e}");
+                return;
+            }
+        };
+        let dir = croft_cache_dir().join("code-scanning");
+        let path = dir.join(format!("analysis-{id}.sarif"));
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                self.status = format!("Opened code scanning analysis #{id}");
+            }
+            Err(e) => self.status = format!("Code scanning analysis #{id}: {e}"),
+        }
+    }
+
+    /// Write the SARIF viewer's visible results to a CSV file (#577),
+    /// relative to the workspace, creating its folder.
+    pub fn submit_sarif_export(&mut self, value: &str) {
+        let Some(view) = self.editor.sarif.as_ref() else {
+            return;
+        };
+        let csv = view.export_csv();
+        let count = csv.lines().count().saturating_sub(1);
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, csv));
+        self.status = match written {
+            Ok(()) => format!(
+                "Exported {count} result{} to {}",
+                if count == 1 { "" } else { "s" },
+                path.display()
+            ),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
+    }
+
+    /// Compare the open viewer against a baseline log (#577): results the
+    /// tool did not mark become new, unchanged or updated, and the
+    /// baseline's vanished results are listed as absent.
+    pub fn submit_sarif_baseline(&mut self, value: &str) {
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let text = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let log = match crate::sarif::load::parse_log(&text) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("{} is not a usable baseline: {e}", path.display());
+                return;
+            }
+        };
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        self.status = if view.set_baseline(&path, log) {
+            // The baseline's own results stop publishing.
+            self.sarif_diag_signature.clear();
+            let count = |s| view.entries.iter().filter(|e| e.baseline == s).count();
+            use crate::sarif::semantics::BaselineState as B;
+            format!(
+                "Against {}: {} new, {} unchanged, {} updated, {} absent",
+                path.display(),
+                count(B::New),
+                count(B::Unchanged),
+                count(B::Updated),
+                count(B::Absent)
+            )
+        } else {
+            String::from("A log cannot be its own baseline")
+        };
+    }
+
+    /// Merge another SARIF log into the open viewer (#577).
+    pub fn submit_sarif_add_log(&mut self, value: &str) {
+        let v = value.trim();
+        let path = if std::path::Path::new(v).is_absolute() {
+            PathBuf::from(v)
+        } else {
+            self.workspace_root().join(v)
+        };
+        let text = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let log = match crate::sarif::load::parse_log(&text) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("{} was not added: {e}", path.display());
+                return;
+            }
+        };
+        let Some(view) = self.editor.sarif.as_mut() else {
+            return;
+        };
+        self.status = if view.add_log(&path, log) {
+            // A new log publishes its results too.
+            self.sarif_diag_signature.clear();
+            format!("Added {} · {} results", path.display(), view.entries.len())
+        } else {
+            format!("{} is already open here", path.display())
+        };
+    }
+
+    /// The Locate prompt's answer (#577): the file must carry the name the
+    /// log gave it; its location teaches a prefix that is saved for this
+    /// workspace, so the log's other files from the same place resolve too.
+    pub fn submit_sarif_locate(&mut self, value: &str) {
+        let Some((uri, line, col)) = self.sarif_locate_pending.clone() else {
+            return;
+        };
+        let v = value.trim();
+        let typed = match v.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(rest),
+            None => PathBuf::from(v),
+        };
+        let path = if typed.is_absolute() {
+            typed
+        } else {
+            self.workspace_root().join(typed)
+        };
+        if !path.is_file() {
+            self.status = format!("{} is not a file", path.display());
+            return;
+        }
+        let want = uri.rsplit('/').next().unwrap_or("").to_string();
+        let want = crate::sarif::resolve::uri_to_path(&want)
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or(want);
+        let got = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if want != got {
+            self.status = format!("File names must match: \"{want}\" and \"{got}\"");
+            return;
+        }
+        self.sarif_locate_pending = None;
+        let root = self.workspace_root().to_path_buf();
+        if let Err(e) = crate::sarif::resolve::save_prefix(&root, &uri, &path) {
+            self.status = format!("Located, but the mapping was not saved: {e}");
+        }
+        self.editor.pin_active();
+        match self.open_at(
+            &path,
+            line.saturating_sub(1) as usize,
+            col.saturating_sub(1) as usize,
+        ) {
+            Ok(()) => {
+                // The learned prefix may change what resolves: republish.
+                self.sarif_diag_signature.clear();
+                self.status =
+                    format!("Located {got}; other files from the same place will resolve");
+            }
+            Err(e) => self.status = format!("Open failed: {e}"),
+        }
+    }
+
+    /// Jump to the next (or previous) SARIF result location from the
+    /// cursor (#577), across files, wrapping at the ends.
+    fn step_sarif_result(&mut self, forward: bool) {
+        let targets = self.sarif_targets();
+        if targets.is_empty() {
+            self.status = String::from("No SARIF results with a location are open");
+            return;
+        }
+        let here = (
+            self.editor.path.clone().unwrap_or_default(),
+            self.editor.cursor_row as i64 + 1,
+            self.editor.cursor_col as i64 + 1,
+        );
+        let key = |t: &(usize, usize, PathBuf, i64, i64)| (t.2.clone(), t.3, t.4);
+        let pick = if forward {
+            targets.iter().position(|t| key(t) > here).unwrap_or(0)
+        } else {
+            targets
+                .iter()
+                .rposition(|t| key(t) < (here.0.clone(), here.1, here.2))
+                .unwrap_or(targets.len() - 1)
+        };
+        let (tab, entry, path, line, col) = targets[pick].clone();
+        let message = self.editor.editors[tab]
+            .sarif
+            .as_ref()
+            .and_then(|v| v.entries.get(entry))
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        if let Some(view) = self.editor.editors[tab].sarif.as_mut()
+            && let Some(row) = view
+                .rows()
+                .iter()
+                .position(|r| *r == crate::sarif::view::Row::Item { entry })
+        {
+            view.selected = row;
+        }
+        if let Err(e) = self.open_at(&path, (line - 1) as usize, (col - 1) as usize) {
+            self.status = format!("Could not open {}: {e}", path.display());
+            return;
+        }
+        self.status = format!("SARIF {}/{}: {message}", pick + 1, targets.len());
+    }
+
+    /// Select, in an open SARIF viewer, the result on the cursor's line
+    /// (#577), the way VS Code's panel follows the editor.
+    pub fn sync_sarif_selection_to_cursor(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.sarif.is_some() {
+            return;
+        }
+        let line = self.editor.cursor_row as i64 + 1;
+        let Some((tab, entry)) = self
+            .sarif_targets()
+            .into_iter()
+            .find(|t| t.2 == path && t.3 == line)
+            .map(|t| (t.0, t.1))
+        else {
+            return;
+        };
+        if let Some(view) = self.editor.editors[tab].sarif.as_mut()
+            && let Some(row) = view
+                .rows()
+                .iter()
+                .position(|r| *r == crate::sarif::view::Row::Item { entry })
+        {
+            view.selected = row;
+        }
+    }
+
+    /// Apply fix `index` of the selected SARIF result (#577) to the open
+    /// buffer of each file it changes (the file on disk when none is open),
+    /// as one undoable edit that stays unsaved, then mark the result fixed.
+    fn apply_sarif_fix(&mut self, index: usize) {
+        let root = self.workspace_root().to_path_buf();
+        let Some((log_path, run_i, result_i, run, fix)) =
+            self.editor.sarif.as_ref().and_then(|v| {
+                let e = v.selected_entry()?;
+                let loaded = v.logs.get(e.log)?;
+                let run = loaded.log.runs.get(e.run)?.clone();
+                let fix = run
+                    .results
+                    .as_ref()?
+                    .get(e.result)?
+                    .fixes
+                    .get(index)?
+                    .clone();
+                Some((loaded.path.clone(), e.run, e.result, run, fix))
+            })
+        else {
+            self.status = String::from("This result offers no fix");
+            return;
+        };
+        let mut roots = vec![root];
+        if let Some(dir) = log_path.parent() {
+            roots.push(dir.to_path_buf());
+        }
+        let resolver = crate::sarif::resolve::Resolver {
+            roots,
+            learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+            ..Default::default()
+        };
+        let open_text = |p: &std::path::Path| -> Option<String> {
+            self.editor
+                .iter_tabs()
+                .find(|t| t.path.as_deref() == Some(p) && !t.has_non_text_view())
+                .map(|t| {
+                    let mut s = t.lines.join("\n");
+                    s.push('\n');
+                    s
+                })
+        };
+        let edits = match crate::sarif::fixes::apply_fix(&run, &fix, &resolver, &mut |p| {
+            open_text(p).or_else(|| std::fs::read_to_string(p).ok())
+        }) {
+            Ok(e) => e,
+            Err(why) => {
+                self.status = format!("Fix not applied: {why}");
+                return;
+            }
+        };
+        self.editor.pin_active();
+        for edit in &edits {
+            if let Err(e) = self.open_at(&edit.path, 0, 0) {
+                self.status = format!("Fix not applied: {e}");
+                return;
+            }
+            self.editor
+                .replace_all_lines(crate::widgets::editor::split_into_lines(&edit.after));
+        }
+        let mut store = crate::sarif::view::FixedStore::load();
+        store.mark(&log_path, run_i, result_i);
+        let _ = store.save();
+        for tab in self.editor.editors.iter_mut() {
+            if let Some(view) = tab.sarif.as_mut() {
+                for e in view.entries.iter_mut() {
+                    if view.logs.get(e.log).is_some_and(|l| l.path == log_path)
+                        && e.run == run_i
+                        && e.result == result_i
+                    {
+                        e.fixed = true;
+                    }
+                }
+            }
+        }
+        // Republish without the fixed result.
+        self.sarif_diag_signature.clear();
+        let what = fix
+            .description
+            .as_ref()
+            .and_then(|m| m.text.clone())
+            .unwrap_or_else(|| String::from("the fix"));
+        self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
+    }
+
+    /// Open a location from the selected result's details (a step, a frame, a
+    /// related location), resolving it the way the result's own location is
+    /// resolved and keeping the viewer tab.
+    fn open_sarif_loc(&mut self, target: &crate::sarif::details::LocRef) {
+        use crate::sarif::region::{ColumnKind, column_kind};
+        if target.uri.is_empty() {
+            self.status = format!("{} has no file to open", target.label);
+            return;
+        }
+        let root = self.workspace_root().to_path_buf();
+        let Some((path, kind)) = self.editor.sarif.as_ref().and_then(|v| {
+            let e = v.selected_entry()?;
+            let loaded = v.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let mut roots = vec![root.clone()];
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            let resolver = crate::sarif::resolve::Resolver {
+                roots,
+                learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                ..Default::default()
+            };
+            let artifact = crate::sarif::model::ArtifactLocation {
+                uri: Some(target.uri.clone()),
+                ..Default::default()
+            };
+            Some((
+                resolver.resolve(run, &artifact, &|p| p.is_file()),
+                column_kind(run),
+            ))
+        }) else {
+            return;
+        };
+        let Some(path) = path else {
+            self.status = format!("Cannot find {} on this machine", target.uri);
+            return;
+        };
+        let line = target.line.max(1) - 1;
+        let column = target.column.max(1) - 1;
         self.editor.pin_active();
         let opened = match kind {
             ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
@@ -57712,6 +58592,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
         let markdown_lint_changed = app.sync_markdown_lint();
+        let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
+        app.sync_sarif_selection_to_cursor();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
@@ -57879,7 +58761,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || install_status_changed
             || blame_changed
             || dap_changed
-            || markdown_lint_changed;
+            || markdown_lint_changed
+            || sarif_diagnostics_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);

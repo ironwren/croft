@@ -8,8 +8,56 @@
 use super::model::{Run, SarifLog, SarifResult};
 use super::resolve::{expand, uri_to_path};
 use super::semantics::{self as sem, BaselineState, Kind, Level, SuppressionState};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+/// Which results the user fixed, per log, kept in croft's cache so the
+/// strike-through survives closing and reopening a log (#577). Keyed by
+/// the log's path, then `run:result`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FixedStore {
+    #[serde(default)]
+    pub logs: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl FixedStore {
+    pub fn path() -> PathBuf {
+        crate::app::croft_cache_dir().join("sarif-fixed.json")
+    }
+
+    pub fn load() -> FixedStore {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, text)
+    }
+
+    pub fn key(run: usize, result: usize) -> String {
+        format!("{run}:{result}")
+    }
+
+    pub fn is_fixed(&self, log: &std::path::Path, run: usize, result: usize) -> bool {
+        self.logs
+            .get(&log.display().to_string())
+            .is_some_and(|s| s.contains(&Self::key(run, result)))
+    }
+
+    pub fn mark(&mut self, log: &std::path::Path, run: usize, result: usize) {
+        self.logs
+            .entry(log.display().to_string())
+            .or_default()
+            .insert(Self::key(run, result));
+    }
+}
 
 /// Largest log the viewer loads into memory. SARIF from a monorepo scan runs
 /// to hundreds of megabytes; past this the JSON tree alone would dwarf it.
@@ -44,6 +92,8 @@ pub struct Entry {
     pub line: i64,
     pub column: i64,
     pub tags: Vec<String>,
+    /// The user applied a fix for it or marked it fixed (#577).
+    pub fixed: bool,
 }
 
 /// A loaded log and where it came from.
@@ -58,6 +108,49 @@ pub enum Tab {
     Locations,
     Rules,
     Logs,
+    /// Each run's tool, invocations and notifications (#577).
+    Run,
+}
+
+/// The details pane's tabs (VS Code: Info, Analysis Steps, Stacks; croft
+/// adds the result's raw JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailTab {
+    Info,
+    Steps,
+    Stacks,
+    Raw,
+    Fix,
+}
+
+impl DetailTab {
+    const ORDER: [DetailTab; 5] = [
+        DetailTab::Info,
+        DetailTab::Steps,
+        DetailTab::Stacks,
+        DetailTab::Raw,
+        DetailTab::Fix,
+    ];
+
+    pub fn step(self, forward: bool) -> DetailTab {
+        let i = Self::ORDER.iter().position(|t| *t == self).unwrap_or(0);
+        let n = Self::ORDER.len();
+        Self::ORDER[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DetailTab::Info => "Info",
+            DetailTab::Steps => "Steps",
+            DetailTab::Stacks => "Stacks",
+            DetailTab::Raw => "Raw",
+            DetailTab::Fix => "Fix",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +311,23 @@ pub struct SarifView {
     /// Screen columns the list occupies: `[list_x, list_x + list_width)`.
     pub list_x: u16,
     pub list_width: u16,
+    pub detail_tab: DetailTab,
+    /// The step (Steps tab), frame (Stacks tab) or location (Info tab) last
+    /// opened with `n`/`N`; reset when the selected result changes.
+    pub nav_cursor: Option<usize>,
+    /// The message link last followed with `L`.
+    pub link_cursor: Option<usize>,
+    /// First details line painted.
+    pub detail_scroll: usize,
+    /// The selected result's resolved details, keyed by entry index.
+    details_cache: Option<(usize, super::details::Details)>,
+    /// The selected result's raw JSON, keyed by entry index.
+    raw_cache: Option<(usize, Option<String>)>,
+    /// The selected result's fix previews, keyed by entry index.
+    fix_cache: Option<(usize, Vec<String>)>,
+    /// Index into `logs` of the baseline the others are compared against;
+    /// only its absent results are listed.
+    pub baseline: Option<usize>,
 }
 
 impl SarifView {
@@ -237,7 +347,181 @@ impl SarifView {
             rows_visible: 0,
             list_x: 0,
             list_width: 0,
+            detail_tab: DetailTab::Info,
+            nav_cursor: None,
+            link_cursor: None,
+            detail_scroll: 0,
+            details_cache: None,
+            raw_cache: None,
+            fix_cache: None,
+            baseline: None,
         }
+    }
+
+    fn selected_index_pub(&self) -> Option<usize> {
+        match self.rows().get(self.selected)? {
+            Row::Item { entry } => Some(*entry),
+            Row::Group { .. } => None,
+        }
+    }
+
+    /// The selected result's details, resolved once per selection. Moving to
+    /// another result resets the step, frame and link cursors.
+    pub fn details(&mut self) -> Option<&super::details::Details> {
+        let idx = self.selected_index_pub()?;
+        if self.details_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let e = self.entries.get(idx)?;
+            let loaded = self.logs.get(e.log)?;
+            let run = loaded.log.runs.get(e.run)?;
+            let result = run.results.as_ref()?.get(e.result)?;
+            let mut roots = Vec::new();
+            if let Some(dir) = loaded.path.parent() {
+                roots.push(dir.to_path_buf());
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                roots.push(cwd);
+            }
+            let d = super::details::details(run, result, &roots);
+            self.details_cache = Some((idx, d));
+            self.nav_cursor = None;
+            self.link_cursor = None;
+            self.detail_scroll = 0;
+        }
+        self.details_cache.as_ref().map(|(_, d)| d)
+    }
+
+    /// The selected result's JSON as the log holds it, read on first use.
+    pub fn raw(&mut self) -> Option<&str> {
+        let idx = self.selected_index_pub()?;
+        if self.raw_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let e = self.entries.get(idx)?;
+            let path = self.logs.get(e.log)?.path.clone();
+            let raw = super::details::raw_result_json(&path, e.run, e.result);
+            self.raw_cache = Some((idx, raw));
+        }
+        self.raw_cache.as_ref().and_then(|(_, r)| r.as_deref())
+    }
+
+    /// The Fix tab's lines for the selected result: each fix's description
+    /// and what it would change, computed once per selection against the
+    /// files on disk.
+    pub fn fix_preview(&mut self) -> Vec<String> {
+        let Some(idx) = self.selected_index_pub() else {
+            return Vec::new();
+        };
+        if self.fix_cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+            let lines = (|| {
+                let e = self.entries.get(idx)?;
+                let loaded = self.logs.get(e.log)?;
+                let run = loaded.log.runs.get(e.run)?;
+                let result = run.results.as_ref()?.get(e.result)?;
+                if result.fixes.is_empty() {
+                    return Some(vec![String::from("This result offers no fix.")]);
+                }
+                let mut roots = Vec::new();
+                if let Some(dir) = loaded.path.parent() {
+                    roots.push(dir.to_path_buf());
+                }
+                if let Ok(cwd) = std::env::current_dir() {
+                    roots.push(cwd);
+                }
+                let resolver = super::resolve::Resolver {
+                    roots,
+                    ..Default::default()
+                };
+                let mut out = Vec::new();
+                for (i, fix) in result.fixes.iter().enumerate() {
+                    let what = fix
+                        .description
+                        .as_ref()
+                        .and_then(|m| m.text.clone())
+                        .unwrap_or_else(|| String::from("(no description)"));
+                    out.push(format!("Fix {}: {what}", i + 1));
+                    match super::fixes::apply_fix(run, fix, &resolver, &mut |p| {
+                        std::fs::read_to_string(p).ok()
+                    }) {
+                        Ok(edits) => out.extend(super::fixes::preview(&edits)),
+                        Err(why) => out.push(format!("cannot apply: {why}")),
+                    }
+                    out.push(String::new());
+                }
+                out.push(String::from("f applies fix 1 to the open buffer (unsaved)"));
+                Some(out)
+            })()
+            .unwrap_or_default();
+            self.fix_cache = Some((idx, lines));
+        }
+        self.fix_cache
+            .as_ref()
+            .map(|(_, l)| l.clone())
+            .unwrap_or_default()
+    }
+
+    /// The locations `n`/`N` walk on the current tab: every step of every
+    /// flow, every frame of every stack, or the result's own locations then
+    /// its related ones.
+    pub fn nav_targets(&mut self) -> Vec<super::details::LocRef> {
+        let tab = self.detail_tab;
+        let Some(d) = self.details() else {
+            return Vec::new();
+        };
+        match tab {
+            DetailTab::Steps => d
+                .threads
+                .iter()
+                .flat_map(|t| t.steps.iter().filter_map(|s| s.location.clone()))
+                .collect(),
+            DetailTab::Stacks => d
+                .stacks
+                .iter()
+                .flat_map(|s| s.frames.iter().filter_map(|f| f.location.clone()))
+                .collect(),
+            DetailTab::Info | DetailTab::Raw | DetailTab::Fix => d
+                .locations
+                .iter()
+                .chain(d.related.iter())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Advance the `n`/`N` cursor and return the location it lands on.
+    pub fn step_nav(&mut self, forward: bool) -> Option<super::details::LocRef> {
+        let targets = self.nav_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        let last = targets.len() - 1;
+        let next = match (self.nav_cursor, forward) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(i), true) => (i + 1).min(last),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.nav_cursor = Some(next);
+        targets.get(next).cloned()
+    }
+
+    /// Advance to the next `[text](id)` link in the message that resolves,
+    /// wrapping, and return where it points.
+    pub fn next_link(&mut self) -> Option<super::details::LocRef> {
+        let d = self.details()?.clone();
+        let links: Vec<_> = d
+            .message
+            .iter()
+            .filter_map(|s| match s {
+                super::semantics::Segment::LocationLink { id, .. } => {
+                    super::details::link_target(&d, *id).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        if links.is_empty() {
+            return None;
+        }
+        let next = self.link_cursor.map_or(0, |i| (i + 1) % links.len());
+        self.link_cursor = Some(next);
+        links.get(next).cloned()
     }
 
     /// A viewer over one log file. File names display relative to the log's
@@ -256,12 +540,210 @@ impl SarifView {
         }];
         let entries = build_entries(&logs, &roots);
         let mut view = SarifView::new(logs, entries);
+        let fixed = FixedStore::load();
+        for e in &mut view.entries {
+            e.fixed = fixed.is_fixed(path, e.run, e.result);
+        }
         // Start on the first result rather than its group header, so the
         // details pane has something to show from the first frame.
         if matches!(view.rows().get(1), Some(Row::Item { .. })) {
             view.selected = 1;
         }
         view
+    }
+
+    /// Rebuild every entry from the open logs, keeping fixed marks, and
+    /// drop the per-selection caches that described the old list.
+    fn rebuild_entries(&mut self) {
+        let mut roots: Vec<PathBuf> = self
+            .logs
+            .iter()
+            .filter_map(|l| l.path.parent().map(|d| d.to_path_buf()))
+            .collect();
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+        self.entries = build_entries(&self.logs, &roots);
+        if let Some(b) = self.baseline.filter(|b| *b < self.logs.len()) {
+            self.apply_baseline(b);
+        }
+        let fixed = FixedStore::load();
+        for e in &mut self.entries {
+            if let Some(l) = self.logs.get(e.log) {
+                e.fixed = fixed.is_fixed(&l.path, e.run, e.result);
+            }
+        }
+        self.details_cache = None;
+        self.raw_cache = None;
+        self.fix_cache = None;
+        let len = self.rows().len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+    }
+
+    /// Compare every other log against log `b`: results the producer left
+    /// without a `baselineState` take the computed one, and `b` itself
+    /// keeps only the results no other log still reports, as absent.
+    fn apply_baseline(&mut self, b: usize) {
+        let mut states = HashMap::new();
+        let mut absent: Option<HashSet<(usize, usize)>> = None;
+        for (li, loaded) in self.logs.iter().enumerate() {
+            if li == b {
+                continue;
+            }
+            let c = super::baseline::compare(&loaded.log, &self.logs[b].log);
+            let gone: HashSet<(usize, usize)> = c.absent.into_iter().collect();
+            absent = Some(match absent {
+                Some(prev) => prev.intersection(&gone).copied().collect(),
+                None => gone,
+            });
+            states.insert(li, c.current);
+        }
+        let absent = absent.unwrap_or_default();
+        self.entries.retain_mut(|e| {
+            if e.log == b {
+                e.baseline = BaselineState::Absent;
+                return absent.contains(&(e.run, e.result));
+            }
+            if e.baseline == BaselineState::Unspecified
+                && let Some(s) = states
+                    .get(&e.log)
+                    .and_then(|runs| runs.get(e.run))
+                    .and_then(|run| run.get(e.result))
+            {
+                e.baseline = *s;
+            }
+            true
+        });
+    }
+
+    /// Compare this viewer against `log` at `path` (opening it as a log if
+    /// it is not one already). `false` when it is the only log: a log is
+    /// never its own baseline.
+    pub fn set_baseline(&mut self, path: &std::path::Path, log: SarifLog) -> bool {
+        let index = match self.logs.iter().position(|l| l.path == path) {
+            Some(i) => i,
+            None => {
+                self.logs.push(LoadedLog {
+                    path: path.to_path_buf(),
+                    log,
+                });
+                self.logs.len() - 1
+            }
+        };
+        if self.logs.len() < 2 {
+            return false;
+        }
+        self.baseline = Some(index);
+        self.rebuild_entries();
+        true
+    }
+
+    /// Merge another log into this viewer. `false` when it is already open.
+    pub fn add_log(&mut self, path: &std::path::Path, log: SarifLog) -> bool {
+        if self.logs.iter().any(|l| l.path == path) {
+            return false;
+        }
+        self.logs.push(LoadedLog {
+            path: path.to_path_buf(),
+            log,
+        });
+        self.rebuild_entries();
+        true
+    }
+
+    /// Close log `index`. The last log stays: closing it is closing the tab.
+    pub fn remove_log(&mut self, index: usize) -> bool {
+        if self.logs.len() <= 1 || index >= self.logs.len() {
+            return false;
+        }
+        self.logs.remove(index);
+        self.baseline = match self.baseline {
+            Some(b) if b == index => None,
+            Some(b) if b > index => Some(b - 1),
+            other => other,
+        };
+        self.rebuild_entries();
+        true
+    }
+
+    /// The log the selected row belongs to: a Logs-tab group header, or any
+    /// result.
+    pub fn selected_log(&self) -> Option<usize> {
+        match self.rows().get(self.selected)? {
+            Row::Item { entry } => self.entries.get(*entry).map(|e| e.log),
+            Row::Group { key, .. } => key.strip_prefix("l:").and_then(|n| n.parse().ok()),
+        }
+    }
+
+    /// The Run tab (#577): for each log and run, the tool, every invocation
+    /// and the tool's own notifications (VS Code shows none of these).
+    pub fn run_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for loaded in &self.logs {
+            let name = loaded
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for (ri, run) in loaded.log.runs.iter().enumerate() {
+                out.push(format!("{name} \u{b7} run {}", ri + 1));
+                let d = &run.tool.driver;
+                let version = d
+                    .semantic_version
+                    .clone()
+                    .or_else(|| d.version.clone())
+                    .unwrap_or_default();
+                out.push(format!("  {} {version}", d.name).trim_end().to_string());
+                if let Some(uri) = &d.information_uri {
+                    out.push(format!("  {uri}"));
+                }
+                for ext in &run.tool.extensions {
+                    let v = ext
+                        .semantic_version
+                        .clone()
+                        .or_else(|| ext.version.clone())
+                        .unwrap_or_default();
+                    out.push(format!("  + {} {v}", ext.name).trim_end().to_string());
+                }
+                if let Some(id) = run.automation_details.as_ref().and_then(|a| a.id.clone()) {
+                    out.push(format!("  automation {id}"));
+                }
+                if run.invocations.is_empty() {
+                    out.push(String::from("  no invocation recorded"));
+                }
+                for inv in &run.invocations {
+                    if let Some(cmd) = &inv.command_line {
+                        out.push(format!("  $ {cmd}"));
+                    }
+                    let mut facts = Vec::new();
+                    if let Some(code) = inv.exit_code {
+                        facts.push(format!("exit {code}"));
+                    }
+                    match inv.execution_successful {
+                        Some(true) => facts.push(String::from("succeeded")),
+                        Some(false) => facts.push(String::from("failed")),
+                        None => {}
+                    }
+                    if let (Some(a), Some(b)) = (&inv.start_time_utc, &inv.end_time_utc) {
+                        facts.push(format!("{a} \u{2192} {b}"));
+                    }
+                    if !facts.is_empty() {
+                        out.push(format!("  {}", facts.join(" \u{b7} ")));
+                    }
+                    for n in inv
+                        .tool_execution_notifications
+                        .iter()
+                        .chain(inv.tool_configuration_notifications.iter())
+                    {
+                        let level = n.level.clone().unwrap_or_else(|| String::from("warning"));
+                        let text = n.message.text.clone().unwrap_or_default();
+                        out.push(format!("  {level}: {text}"));
+                    }
+                }
+                out.push(String::new());
+            }
+        }
+        out
     }
 
     /// Distinct tool names across every run, for the header.
@@ -284,6 +766,35 @@ impl SarifView {
             && !f.hidden_baselines.contains(&e.baseline)
             && !f.hidden_suppressions.contains(&e.suppression)
             && !f.hidden_kinds.contains(&e.kind)
+    }
+
+    /// The results the filters leave visible, as CSV (#577): one row each,
+    /// RFC 4180 quoting, labels as the list shows them.
+    pub fn export_csv(&self) -> String {
+        fn field(s: &str) -> String {
+            if s.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        }
+        let mut out = String::from("rule,level,file,line,column,message,baseline,suppression\n");
+        for i in self.visible() {
+            let e = &self.entries[i];
+            let cells = [
+                field(&e.rule_id),
+                e.level.as_str().to_string(),
+                field(&e.file),
+                e.line.to_string(),
+                e.column.to_string(),
+                field(&e.message),
+                super::render::baseline_label(e.baseline).to_string(),
+                super::render::suppression_label(e.suppression).to_string(),
+            ];
+            out.push_str(&cells.join(","));
+            out.push('\n');
+        }
+        out
     }
 
     /// Entries passing the chips and the keyword query.
@@ -315,13 +826,18 @@ impl SarifView {
                     format!("{} · {}", e.rule_id, e.rule_name)
                 },
             ),
-            Tab::Logs => {
+            Tab::Logs | Tab::Run => {
                 let label = self
                     .logs
                     .get(e.log)
                     .and_then(|l| l.path.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| format!("log {}", e.log + 1));
+                let label = if self.baseline == Some(e.log) {
+                    format!("{label} (baseline)")
+                } else {
+                    label
+                };
                 (format!("l:{}", e.log), label)
             }
         }
@@ -604,6 +1120,7 @@ fn entry_for(
         line: region.and_then(|r| r.start_line).unwrap_or(0),
         column: region.and_then(|r| r.start_column).unwrap_or(0),
         tags,
+        fixed: false,
     }
 }
 
@@ -619,7 +1136,7 @@ fn string_list(v: Option<&serde_json::Value>) -> Vec<String> {
 
 /// A file URI under a workspace root shows relative to it; any other file
 /// URI shows as its path; a relative reference shows as written.
-fn display_file(uri: &str, roots: &[PathBuf]) -> String {
+pub(crate) fn display_file(uri: &str, roots: &[PathBuf]) -> String {
     if uri.is_empty() {
         return String::new();
     }
@@ -658,6 +1175,7 @@ mod tests {
             line,
             column: 1,
             tags: vec![],
+            fixed: false,
         }
     }
 
@@ -692,6 +1210,34 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ── export ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_csv_lists_the_visible_results_with_quoting() {
+        let mut v = sample();
+        v.entries[0].message = String::from("SQL built from \"input\", unsafely");
+        v.filters.hidden_levels.insert(Level::Note);
+        let csv = v.export_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "rule,level,file,line,column,message,baseline,suppression"
+        );
+        // The note is filtered out; everything else is listed.
+        assert_eq!(lines.len(), 1 + 4, "{csv}");
+        assert!(!csv.contains("prefer ? over unwrap"));
+        assert!(
+            lines.contains(
+                &"R1,error,src/a.rs,30,1,\"SQL built from \"\"input\"\", unsafely\",no baseline,not suppressed"
+            ),
+            "{csv}"
+        );
+        assert!(
+            lines.contains(&"R4,none,,0,1,no location,no baseline,not suppressed"),
+            "{csv}"
+        );
     }
 
     // ── query grammar ───────────────────────────────────────────────────
