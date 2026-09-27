@@ -422,8 +422,18 @@ pub const ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(12
 #[serde(tag = "decision", rename_all = "lowercase")]
 pub enum Decision {
     Allow,
-    Deny { reason: String },
-    Ask { reason: String },
+    /// Allow, with the tool input replaced by the user's edited version of
+    /// the proposal (#347): Claude Code's `updatedInput`.
+    #[serde(rename = "allow_edited")]
+    AllowEdited {
+        input: Value,
+    },
+    Deny {
+        reason: String,
+    },
+    Ask {
+        reason: String,
+    },
 }
 
 /// The one line a hook sends to croft: which agent, which tool, and the
@@ -478,17 +488,21 @@ fn exchange(
 pub fn claude_code_reply(decision: &Decision) -> String {
     let (verdict, reason) = match decision {
         Decision::Allow => ("allow", "approved in croft"),
+        Decision::AllowEdited { .. } => ("allow", "approved in croft, as edited there"),
         Decision::Deny { reason } => ("deny", reason.as_str()),
         Decision::Ask { reason } => ("ask", reason.as_str()),
     };
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": verdict,
             "permissionDecisionReason": reason,
         }
-    })
-    .to_string()
+    });
+    if let Decision::AllowEdited { input } = decision {
+        out["hookSpecificOutput"]["updatedInput"] = input.clone();
+    }
+    out.to_string()
 }
 
 /// `croft hook claude-code`: read Claude Code's payload from `input`, ask
@@ -768,6 +782,17 @@ mod tests {
                 .unwrap();
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
         assert_eq!(v["hookSpecificOutput"]["permissionDecisionReason"], "r");
+        // An edited approval allows with the replacement input (#347).
+        let edited = Decision::AllowEdited {
+            input: serde_json::json!({"file_path": "/a", "content": "x"}),
+        };
+        let v: Value = serde_json::from_str(&claude_code_reply(&edited)).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(v["hookSpecificOutput"]["updatedInput"]["content"], "x");
+        // And it survives the socket, whose line is the serde form.
+        let line = serde_json::to_string(&edited).unwrap();
+        assert!(line.contains("\"decision\":\"allow_edited\""), "{line}");
+        assert_eq!(serde_json::from_str::<Decision>(&line).unwrap(), edited);
     }
 
     #[test]
