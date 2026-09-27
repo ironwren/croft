@@ -57,10 +57,35 @@ fn percent(covered: usize, total: usize) -> Option<f64> {
     (total > 0).then(|| covered as f64 * 100.0 / total as f64)
 }
 
+/// Where a suite's source may be, relative to the runner's root: see
+/// [`Coverage::suite_percent`].
+fn suite_source_candidates(suite: &str) -> Vec<PathBuf> {
+    let head = suite.split("::").next().unwrap_or(suite);
+    let file_name = head.rsplit('/').next().unwrap_or(head);
+    if file_name.contains('.') {
+        return vec![PathBuf::from(head)];
+    }
+    let mut segs: Vec<&str> = suite.split("::").collect();
+    while segs.last().is_some_and(|s| *s == "tests" || *s == "test") {
+        segs.pop();
+    }
+    if segs.is_empty() {
+        return vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")];
+    }
+    let module = segs.join("/");
+    vec![
+        PathBuf::from(format!("src/{module}.rs")),
+        PathBuf::from(format!("src/{module}/mod.rs")),
+    ]
+}
+
 /// Coverage for a run, by absolute path.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Coverage {
     pub files: HashMap<PathBuf, FileCoverage>,
+    /// Where the runner ran, which relative report and suite paths are
+    /// taken against.
+    pub root: PathBuf,
 }
 
 impl Coverage {
@@ -115,7 +140,23 @@ impl Coverage {
                     .push(taken);
             }
         }
-        Self { files }
+        Self {
+            files,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// The line percentage of the source file a Testing-tree suite lives in
+    /// (#263), when it can be told from the suite's name alone: a pytest or
+    /// JS suite is a file path (`tests/test_x.py`, `src/a.test.ts`); a cargo
+    /// suite is a module path whose `tests` tail is the in-file test module
+    /// (`widgets::testing::tests` is `src/widgets/testing.rs`, or its
+    /// `mod.rs`). `None` when no such file is in the report.
+    pub fn suite_percent(&self, suite: &str) -> Option<f64> {
+        suite_source_candidates(suite)
+            .into_iter()
+            .find_map(|rel| self.files.get(&self.root.join(rel)))
+            .and_then(FileCoverage::percent)
     }
 
     /// The whole run's line percentage.
@@ -224,6 +265,32 @@ mod tests {
         assert_eq!(a.line(4), None, "not executable");
         let b = &c.files[Path::new("/abs/b.rs")];
         assert_eq!(b.line(10), Some(LineCov::Uncovered));
+    }
+
+    #[test]
+    fn a_suite_reads_the_percentage_of_the_file_it_lives_in() {
+        // #263: a cargo suite is a module path, its `tests` tail the in-file
+        // test module; a pytest or JS suite is the file itself.
+        let lcov = "SF:src/widgets/testing.rs\nDA:1,1\nDA:2,0\nend_of_record\n\
+                    SF:src/parse/mod.rs\nDA:1,1\nend_of_record\n\
+                    SF:tests/test_x.py\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n\
+                    SF:src/lib.rs\nDA:1,0\nend_of_record\n";
+        let c = Coverage::from_lcov(lcov, Path::new("/w"));
+        assert_eq!(c.suite_percent("widgets::testing::tests"), Some(50.0));
+        assert_eq!(c.suite_percent("widgets::testing"), Some(50.0));
+        assert_eq!(
+            c.suite_percent("parse::tests"),
+            Some(100.0),
+            "a mod.rs module"
+        );
+        assert_eq!(c.suite_percent("tests/test_x.py"), Some(75.0));
+        assert_eq!(c.suite_percent("tests/test_x.py::TestX"), Some(75.0));
+        assert_eq!(
+            c.suite_percent("tests"),
+            Some(0.0),
+            "the crate root's tests"
+        );
+        assert_eq!(c.suite_percent("nowhere::tests"), None);
     }
 
     #[test]

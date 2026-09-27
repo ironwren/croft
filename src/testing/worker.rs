@@ -839,11 +839,13 @@ fn coverage_report(dir: &Path) -> PathBuf {
 
 /// Which tests a coverage run covers, when not all of them (#263): `name`
 /// as run-at-cursor resolved it, `exact` when it is a full test name
-/// rather than a substring filter.
+/// rather than a substring filter, `suite` when it is a suite from the
+/// Testing tree, selected as a plain run of that suite selects it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageScope {
     pub name: String,
     pub exact: bool,
+    pub suite: bool,
 }
 
 /// The filter arguments that narrow a coverage run to `scope`: the same
@@ -858,7 +860,7 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
     };
     match runner {
         Runner::Pytest => {
-            if scope.exact || name.contains(".py") {
+            if scope.exact || scope.suite || name.contains(".py") {
                 vec![name.to_string()]
             } else {
                 vec![String::from("-k"), name.to_string()]
@@ -868,7 +870,7 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
             if scope.exact {
                 vitest_one_args(name)
             } else {
-                vitest_filter_args(name, false)
+                vitest_filter_args(name, scope.suite)
             },
             &["run"],
         ),
@@ -876,13 +878,19 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
             if scope.exact {
                 jest_one_args(name)
             } else {
-                jest_filter_args(name, false)
+                jest_filter_args(name, scope.suite)
             },
             &["--json"],
         ),
-        // `cargo llvm-cov [TESTNAME] [-- <libtest args>]`, as `cargo test`.
+        // `cargo llvm-cov [TESTNAME] [-- <libtest args>]`, as `cargo test`,
+        // a suite anchored as its plain run anchors it.
         Runner::Cargo => {
-            let mut a = vec![name.to_string()];
+            let name = if scope.suite {
+                super::suite_pattern(name)
+            } else {
+                name.to_string()
+            };
+            let mut a = vec![name];
             if scope.exact {
                 a.push(String::from("--"));
                 a.push(String::from("--exact"));
@@ -893,7 +901,7 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
             if scope.exact {
                 super::gotest::one_args(name)
             } else {
-                super::gotest::filter_args(name, false)
+                super::gotest::filter_args(name, scope.suite)
             }
         }
     }
@@ -1710,11 +1718,35 @@ mod tests {
         let exact = |n: &str| CoverageScope {
             name: n.into(),
             exact: true,
+            suite: false,
         };
         let loose = |n: &str| CoverageScope {
             name: n.into(),
             exact: false,
+            suite: false,
         };
+        let suite = |n: &str| CoverageScope {
+            name: n.into(),
+            exact: false,
+            suite: true,
+        };
+        // A suite selects what its plain run selects (#263): cargo anchored
+        // at `suite::`, pytest by node-ID prefix, JS by file.
+        assert_eq!(
+            coverage_scope_args(Runner::Cargo, &suite("parse")),
+            vec!["parse::"]
+        );
+        assert_eq!(
+            coverage_scope_args(Runner::Pytest, &suite("test_x")),
+            vec!["test_x"]
+        );
+        assert_eq!(
+            coverage_scope_args(Runner::Vitest, &suite("tests/a.test.js")),
+            vitest_filter_args("tests/a.test.js", true)
+                .into_iter()
+                .filter(|a| a != "run" && !a.starts_with("--reporter="))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             coverage_scope_args(Runner::Cargo, &exact("parse::a")),
             vec!["parse::a", "--", "--exact"]
