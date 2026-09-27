@@ -797,6 +797,55 @@ impl SarifView {
         out
     }
 
+    /// The results the filters leave visible, as a SARIF 2.1.0 log (#577):
+    /// each source run kept whole (its tool, rules and artifacts, so every
+    /// index a result carries still resolves) with only the visible results
+    /// in it, and runs left with none dropped. Read from the files on disk,
+    /// since the viewer's model keeps only what it shows. `None` when a log
+    /// can no longer be read.
+    pub fn export_sarif(&self) -> Option<String> {
+        use std::collections::BTreeSet;
+        let mut keep: std::collections::BTreeMap<(usize, usize), BTreeSet<usize>> =
+            Default::default();
+        for i in self.visible() {
+            let e = &self.entries[i];
+            keep.entry((e.log, e.run)).or_default().insert(e.result);
+        }
+        let mut runs = Vec::new();
+        for (log_index, loaded) in self.logs.iter().enumerate() {
+            if !keep.keys().any(|(l, _)| *l == log_index) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&loaded.path).ok()?;
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            let mut log: serde_json::Value = serde_json::from_str(text).ok()?;
+            let Some(src_runs) = log.get_mut("runs").and_then(|r| r.as_array_mut()) else {
+                continue;
+            };
+            for (run_index, run) in src_runs.iter_mut().enumerate() {
+                let Some(wanted) = keep.get(&(log_index, run_index)) else {
+                    continue;
+                };
+                if let Some(results) = run.get_mut("results").and_then(|r| r.as_array_mut()) {
+                    let kept: Vec<serde_json::Value> = std::mem::take(results)
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, _)| wanted.contains(i))
+                        .map(|(_, r)| r)
+                        .collect();
+                    *results = kept;
+                }
+                runs.push(run.take());
+            }
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": "2.1.0",
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "runs": runs,
+        }))
+        .ok()
+    }
+
     /// Entries passing the chips and the keyword query.
     pub fn visible(&self) -> Vec<usize> {
         let q = parse_query(&self.query_text);
