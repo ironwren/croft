@@ -5894,6 +5894,10 @@ impl App {
         // construction so the panel keeps one plain `new()`.
         app.problems.scope =
             crate::widgets::problems::ProblemScope::from_config(&loaded_prefs.problems_scope);
+        // #578: the Testing view runs CodeQL tests with the same `codeql`
+        // as the side bar, from the first tree click on.
+        app.test_worker
+            .set_codeql_program(app.codeql_program.clone());
         app.sync_focus_flags();
         // Seed the highlighter with the persisted theme's code palette so a
         // file opened before the first theme switch already highlights in the
@@ -22345,6 +22349,10 @@ impl App {
                 self.status = String::from("The coverage run wrote no report");
                 changed = true;
             }
+            Some(CoverageError::Unsupported { runner }) => {
+                self.status = format!("Coverage is not available for {runner}");
+                changed = true;
+            }
             None => {}
         }
         let fresh = self.testing.take_coverage_fresh();
@@ -22627,6 +22635,36 @@ impl App {
         }
     }
 
+    /// CodeQL: Run Tests (#578): every CodeQL test, through the Testing
+    /// view's run-all, with the same `codeql` the side bar runs. Refused,
+    /// with the reason, when the workspace's runner is not the CodeQL one.
+    fn run_codeql_tests(&mut self) {
+        use crate::testing::worker::{Runner, runner_for};
+        if runner_for(&self.active_test_root) != Some(Runner::Codeql) {
+            self.status = String::from(
+                "No CodeQL tests here: a test pack's qlpack.yml declares tests: or extractor:",
+            );
+            return;
+        }
+        if self.testing.is_busy() {
+            self.status = String::from("Tests are already running");
+            return;
+        }
+        self.run_all_tests();
+        self.status = String::from("Running CodeQL tests");
+    }
+
+    /// Point every CodeQL run at `program`: the side bar's queries and,
+    /// through the test worker, the Testing view's CodeQL tests (#578).
+    /// The one place the configured `codeql` changes, so the two never
+    /// disagree. There is no user setting for it yet, so only tests change
+    /// it; the worker is told the startup value in [`App::new`].
+    #[cfg(test)]
+    fn set_codeql_program(&mut self, program: PathBuf) {
+        self.test_worker.set_codeql_program(program.clone());
+        self.codeql_program = program;
+    }
+
     /// Kick off a full test run on the worker (no-op if a run/discovery is
     /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
@@ -22857,6 +22895,13 @@ impl App {
                 self.disarm_failure_breakpoint();
                 self.status =
                     String::from("Debugging JS tests is not wired yet — the play glyph runs them");
+            }
+            Some(crate::testing::worker::Runner::Codeql) => {
+                // No session starts here either (#373).
+                self.disarm_failure_breakpoint();
+                self.status = String::from(
+                    "Debugging is not available for CodeQL tests — the play glyph runs them",
+                );
             }
             None => {
                 self.disarm_failure_breakpoint();
@@ -44094,6 +44139,7 @@ impl App {
                 self.status =
                     String::from("Running a variant analysis is not available yet (#578)");
             }
+            Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),

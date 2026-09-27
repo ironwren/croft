@@ -28,6 +28,7 @@ pub enum Runner {
     Vitest,
     Jest,
     Go,
+    Codeql,
 }
 
 /// Detect the workspace's test runner from the enabled extensions'
@@ -57,6 +58,10 @@ pub enum TestRequest {
     /// a Make Root into a child repo `cargo test -- --list` errors with "could
     /// not find Cargo.toml" and the tree never populates.
     SetRoot(PathBuf),
+    /// Rebind the `codeql` program CodeQL test runs shell: the app's own, so
+    /// the Testing view and the CodeQL side bar run the same CLI (and a test
+    /// can stand a script in for it).
+    SetCodeqlProgram(PathBuf),
 }
 
 pub enum TestResponse {
@@ -90,6 +95,8 @@ pub enum CoverageError {
     /// The run ended without writing a report (it failed to build, or
     /// the tool errored).
     NoReport,
+    /// The runner has no coverage tool croft can drive: its name.
+    Unsupported { runner: &'static str },
 }
 
 pub struct TestWorker {
@@ -171,6 +178,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::Discover);
     }
 
+    pub fn set_codeql_program(&self, program: PathBuf) {
+        let _ = self.request_tx.send(TestRequest::SetCodeqlProgram(program));
+    }
+
     /// Rebind the worker to a new workspace root after an Explorer re-root.
     /// Everything still streaming for the old root carries the old epoch and
     /// is dropped by [`Self::drain`].
@@ -217,6 +228,10 @@ impl TestWorker {
 struct EpochTx<'a> {
     tx: &'a Sender<(u64, TestResponse)>,
     epoch: u64,
+    /// The `codeql` program a CodeQL test run shells (see
+    /// [`TestRequest::SetCodeqlProgram`]); carried here because every
+    /// handler already takes the sender.
+    codeql: &'a Path,
 }
 
 impl EpochTx<'_> {
@@ -232,8 +247,15 @@ impl EpochTx<'_> {
 
 fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, TestResponse)>) {
     let mut epoch = 0u64;
+    // Found on PATH, as the CodeQL side bar finds it, until the app says
+    // otherwise.
+    let mut codeql = PathBuf::from("codeql");
     while let Ok(req) = rx.recv() {
-        let etx = EpochTx { tx: &tx, epoch };
+        let etx = EpochTx {
+            tx: &tx,
+            epoch,
+            codeql: &codeql,
+        };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
@@ -245,6 +267,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
                 root = p;
                 epoch += 1;
             }
+            TestRequest::SetCodeqlProgram(p) => codeql = p,
         }
     }
 }
@@ -357,6 +380,39 @@ fn run_go<S: AsRef<std::ffi::OsStr>>(tx: &EpochTx, root: &Path, args: &[S]) -> O
             .into_iter()
             .collect()
     })
+}
+
+/// Run `codeql <args>` in `root` and stream each test's result (#578). A
+/// result is complete once the diff or errors after its line have arrived,
+/// so it lands when the next test's line (or the end of output) does; each
+/// failure also gets a one-line summary in OUTPUT, above the CLI's own
+/// diff-heavy text.
+fn run_codeql(tx: &EpochTx, root: &Path, args: &[String]) -> Option<bool> {
+    let mut cmd = Command::new(tx.codeql);
+    cmd.args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let stream = std::cell::RefCell::new(super::codeqltest::RunStream::new(root));
+    let report = |o: super::codeqltest::Outcome| {
+        if let Some(summary) = o.failure_summary() {
+            output::push(output::CHANNEL_TESTS, OutputLevel::Error, &summary);
+        }
+        o.case()
+    };
+    let ok = run_streaming(tx, cmd, |line| {
+        stream
+            .borrow_mut()
+            .feed(line)
+            .map(report)
+            .into_iter()
+            .collect()
+    });
+    if let Some(o) = stream.borrow_mut().finish() {
+        tx.send(TestResponse::Case(report(o)));
+    }
+    ok
 }
 
 /// Absolute path to a JS test runner binary for a workspace: the project's own
@@ -827,9 +883,19 @@ fn run_all(root: &Path, tx: &EpochTx) {
             run_streaming(tx, cmd, one(parse_test_line))
         }
         Runner::Go => run_go(tx, root, &[String::from("./...")]),
+        Runner::Codeql => {
+            let packs = super::codeqltest::test_packs(root, &codeql_markers());
+            run_codeql(tx, root, &super::codeqltest::all_args(root, &packs))
+        }
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// The pack files the bundled CodeQL runner looks for. A run needs the test
+/// packs again, not just the verdict that there is one.
+fn codeql_markers() -> Vec<String> {
+    vec![String::from("qlpack.yml"), String::from("codeql-pack.yml")]
 }
 
 /// The report every runner is asked to write: LCOV, into `dir`.
@@ -904,6 +970,8 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
                 super::gotest::filter_args(name, scope.suite)
             }
         }
+        // Refused before any argv is built (see run_coverage).
+        Runner::Codeql => Vec::new(),
     }
 }
 
@@ -948,6 +1016,7 @@ fn coverage_args(runner: Runner, dir: &Path) -> Vec<String> {
         }
         // A Go cover profile, turned into `report` once the run ends.
         Runner::Go => vec![format!("-coverprofile={}", go_cover_profile(dir).display())],
+        Runner::Codeql => Vec::new(),
     }
 }
 
@@ -985,8 +1054,8 @@ fn coverage_install(runner: Runner, root: &Path) -> Option<(&'static str, String
                 String::from("npm install -D @vitest/coverage-v8")
             },
         )),
-        // Coverage is built into `go test`.
-        Runner::Jest | Runner::Go => None,
+        // Coverage is built into `go test`; CodeQL has none to install.
+        Runner::Jest | Runner::Go | Runner::Codeql => None,
     }
 }
 
@@ -1006,7 +1075,7 @@ fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
                 .iter()
                 .any(|p| dir.join("node_modules/@vitest").join(p).is_dir())
         }),
-        Runner::Jest | Runner::Go => true,
+        Runner::Jest | Runner::Go | Runner::Codeql => true,
     }
 }
 
@@ -1018,6 +1087,14 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
         tx.send(TestResponse::Refused);
         return;
     };
+    // A query test has no source lines of its own to cover.
+    if runner == Runner::Codeql {
+        tx.send(TestResponse::Coverage(Err(CoverageError::Unsupported {
+            runner: "CodeQL tests",
+        })));
+        tx.send(TestResponse::Finished { ok: None });
+        return;
+    }
     if !coverage_tool_present(runner, root)
         && let Some((tool, install)) = coverage_install(runner, root)
     {
@@ -1060,6 +1137,7 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
         }),
         Runner::Cargo => run_streaming(tx, cargo_cmd(root, &args), one(parse_test_line)),
         Runner::Go => run_go(tx, root, &args),
+        Runner::Codeql => None,
     }
     .unwrap_or(false);
     let lcov = if runner == Runner::Go {
@@ -1107,6 +1185,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
             run_streaming(tx, cmd, one(parse_test_line))
         }
         Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
+        Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(name)),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1160,6 +1239,9 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             run_streaming(tx, cmd, one(parse_test_line))
         }
         Runner::Go => run_go(tx, root, &super::gotest::filter_args(pattern, suite)),
+        // A suite is its folder; any other filter is taken as the path (or
+        // id) of what to run.
+        Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(pattern)),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1229,6 +1311,12 @@ fn discover(root: &Path, tx: &EpochTx) {
                     .collect()
             });
         }
+        // Tests are files; listing them needs no CLI.
+        Runner::Codeql => {
+            for id in super::codeqltest::discover(root) {
+                tx.send(TestResponse::Case(not_run(id)));
+            }
+        }
     }
     tx.send(TestResponse::Finished { ok: None });
 }
@@ -1246,7 +1334,11 @@ mod tests {
     fn refusing_a_run_with_no_runner_never_wipes_or_strands_the_panel() {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let etx = EpochTx { tx: &tx, epoch: 0 };
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
         run_filter(tmp.path(), &etx, "a", false);
@@ -1270,6 +1362,121 @@ mod tests {
                 .any(|m| matches!(m, TestResponse::Finished { .. })),
             "a bare Finished after start_single/start_filter strands cases Running"
         );
+    }
+
+    /// A stand-in `codeql` in `dir` that logs its arguments and prints
+    /// `out` (`@ROOT@` replaced by `root`), exiting nonzero when it reports
+    /// a failure, as `codeql test run` does.
+    #[cfg(unix)]
+    fn fake_codeql(dir: &Path, root: &Path, out: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let code = i32::from(out.contains("FAILED"));
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncat <<'EOF'\n{out}EOF\nexit {code}\n",
+            log = dir.join("calls.log").display(),
+            out = out.replace("@ROOT@", &root.display().to_string()),
+        );
+        let bin = dir.join("codeql");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// CodeQL tests (#578) end to end against a fake CLI: discovery lists
+    /// each test file without running anything, a run of the test pack
+    /// reports the pass and the diff failure, one test runs by its file,
+    /// a suite by its folder, and coverage is refused as unavailable.
+    #[cfg(unix)]
+    #[test]
+    fn codeql_tests_discover_run_and_refuse_coverage_with_a_fake_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write(
+            "test/qlpack.yml",
+            "name: acme/tests\nextractor: javascript\ntests: .\n",
+        );
+        write("test/Find/Find.qlref", "Find.ql\n");
+        write("test/Find/Find.expected", "");
+        write("test/Bad/Bad.ql", "select 1");
+        write("test/Bad/Bad.expected", "");
+        let bin = tempfile::tempdir().unwrap();
+        let codeql = fake_codeql(
+            bin.path(),
+            root,
+            "Executing 2 tests in 2 directories.\n\
+             [1/2 comp 1.1s eval 20ms] PASSED @ROOT@/test/Find/Find.qlref\n\
+             [2/2 comp 1.0s eval 18ms] FAILED(RESULT) @ROOT@/test/Bad/Bad.ql\n\
+             --- expected\n+++ actual\n@@ -0,0 +1 @@\n+| 1 |\n\
+             1 tests passed; 1 tests failed:\n  FAILED: @ROOT@/test/Bad/Bad.ql\n",
+        );
+        assert_eq!(runner_for(root), Some(Runner::Codeql));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: &codeql,
+        };
+        let drain = |rx: &Receiver<(u64, TestResponse)>| {
+            let mut cases = Vec::new();
+            let mut finished = None;
+            for (_, r) in rx.try_iter() {
+                match r {
+                    TestResponse::Case(c) => cases.push((c.name, c.status)),
+                    TestResponse::Finished { ok } => finished = Some(ok),
+                    _ => {}
+                }
+            }
+            (cases, finished)
+        };
+        let log = || std::fs::read_to_string(bin.path().join("calls.log")).unwrap_or_default();
+
+        discover(root, &etx);
+        let (cases, finished) = drain(&rx);
+        assert_eq!(
+            cases,
+            vec![
+                (String::from("test/Bad::Bad.ql"), TestStatus::NotRun),
+                (String::from("test/Find::Find.qlref"), TestStatus::NotRun),
+            ]
+        );
+        assert_eq!(finished, Some(None));
+        assert_eq!(log(), "", "discovery never shells the CLI");
+
+        run_all(root, &etx);
+        let (cases, finished) = drain(&rx);
+        assert_eq!(
+            cases,
+            vec![
+                (String::from("test/Find::Find.qlref"), TestStatus::Passed),
+                (String::from("test/Bad::Bad.ql"), TestStatus::Failed),
+            ]
+        );
+        assert_eq!(finished, Some(Some(false)), "a failing test fails the run");
+        assert_eq!(log(), "test run test\n", "run all runs the test pack");
+
+        run_one(root, &etx, "test/Find::Find.qlref");
+        run_filter(root, &etx, "test/Bad", true);
+        let _ = drain(&rx);
+        assert!(
+            log().ends_with("test run test/Find/Find.qlref\ntest run test/Bad\n"),
+            "{}",
+            log()
+        );
+
+        run_coverage(root, &etx, None);
+        let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
+        assert!(matches!(
+            msgs.as_slice(),
+            [
+                TestResponse::Coverage(Err(CoverageError::Unsupported { .. })),
+                TestResponse::Finished { ok: None }
+            ]
+        ));
     }
 
     /// End to end against a real `go` (#264): discovery lists each
@@ -1302,7 +1509,11 @@ mod tests {
         )
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let etx = EpochTx { tx: &tx, epoch: 0 };
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
         let cases = |rx: &Receiver<(u64, TestResponse)>| {
             let mut v: Vec<(String, TestStatus)> = rx
                 .try_iter()
