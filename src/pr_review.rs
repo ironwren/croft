@@ -52,13 +52,13 @@ pub struct PrInfo {
     pub checks: Vec<Check>,
 }
 
-/// The `gh` arguments that fetch pull request `number` in the shape
-/// [`parse_pr`] reads.
-pub fn view_args(number: u64) -> Vec<String> {
+/// The `gh` arguments that fetch the pull request `selector` names (a
+/// number, or its URL) in the shape [`parse_pr`] reads.
+pub fn view_args(selector: &str) -> Vec<String> {
     vec![
         String::from("pr"),
         String::from("view"),
-        number.to_string(),
+        selector.to_string(),
         String::from("--json"),
         String::from(PR_FIELDS),
     ]
@@ -112,27 +112,103 @@ pub fn review_key(pr: &PrInfo) -> String {
     format!("{path}#{}", pr.number)
 }
 
-/// A pull request number as a person types it: `579`, `#579`, or its URL.
-pub fn parse_pr_number(input: &str) -> Option<u64> {
+/// What `gh pr view` should look up for a pull request as a person types
+/// it: `579` or `#579` is that number in this repository, and a pasted URL
+/// stays a URL (trimmed to the PR itself), so a PR from another repository
+/// opens that PR rather than this repository's PR with the same number.
+pub fn parse_pr_selector(input: &str) -> Option<String> {
     let t = input.trim();
-    let digits = match t.split_once("/pull/") {
-        Some((_, rest)) => rest.split('/').next().unwrap_or(""),
-        None => t.strip_prefix('#').unwrap_or(t),
-    };
-    digits.parse::<u64>().ok().filter(|n| *n > 0)
+    let number = |s: &str| s.parse::<u64>().ok().filter(|n| *n > 0);
+    match t.split_once("/pull/") {
+        Some((base, rest)) => {
+            let n = number(rest.split('/').next().unwrap_or(""))?;
+            Some(format!("{base}/pull/{n}"))
+        }
+        None => number(t.strip_prefix('#').unwrap_or(t)).map(|n| n.to_string()),
+    }
 }
 
-static STARTUP_PR: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+/// How long one `gh` call may take before it is killed and reported: a
+/// slow network or a large log must not hang the review for good.
+pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `croft pr <n>` records the number here before the app starts.
-pub fn set_startup_pr(number: u64) {
+/// Run `gh` (`program`) with `args` in `cwd` and return its stdout, or its
+/// stderr (or why it could not run, or that it timed out) as the error.
+/// Blocking: the app calls it on a worker thread.
+pub fn run_gh(
+    program: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    // Drained while it runs: a log larger than a pipe buffer would
+    // otherwise block gh on its write until the deadline.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{program} took longer than {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Err(format!("could not wait on {program}: {e}")),
+        }
+    };
+    let text = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        String::from_utf8_lossy(&rx.recv().unwrap_or_default()).into_owned()
+    };
+    if status.success() {
+        Ok(text(stdout))
+    } else {
+        Err(text(stderr).trim().to_string())
+    }
+}
+
+static STARTUP_PR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `croft pr <n>` records the selector here before the app starts.
+pub fn set_startup_pr(selector: String) {
     if let Ok(mut slot) = STARTUP_PR.lock() {
-        *slot = Some(number);
+        *slot = Some(selector);
     }
 }
 
 /// The app takes it once, after its first frame.
-pub fn take_startup_pr() -> Option<u64> {
+pub fn take_startup_pr() -> Option<String> {
     STARTUP_PR.lock().ok().and_then(|mut slot| slot.take())
 }
 
@@ -494,7 +570,7 @@ mod tests {
 
     #[test]
     fn the_fetch_asks_gh_for_every_field_the_parser_reads() {
-        let args = view_args(579);
+        let args = view_args("579");
         assert_eq!(&args[..3], ["pr", "view", "579"]);
         assert_eq!(args[3], "--json");
         for field in ["files", "statusCheckRollup", "headRefOid", "author", "url"] {
@@ -526,27 +602,62 @@ mod tests {
     }
 
     #[test]
-    fn pr_numbers_parse_as_typed_or_pasted() {
-        assert_eq!(parse_pr_number("579"), Some(579));
-        assert_eq!(parse_pr_number(" #579 "), Some(579));
+    fn pr_selectors_parse_as_typed_or_pasted() {
+        let sel = |s: &str| parse_pr_selector(s);
+        assert_eq!(sel("579").as_deref(), Some("579"));
+        assert_eq!(sel(" #579 ").as_deref(), Some("579"));
+        // A URL keeps its repository, so another repository's PR opens.
         assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/579"),
-            Some(579)
+            sel("https://github.com/x/y/pull/579").as_deref(),
+            Some("https://github.com/x/y/pull/579")
         );
         assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/579/files"),
-            Some(579)
+            sel("https://github.com/o/r/pull/579/files").as_deref(),
+            Some("https://github.com/o/r/pull/579")
         );
-        assert_eq!(parse_pr_number("abc"), None);
-        assert_eq!(parse_pr_number(""), None);
-        assert_eq!(parse_pr_number("#0"), None, "no PR zero");
+        assert_eq!(sel("https://github.com/o/r/pull/x"), None);
+        assert_eq!(sel("abc"), None);
+        assert_eq!(sel(""), None);
+        assert_eq!(sel("#0"), None, "no PR zero");
     }
 
     #[test]
     fn the_startup_pr_is_taken_once() {
-        set_startup_pr(579);
-        assert_eq!(take_startup_pr(), Some(579));
+        set_startup_pr(String::from("579"));
+        assert_eq!(take_startup_pr().as_deref(), Some("579"));
         assert_eq!(take_startup_pr(), None);
+    }
+
+    #[test]
+    fn gh_runs_bounded_and_reports_stdout_or_stderr() {
+        let dir = std::env::temp_dir();
+        let sh = |script: &str| vec![String::from("-c"), String::from(script)];
+        let t = std::time::Duration::from_secs(5);
+        assert_eq!(
+            run_gh("/bin/sh", &sh("echo out"), &dir, t).as_deref(),
+            Ok("out\n")
+        );
+        assert_eq!(
+            run_gh("/bin/sh", &sh("echo why >&2; exit 1"), &dir, t),
+            Err(String::from("why"))
+        );
+        let started = std::time::Instant::now();
+        let slow = run_gh(
+            "/bin/sh",
+            &sh("sleep 5"),
+            &dir,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(slow.unwrap_err().contains("took longer"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "killed at the bound"
+        );
+        assert!(
+            run_gh("/nonexistent/gh", &[], &dir, t)
+                .unwrap_err()
+                .contains("could not run")
+        );
     }
 
     #[test]
