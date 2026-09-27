@@ -22439,7 +22439,8 @@ impl App {
     /// folder in the Explorer. On a query history row, Delete removes it, F2
     /// renames it, `v` opens its query and `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
-    /// databases' anywhere else.
+    /// databases' anywhere else. `n` creates a query, in the selected pack
+    /// when there is one.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
         use crate::widgets::codeql::{Action, Hit};
         let db = self.codeql.selected_database();
@@ -22489,13 +22490,15 @@ impl App {
                 self.sort_codeql_history();
             }
             KeyCode::Char('s') => self.sort_codeql_databases(),
+            KeyCode::Char('n') => self.prompt_create_codeql_query(),
             _ => {}
         }
     }
 
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
-    /// the language and database lists select; a query row runs; the actions
-    /// still to come in #578 say so rather than do nothing.
+    /// the language and database lists select; a query row runs; "Create
+    /// one" asks for a query name; the actions still to come in #578 say so
+    /// rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22597,9 +22600,9 @@ impl App {
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
+            Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
             Hit::Action(action) => {
                 let what = match action {
-                    Action::CreateQuery => "Creating CodeQL queries",
                     Action::SetUpControllerRepository => "Variant analysis",
                     Action::ViewAst => "The AST viewer",
                     _ => unreachable!("handled above"),
@@ -23004,6 +23007,60 @@ impl App {
     /// Called when the view opens, not every frame: it walks the tree.
     fn refresh_codeql_queries(&mut self) {
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Ask for the name of a new query (#578, VS Code's "CodeQL: Create
+    /// Query"). It goes into the pack whose line or query row is selected in
+    /// the Queries section, else the workspace root, and is written in the
+    /// pack's language, else the Language section's, else none.
+    fn prompt_create_codeql_query(&mut self) {
+        use crate::widgets::codeql::LANGUAGE_IDS;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let pack = self
+            .codeql
+            .selected_pack()
+            .and_then(|p| self.codeql.queries.get(p));
+        let root = self.workspace_root().to_path_buf();
+        let dir = pack.map_or_else(|| root.clone(), |p| p.dir.clone());
+        let language = pack
+            .and_then(|p| p.language.clone())
+            .or_else(|| self.codeql.language.map(|i| LANGUAGE_IDS[i].to_string()));
+        let place = match pack {
+            Some(p) if p.name != crate::codeql_query::NO_PACK => p.name.clone(),
+            _ => String::from("the workspace root"),
+        };
+        let lang = language
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlCreateQuery { dir, language },
+            format!("Create CodeQL Query in {place}{lang}"),
+            "query name, e.g. find-unsafe-calls",
+        ));
+    }
+
+    /// Write the new query, open it and list it in the Queries section;
+    /// a refused name or an existing file is said on the status line.
+    fn submit_create_codeql_query(&mut self, dir: &Path, language: Option<&str>, name: &str) {
+        let root = self.workspace_root().to_path_buf();
+        let path = match crate::codeql_query::scaffold_query(&root, dir, name, language) {
+            Ok(path) => path,
+            Err(e) => {
+                self.status = format!("Could not create the query: {e}");
+                return;
+            }
+        };
+        self.refresh_codeql_queries();
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                let shown = path.strip_prefix(&root).unwrap_or(&path);
+                self.status = format!("Created CodeQL query {}", shown.display());
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
     }
 
     /// Run the open `.ql` file on the current database (#578), from the
@@ -27193,6 +27250,10 @@ impl App {
             InputPurpose::CodeqlRenameHistory { output } => {
                 self.close_input_prompt();
                 self.submit_rename_codeql_history(&output, &value);
+            }
+            InputPurpose::CodeqlCreateQuery { dir, language } => {
+                self.close_input_prompt();
+                self.submit_create_codeql_query(&dir, language.as_deref(), &value);
             }
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
@@ -42165,6 +42226,7 @@ impl App {
                     self.view_codeql_history_query(i);
                 }
             }
+            Cmd::CodeqlCreateQuery => self.prompt_create_codeql_query(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
