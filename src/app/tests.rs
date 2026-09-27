@@ -53400,6 +53400,172 @@ fn click_first_cell_glyph(
         md.last_area.x,
         md.last_area.y + (md.run_rows[0] - md.scroll as usize) as u16,
     );
+}
+
+/// Coverage (#263) through the App, from a report arriving the way the
+/// worker's drain delivers it: the active file's lines are marked in the
+/// gutter lane, the status readout carries its percentage, an edit dims
+/// the marks, a missing tool offers its install, and Clear hands the lane
+/// back.
+#[test]
+fn a_coverage_report_marks_the_gutter_and_dims_after_an_edit() {
+    use crate::testing::coverage::{Coverage, LineCov};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("f.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.testing.on_coverage(Ok(Coverage::from_lcov(
+        "SF:f.rs\nDA:1,3\nDA:2,0\nend_of_record\n",
+        &root,
+    )));
+    assert!(app.sync_coverage());
+    let lens = app
+        .editor
+        .coverage
+        .clone()
+        .expect("the open file is covered");
+    assert_eq!(lens.lines.get(&0), Some(&LineCov::Covered));
+    assert_eq!(lens.lines.get(&1), Some(&LineCov::Uncovered));
+    assert!(!lens.stale);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar_x = app.editor.last_inner.x + app.editor.last_gutter_width;
+    let y = app.editor.last_inner.y;
+    let buf = term.backend().buffer();
+    assert_eq!(buf[(bar_x, y)].symbol(), "\u{258c}");
+    assert_ne!(
+        buf[(bar_x, y)].fg,
+        buf[(bar_x, y + 1)].fg,
+        "covered and uncovered differ"
+    );
+    let status_row: String = (0..120).map(|x| buf[(x, 29)].symbol()).collect();
+    assert!(status_row.contains("50% covered"), "{status_row}");
+
+    app.editor.insert_char('x');
+    app.sync_coverage();
+    assert!(
+        app.editor.coverage.as_ref().unwrap().stale,
+        "an edit dims the marks"
+    );
+
+    app.testing
+        .on_coverage(Err(crate::testing::worker::CoverageError::Missing {
+            tool: "cargo-llvm-cov",
+            install: String::from("cargo install cargo-llvm-cov"),
+        }));
+    app.sync_coverage();
+    assert!(app.status.contains("cargo-llvm-cov"), "{}", app.status);
+    assert_eq!(
+        app.coverage_install.as_deref(),
+        Some("cargo install cargo-llvm-cov")
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::CoverageClear);
+    assert!(app.editor.coverage.is_none() && app.testing.coverage.is_none());
+}
+
+/// Acceptance for #263 against real pytest-cov: "Run All Tests with
+/// Coverage" on a pytest project marks the tested file's lines, uncovered
+/// branch-free lines red, and reports a percentage. Set
+/// `CROFT_TEST_PYTEST_COV_PYTHON` to a venv python with pytest and
+/// pytest-cov; the test links that venv in as the project's `.venv`.
+#[test]
+#[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
+fn a_real_pytest_cov_run_marks_the_covered_file() {
+    use crate::testing::coverage::LineCov;
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_PYTEST_COV_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(
+        python.parent().and_then(Path::parent).unwrap(),
+        root.join(".venv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef unused():\n    return 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("test_calc.py"),
+        "from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("calc.py")).unwrap();
+    app.run_all_tests_with_coverage();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while app.editor.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let lens = app.editor.coverage.clone().unwrap();
+    assert_eq!(
+        lens.lines.get(&1),
+        Some(&LineCov::Covered),
+        "`return a + b` ran"
+    );
+    assert_eq!(
+        lens.lines.get(&5),
+        Some(&LineCov::Uncovered),
+        "`return 0` never ran"
+    );
+    assert!(
+        lens.percent.is_some_and(|p| p > 0.0 && p < 100.0),
+        "{:?}",
+        lens.percent
+    );
+}
+
+/// Watch mode (#263) end to end through the App: the eye on a test's row
+/// watches it, a save anywhere under the runner's root reruns exactly that
+/// test once the debounce passes, without moving the sidebar, and a rerun
+/// that turns red says which test failed.
+#[test]
+fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::testing::watch::WatchScope;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let src = tmp.path().join("lib.rs");
+    std::fs::write(&src, "fn a() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::a", "parse::b"] {
+        app.testing.apply_case(TestCase {
+            name: n.into(),
+            status: TestStatus::Passed,
+        });
+    }
+    app.set_sidebar_view(SidebarView::Testing);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Find parse::a's eye where it is drawn, and click it.
+    let area = app.testing.last_area;
+    let x = area.x + area.width - 3;
+    let y = (area.y..area.y + area.height)
+        .find(|&y| {
+            app.testing.hit_at(x, y)
+                == Some(crate::widgets::testing::RowHit::ToggleWatch(
+                    WatchScope::Test("parse::a".into()),
+                ))
+        })
+        .expect("parse::a has an eye");
+    assert_eq!(term.backend().buffer()[(x, y)].symbol(), "\u{ea70}");
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: x,
@@ -53612,6 +53778,39 @@ fn review_pull_request_is_a_palette_command_with_a_number_prompt() {
     app.submit_pr_number("not a number");
     assert!(
         app.status.contains("not a pull request number"),
+}
+
+    assert!(
+        app.testing
+            .watch
+            .is_watching(&WatchScope::Test("parse::a".into()))
+    );
+
+    // The user goes back to the files and saves one.
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.editor.open(&src).unwrap();
+    app.editor.insert_char('x');
+    app.save();
+    assert!(!app.tick_test_watch(), "not before the debounce");
+    std::thread::sleep(crate::testing::watch::DEBOUNCE + std::time::Duration::from_millis(50));
+    assert!(app.tick_test_watch());
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("parse::b"), Some(TestStatus::Passed));
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Explorer,
+        "a rerun never moves the sidebar"
+    );
+
+    // The rerun ends red: the status says which test, once.
+    app.testing.apply_case(TestCase {
+        name: "parse::a".into(),
+        status: TestStatus::Failed,
+    });
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    assert!(
+        app.status.contains("Watched tests failed: parse::a"),
         "{}",
         app.status
     );
@@ -53658,3 +53857,5 @@ fn take_the_tour_is_a_palette_command() {
     );
     assert_eq!(Command::TakeTheTour.title(), "Help: Take the Tour");
 }
+}
+

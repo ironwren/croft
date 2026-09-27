@@ -3185,6 +3185,12 @@ pub struct App {
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
+    /// When the shown coverage report was taken, the file its editor lens
+    /// was built for, and the install command a missing coverage tool
+    /// needs (#263).
+    coverage_at: Option<std::time::SystemTime>,
+    coverage_lens_path: Option<PathBuf>,
+    coverage_install: Option<String>,
     /// How long one frame may spend serving `croft view` clients (see
     /// `drain_view_requests`). A field so a test on a loaded machine can
     /// stretch it: the fixed 20ms is shorter than one file open there.
@@ -5136,6 +5142,9 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             approval_ui: None,
             notebook_kernels: std::collections::HashMap::new(),
+            coverage_at: None,
+            coverage_lens_path: None,
+            coverage_install: None,
             view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
@@ -17550,9 +17559,19 @@ impl App {
         // controls and commentary stop sharing a costume; the clickable ones
         // take a hover fill under the pointer (spans are built after `rx` is
         // known, below, so hover can be computed against this frame's rects).
+        // The active file's coverage rides the Ln/Col readout (#263): that
+        // segment is not a click target, so the clickable ones keep their
+        // indices.
+        let coverage = self
+            .editor
+            .coverage
+            .as_ref()
+            .and_then(|l| l.percent)
+            .map(|p| format!(" \u{b7} {p:.0}% covered"))
+            .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {} ",
+                " Ln {}, Col {}{coverage} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1
             ),
@@ -20954,6 +20973,9 @@ impl App {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
+            KeyCode::Char('w' | 'W') => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
             KeyCode::Up => self.testing.scroll_up(1),
             KeyCode::Down => self.testing.scroll_down(1),
             _ => {}
@@ -20988,6 +21010,170 @@ impl App {
         self.pending_test_debug = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
+        }
+    }
+
+    /// Run everything with the runner's coverage tool (#263). Results
+    /// stream into the tree as usual; the report lands in the editor's
+    /// gutter, the status bar and the Testing summary.
+    fn run_all_tests_with_coverage(&mut self) {
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        self.test_worker.run_coverage();
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = String::from("Running tests with coverage");
+    }
+
+    /// Fold a finished coverage run into the editor, and keep the active
+    /// file's lens current: rebuilt when the report or the file changes,
+    /// dimmed once the file is edited or rewritten after the run.
+    fn sync_coverage(&mut self) -> bool {
+        use crate::testing::worker::CoverageError;
+        let mut changed = false;
+        match self.testing.take_coverage_error() {
+            Some(CoverageError::Missing { tool, install }) => {
+                self.status = format!(
+                    "Coverage needs {tool}: run \"Testing: Install Coverage Tool\" ({install})"
+                );
+                self.coverage_install = Some(install);
+                changed = true;
+            }
+            Some(CoverageError::NoReport) => {
+                self.status = String::from("The coverage run wrote no report");
+                changed = true;
+            }
+            None => {}
+        }
+        let fresh = self.testing.take_coverage_fresh();
+        if fresh {
+            self.coverage_at = Some(std::time::SystemTime::now());
+            if let Some(pct) = self.testing.coverage.as_ref().and_then(|c| c.percent()) {
+                self.status = format!("Coverage: {pct:.0}% of lines");
+            }
+        }
+        let path = self.editor.path.clone();
+        if fresh || path != self.coverage_lens_path {
+            self.coverage_lens_path = path.clone();
+            let stale = path
+                .as_ref()
+                .is_some_and(|p| self.file_changed_since_coverage(p));
+            self.editor.coverage = match (self.testing.coverage.as_ref(), path.as_ref()) {
+                (Some(c), Some(p)) => c.lens(p, stale),
+                _ => None,
+            };
+            changed = true;
+        }
+        if self.editor.dirty
+            && let Some(lens) = self.editor.coverage.as_mut()
+            && !lens.stale
+        {
+            lens.stale = true;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The file on disk is newer than the coverage run.
+    fn file_changed_since_coverage(&self, path: &Path) -> bool {
+        let Some(at) = self.coverage_at else {
+            return false;
+        };
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m > at)
+    }
+
+    /// Drop the coverage report and give the gutter lane back to git.
+    fn clear_coverage(&mut self) {
+        self.testing.coverage = None;
+        self.editor.coverage = None;
+        self.coverage_at = None;
+        self.status = String::from("Coverage cleared");
+    }
+
+    /// Install the runner's coverage tool in a terminal pane, where its
+    /// output and any prompt are visible.
+    fn install_coverage_tool(&mut self) {
+        let Some(command) = self.coverage_install.clone() else {
+            self.status = String::from("No coverage tool is missing");
+            return;
+        };
+        match crate::widgets::terminal::PtyTerminal::new(&self.active_test_root) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("coverage install")));
+                term.write_input(format!("{command}\r").as_bytes());
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Installing: {command}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
+    }
+
+    /// Watch `scope`, or stop watching it (#263).
+    fn toggle_test_watch(&mut self, scope: crate::testing::watch::WatchScope) {
+        use crate::testing::watch::WatchScope;
+        let label = match &scope {
+            WatchScope::All => String::from("all tests"),
+            WatchScope::Suite(s) => format!("suite {s}"),
+            WatchScope::Test(t) => t.clone(),
+        };
+        self.status = if self.testing.watch.toggle(scope) {
+            format!("Watching {label}: it reruns when a file is saved")
+        } else {
+            format!("Stopped watching {label}")
+        };
+    }
+
+    /// Rerun what is watched, if a save made it due, and report a watched
+    /// run that has just turned red. A rerun leaves the sidebar where the
+    /// user has it: a save should not pull them away from what they were
+    /// doing. A red run already raises the activity-bar badge; the status
+    /// line adds which test and how to get to it.
+    fn tick_test_watch(&mut self) -> bool {
+        use crate::testing::watch::{WatchNotice, WatchScope};
+        let mut changed = false;
+        if let Some(ok) = self.testing.take_finished()
+            && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
+        {
+            self.status = match self.testing.first_failed() {
+                Some(name) => {
+                    format!("Watched tests failed: {name} (Testing: Go to First Failure)")
+                }
+                None => String::from("Watched tests failed"),
+            };
+            changed = true;
+        }
+        if self.testing.watch.scope().is_none() {
+            return changed;
+        }
+        let busy = self.testing.is_busy()
+            || crate::testing::worker::runner_for(&self.active_test_root).is_none();
+        let Some(scope) = self.testing.watch.take_due(std::time::Instant::now(), busy) else {
+            return changed;
+        };
+        match scope {
+            WatchScope::All => self.test_worker.run_all(),
+            WatchScope::Suite(suite) => {
+                self.testing
+                    .start_filter(&crate::testing::suite_pattern(&suite));
+                self.test_worker.run_suite(suite);
+            }
+            WatchScope::Test(name) => {
+                self.testing.start_single(&name);
+                self.test_worker.run_one(name);
+            }
+        }
+        true
+    }
+
+    /// Jump to the first failing test's source.
+    fn go_to_first_failed_test(&mut self) {
+        match self.testing.first_failed() {
+            Some(name) => self.jump_to_test_source(name),
+            None => self.status = String::from("No failing tests"),
         }
     }
 
@@ -38950,6 +39136,13 @@ impl App {
             Cmd::NotebookRestart => {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
+            Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
+            Cmd::CoverageClear => self.clear_coverage(),
+            Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
+            Cmd::TestingToggleWatchAll => {
+                self.toggle_test_watch(crate::testing::watch::WatchScope::All)
+            }
+            Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -43500,8 +43693,13 @@ impl App {
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
                         self.testing_scrollbar_drag = true;
+                    } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
+                        self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
+                            Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
+                                self.toggle_test_watch(scope)
+                            }
                             Some(crate::widgets::testing::RowHit::RunCase(name)) => {
                                 self.run_test(name)
                             }
@@ -46729,6 +46927,11 @@ impl App {
         seats: crate::provenance::Provenance,
         described: Option<Vec<u8>>,
     ) {
+        // Every save lands here, so this is where a watched test scope
+        // hears about it (#263).
+        self.testing
+            .watch
+            .on_saved(path, &self.active_test_root, std::time::Instant::now());
         let root = self.history_root.clone();
         let path = path.to_path_buf();
         let tx = self.history_done_tx.clone();
@@ -55790,6 +55993,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
+        let coverage_changed = app.sync_coverage();
+        let watch_changed = app.tick_test_watch();
         if app.testing.take_failed_run() {
             let (passed, failed, _) = app.testing.counts();
             app.notifier.emit(
@@ -55830,6 +56035,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || mcp_changed
             || pair_changed
             || tests_changed
+            || coverage_changed
+            || watch_changed
             || blink_changed
             || spinner_changed
             || ext_index_changed
