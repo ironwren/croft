@@ -29926,7 +29926,7 @@ impl App {
             self.status = String::from("The tour is already running (Esc leaves it)");
             return;
         }
-        let tour = match crate::tour::Tour::parse(crate::tour::TOUR_JSON) {
+        let tour = match crate::tour::Tour::parse(&crate::tour::tour_source()) {
             Ok(t) => t,
             Err(e) => {
                 self.status = format!("The tour could not start: {e}");
