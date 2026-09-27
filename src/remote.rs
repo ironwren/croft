@@ -2336,14 +2336,11 @@ fn push_config_files(ssh: &SshControl, log: &mut dyn FnMut(String)) {
         // nothing about whether the one they just edited went.
         let names: Vec<&str> = pushed.iter().map(|s| s.name).collect();
         log(format!("Config sync: pushed {}", names.join(", ")));
-        // ALL of it applies on the remote's next launch, not just the files
-        // with no reload arm. The reload path is driven by croft's own save
-        // (`reload_config_for_path`), and nothing watches ~/.config/croft, so
-        // a file that arrives by rsync is not noticed at all until relaunch.
-        // Saying "these four are live" would be the lie this message exists
-        // to prevent.
+        // A croft already running on the remote applies them within its
+        // config watch's interval (`ConfigWatch`, #262); one started later
+        // reads them at launch.
         log(format!(
-            "Config sync: {} applies on the remote's next launch",
+            "Config sync: {} applies on the remote within a few seconds",
             names.join(", ")
         ));
     }
