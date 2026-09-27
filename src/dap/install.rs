@@ -248,6 +248,32 @@ pub fn find_dlv(
         .find(|p| p.is_file())
 }
 
+/// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
+/// terminal pane (#264). `GOBIN` puts `dlv` in croft's servers directory,
+/// the last place [`find_dlv`] looks, so it never shadows a delve the user
+/// installed themselves.
+pub const DLV_INSTALL: &str =
+    "GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@latest";
+
+/// Whether the `go` toolchain is on PATH: installing delve needs it.
+pub fn go_on_path() -> bool {
+    which("go")
+}
+
+/// Why Go debugging cannot start, and the next step. Without Go there is
+/// nothing to install delve with, which is a different fix.
+pub fn dlv_missing_message(go_available: bool) -> String {
+    if go_available {
+        String::from(
+            "Go debugging needs delve: run Debug: Install Go Debugger (delve) to `go install` it",
+        )
+    } else {
+        String::from(
+            "Go debugging needs delve, and installing delve needs Go: install Go from https://go.dev/dl, then run Debug: Install Go Debugger (delve)",
+        )
+    }
+}
+
 /// `dlv` for this machine, or an error that says how to install it.
 pub fn dlv_program() -> Result<PathBuf> {
     let gobin = std::env::var_os("GOBIN").map(PathBuf::from);
@@ -259,11 +285,7 @@ pub fn dlv_program() -> Result<PathBuf> {
         gopath.as_deref(),
         home.as_deref(),
     )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "Go debugging needs delve: run `go install github.com/go-delve/delve/cmd/dlv@latest`"
-        )
-    })
+    .ok_or_else(|| anyhow::anyhow!(dlv_missing_message(go_on_path())))
 }
 
 #[cfg(test)]
@@ -301,6 +323,19 @@ mod tests {
 
     /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
     /// for an unset GOPATH, and croft's servers dir comes last.
+    #[test]
+    fn a_missing_delve_says_whether_go_is_there_to_install_it() {
+        let with_go = dlv_missing_message(true);
+        assert!(with_go.contains("Debug: Install Go Debugger (delve)"));
+        assert!(!with_go.contains("go.dev"));
+        let without = dlv_missing_message(false);
+        assert!(without.contains("installing delve needs Go"));
+        assert!(without.contains("https://go.dev/dl"));
+        // The install lands where find_dlv looks last.
+        assert!(DLV_INSTALL.starts_with("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+        assert!(DLV_INSTALL.ends_with("github.com/go-delve/delve/cmd/dlv@latest"));
+    }
+
     #[test]
     fn find_dlv_searches_path_then_gobin_then_gopath_then_croft() {
         let tmp = tempfile::tempdir().unwrap();

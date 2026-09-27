@@ -21436,6 +21436,30 @@ impl App {
         }
     }
 
+    /// Debug: Install Go Debugger (delve) (#264). Runs `go install` in a
+    /// terminal pane, where the user sees the command and its output: that
+    /// visible run is the consent, as for a coverage tool. Without Go there
+    /// is nothing to run it with, so it says that instead.
+    fn install_delve(&mut self) {
+        if !crate::dap::install::go_on_path() {
+            self.status = crate::dap::install::dlv_missing_message(false);
+            return;
+        }
+        match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("delve install")));
+                term.write_input(format!("{}\r", crate::dap::install::DLV_INSTALL).as_bytes());
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = String::from(
+                    "Installing delve into ~/.croft/servers/go; start debugging again once it finishes",
+                );
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
+    }
+
     /// Watch `scope`, or stop watching it (#263).
     fn toggle_test_watch(&mut self, scope: crate::testing::watch::WatchScope) {
         use crate::testing::watch::WatchScope;
@@ -40649,6 +40673,7 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::DebugInstallDelve => self.install_delve(),
             Cmd::ScrubOpenHere => self.scrub_open_here(),
             Cmd::ScrubDiffToWorkingTree => self.scrub_diff_to_working_tree(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
