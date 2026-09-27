@@ -94,7 +94,12 @@ pub enum HookAction {
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
     /// Take the guided tour (#377) in a throwaway sample project.
-    Demo,
+    Demo {
+        /// Run this tour file (the same JSON shape as the built-in
+        /// assets/tour/tour.json) instead of the built-in tour.
+        #[arg(long)]
+        tour: Option<PathBuf>,
+    },
     /// Review a pull request (#365): open croft on this repository with the
     /// PR's changed files, checks and viewed marks in their own tab.
     Pr {
@@ -641,7 +646,16 @@ impl Cli {
                 let cwd = std::env::current_dir()?;
                 crate::app::run(cwd, None, None, false, Vec::new())
             }
-            Some(CliCommand::Demo) => {
+            Some(CliCommand::Demo { tour }) => {
+                if let Some(path) = tour {
+                    let json = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    if let Err(e) = crate::tour::Tour::parse(&json) {
+                        eprintln!("croft demo: {} is not a tour: {e}", path.display());
+                        std::process::exit(2);
+                    }
+                    crate::tour::set_custom_tour(json);
+                }
                 crate::tour::request_startup_demo();
                 let cwd = std::env::current_dir()?;
                 crate::app::run(cwd, None, None, false, Vec::new())
@@ -1974,7 +1988,11 @@ mod tests {
     #[test]
     fn demo_is_a_subcommand() {
         let cli = Cli::try_parse_from(["croft", "demo"]).unwrap();
-        assert!(matches!(cli.command, Some(CliCommand::Demo)));
+        assert!(matches!(cli.command, Some(CliCommand::Demo { tour: None })));
+        let cli = Cli::try_parse_from(["croft", "demo", "--tour", "mine.json"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(CliCommand::Demo { tour: Some(p) }) if p == Path::new("mine.json"))
+        );
     }
 
     /// #375: `--build-info` says when a package manager owns the binary, so a

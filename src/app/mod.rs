@@ -1565,6 +1565,27 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What "open shell here" types for a fleet target (#363): nothing for
+/// localhost (the pane is already a shell there), `docker exec -it` for a
+/// container, `ssh` for a host. Names are quoted for the pane's shell.
+fn fleet_shell_command(host: &str) -> Option<String> {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    if host == "localhost" {
+        return None;
+    }
+    Some(match host.strip_prefix("docker:") {
+        Some(name) => format!("docker exec -it {} sh", quote(name)),
+        None => format!("ssh {}", quote(host)),
+    })
+}
+
+/// What an Agent Lane row's `+n −m` was counted from (#345): the reviewed
+/// snapshot, the agent's last write, and the file's mtime on disk.
+type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
+
+/// How often an open review tab with running checks re-reads them (#365).
+const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What a pull request review tab's `gh` call is fetching (#365).
 enum PrGhJob {
     /// The PR itself (`gh pr view`), by number or URL.
@@ -1573,6 +1594,11 @@ enum PrGhJob {
     Diff { path: String },
     /// A failing check's log, for OUTPUT > PR Checks.
     Log { name: String },
+    /// The open PRs, for the Review Pull Request picker.
+    List,
+    /// A background re-read of the PR while its checks run: only the
+    /// checks of the open tab for `url` are replaced.
+    Checks { url: String },
 }
 
 /// What a network git operation's worker hands back: the UI-thread half
@@ -2698,6 +2724,9 @@ pub struct App {
     pub timeline: TimelinePanel,
     /// The Explorer's AGENT LANE section (#345).
     pub agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel,
+    /// Per lane file, the `+n −m` its row shows and what it was counted
+    /// from: (reviewed snapshot, last agent write, disk mtime).
+    lane_change_counts: std::collections::HashMap<PathBuf, (LaneCountKey, Option<(usize, usize)>)>,
     /// The Explorer's DEPENDENCIES section: the workspace's packages, resolved
     /// off-thread per detected ecosystem. See [`DependenciesPanel`].
     pub dependencies: DependenciesPanel,
@@ -3469,6 +3498,8 @@ pub struct App {
     /// True while a run is in flight, so a second invocation says so rather
     /// than starting a competing fleet against the same hosts.
     fleet_running: bool,
+    /// The command the fleet run in flight is running, for its tab (#363).
+    fleet_command: String,
     port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
@@ -3807,6 +3838,8 @@ pub struct App {
     /// The review tab's `gh` call in flight (#365): what it is for, and
     /// where its answer arrives.
     pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
+    /// When the open review tab's checks were last re-read (#365).
+    pr_checks_polled: Option<std::time::Instant>,
     review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
     review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
@@ -3833,6 +3866,13 @@ pub struct App {
     /// rebuilds the view for the new file rather than showing the old one's
     /// history over it.
     scrub_for: Option<PathBuf>,
+    /// `a` in the approval popup (#347): the agent whose edits are
+    /// approved without asking, until when.
+    auto_approve: Option<(String, std::time::Instant)>,
+    /// The scrubber slider's track, from the last frame, and whether a
+    /// drag that started on it is under way (#371).
+    scrub_slider: Rect,
+    scrub_dragging: bool,
     /// File text per (commit, workspace-relative path) for the scrubber;
     /// `None` records that the file did not exist there.
     scrub_cache: std::collections::HashMap<(String, String), Option<String>>,
@@ -5095,6 +5135,7 @@ impl App {
             open_editors,
             timeline,
             agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel::new(),
+            lane_change_counts: std::collections::HashMap::new(),
             dependencies,
             dep_ecosystems,
             explorer_views,
@@ -5335,6 +5376,7 @@ impl App {
             fleet_rx,
             fleet_tx,
             fleet_running: false,
+            fleet_command: String::new(),
             port_poll_tx,
             port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_label_refresh: std::time::Instant::now(),
@@ -5608,6 +5650,7 @@ impl App {
             review_verdict: None,
             review_gh: String::from("gh"),
             pr_gh: None,
+            pr_checks_polled: None,
             review_tx,
             review_rx,
             recording: None,
@@ -5615,6 +5658,9 @@ impl App {
             scrubber: None,
             scrub_view: None,
             scrub_for: None,
+            auto_approve: None,
+            scrub_slider: Rect::default(),
+            scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             tour: None,
             tour_done: loaded_prefs.tour_done,
@@ -11711,31 +11757,96 @@ impl App {
     /// The AGENT LANE rows (#345): each agent that changed files, then those
     /// files as the ledger orders them (unreviewed first), labelled relative
     /// to their workspace root.
-    fn agent_lane_panel_rows(&self) -> Vec<crate::widgets::agent_lane::LaneRow> {
+    fn agent_lane_panel_rows(&mut self) -> Vec<crate::widgets::agent_lane::LaneRow> {
         use crate::widgets::agent_lane::LaneRow;
         let mut rows = Vec::new();
-        for agent in self.agent_ledger.agents() {
+        let agents: Vec<String> = self
+            .agent_ledger
+            .agents()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for agent in agents {
             rows.push(LaneRow::Agent {
-                name: agent.to_string(),
-                unreviewed: self.agent_ledger.unreviewed_count(agent),
+                name: agent.clone(),
+                unreviewed: self.agent_ledger.unreviewed_count(&agent),
             });
-            for file in self.agent_ledger.lane(agent) {
+            let files: Vec<_> = self
+                .agent_ledger
+                .lane(&agent)
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        f.reviewed_millis,
+                        f.current_hash,
+                        f.unreviewed(),
+                    )
+                })
+                .collect();
+            for (path, reviewed_millis, current_hash, unreviewed) in files {
+                let changes = reviewed_millis
+                    .and_then(|millis| self.lane_changes(&path, millis, current_hash));
                 let label = self
                     .roots
-                    .owning_root(&file.path)
-                    .and_then(|root| file.path.strip_prefix(root).ok())
-                    .unwrap_or(&file.path)
+                    .owning_root(&path)
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(&path)
                     .display()
                     .to_string();
                 rows.push(LaneRow::File {
-                    agent: agent.to_string(),
-                    path: file.path.clone(),
+                    agent: agent.clone(),
+                    path,
                     label,
-                    unreviewed: file.unreviewed(),
+                    unreviewed,
+                    changes,
                 });
             }
         }
         rows
+    }
+
+    /// Lines added and removed in `path` since the snapshot it was reviewed
+    /// against (#345), for its lane row. Rows render every frame, so the
+    /// count is kept until the snapshot, the agent's last write or the file
+    /// on disk changes. `None` when the snapshot or the file can't be read.
+    fn lane_changes(
+        &mut self,
+        path: &Path,
+        millis: u64,
+        current_hash: u64,
+    ) -> Option<(usize, usize)> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = (millis, current_hash, mtime);
+        if let Some((k, counts)) = self.lane_change_counts.get(path)
+            && *k == key
+        {
+            return *counts;
+        }
+        let counts = (|| {
+            let snap = crate::history::snapshot_file_in(&self.history_root, path, millis)?;
+            let decode = |bytes: Vec<u8>| {
+                let enc = encoding_rs::Encoding::for_bom(&bytes)
+                    .map(|(e, _)| e)
+                    .unwrap_or(encoding_rs::UTF_8);
+                enc.decode(&bytes).0.into_owned()
+            };
+            let before = decode(std::fs::read(snap).ok()?);
+            let after = decode(std::fs::read(path).ok()?);
+            let diff = similar::TextDiff::from_lines(&before, &after);
+            let (mut added, mut removed) = (0, 0);
+            for change in diff.iter_all_changes() {
+                match change.tag() {
+                    similar::ChangeTag::Insert => added += 1,
+                    similar::ChangeTag::Delete => removed += 1,
+                    similar::ChangeTag::Equal => {}
+                }
+            }
+            Some((added, removed))
+        })();
+        self.lane_change_counts
+            .insert(path.to_path_buf(), (key, counts));
+        counts
     }
 
     /// Cmd+K V (#345): make the AGENT LANE section visible and open, on the
@@ -15700,15 +15811,22 @@ impl App {
         // them with pane reads would need the pane borrowed twice around
         // them — which compiles but reads as an accident rather than as a
         // decision.
+        let triggers = self.triggers.clone();
         let Some((size, lines)) = self.terminals.get(self.active_terminal).map(|t| {
-            let (mut all, top) = t.grid_lines();
+            let (mut all, mut wraps, top) = t.grid_lines_wrapped();
             // The VISIBLE screen only. `grid_lines` starts at
             // `topmost_line()`, which is negative scrollback — up to
             // 5000 rows. Writing all of it after a clear scrolls the
             // live screen straight off the top, so the cast shows the
             // tail of the history rather than what the user was looking
             // at, at ~400 KB per frame.
-            let visible = all.split_off((-top).max(0) as usize);
+            let first = ((-top).max(0) as usize).min(all.len());
+            let visible = all.split_off(first);
+            let visible_wraps = wraps.split_off(first.min(wraps.len()));
+            // Masked like a scrollback dump (#360): a cast is a file made to
+            // be shared, so every redact rule applies, and a reveal on
+            // screen never reaches it.
+            let visible = crate::triggers::mask_rows(&visible, &visible_wraps, &triggers);
             ((t.last_inner.width, t.last_inner.height), visible)
         }) else {
             return;
@@ -15767,6 +15885,8 @@ impl App {
             Some(listener) => crate::agent_approval::accept_into(listener, &mut self.approvals),
             None => false,
         };
+        // Auto-approved edits are answered before anyone is notified.
+        changed |= self.apply_auto_approve();
         self.notify_new_approvals();
         let now = std::time::Instant::now();
         let before = self.approvals.len();
@@ -15809,6 +15929,48 @@ impl App {
         }
     }
 
+    /// Answer "allow" to every queued proposal from the auto-approved agent
+    /// while its window lasts (#347), and drop the window once it ends.
+    /// Returns true when anything was approved or the window closed.
+    fn apply_auto_approve(&mut self) -> bool {
+        let Some((agent, until)) = self.auto_approve.clone() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.auto_approve = None;
+            self.status = format!("Stopped auto-approving {agent}: its 10 minutes are up");
+            return true;
+        }
+        let mut approved = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for p in std::mem::take(&mut self.approvals) {
+            if p.request.agent == agent {
+                approved.push(p.proposal.path.display().to_string());
+                p.answer(&crate::agent_hook::Decision::Allow);
+            } else {
+                kept.push_back(p);
+            }
+        }
+        self.approvals = kept;
+        if approved.is_empty() {
+            return false;
+        }
+        if self.approvals.is_empty() {
+            self.approval_ui = None;
+        }
+        self.status = format!("Auto-approved {agent}'s edit to {}", approved.join(", "));
+        true
+    }
+
+    /// Agents: Stop Auto-Approving (#347).
+    fn stop_auto_approve(&mut self) {
+        self.status = match self.auto_approve.take() {
+            Some((agent, _)) => format!("Stopped auto-approving {agent}"),
+            None => String::from("No agent is being auto-approved"),
+        };
+    }
+
     fn handle_approval_key(&mut self, key: KeyEvent) {
         let rows = self
             .approvals
@@ -15821,8 +15983,23 @@ impl App {
         let Some(decision) = ui.key(key, std::time::Instant::now(), rows) else {
             return;
         };
+        let approve_all = ui.approve_all;
         if let Some(head) = self.approvals.pop_front() {
+            if approve_all {
+                let agent = head.request.agent.clone();
+                self.auto_approve = Some((
+                    agent.clone(),
+                    std::time::Instant::now() + crate::agent_approval::AUTO_APPROVE_FOR,
+                ));
+                self.status = format!(
+                    "Approving every edit from {agent} for 10 minutes (Agents: Stop Auto-Approving ends it)"
+                );
+            }
             head.answer(&decision);
+        }
+        // What was already queued from that agent goes through too.
+        if approve_all {
+            self.apply_auto_approve();
         }
         self.approval_ui = (!self.approvals.is_empty())
             .then(|| crate::agent_approval::ApprovalUi::new(std::time::Instant::now()));
@@ -17359,6 +17536,7 @@ impl App {
                 );
                 frame.render_widget(view, body);
             }
+            self.render_scrub_slider(frame);
             if self.focus == Pane::Editor
                 && self.completion_popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
@@ -17870,6 +18048,45 @@ impl App {
                     .fg(self.theme.ui(Color::Rgb(0x2d, 0xd4, 0xbf)))
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+        if let Some((agent, until)) = &self.auto_approve {
+            let left = until
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            spans.push(Span::styled(
+                format!(
+                    " \u{2713} auto-approving {agent} {}:{:02} ",
+                    left / 60,
+                    left % 60
+                ),
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        if let Some(chip) = self.notebook_kernel_chip() {
+            spans.push(Span::styled(
+                chip,
+                Style::default()
+                    .fg(self.theme.ui(Color::Rgb(0xf3, 0x9c, 0x12)))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some((_, _, started)) = &self.recording {
+            // A terminal recording (#356) is the other state a user can
+            // leave on; it is not the macro recorder, so it has its own
+            // badge and says how long it has run.
+            let secs = started.elapsed().as_secs();
+            spans.push(Span::styled(
+                format!(" \u{25cf} CAST {}:{:02} ", secs / 60, secs % 60),
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
         }
         if let Some(rec) = &self.macro_recording {
             // Recording is state a user can forget they left on, so it gets a
@@ -21602,6 +21819,23 @@ impl App {
         self.status = String::from("Coverage cleared");
     }
 
+    /// Testing: Show Coverage Report (#263): the last coverage run as a
+    /// tab, one file per line with its percentage, least covered first.
+    fn show_coverage_report(&mut self) {
+        let Some(coverage) = self.testing.coverage.as_ref() else {
+            self.status = String::from("No coverage yet: run Testing: Run All Tests with Coverage");
+            return;
+        };
+        let report = coverage.report(&self.active_test_root);
+        match self
+            .editor
+            .open_text_buffer(Path::new("Coverage Report"), &report)
+        {
+            Ok(()) => self.focus_pane(Pane::Editor),
+            Err(e) => self.status = format!("Could not open the report: {e}"),
+        }
+    }
+
     /// Install the runner's coverage tool in a terminal pane, where its
     /// output and any prompt are visible.
     fn install_coverage_tool(&mut self) {
@@ -21617,6 +21851,30 @@ impl App {
                 self.show_terminal = true;
                 self.focus_pane(Pane::Terminal);
                 self.status = format!("Installing: {command}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
+    }
+
+    /// Debug: Install Go Debugger (delve) (#264). Runs `go install` in a
+    /// terminal pane, where the user sees the command and its output: that
+    /// visible run is the consent, as for a coverage tool. Without Go there
+    /// is nothing to run it with, so it says that instead.
+    fn install_delve(&mut self) {
+        if !crate::dap::install::go_on_path() {
+            self.status = crate::dap::install::dlv_missing_message(false);
+            return;
+        }
+        match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("delve install")));
+                term.write_input(format!("{}\r", crate::dap::install::DLV_INSTALL).as_bytes());
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = String::from(
+                    "Installing delve into ~/.croft/servers/go; start debugging again once it finishes",
+                );
             }
             Err(e) => self.status = format!("Could not open a terminal: {e}"),
         }
@@ -21769,6 +22027,39 @@ impl App {
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
+    }
+
+    /// Testing: Run Test at Cursor with Coverage (#263): the caret's test
+    /// alone, resolved as run-at-cursor resolves it, under the coverage
+    /// tool. The report replaces the last one, and so describes only the
+    /// code that test reached.
+    fn run_test_at_cursor_with_coverage(&mut self) {
+        let Some(name) =
+            crate::testing::locate::enclosing_fn_name(&self.editor.lines, self.editor.cursor_row)
+        else {
+            self.status =
+                String::from("Run Test at Cursor with Coverage: no function at the caret");
+            return;
+        };
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
+            Some(full) => (full, true),
+            None => (name, false),
+        };
+        if exact {
+            self.testing.start_single(&run);
+        } else {
+            self.testing.start_filter(&run);
+        }
+        self.test_worker
+            .run_coverage_scoped(crate::testing::worker::CoverageScope {
+                name: run.clone(),
+                exact,
+            });
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = format!("Running test {run} with coverage");
     }
 
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
@@ -22980,6 +23271,28 @@ impl App {
                 title: String::from("CALL STACK"),
             },
         });
+        // With more than one thread (goroutines, under delve), each gets a
+        // row and the selected one's frames sit under it, as in VS Code
+        // (#264). A single thread keeps the plain frame list.
+        let threaded = session.threads.len() > 1;
+        let mut frames_at = rows.len();
+        if threaded {
+            for (id, name) in &session.threads {
+                let selected = session.stopped_thread == Some(*id);
+                rows.push(DebugRow {
+                    indent: 1,
+                    kind: DebugRowKind::Thread {
+                        id: *id,
+                        name: name.clone(),
+                        selected,
+                    },
+                });
+                if selected {
+                    frames_at = rows.len();
+                }
+            }
+        }
+        let mut frame_rows = Vec::new();
         for f in &session.stack_frames {
             let loc = f
                 .path
@@ -22987,8 +23300,8 @@ impl App {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            rows.push(DebugRow {
-                indent: 1,
+            frame_rows.push(DebugRow {
+                indent: if threaded { 2 } else { 1 },
                 kind: DebugRowKind::Frame {
                     id: f.id,
                     selected: Some(f.id) == session.selected_frame,
@@ -22997,6 +23310,7 @@ impl App {
                 },
             });
         }
+        rows.splice(frames_at..frames_at, frame_rows);
         rows.push(DebugRow {
             indent: 0,
             kind: DebugRowKind::Header {
@@ -23164,6 +23478,12 @@ impl App {
             return;
         };
         match row.kind.clone() {
+            DebugRowKind::Thread { id, .. } => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.select_thread(id);
+                }
+                self.debug_expanded.clear();
+            }
             DebugRowKind::Frame { id, .. } => {
                 if let Some(session) = self.debug_sessions.focused_mut() {
                     session.load_frame(id);
@@ -28538,6 +28858,13 @@ impl App {
                     self.run_project_task(task);
                 }
             }
+            ListPurpose::ReviewPullRequest => {
+                if row.id == crate::widgets::list_picker::PR_BY_NUMBER {
+                    self.open_pr_number_prompt();
+                } else {
+                    self.start_pr_review(row.id.clone());
+                }
+            }
             ListPurpose::AttachProcess => {
                 if let Some((rc, slot)) = row
                     .id
@@ -30064,7 +30391,7 @@ impl App {
             self.status = String::from("The tour is already running (Esc leaves it)");
             return;
         }
-        let tour = match crate::tour::Tour::parse(crate::tour::TOUR_JSON) {
+        let tour = match crate::tour::Tour::parse(&crate::tour::tour_source()) {
             Ok(t) => t,
             Err(e) => {
                 self.status = format!("The tour could not start: {e}");
@@ -30238,8 +30565,9 @@ impl App {
         }
         let n = commits.len();
         self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
-        self.status =
-            format!("Scrubbing {n} commits — arrows step, Home returns to your working tree");
+        self.status = format!(
+            "Scrubbing {n} commits — arrows step, Enter opens a commit's version, Home returns to your working tree"
+        );
     }
 
     /// Keep symbol tabs (#369) and the other tabs of their files in step.
@@ -30610,6 +30938,19 @@ impl App {
         self.sync_open_file_poll_mtime();
         self.focus_pane(Pane::Editor);
         self.status = format!("Opened {name} as its own tab");
+    }
+
+    /// The status bar's kernel chip for the notebook in the editor (#355):
+    /// the kernel's name once it is up, and whether a cell is running.
+    /// `None` for any other file, or before a kernel has started.
+    fn notebook_kernel_chip(&self) -> Option<String> {
+        let run = self.notebook_kernels.get(self.editor.path.as_ref()?)?;
+        let name = run.kernel.as_deref()?;
+        Some(if run.running_indices().is_empty() {
+            format!(" kernel: {name} ")
+        } else {
+            format!(" kernel: {name} \u{b7} busy ")
+        })
     }
 
     /// Start or stop recording the active terminal as an asciicast (#356).
@@ -31056,6 +31397,7 @@ impl App {
         let host_count = hosts.len();
         let tx = self.fleet_tx.clone();
         let command = command.to_string();
+        self.fleet_command = command.clone();
         self.fleet_running = true;
         std::thread::spawn(move || {
             let _ = tx.send(crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT));
@@ -31122,8 +31464,90 @@ impl App {
                 &summary.line(),
             );
             self.status = format!("Fleet: {}", summary.line());
+            // The tiles (#363); OUTPUT keeps the text record above.
+            self.editor
+                .open_fleet(crate::widgets::fleet::FleetView::new(
+                    self.fleet_command.clone(),
+                    results,
+                ));
+            self.focus_pane(Pane::Editor);
         }
         true
+    }
+
+    /// FLEET tab keys (#363).
+    fn handle_fleet_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.editor.fleet.as_mut() else {
+            return;
+        };
+        let cols = view.columns.max(1) as isize;
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => view.move_selection(-1),
+            KeyCode::Right | KeyCode::Char('l') => view.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-cols),
+            KeyCode::Down | KeyCode::Char('j') => view.move_selection(cols),
+            KeyCode::Char('d') => view.diff_mode = !view.diff_mode,
+            KeyCode::Char('r') => {
+                view.toggle_reference();
+                self.status = match &view.reference_host {
+                    Some(h) => format!("Fleet: comparing with {h}"),
+                    None => String::from("Fleet: comparing with the most common output"),
+                };
+            }
+            KeyCode::Char('s') => self.save_fleet_capture(),
+            KeyCode::Enter => self.open_fleet_shell(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.editor.close_active();
+                self.status = String::from("Closed the fleet results");
+            }
+            _ => {}
+        }
+    }
+
+    /// Save the fleet tab's run to `fleet-<time>.txt` in the workspace
+    /// (#363): the command, the summary and every host's full output.
+    fn save_fleet_capture(&mut self) {
+        let Some(view) = self.editor.fleet.as_ref() else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = self.workspace_root().join(format!("fleet-{stamp}.txt"));
+        self.status = match std::fs::write(&path, view.capture()) {
+            Ok(()) => format!("Fleet run saved to {}", path.display()),
+            Err(e) => format!("Could not save the fleet run: {e}"),
+        };
+    }
+
+    /// "Open shell here" (#363): a terminal pane on the selected tile's
+    /// host: `ssh` for a host, a shell for localhost, `docker exec` for a
+    /// container. Typed into a fresh pane so the user sees what runs.
+    fn open_fleet_shell(&mut self) {
+        let Some(host) = self
+            .editor
+            .fleet
+            .as_ref()
+            .and_then(|v| v.selected_result())
+            .map(|r| r.host.clone())
+        else {
+            return;
+        };
+        let command = fleet_shell_command(&host);
+        match crate::widgets::terminal::PtyTerminal::new(self.workspace_root()) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(host.clone()));
+                if let Some(cmd) = command {
+                    term.write_input(format!("{cmd}\r").as_bytes());
+                }
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                self.status = format!("Shell on {host}");
+            }
+            Err(e) => self.status = format!("Could not open a terminal: {e}"),
+        }
     }
 
     /// Ask for a new lane's name (#348); the palette command and `Cmd+K
@@ -31562,6 +31986,13 @@ impl App {
             KeyCode::Left => scrub.older(),
             KeyCode::Right => scrub.newer(),
             KeyCode::Home => scrub.home(),
+            // Enter at a commit opens that version as a tab of its own; at
+            // the working tree there is nothing to open, so it passes
+            // through to the live buffer like any other typing.
+            KeyCode::Enter if scrub.commit().is_some() => {
+                self.scrub_open_here();
+                return true;
+            }
             KeyCode::Esc => {
                 // Closing returns to the live buffer by construction: the
                 // scrubber never replaced it, so there is nothing to put
@@ -31582,6 +32013,180 @@ impl App {
         };
         self.rebuild_scrub_view();
         true
+    }
+
+    /// The active file at the scrubber's commit (#371): its path, its
+    /// workspace-relative name, the commit, and its text there (`None` when
+    /// the file did not exist yet). `None` with a status line when there is
+    /// no scrubbed commit or no file to show.
+    fn scrubbed_file(
+        &mut self,
+    ) -> Option<(PathBuf, String, crate::git::GraphCommit, Option<String>)> {
+        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
+            self.status = String::from("Step the scrubber to a commit first");
+            return None;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file is open to scrub");
+            return None;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let Ok(rel) = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            self.status = String::from("The open file is outside the workspace");
+            return None;
+        };
+        let text = self
+            .scrub_cache
+            .entry((commit.hash.clone(), rel.clone()))
+            .or_insert_with(|| crate::git::read_file_at_rev(&root, &commit.hash, &rel).ok())
+            .clone();
+        Some((path, rel, commit, text))
+    }
+
+    /// Leave the scrubber for a tab that shows what it was showing.
+    fn close_scrubber_for_tab(&mut self) {
+        self.scrubber = None;
+        self.scrub_view = None;
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// **Open here** (#371): the scrubbed version of the file as a normal
+    /// tab, highlighted as its language, labelled with the commit. It has no
+    /// file on disk behind it, so nothing reloads or overwrites it.
+    fn scrub_open_here(&mut self) {
+        let Some((path, rel, commit, text)) = self.scrubbed_file() else {
+            return;
+        };
+        let Some(text) = text else {
+            self.status = format!("{rel} did not exist at {}", commit.short_hash);
+            return;
+        };
+        let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        if let Err(e) = self.editor.open_text_buffer(&label, &text) {
+            self.status = format!("Could not open {rel} at {}: {e}", commit.short_hash);
+            return;
+        }
+        // Highlighting only: no language server hears about a tab with no
+        // file behind it.
+        self.editor.set_language(
+            path.extension()
+                .and_then(|x| x.to_str())
+                .and_then(crate::highlight::lang_for_extension),
+        );
+        self.close_scrubber_for_tab();
+        self.status = format!("{rel} at {} — {}", commit.short_hash, commit.summary);
+    }
+
+    /// **Diff to working tree** (#371): the scrubbed version against the
+    /// file on disk, in the side-by-side diff.
+    fn scrub_diff_to_working_tree(&mut self) {
+        let Some((path, rel, commit, text)) = self.scrubbed_file() else {
+            return;
+        };
+        let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        // A file the commit predates diffs as all added, which is what
+        // happened to it since.
+        let text = text.unwrap_or_default();
+        if let Err(e) = self
+            .editor
+            .open_head_diff_with_text(label, &text, &path, false)
+        {
+            self.status = format!("Could not diff {rel}: {e}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::FixedLeft { left_text: text });
+        self.close_scrubber_for_tab();
+        self.status = format!("{rel}: {} → working tree", commit.short_hash);
+    }
+
+    /// Seek the scrubber to the stop under screen column `col` on the
+    /// slider, and show that commit.
+    fn scrub_seek_column(&mut self, col: u16) {
+        let track = self.scrub_slider;
+        if track.width == 0 {
+            return;
+        }
+        let Some(scrub) = self.scrubber.as_mut() else {
+            return;
+        };
+        let span = track.width.saturating_sub(1).max(1) as f32;
+        let f = (col.saturating_sub(track.x) as f32 / span).clamp(0.0, 1.0);
+        let before = scrub.position();
+        scrub.seek_fraction(f);
+        if scrub.position() == before {
+            return;
+        }
+        self.status = match self.scrubber.as_ref().and_then(|s| s.commit()) {
+            Some(c) => format!("At {} — {}", c.short_hash, c.summary),
+            None => String::from("At your working tree"),
+        };
+        self.rebuild_scrub_view();
+    }
+
+    /// The history scrubber's slider (#371), on the editor body's last row
+    /// while scrubbing: where the cursor is (a commit's short hash and its
+    /// place in the history, or the working tree), then a track from the
+    /// oldest loaded commit on the left to the working tree on the right,
+    /// with the handle where the view is.
+    fn render_scrub_slider(&mut self, frame: &mut ratatui::Frame) {
+        self.scrub_slider = Rect::default();
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return;
+        };
+        let body = self.editor.last_body;
+        if body.width < 20 || body.height < 2 {
+            return;
+        }
+        let row = Rect {
+            x: body.x,
+            y: body.y + body.height - 1,
+            width: body.width,
+            height: 1,
+        };
+        let label = match (scrub.position(), scrub.commit()) {
+            (crate::scrubber::Position::At(i), Some(c)) => {
+                format!(" {} {}/{} ", c.short_hash, scrub.len() - i, scrub.len())
+            }
+            _ => String::from(" working tree "),
+        };
+        let label_w = (label.chars().count() as u16).min(row.width / 2);
+        let track = Rect {
+            x: row.x + label_w + 1,
+            y: row.y,
+            width: row.width.saturating_sub(label_w + 2),
+            height: 1,
+        };
+        let bar_bg = self.theme.ui(Color::Rgb(0x1c, 0x21, 0x2b));
+        let buf = frame.buffer_mut();
+        buf.set_style(row, Style::default().bg(bar_bg));
+        buf.set_stringn(
+            row.x,
+            row.y,
+            &label,
+            label_w as usize,
+            Style::default()
+                .fg(self.theme.accent())
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        let handle = (scrub.fraction() * track.width.saturating_sub(1) as f32).round() as u16;
+        for dx in 0..track.width {
+            let (sym, fg) = if dx == handle {
+                ("\u{25cf}", self.theme.accent())
+            } else {
+                ("\u{2500}", self.theme.ui(Color::Rgb(0x5a, 0x63, 0x73)))
+            };
+            buf.set_string(
+                track.x + dx,
+                track.y,
+                sym,
+                Style::default().fg(fg).bg(bar_bg),
+            );
+        }
+        self.scrub_slider = track;
     }
 
     /// Build the read-only view of the active file at the scrubber's commit
@@ -33439,6 +34044,10 @@ impl App {
         }
         if self.editor.pr_review.is_some() {
             self.handle_pr_review_key(key);
+            return;
+        }
+        if self.editor.fleet.is_some() {
+            self.handle_fleet_key(key);
             return;
         }
         if self.editor.sarif.is_some() {
@@ -40694,6 +41303,8 @@ impl App {
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
+            Cmd::TestingShowCoverageReport => self.show_coverage_report(),
+            Cmd::RunTestAtCursorWithCoverage => self.run_test_at_cursor_with_coverage(),
             Cmd::TestingToggleWatchAll => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
@@ -40989,6 +41600,10 @@ impl App {
             Cmd::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
+            Cmd::DebugInstallDelve => self.install_delve(),
+            Cmd::StopAutoApprove => self.stop_auto_approve(),
+            Cmd::ScrubOpenHere => self.scrub_open_here(),
+            Cmd::ScrubDiffToWorkingTree => self.scrub_diff_to_working_tree(),
             Cmd::OpenAsSymbolTab => self.open_symbol_tab(),
             Cmd::LoadReviewThreads => self.load_review_threads(),
             Cmd::ReviewAddComment => self.open_review_comment_prompt(),
@@ -41013,12 +41628,11 @@ impl App {
             }
             Cmd::NewWorktreeLane => self.open_new_lane_prompt(),
             Cmd::ReviewPullRequest => {
-                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                self.open_input_prompt(InputPrompt::new(
-                    InputPurpose::PullRequestNumber,
-                    String::from("Review Pull Request"),
-                    String::from("number, #number, or the PR's URL"),
-                ));
+                // The open PRs first, fetched off the UI thread; the typed
+                // prompt stays one row away (and is the fallback when gh
+                // cannot list).
+                self.status = String::from("Listing open pull requests…");
+                self.spawn_pr_gh(PrGhJob::List, crate::pr_review::list_args());
             }
             Cmd::DiffWorktreeLane => self.diff_worktree_lane(),
             Cmd::CloseWorktreeLane => self.close_worktree_lane(),
@@ -43381,6 +43995,28 @@ impl App {
         if self.approval_ui.is_some() {
             return;
         }
+        // The history scrubber's slider (#371): a press on the track seeks
+        // there, and a drag that started on it keeps seeking wherever the
+        // pointer goes, so the handle can be dragged off the row and back.
+        if self.scrubber.is_some() && !self.modal_overlay_open() {
+            let on_track = rect_contains(self.scrub_slider, m.column, m.row);
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) if on_track => {
+                    self.scrub_dragging = true;
+                    self.scrub_seek_column(m.column);
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.scrub_dragging => {
+                    self.scrub_seek_column(m.column);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) if self.scrub_dragging => {
+                    self.scrub_dragging = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.connect_dialog.is_some() {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.handle_connect_dialog_click(m.column, m.row);
@@ -44683,10 +45319,19 @@ impl App {
                     } else if let Some(crate::widgets::agent_lane::LaneRow::File {
                         agent,
                         path,
+                        label,
                         ..
                     }) = self.agent_lane_panel.row_at(m.row).cloned()
                     {
-                        self.diff_agent_lane_row(&agent, &path);
+                        // The ● marks the file reviewed; the rest of the row
+                        // opens its diff.
+                        if self.agent_lane_panel.hit_dot(m.column, m.row) {
+                            if self.mark_agent_file_reviewed(&agent, &path) {
+                                self.status = format!("{label}: reviewed");
+                            }
+                        } else {
+                            self.diff_agent_lane_row(&agent, &path);
+                        }
                     }
                     return;
                 }
@@ -45562,6 +46207,14 @@ impl App {
                                 let cursor = value.len();
                                 view.editing = Some(crate::sheet::CellEdit { value, cursor });
                             }
+                        }
+                        self.poke_cursor();
+                        return;
+                    }
+                    // Fleet tiles (#363): a click selects a tile.
+                    if let Some(view) = self.editor.fleet.as_mut() {
+                        if let Some(i) = view.tile_at(m.column, m.row) {
+                            view.selected = i;
                         }
                         self.poke_cursor();
                         return;
@@ -51478,6 +52131,16 @@ impl App {
         self.status = format!("Reviewing PR #{n}");
     }
 
+    /// Ask for a pull request by number or URL (#365).
+    fn open_pr_number_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::PullRequestNumber,
+            String::from("Review Pull Request"),
+            String::from("number, #number, or the PR's URL"),
+        ));
+    }
+
     /// The Review Pull Request prompt's answer.
     fn submit_pr_number(&mut self, input: &str) {
         match crate::pr_review::parse_pr_selector(input) {
@@ -51515,9 +52178,40 @@ impl App {
         self.pr_gh = Some((job, rx));
     }
 
+    /// While the open review tab has checks still running, re-read the PR
+    /// every [`PR_CHECKS_POLL`] so they turn green or red on their own
+    /// (#365). Never while another review call is in flight, which it would
+    /// otherwise replace.
+    fn refresh_pending_pr_checks(&mut self) {
+        if self.pr_gh.is_some() {
+            return;
+        }
+        let Some(view) = self.editor.pr_review.as_ref() else {
+            return;
+        };
+        if !view.has_pending_checks() || view.pr.url.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.pr_checks_polled {
+            Some(at) if now.duration_since(at) < PR_CHECKS_POLL => return,
+            // The first sight of a pending tab starts the clock.
+            None => {
+                self.pr_checks_polled = Some(now);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.pr_checks_polled = Some(now);
+        let url = view.pr.url.clone();
+        let args = crate::pr_review::view_args(&url);
+        self.spawn_pr_gh(PrGhJob::Checks { url }, args);
+    }
+
     /// Apply a finished review `gh` call. Returns true when it changed what
     /// is on screen.
     fn poll_pr_gh(&mut self) -> bool {
+        self.refresh_pending_pr_checks();
         let Some((_, rx)) = self.pr_gh.as_ref() else {
             return false;
         };
@@ -51551,6 +52245,58 @@ impl App {
                 }
                 Err(why) => self.status = format!("gh pr diff failed: {why}"),
             },
+            PrGhJob::List => {
+                use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow, PR_BY_NUMBER};
+                let items = result.and_then(|json| crate::pr_review::parse_pr_list(&json));
+                let items = match items {
+                    Ok(items) if !items.is_empty() => items,
+                    other => {
+                        self.open_pr_number_prompt();
+                        if let Err(why) = other {
+                            self.status = format!("Could not list pull requests: {why}");
+                        }
+                        return true;
+                    }
+                };
+                let mut rows: Vec<ListRow> = items
+                    .into_iter()
+                    .map(|p| ListRow {
+                        id: p.url,
+                        label: format!(
+                            "#{:<5} {}{}  ({})",
+                            p.number,
+                            if p.draft { "[draft] " } else { "" },
+                            p.title,
+                            p.author
+                        ),
+                    })
+                    .collect();
+                rows.push(ListRow {
+                    id: PR_BY_NUMBER.to_string(),
+                    label: String::from("Another pull request by number or URL…"),
+                });
+                self.status.clear();
+                self.list_picker = Some(ListPicker::new(
+                    ListPurpose::ReviewPullRequest,
+                    String::from("Review Pull Request"),
+                    rows,
+                ));
+            }
+            PrGhJob::Checks { url } => {
+                // A failed re-read changes nothing: the next one retries.
+                let Ok(pr) = result.and_then(|json| crate::pr_review::parse_pr(&json)) else {
+                    return false;
+                };
+                let Some(view) = self.editor.pr_review.as_mut().filter(|v| v.pr.url == url) else {
+                    return false;
+                };
+                let was_pending = view.has_pending_checks();
+                view.pr.checks = pr.checks;
+                view.move_selection(0);
+                if was_pending && !view.has_pending_checks() {
+                    self.status = format!("PR #{}: every check has finished", view.pr.number);
+                }
+            }
             PrGhJob::Log { name } => {
                 let channel = "PR Checks";
                 crate::output::clear(channel);

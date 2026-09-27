@@ -97,6 +97,14 @@ pub enum DebugRowKind {
         name: String,
         location: String,
     },
+    /// A thread (a goroutine, under delve) in the CALL STACK when the
+    /// debuggee has more than one (#264); `selected` is the one whose frames
+    /// are listed and that stepping applies to.
+    Thread {
+        id: i64,
+        name: String,
+        selected: bool,
+    },
     /// A scope container row ("Locals", "Globals").
     Scope { name: String },
     /// A variable. `reference > 0` means expandable; `value`/`type_name` are
@@ -511,6 +519,18 @@ impl RunDebugPanel {
                         location,
                         with_bg(Style::default().fg(self.theme.ui(DBG_LOC)), bg),
                     );
+                }
+                DebugRowKind::Thread { name, selected, .. } => {
+                    // Open chevron on the thread whose frames follow.
+                    let text = format!("{} {name}", if *selected { "▾" } else { "▸" });
+                    let style = if *selected {
+                        Style::default()
+                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.ui(DBG_SCOPE))
+                    };
+                    put(buf, inner.x + 1, row_y, right, &text, style);
                 }
                 DebugRowKind::Scope { name } => {
                     put(

@@ -14,6 +14,7 @@ pub mod editor_find;
 pub mod extensions;
 pub mod file_finder;
 pub mod file_tree;
+pub mod fleet;
 pub mod header_pill;
 pub mod history_popup;
 pub mod hover;
