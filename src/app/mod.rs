@@ -21739,6 +21739,39 @@ impl App {
         self.status = format!("Running test {run}");
     }
 
+    /// Testing: Run Test at Cursor with Coverage (#263): the caret's test
+    /// alone, resolved as run-at-cursor resolves it, under the coverage
+    /// tool. The report replaces the last one, and so describes only the
+    /// code that test reached.
+    fn run_test_at_cursor_with_coverage(&mut self) {
+        let Some(name) =
+            crate::testing::locate::enclosing_fn_name(&self.editor.lines, self.editor.cursor_row)
+        else {
+            self.status =
+                String::from("Run Test at Cursor with Coverage: no function at the caret");
+            return;
+        };
+        if self.testing.is_busy() || !self.testing_runner_available() {
+            return;
+        }
+        let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
+            Some(full) => (full, true),
+            None => (name, false),
+        };
+        if exact {
+            self.testing.start_single(&run);
+        } else {
+            self.testing.start_filter(&run);
+        }
+        self.test_worker
+            .run_coverage_scoped(crate::testing::worker::CoverageScope {
+                name: run.clone(),
+                exact,
+            });
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = format!("Running test {run} with coverage");
+    }
+
     /// Debug the test the editor caret sits in (Cmd+K Shift+Enter, palette).
     fn debug_test_at_cursor(&mut self) {
         let Some(name) =
@@ -40522,6 +40555,7 @@ impl App {
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
             Cmd::TestingShowCoverageReport => self.show_coverage_report(),
+            Cmd::RunTestAtCursorWithCoverage => self.run_test_at_cursor_with_coverage(),
             Cmd::TestingToggleWatchAll => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }

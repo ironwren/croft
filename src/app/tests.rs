@@ -56217,3 +56217,58 @@ fn a_recorded_frame_masks_secrets_even_while_revealed() {
     assert!(!text.contains(key), "the key reached the cast:\n{text}");
     assert!(text.contains("export KEY="), "{text}");
 }
+
+/// #263 against real pytest-cov: "Run Test at Cursor with Coverage" runs
+/// only the caret's test, so code that only another test reaches stays
+/// uncovered. Set `CROFT_TEST_PYTEST_COV_PYTHON` as for the whole-run test.
+#[test]
+#[ignore = "needs pytest and pytest-cov; set CROFT_TEST_PYTEST_COV_PYTHON"]
+fn a_real_scoped_coverage_run_covers_only_the_test_at_the_cursor() {
+    use crate::testing::coverage::LineCov;
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_PYTEST_COV_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(
+        python.parent().and_then(Path::parent).unwrap(),
+        root.join(".venv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.py"),
+        "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("test_calc.py"),
+        "from calc import add, sub\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\ndef test_sub():\n    assert sub(3, 2) == 1\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("test_calc.py")).unwrap();
+    app.editor.cursor_row = 4; // inside test_add
+    app.run_command(crate::widgets::command_palette::Command::RunTestAtCursorWithCoverage);
+    assert!(app.status.contains("with coverage"), "{}", app.status);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while app.testing.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let cov = app.testing.coverage.clone().unwrap();
+    let calc = cov
+        .files
+        .get(&root.join("calc.py"))
+        .expect("calc.py measured");
+    assert_eq!(calc.line(2), Some(LineCov::Covered), "`return a + b` ran");
+    assert_eq!(
+        calc.line(6),
+        Some(LineCov::Uncovered),
+        "only test_sub reaches `return a - b`"
+    );
+}

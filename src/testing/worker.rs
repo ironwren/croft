@@ -47,8 +47,9 @@ pub enum TestRequest {
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
     RunSuite(String),
-    /// Run everything with the runner's coverage tool on (#263).
-    RunCoverage,
+    /// Run with the runner's coverage tool on (#263): everything, or only
+    /// the tests `scope` names.
+    RunCoverage(Option<CoverageScope>),
     Discover,
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
@@ -141,7 +142,12 @@ impl TestWorker {
     }
 
     pub fn run_coverage(&self) {
-        let _ = self.request_tx.send(TestRequest::RunCoverage);
+        let _ = self.request_tx.send(TestRequest::RunCoverage(None));
+    }
+
+    /// Run only the tests `scope` names with coverage on (#263).
+    pub fn run_coverage_scoped(&self, scope: CoverageScope) {
+        let _ = self.request_tx.send(TestRequest::RunCoverage(Some(scope)));
     }
 
     pub fn run_all(&self) {
@@ -229,7 +235,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
         let etx = EpochTx { tx: &tx, epoch };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
-            TestRequest::RunCoverage => run_coverage(&root, &etx),
+            TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
@@ -777,6 +783,61 @@ fn coverage_report(dir: &Path) -> PathBuf {
     dir.join("lcov.info")
 }
 
+/// Which tests a coverage run covers, when not all of them (#263): `name`
+/// as run-at-cursor resolved it, `exact` when it is a full test name
+/// rather than a substring filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageScope {
+    pub name: String,
+    pub exact: bool,
+}
+
+/// The filter arguments that narrow a coverage run to `scope`: the same
+/// selection a plain run of that test makes, less what [`coverage_args`]
+/// already says (vitest's `run` and reporter, jest's `--json`).
+fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
+    let name = scope.name.as_str();
+    let drop = |args: Vec<String>, skip: &[&str]| {
+        args.into_iter()
+            .filter(|a| !skip.contains(&a.as_str()) && !a.starts_with("--reporter="))
+            .collect::<Vec<_>>()
+    };
+    match runner {
+        Runner::Pytest => {
+            if scope.exact || name.contains(".py") {
+                vec![name.to_string()]
+            } else {
+                vec![String::from("-k"), name.to_string()]
+            }
+        }
+        Runner::Vitest => drop(
+            if scope.exact {
+                vitest_one_args(name)
+            } else {
+                vitest_filter_args(name, false)
+            },
+            &["run"],
+        ),
+        Runner::Jest => drop(
+            if scope.exact {
+                jest_one_args(name)
+            } else {
+                jest_filter_args(name, false)
+            },
+            &["--json"],
+        ),
+        // `cargo llvm-cov [TESTNAME] [-- <libtest args>]`, as `cargo test`.
+        Runner::Cargo => {
+            let mut a = vec![name.to_string()];
+            if scope.exact {
+                a.push(String::from("--"));
+                a.push(String::from("--exact"));
+            }
+            a
+        }
+    }
+}
+
 /// The run-everything argv with coverage on, writing LCOV into `dir`. Each
 /// keeps the output format the normal run parses, so results stream into
 /// the tree as usual.
@@ -871,7 +932,7 @@ fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
 /// Run everything with coverage (#263). A missing tool is reported before
 /// anything runs, with the command that installs it; the tree is left as
 /// it was.
-fn run_coverage(root: &Path, tx: &EpochTx) {
+fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     let Some(runner) = runner_for(root) else {
         tx.send(TestResponse::Refused);
         return;
@@ -891,8 +952,15 @@ fn run_coverage(root: &Path, tx: &EpochTx) {
     let dir = std::env::temp_dir().join(format!("croft-coverage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
-    tx.send(TestResponse::Started(Activity::Running));
-    let args = coverage_args(runner, &dir);
+    // A scoped run, like `run_one`, leaves the rest of the tree as it is:
+    // the app has already marked what it runs.
+    if scope.is_none() {
+        tx.send(TestResponse::Started(Activity::Running));
+    }
+    let mut args = coverage_args(runner, &dir);
+    if let Some(scope) = scope {
+        args.extend(coverage_scope_args(runner, scope));
+    }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ok = match runner {
         Runner::Pytest => run_streaming(tx, pytest_cmd(root, &args), one(parse_pytest_line)),
@@ -1445,6 +1513,46 @@ mod tests {
         assert_eq!(ca[0], "llvm-cov");
         assert_eq!(ca.last().unwrap(), "/t/cov/lcov.info");
         assert_eq!(coverage_report(dir), Path::new("/t/cov/lcov.info"));
+    }
+
+    #[test]
+    fn a_scoped_coverage_run_narrows_to_the_test_as_a_plain_run_would() {
+        let exact = |n: &str| CoverageScope {
+            name: n.into(),
+            exact: true,
+        };
+        let loose = |n: &str| CoverageScope {
+            name: n.into(),
+            exact: false,
+        };
+        assert_eq!(
+            coverage_scope_args(Runner::Cargo, &exact("parse::a")),
+            vec!["parse::a", "--", "--exact"]
+        );
+        assert_eq!(
+            coverage_scope_args(Runner::Cargo, &loose("parse")),
+            vec!["parse"]
+        );
+        assert_eq!(
+            coverage_scope_args(Runner::Pytest, &exact("tests/test_x.py::test_a")),
+            vec!["tests/test_x.py::test_a"]
+        );
+        assert_eq!(
+            coverage_scope_args(Runner::Pytest, &loose("test_a")),
+            vec!["-k", "test_a"]
+        );
+        // The coverage args already say `run`, the reporter and `--json`:
+        // the scope adds only the selection, so none appears twice.
+        let vi = coverage_scope_args(Runner::Vitest, &exact("tests/a.test.js::adds"));
+        assert!(
+            !vi.iter()
+                .any(|a| a == "run" || a.starts_with("--reporter=")),
+            "{vi:?}"
+        );
+        assert!(vi.contains(&String::from("tests/a.test.js")) && vi.contains(&String::from("-t")));
+        let je = coverage_scope_args(Runner::Jest, &exact("tests/a.test.js::adds"));
+        assert!(!je.contains(&String::from("--json")), "{je:?}");
+        assert!(je.contains(&String::from("tests/a.test.js")));
     }
 
     #[test]
