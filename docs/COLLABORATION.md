@@ -96,6 +96,16 @@ In croft, each proposal opens a popup over everything else. The title reads
 unified diff against the file on disk. More than one proposal queues in
 arrival order, and the title counts the ones waiting (`· 2 pending`).
 
+When the file's language has a server, croft sends it the proposed text as
+the file's content while the popup is up, so problems the edit introduces show
+before you approve. A line above the diff says what the servers found (still
+checking, nothing, or how many errors and warnings with the first one), and a
+proposed row a problem names carries it at its end. Those diagnostics belong to
+the proposal: the editor and PROBLEMS keep the buffer's own. When the proposal
+is answered or leaves, the server gets the file back: an open tab's text is
+sent again, and a file no tab holds is closed. Edits to that tab meanwhile are
+sent once the check ends.
+
 | Key | Does |
 |---|---|
 | `Enter` | approve |
