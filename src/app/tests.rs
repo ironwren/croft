@@ -53682,6 +53682,155 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
+/// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
+/// socket, as Claude Code's hook would; the returned stream is the hook's
+/// end, kept open for the answer.
+fn queue_edit_proposal(
+    app: &mut App,
+    dir: &Path,
+    file: &Path,
+    old: &str,
+    new: &str,
+) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    let sock = dir.join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": old, "new_string": new}),
+        cwd: dir.into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    hook
+}
+
+fn popup_screen(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let mut screen = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            screen.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// #347: what the language server says about a proposal's file while it is
+/// checked goes to the popup, against the proposed row it names, and not to
+/// the buffer's diagnostics; answering the proposal ends the check.
+#[test]
+fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.lsp = None;
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    app.sync_approval_check();
+    assert!(
+        app.approval_check.is_none(),
+        "no server, nothing to check with"
+    );
+    // As a server would once the proposal's text was sent as the file's.
+    app.approval_check = Some(crate::agent_approval::ProposalCheck {
+        arrived: app.approvals[0].arrived,
+        started: std::time::Instant::now(),
+        path: file.clone(),
+        opened: true,
+        by_server: Default::default(),
+    });
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(screen.contains("Checking the proposed file"), "{screen}");
+    app.apply_diagnostics_updates(vec![crate::lsp::manager::DiagnosticsUpdate {
+        path: file.clone(),
+        server: "ruff".into(),
+        diagnostics: vec![crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 18,
+            severity: crate::lsp::manager::DiagnosticSeverity::Error,
+            message: "Undefined name `nope_undefined`".into(),
+        }],
+    }]);
+    assert!(
+        !app.lsp_diagnostics.contains_key(&file),
+        "the buffer's diagnostics are the buffer's"
+    );
+    let screen = popup_screen(&mut app, 110, 30);
+    assert!(
+        screen.contains("1 error, 0 warnings in the proposed file"),
+        "{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains("+ x = nope_undefined") && l.contains("\u{25c0} Undefined name")),
+        "the proposed row carries it: {screen}"
+    );
+    // Answered: the check ends with the proposal.
+    app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.approvals.is_empty());
+    app.sync_approval_check();
+    assert!(app.approval_check.is_none());
+}
+
+/// #347's criterion against a real server: a proposal that uses an
+/// undefined name shows the server's diagnostic in the popup before it is
+/// approved. Ignored by default: it needs a Python language server that
+/// publishes diagnostics for an open buffer (run it with `--ignored` where
+/// one does); `a_proposals_diagnostics_show_in_the_popup_not_the_buffer`
+/// covers the routing and rendering without one.
+#[test]
+#[ignore]
+fn a_real_server_flags_the_proposal_before_approval() {
+    if !["ruff", "pyright-langserver", "basedpyright-langserver"]
+        .iter()
+        .any(|b| crate::lsp::manager::is_on_path(b))
+    {
+        eprintln!("SKIPPED: no Python language server on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    if app.lsp.is_none() {
+        eprintln!("SKIPPED: no language server manager");
+        return;
+    }
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        app.sync_approval_check();
+        app.drain_lsp_diagnostics();
+        let found = app.approval_check.as_ref().is_some_and(|c| {
+            c.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("nope_undefined"))
+        });
+        if found {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no server flagged the proposal: {:?}",
+            app.approval_check
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!app.lsp_diagnostics.contains_key(&file));
+}
+
 /// An agent's edit proposal, end to end through the App: the hook's
 /// request opens the popup over everything, keys go to the popup and not
 /// to the editor under it, and the answer reaches the hook's connection.
@@ -54615,6 +54764,65 @@ fn a_real_pytest_cov_run_marks_the_covered_file() {
         "{:?}",
         lens.percent
     );
+}
+
+/// #263: the Testing tree's coverage glyphs run their row with coverage,
+/// marking just that scope as running, as a plain run of it would.
+#[test]
+fn a_rows_coverage_glyph_runs_that_scope_with_coverage() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::widgets::testing::RowHit;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for n in ["parse::a", "parse::b", "other::c"] {
+        app.testing.apply_case(TestCase {
+            name: n.into(),
+            status: TestStatus::Passed,
+        });
+    }
+    app.set_sidebar_view(SidebarView::Testing);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.testing.last_area;
+    let x = area.x + area.width - 5;
+    let click = |app: &mut App, want: RowHit| {
+        let y = (area.y..area.y + area.height)
+            .find(|&y| app.testing.hit_at(x, y) == Some(want.clone()))
+            .unwrap_or_else(|| panic!("no {want:?} glyph"));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    click(&mut app, RowHit::CoverSuite("parse".into()));
+    assert_eq!(app.status, "Running suite parse with coverage");
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("parse::b"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("other::c"), Some(TestStatus::Passed));
+    app.testing.on_finished(Some(true));
+
+    click(&mut app, RowHit::CoverCase("other::c".into()));
+    assert_eq!(app.status, "Running test other::c with coverage");
+    assert_eq!(app.testing.status_of("other::c"), Some(TestStatus::Running));
+    app.testing.on_finished(Some(true));
+
+    // The header's glyph runs everything with coverage.
+    let all = app.testing.last_cover_all;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: all.x,
+        row: all.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.status, "Running tests with coverage");
 }
 
 /// Watch mode (#263) end to end through the App: the eye on a test's row
@@ -58259,6 +58467,63 @@ fn only_a_remote_launched_croft_polls_the_build_marker() {
     );
 }
 
+/// #737: the poll's positive path. A marker naming a live build pauses the
+/// servers of a remote-launched croft; the marker going resumes them.
+#[test]
+fn a_live_build_marker_pauses_the_servers_and_its_removal_resumes_them() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_watch = Some(crate::update_watch::UpdateWatch::start(
+            tmp.path().to_path_buf(),
+            String::new(),
+        ));
+        let cache = croft_cache_dir();
+        std::fs::create_dir_all(&cache).unwrap();
+        let marker = cache.join(format!(
+            "{}{}",
+            crate::update_watch::BUILD_MARKER_PREFIX,
+            std::process::id()
+        ));
+        // This test process stands in for the compile: alive, and ours.
+        std::fs::write(&marker, std::process::id().to_string()).unwrap();
+        if let Some(boot) = crate::update_watch::boot_id() {
+            let sidecar = format!(
+                "{}{}",
+                marker.display(),
+                crate::update_watch::BOOT_SIDECAR_SUFFIX
+            );
+            std::fs::write(sidecar, boot).unwrap();
+        }
+        assert!(app.poll_source_build_marker());
+        assert!(app.lsp.is_none() && app.lsp_paused_for_build);
+
+        std::fs::remove_file(&marker).unwrap();
+        app.build_marker_checked = None; // past the once-a-second gate
+        assert!(app.poll_source_build_marker());
+        assert!(app.lsp.is_some() && !app.lsp_paused_for_build);
+    });
+}
+
+/// #737: a re-root starts a new manager, which numbers semantic replies from
+/// 0 again, so the old high-water marks go with the old one.
+#[test]
+fn a_reroot_forgets_the_old_semantic_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let p = tmp.path().join("a.rs");
+    app.semantic_generation_seen.insert(p.clone(), 500);
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(
+        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        "the new server's first reply must be accepted"
+    );
+    assert!(app.lsp.is_some(), "the new root's servers started");
+}
+
 /// #694: an "all clear" from the last server reporting on a path drops the
 /// path from the store instead of leaving an empty entry behind; another
 /// server's findings on it survive.
@@ -58610,6 +58875,118 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     });
 }
 
+#[test]
+fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
+    // #577: `code_scanning = on` loads the branch's newest analysis per
+    // tool at the nearest scanned commit, and again after a checkout of
+    // another branch; `prompt` names them and waits; `off` never asks.
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "scanned"]);
+        let scanned = git(&["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), "b").unwrap();
+        git(&["commit", "-q", "-am", "not scanned yet"]);
+
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *sarif+json*) echo '{{"version": "2.1.0", "runs": []}}' ;;
+  *) echo '[{{"id": 7, "ref": "refs/heads/main", "commit_sha": "{scanned}", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-01T00:00:00Z", "results_count": 0}}, {{"id": 6, "ref": "refs/heads/main", "commit_sha": "0000", "tool": {{"name": "CodeQL"}}, "created_at": "2026-09-02T00:00:00Z", "results_count": 0}}]' ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh.clone();
+        app.source_control.status.in_repo = true;
+        app.source_control.status.branch = Some(String::from("main"));
+
+        // Off: nothing is asked.
+        app.poll_code_scanning();
+        assert!(
+            app.code_scan_list.is_none() && !log.exists(),
+            "off never calls gh"
+        );
+
+        app.code_scanning = crate::sarif::github::CodeScanningMode::On;
+        let settle = |app: &mut App| {
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_secs(10),
+                "code scanning",
+                || {
+                    app.poll_code_scanning();
+                    app.code_scan_list.is_none() && app.code_scan_fetch.is_none()
+                },
+            );
+        };
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert_eq!(app.status, "Loaded 1 code scanning analysis");
+        assert!(
+            app.editor.sarif.is_some(),
+            "the analysis opened in the viewer"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("ref=refs%2Fheads%2Fmain") || calls.contains("ref=refs/heads/main"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("analyses/7"),
+            "the one at the nearest scanned commit: {calls}"
+        );
+        assert!(!calls.contains("analyses/6"), "{calls}");
+
+        // The same branch is not looked up again; another one is.
+        std::fs::remove_file(&log).unwrap();
+        app.poll_code_scanning();
+        assert!(app.code_scan_list.is_none() && !log.exists());
+        app.code_scanning = crate::sarif::github::CodeScanningMode::Prompt;
+        app.source_control.status.branch = None;
+        app.source_control.status.detached_hash = Some(scanned.clone());
+        app.poll_code_scanning();
+        settle(&mut app);
+        assert!(
+            app.status
+                .starts_with("Code scanning has 1 analysis for detached HEAD"),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("sarif+json"),
+            "prompt downloads nothing: {calls}"
+        );
+    });
+}
+
 /// #694: Developer: Show Memory Usage opens a tab attributing memory to
 /// each subsystem, with the stored diagnostics counted per server.
 #[test]
@@ -58635,6 +59012,83 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
         assert!(text.contains(section), "{text}");
     }
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+}
+
+/// #345: the agent review queue, and what was marked reviewed, survive a
+/// restart and a re-root away and back; the Explorer's dots come back too.
+#[test]
+fn the_agent_review_queue_survives_a_restart_and_a_reroot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap().keep().join("agent_lane.json");
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let working = [String::from("claude")];
+    let root = tmp.path().canonicalize().unwrap();
+    let (a, b) = (root.join("a.rs"), root.join("b.rs"));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.agent_ledger_store = Some(store.clone());
+    app.agent_ledger.record_write(&a, 1, &working);
+    app.agent_ledger.record_write(&b, 2, &working);
+    app.agent_ledger.mark_reviewed("claude", &b, 2, None);
+    app.persist_agent_ledger(true);
+    drop(app);
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.agent_ledger_store = Some(store.clone());
+    app.agent_ledger = app.load_agent_ledger(&root);
+    app.sync_agent_lane_decorations();
+    assert!(app.agent_ledger.is_unreviewed(&a), "the queue came back");
+    assert!(!app.agent_ledger.is_unreviewed(&b), "and b stays reviewed");
+    assert!(app.tree.agent_touched.contains(&a), "the Explorer's dot");
+
+    // Away and back: each workspace keeps its own queue.
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(app.agent_ledger.is_empty());
+    app.change_workspace_root(tmp.path().to_path_buf());
+    assert!(app.agent_ledger.is_unreviewed(&a));
+
+    // Reviewing everything empties the queue and drops its saved entry.
+    app.agent_ledger.mark_reviewed("claude", &a, 1, None);
+    app.agent_ledger.forget("claude");
+    app.persist_agent_ledger(true);
+    let saved = std::fs::read_to_string(&store).unwrap();
+    assert!(!saved.contains(&root.display().to_string()), "{saved}");
+}
+
+/// #345: the lane is reachable from the keyboard: "Agents: Review a Changed
+/// File" lists every lane's files, and Enter opens the chosen one's diff.
+#[test]
+fn the_lane_file_picker_opens_the_chosen_files_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let a = root.join("a.rs");
+    std::fs::write(&a, "a\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::PickAgentLaneFile);
+    assert_eq!(app.status, "No agent has changed a file");
+    assert!(app.list_picker.is_none());
+
+    app.agent_ledger
+        .record_write(&a, 1, &[String::from("claude")]);
+    app.run_command(crate::widgets::command_palette::Command::PickAgentLaneFile);
+    let picker = app.list_picker.as_ref().expect("a picker");
+    assert_eq!(picker.rows.len(), 1);
+    assert!(
+        picker.rows[0].label.contains("a.rs"),
+        "{}",
+        picker.rows[0].label
+    );
+    assert!(picker.rows[0].label.contains("(claude)"));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    // Never reviewed, so the diff is refused with the reason, as a click on
+    // the row is: the pick reached `diff_agent_lane_row`.
+    assert!(app.status.contains("review"), "{}", app.status);
 }
 
 #[test]
@@ -58719,6 +59173,97 @@ fn edit_then_approve_sends_the_saved_text_as_the_tools_input() {
         app.editor.open_pinned(&other).unwrap();
         assert!(app.editor.dirty, "the other tab kept its unsaved work");
         assert_eq!(app.editor.lines[0], "fn b() { unsaved }");
+    });
+}
+
+#[test]
+fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
+    // #347: the proposal is computed from disk, so approving it over a tab
+    // with unsaved edits would put the agent's write under them. Enter
+    // opens a merge (disk, yours, the agent's) instead; auto-approve never
+    // lets it through; saving with conflicts left approves nothing; the
+    // resolved result is what the agent writes, and the tab holds it too.
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&target).unwrap();
+        app.editor.lines[0] = String::from("ONE"); // yours: line 1
+        app.editor.lines[2] = String::from("mine"); // yours: line 3, in conflict
+        app.editor.dirty = true;
+        app.editor.pin_active(); // as any real edit does
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        // The agent's: lines 3 and 5 (Write, so the whole text).
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Write".into(),
+            input: serde_json::json!({"file_path": target, "content": "one\ntwo\ntheirs\nfour\nFIVE\n"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        // Auto-approving this agent does not approve an edit under unsaved text.
+        app.auto_approve = Some((
+            String::from("claude-code"),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        app.drain_hook_requests();
+        assert_eq!(app.approvals.len(), 1, "auto-approved over unsaved edits");
+        app.auto_approve = None;
+        assert!(app.approval_ui.as_ref().unwrap().target_dirty);
+
+        app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.approvals.len(), 1, "Enter approved over unsaved edits");
+        let scratch = app.approval_edit.as_ref().unwrap().1.clone();
+        assert_eq!(app.editor.path.as_deref(), Some(scratch.as_path()));
+        let mv = app.editor.merge.as_ref().expect("a merge view");
+        assert_eq!(mv.conflicts.len(), 1, "line 3 changed on both sides");
+        let conflict_row = mv.conflicts[0].result_start;
+        assert_eq!(
+            app.editor.lines,
+            ["ONE", "two", "three", "four", "FIVE"],
+            "each side's own change applied, the conflict holding the base"
+        );
+
+        // Saving with the conflict open approves nothing.
+        app.editor.dirty = true;
+        app.write_current_to_disk();
+        assert!(app.status.contains("1 conflict left"), "{}", app.status);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.editor.cursor_row = conflict_row;
+        app.merge_apply(crate::merge_editor::ConflictState::Incoming);
+        app.write_current_to_disk();
+        assert!(app.approvals.is_empty(), "{}", app.status);
+        assert!(
+            app.status.contains("your tab holds the same text"),
+            "{}",
+            app.status
+        );
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        assert_eq!(input["content"], "ONE\ntwo\ntheirs\nfour\nFIVE\n");
+        // The user's tab is still there, and holds what the agent is about
+        // to write.
+        app.editor.open_pinned(&target).unwrap();
+        assert_eq!(app.editor.lines, ["ONE", "two", "theirs", "four", "FIVE"]);
     });
 }
 
