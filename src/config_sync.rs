@@ -25,15 +25,10 @@ use std::path::PathBuf;
 pub struct Syncable {
     /// Name under `~/.config/croft/`, and the name it lands under remotely.
     pub name: &'static str,
-    /// Whether croft reloads this file when it is saved THROUGH croft on the
-    /// machine that owns it (`reload_config_for_path` has an arm for it).
-    ///
-    /// This says nothing about a file that ARRIVES by sync. Nothing watches
-    /// `~/.config/croft`: the reload path is driven by the editor's own save,
-    /// so a file rsynced in from elsewhere is not noticed until the remote
-    /// next launches, whatever this flag says. Kept because it records a real
-    /// property worth pinning, but the OUTPUT message deliberately does not
-    /// use it to promise a live apply.
+    /// Whether a running croft applies this file when it changes on disk:
+    /// `reload_config_for_path` has an arm for it, reached both by croft's
+    /// own save and by [`ConfigWatch`], which notices a file that ARRIVES by
+    /// sync (or any other writer) within [`ConfigWatch::INTERVAL`].
     pub hot_reloads: bool,
 }
 
@@ -96,6 +91,74 @@ pub const NEVER_SYNC: &[(&str, &str)] = &[
         "command history is per-machine working state",
     ),
 ];
+
+/// Notices croft's own config files changing on disk (#262).
+///
+/// The reload path used to run only when croft itself saved the file, so a
+/// file that arrived by config sync, or was written by any other tool, was
+/// not applied until the next launch. The editor's filesystem watcher covers
+/// the workspace, not `~/.config/croft`, and a handful of known files does
+/// not need one: this compares each file's modification time and length
+/// every [`ConfigWatch::INTERVAL`]. A file that appears or disappears counts
+/// as a change too, so deleting keybindings.json falls back to the defaults.
+#[derive(Debug)]
+pub struct ConfigWatch {
+    files: Vec<(PathBuf, Option<Stamp>)>,
+    next: std::time::Instant,
+}
+
+type Stamp = (std::time::SystemTime, u64);
+
+fn stamp(path: &std::path::Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+impl ConfigWatch {
+    /// How often the files are checked: a sync is noticed within this long.
+    pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Watch `paths`, taking their current state as already applied.
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        let files = paths
+            .into_iter()
+            .map(|p| {
+                let s = stamp(&p);
+                (p, s)
+            })
+            .collect();
+        ConfigWatch {
+            files,
+            next: std::time::Instant::now() + Self::INTERVAL,
+        }
+    }
+
+    /// The watched files that changed since they were last seen, once per
+    /// [`Self::INTERVAL`]; empty between checks.
+    pub fn poll(&mut self, now: std::time::Instant) -> Vec<PathBuf> {
+        if now < self.next {
+            return Vec::new();
+        }
+        self.next = now + Self::INTERVAL;
+        let mut changed = Vec::new();
+        for (path, seen) in &mut self.files {
+            let current = stamp(path);
+            if current != *seen {
+                *seen = current;
+                changed.push(path.clone());
+            }
+        }
+        changed
+    }
+
+    /// Record `path` as applied in its current state, so a reload croft has
+    /// just done itself (on its own save) is not repeated by the next poll.
+    pub fn note(&mut self, path: &std::path::Path) {
+        if let Some((_, seen)) = self.files.iter_mut().find(|(p, _)| p == path) {
+            *seen = stamp(path);
+        }
+    }
+}
 
 /// Local paths of the syncable files that actually exist.
 ///
@@ -211,25 +274,43 @@ mod tests {
     }
 
     #[test]
-    fn the_hot_reload_flag_matches_what_croft_actually_reloads_on_save() {
-        // `reload_config_for_path` has an arm for each of these. The flag
-        // records that and nothing more: a SYNCED file is not reloaded
-        // either way, because nothing watches the config directory.
-        let hot: Vec<&str> = SYNCABLE
-            .iter()
-            .filter(|s| s.hot_reloads)
-            .map(|s| s.name)
-            .collect();
-        assert_eq!(
-            hot,
-            vec![
-                "keybindings.json",
-                "snippets.json",
-                "triggers.json",
-                "matchers.json",
-                "macros.json"
-            ]
-        );
+    fn every_syncable_file_reloads_live() {
+        // `reload_config_for_path` has an arm for each, and `ConfigWatch`
+        // reaches it for a file that arrives by sync (#262).
+        assert!(SYNCABLE.iter().all(|s| s.hot_reloads), "{SYNCABLE:?}");
+    }
+
+    #[test]
+    fn the_watch_reports_a_changed_created_or_deleted_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("keybindings.json");
+        let fresh = dir.path().join("snippets.json");
+        std::fs::write(&kept, "[]").unwrap();
+        let mut watch = ConfigWatch::new(vec![kept.clone(), fresh.clone()]);
+        let t0 = std::time::Instant::now();
+        let later = |n: u32| t0 + ConfigWatch::INTERVAL * n;
+        assert!(watch.poll(later(1)).is_empty(), "nothing changed yet");
+        // A different length is a change even within the mtime's resolution.
+        std::fs::write(&kept, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        std::fs::write(&fresh, "{}").unwrap();
+        // Between checks nothing is reported.
+        assert!(watch.poll(later(1)).is_empty());
+        assert_eq!(watch.poll(later(2)), vec![kept.clone(), fresh.clone()]);
+        assert!(watch.poll(later(3)).is_empty(), "reported once");
+        std::fs::remove_file(&fresh).unwrap();
+        assert_eq!(watch.poll(later(4)), vec![fresh]);
+    }
+
+    #[test]
+    fn a_change_croft_noted_itself_is_not_reported_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keybindings.json");
+        std::fs::write(&file, "[]").unwrap();
+        let mut watch = ConfigWatch::new(vec![file.clone()]);
+        std::fs::write(&file, "[ ]").unwrap();
+        watch.note(&file);
+        let later = std::time::Instant::now() + ConfigWatch::INTERVAL * 2;
+        assert!(watch.poll(later).is_empty());
     }
 
     /// #262: the per-host opt-out, case-insensitive like the other lists.
