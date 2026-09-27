@@ -1463,6 +1463,9 @@ fn dummy_activity_images() -> ActivityBarImages {
         testing_active: s(),
         testing_inactive: s(),
         testing_hovered: s(),
+        codeql_active: s(),
+        codeql_inactive: s(),
+        codeql_hovered: s(),
         settings_active: s(),
         settings_inactive: s(),
         settings_hovered: s(),
@@ -11754,6 +11757,9 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         testing_active: String::new(),
         testing_inactive: String::new(),
         testing_hovered: String::new(),
+        codeql_active: String::new(),
+        codeql_inactive: String::new(),
+        codeql_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -11816,6 +11822,9 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         testing_active: String::new(),
         testing_inactive: String::new(),
         testing_hovered: String::new(),
+        codeql_active: String::new(),
+        codeql_inactive: String::new(),
+        codeql_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -15326,8 +15335,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 11,
-        "precondition: seven view icons + the settings gear + the three layout toolbar icons emit"
+        before, 12,
+        "precondition: eight view icons + the settings gear + the three layout toolbar icons emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
@@ -15375,8 +15384,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        11,
-        "seven view icons + the settings gear + the three layout toolbar icons emit"
+        12,
+        "eight view icons + the settings gear + the three layout toolbar icons emit"
     );
 }
 
@@ -25626,6 +25635,9 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         testing_active: "TA".into(),
         testing_inactive: "TI".into(),
         testing_hovered: "TH".into(),
+        codeql_active: "CA".into(),
+        codeql_inactive: "CI".into(),
+        codeql_hovered: "CH".into(),
         settings_active: "GA".into(),
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
@@ -51465,6 +51477,217 @@ fn a_switched_to_member_replays_its_queued_stop() {
     app.debug_stop();
 }
 
+/// A workspace with two source files and breakpoints set in both (#250).
+fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&a, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    std::fs::write(&b, "x\ny\nz\nw\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(b.clone())
+        .or_default()
+        .insert(4);
+    app.editor
+        .breakpoints
+        .entry(a.clone())
+        .or_default()
+        .extend([3, 1]);
+    app.editor
+        .breakpoint_conditions
+        .entry(a.clone())
+        .or_default()
+        .insert(3, String::from("n > 2"));
+    app.editor
+        .breakpoint_logs
+        .entry(b.clone())
+        .or_default()
+        .insert(4, String::from("at {i}"));
+    (tmp, app, a, b)
+}
+
+#[test]
+fn breakpoint_items_list_every_breakpoint_by_file_then_line() {
+    let (_tmp, app, _a, _b) = app_with_breakpoints();
+    let items = app.breakpoint_items();
+    let shown: Vec<(String, Option<String>)> = items
+        .iter()
+        .map(|i| (i.label.clone(), i.detail.clone()))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            (String::from("a.rs:1"), None),
+            (String::from("a.rs:3"), Some(String::from("if n > 2"))),
+            (String::from("b.rs:4"), Some(String::from("log at {i}"))),
+        ]
+    );
+}
+
+/// The ✕ removes the breakpoint and the condition that went with it, so a
+/// breakpoint set again later on that line starts plain.
+#[test]
+fn removing_from_the_list_drops_the_breakpoint_and_its_condition() {
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.sync_breakpoint_list();
+    let idx = app
+        .run_debug
+        .breakpoints
+        .iter()
+        .position(|i| i.label == "a.rs:3")
+        .unwrap();
+    app.breakpoint_list_click(idx, true);
+    assert!(!app.editor.breakpoints[&a].contains(&3));
+    assert!(
+        app.editor.breakpoints[&a].contains(&1),
+        "only that one goes"
+    );
+    assert!(!app.editor.breakpoint_conditions[&a].contains_key(&3));
+    assert_eq!(app.run_debug.breakpoints.len(), 2, "the list follows");
+}
+
+#[test]
+fn clicking_a_breakpoint_opens_its_file_at_the_line() {
+    // Line 1 of a three-line file: a jump one row off lands on a different
+    // line, where the file's LAST line would be clamped back and hide it.
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.sync_breakpoint_list();
+    let idx = app
+        .run_debug
+        .breakpoints
+        .iter()
+        .position(|i| i.label == "a.rs:1")
+        .unwrap();
+    app.breakpoint_list_click(idx, false);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 0, "line 1, 0-based");
+}
+
+/// While a session is shown the tree carries the list as its last section;
+/// a change swaps that section rather than stacking a second one.
+#[test]
+fn the_tree_breakpoint_section_follows_changes_without_duplicating() {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let (_tmp, mut app, a, _b) = app_with_breakpoints();
+    app.run_debug.debug_active = true;
+    app.run_debug.debug_rows = vec![DebugRow {
+        indent: 0,
+        kind: DebugRowKind::Header {
+            title: String::from("CALL STACK"),
+        },
+    }];
+    app.sync_breakpoint_list();
+    let count = |app: &App| {
+        (
+            app.run_debug
+                .debug_rows
+                .iter()
+                .filter(
+                    |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
+                )
+                .count(),
+            app.run_debug
+                .debug_rows
+                .iter()
+                .filter(|r| matches!(r.kind, DebugRowKind::Breakpoint { .. }))
+                .count(),
+        )
+    };
+    assert_eq!(count(&app), (1, 3));
+    app.editor.breakpoints.get_mut(&a).unwrap().insert(2);
+    app.sync_breakpoint_list();
+    assert_eq!(count(&app), (1, 4), "one header, one more row");
+    assert!(matches!(
+        &app.run_debug.debug_rows[0].kind,
+        DebugRowKind::Header { title } if title == "CALL STACK"
+    ));
+}
+
+fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(tmp.path().join(".vscode/launch.json"), json).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path())
+        .into_iter()
+        .next()
+        .expect("one config");
+    let ctx = crate::dap::configs::SubstCtx {
+        workspace_folder: tmp.path().to_path_buf(),
+        file: None,
+    };
+    crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
+}
+
+/// #250: an lldb attach whose `processId` is `${command:pickProcess}` opens
+/// a process picker instead of failing, and the chosen pid resumes it.
+#[test]
+fn a_pick_process_attach_opens_the_process_picker() {
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Attach", "type": "lldb", "request": "attach",
+             "processId": "${command:pickProcess}" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert!(matches!(picker.purpose, ListPurpose::AttachProcess));
+    assert!(
+        !picker.rows.is_empty(),
+        "this test process's siblings are listed"
+    );
+    assert!(
+        picker.rows.iter().all(|r| r.id.parse::<i64>().is_ok()),
+        "every row id is a pid"
+    );
+    assert!(
+        !picker
+            .rows
+            .iter()
+            .any(|r| r.id == std::process::id().to_string()),
+        "croft does not offer itself"
+    );
+    assert!(
+        app.debug_sessions.is_empty(),
+        "nothing launched before the pick"
+    );
+
+    let (rc, _) = app.take_pending_attach(4242).expect("the attach is parked");
+    assert_eq!(rc.process_id, Some(4242));
+    assert!(
+        app.take_pending_attach(4242).is_none(),
+        "taken once, not twice"
+    );
+}
+
+/// `pickProcess` on an adapter that does not attach by pid is refused with
+/// a message, not launched with the key silently dropped.
+#[test]
+fn pick_process_on_a_non_lldb_config_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Py", "type": "python", "request": "attach",
+             "processId": "${command:pickProcess}" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    assert!(app.list_picker.is_none());
+    assert!(
+        app.status.contains("pickProcess")
+            || app
+                .run_debug
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("pickProcess"),
+        "status: {} / feedback: {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+}
+
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -51472,6 +51695,69 @@ fn poll_until_shrinks(app: &mut App, from: usize) {
         app.poll_dap();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// A workspace whose tasks.json declares a `cleanup` task (#250).
+fn app_with_cleanup_task() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "cleanup", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+fn last_task_label(app: &App) -> Option<String> {
+    app.last_task.as_ref().map(|t| t.label.clone())
+}
+
+/// #250: a config's `postDebugTask` runs when the user stops the session.
+#[test]
+fn stopping_a_session_runs_its_post_debug_task_once() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop_by_user();
+    assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
+    assert!(app.debug_post_tasks.is_empty(), "it runs once, not again");
+}
+
+/// With nothing running there is no session to clean up after: a launch
+/// that failed before a session started must not trigger the task.
+#[test]
+fn stopping_with_no_session_runs_no_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop_by_user();
+    assert_eq!(last_task_label(&app), None);
+}
+
+/// #250: a session that ends by itself runs the task too.
+#[test]
+fn a_session_ending_on_its_own_runs_its_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
+}
+
+/// Replacing the set for a new launch is not the end of a debug run, so
+/// the internal stop leaves the task alone (VS Code runs it on stop and on
+/// termination, not on relaunch).
+#[test]
+fn the_internal_stop_before_a_relaunch_runs_no_post_debug_task() {
+    let (_tmp, mut app) = app_with_cleanup_task();
+    app.debug_sessions.push("A", stub_member(false));
+    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug_stop();
+    assert_eq!(last_task_label(&app), None);
 }
 
 #[test]
@@ -54242,6 +54528,536 @@ fn watching_a_test_reruns_it_after_a_save_and_reports_it_turning_red() {
         "{}",
         app.status
     );
+}
+
+/// A workspace with one source file and a SARIF log pointing into it.
+fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/a.rs"),
+        "fn main() {\n    let q = format!(\"{}\", id);\n}\n",
+    )
+    .unwrap();
+    let log = tmp.path().join("results.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"lint","rules":[{"id":"R1","name":"Taint"}]}},
+            "results":[{"ruleId":"R1","level":"error","message":{"text":"Query built from user input."},
+            "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/a.rs"},
+            "region":{"startLine":2,"startColumn":9}}}]}]}]}"#,
+    )
+    .unwrap();
+    (tmp, log)
+}
+
+fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut all = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            all.push_str(buf[(x, y)].symbol());
+        }
+        all.push('\n');
+    }
+    all
+}
+
+#[test]
+fn sarif_log_opens_as_the_results_viewer() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    let view = app
+        .editor
+        .sarif
+        .as_ref()
+        .expect(".sarif opens in the viewer");
+    assert_eq!(view.entries.len(), 1);
+    assert_eq!(view.entries[0].file, "src/a.rs");
+    assert!(
+        app.editor.has_non_text_view(),
+        "a save must not write the stub"
+    );
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_text(&term);
+    assert!(
+        screen.contains("src/a.rs"),
+        "group header painted:\n{screen}"
+    );
+    assert!(
+        screen.contains("Query built from user input."),
+        "result row painted:\n{screen}"
+    );
+    assert!(screen.contains("Locations"), "tab strip painted:\n{screen}");
+    // The first result starts selected, so its details are already showing.
+    assert!(
+        screen.contains("R1 · Taint"),
+        "details pane shows the first result:\n{screen}"
+    );
+}
+
+#[test]
+fn sarif_enter_opens_the_location_and_keeps_the_viewer_tab() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    let tabs_before = app.editor.tab_count();
+    app.handle_sarif_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/a.rs").as_path()),
+        "the location opened: {}",
+        app.status
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 8));
+    assert_eq!(
+        app.editor.tab_count(),
+        tabs_before + 1,
+        "the viewer was pinned, not replaced by the preview open"
+    );
+}
+
+#[test]
+fn sarif_filter_typing_narrows_the_list() {
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    for c in "nomatch".chars() {
+        app.handle_sarif_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.query_text, "nomatch");
+    assert!(view.rows().is_empty());
+    // Esc leaves the filter box and clears it.
+    app.handle_sarif_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.query_text, "");
+    assert_eq!(view.rows().len(), 2);
+}
+
+#[test]
+fn sarif_that_does_not_load_opens_as_text_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.sarif");
+    std::fs::write(&bad, "{\n  \"version\": \"2.1.0\",\n  oops\n}\n").unwrap();
+    let old = tmp.path().join("old.sarif");
+    std::fs::write(&old, r#"{"version":"1.0.0","runs":[]}"#).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.editor.open(&bad).unwrap();
+    assert!(app.editor.sarif.is_none());
+    assert_eq!(app.editor.lines[2], "  oops");
+    assert!(
+        app.editor.status.contains("invalid JSON at 3:"),
+        "status names the position: {}",
+        app.editor.status
+    );
+
+    app.editor.open(&old).unwrap();
+    assert!(app.editor.sarif.is_none());
+    assert!(
+        app.editor.status.contains("1.0.0"),
+        "status names the version: {}",
+        app.editor.status
+    );
+}
+
+fn screen_lower(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut all = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            all.push_str(buf[(x, y)].symbol());
+        }
+        all.push('\n');
+    }
+    all.to_lowercase()
+}
+
+#[test]
+fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
+    // #578: VS Code's CodeQL extension adds a QL entry to the activity bar;
+    // croft's sits directly below Testing and opens the CodeQL side bar.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let ql = app.sidebar_areas.codeql_icon;
+    let testing = app.sidebar_areas.testing_icon;
+    assert!(ql.width > 0, "the QL icon lays out on a tall bar");
+    assert_eq!(ql.y, testing.y + testing.height, "directly below Testing");
+    left_click(&mut app, ql.x, ql.y);
+    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_lower(&term);
+    for section in [
+        "language",
+        "databases",
+        "queries",
+        "variant analysis",
+        "query history",
+        "ast viewer",
+        "method modeling",
+    ] {
+        assert!(
+            screen.contains(section),
+            "section {section:?} listed:\n{screen}"
+        );
+    }
+    // The Databases welcome offers VS Code's four ways to add one.
+    for action in [
+        "from a folder",
+        "from an archive",
+        "from a url",
+        "from github",
+    ] {
+        assert!(screen.contains(action), "{action:?} offered:\n{screen}");
+    }
+}
+
+#[test]
+fn codeql_view_label_round_trips_for_session_restore() {
+    assert_eq!(sidebar_view_label(SidebarView::CodeQL), "CodeQL");
+    assert_eq!(sidebar_view_from_label("CodeQL"), Some(SidebarView::CodeQL));
+}
+
+#[test]
+fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
+    let summaries = crate::lsp::manifest::summaries(crate::lsp::manifest::BUNDLED_MANIFESTS);
+    assert!(
+        summaries.iter().any(|s| s.id == "codeql"),
+        "a built-in CodeQL row in the Extensions panel"
+    );
+    use crate::widgets::command_palette::Command;
+    assert_eq!(Command::from_id("show_codeql"), Some(Command::ShowCodeQL));
+    assert_eq!(Command::ShowCodeQL.title(), "View: Show CodeQL");
+}
+
+#[test]
+fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Never write the developer's real ~/.config/croft from a test.
+    app.config_dir = tmp.path().join("config");
+    app.open_codeql_view();
+    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+    app.set_extension_enabled("codeql", false);
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Explorer,
+        "a disabled feature's view does not stay open"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon is gone");
+    assert!(
+        app.sidebar_areas.settings_icon.width > 0,
+        "the gear still lays out"
+    );
+    app.open_codeql_view();
+    assert_ne!(
+        app.sidebar_view,
+        SidebarView::CodeQL,
+        "cannot open while disabled"
+    );
+    assert!(app.status.contains("disabled"), "{}", app.status);
+    app.set_extension_enabled("codeql", true);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.sidebar_areas.codeql_icon.width > 0,
+        "re-enabling restores it"
+    );
+}
+
+fn make_codeql_db(root: &std::path::Path, name: &str, lang: &str) -> std::path::PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("codeql-database.yml"),
+        format!("primaryLanguage: \"{lang}\"\n"),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // #578: Databases > From a folder.
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_codeql_db(tmp.path(), "flask-db", "python");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        assert!(
+            app.status.contains("Added CodeQL database flask-db"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.codeql.databases.len(), 1);
+        assert_eq!(app.codeql.current_db, Some(0));
+        // A new session lists it too.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.databases.len(), 1, "the list persists");
+        assert_eq!(
+            again.codeql.databases[0].language.as_deref(),
+            Some("python")
+        );
+    });
+}
+
+#[test]
+fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let zp = tmp.path().join("kafka-db.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file("java/codeql-database.yml", opts).unwrap();
+        z.write_all(b"primaryLanguage: \"java\"\n").unwrap();
+        z.finish().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Archive,
+            &zp.display().to_string(),
+        );
+        assert_eq!(app.codeql.databases.len(), 1, "{}", app.status);
+        let entry = &app.codeql.databases[0];
+        assert_eq!(entry.language.as_deref(), Some("java"));
+        assert!(
+            entry.path.starts_with(home.path()),
+            "extracted under croft's cache, not beside the archive: {}",
+            entry.path.display()
+        );
+    });
+}
+
+#[test]
+fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
+    // The cache-dir override is process-global; serialize with the
+    // other tests that redirect it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &tmp.path().display().to_string(),
+        );
+        assert!(
+            app.status.contains("not a CodeQL database"),
+            "{}",
+            app.status
+        );
+        assert!(app.codeql.databases.is_empty());
+        let a = make_codeql_db(tmp.path(), "a-db", "python");
+        let b = make_codeql_db(tmp.path(), "b-db", "go");
+        for db in [&a, &b] {
+            app.submit_codeql_database(
+                crate::widgets::input_prompt::CodeqlDbSource::Folder,
+                &db.display().to_string(),
+            );
+        }
+        assert_eq!(app.codeql.current_db, Some(1));
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::SelectDatabase(0),
+        ));
+        assert_eq!(app.codeql.current_db, Some(0));
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.open_codeql_view();
+        assert_eq!(again.codeql.current_db, Some(0), "the selection persists");
+    });
+}
+
+/// A stand-in `codeql`: logs its arguments, writes `body` to the path its
+/// `--output=` names, and exits with `code` (printing `err` on stderr).
+#[cfg(unix)]
+fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let reply = dir.join("codeql-reply");
+    std::fs::write(&reply, body).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; esac; done\n[ -n '{err}' ] && echo '{err}' >&2\nexit {code}\n",
+        log = dir.join("codeql-calls.log").display(),
+        reply = reply.display(),
+    );
+    let bin = dir.join("codeql");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Drain the query run until it lands, or fail after a few seconds.
+fn wait_for_codeql(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.codeql_run.is_some() {
+        app.drain_codeql_run();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query run never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A workspace with `q.ql` open and database "app" current.
+fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
+    let db = tmp.join("dbs/app");
+    std::fs::create_dir_all(&db).unwrap();
+    let store = crate::codeql_db::DatabaseStore {
+        databases: vec![crate::codeql_db::DbEntry {
+            name: String::from("app"),
+            path: db,
+            language: Some(String::from("rust")),
+        }],
+        current: Some(0),
+    };
+    store.save(&App::codeql_db_store_path()).unwrap();
+    let q = tmp.join("q.ql");
+    std::fs::write(&q, source).unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.editor.open(&q).unwrap();
+    app
+}
+
+#[cfg(unix)]
+#[test]
+fn a_problem_query_runs_on_the_current_database_and_opens_as_sarif() {
+    // #578: VS Code's "Run Query on Selected Database"; alerts open in the
+    // SARIF viewer and the run is kept in the query history.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "/**\n * @kind problem\n */\nimport rust\nselect 1",
+        );
+        app.codeql_program = fake_codeql(
+            bin.path(),
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[{"ruleId":"q","message":{"text":"From codeql."}}]}]}"#,
+            0,
+            "",
+        );
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(app.status.contains("Running q.ql on app"), "{}", app.status);
+        assert_eq!(app.codeql.history.len(), 1);
+        assert!(
+            app.codeql.history[0].contains("running"),
+            "{:?}",
+            app.codeql.history
+        );
+        wait_for_codeql(&mut app);
+        // The alerts open as a .sarif file, which the SARIF viewer claims.
+        let opened = app.editor.path.clone().expect("the results open");
+        assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("sarif"));
+        assert!(
+            std::fs::read_to_string(&opened)
+                .unwrap()
+                .contains("From codeql.")
+        );
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} q.ql \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(calls.starts_with("database analyze "), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_query_run_is_recorded_with_codeqls_own_words() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "ERROR: could not resolve module rust");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            app.codeql.history[0],
+            "\u{2717} q.ql \u{b7} app \u{b7} failed: ERROR: could not resolve module rust"
+        );
+        assert!(
+            app.status.contains("could not resolve module"),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.starts_with("query run "),
+            "a table query runs as a query: {calls}"
+        );
+    });
+}
+
+#[test]
+fn running_a_query_needs_an_open_ql_file_and_a_database() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&tmp.path().join("a.rs")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(app.status.contains("Open a .ql query"), "{}", app.status);
+        std::fs::write(tmp.path().join("q.ql"), "select 1").unwrap();
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        assert!(
+            app.status.contains("Add a CodeQL database"),
+            "{}",
+            app.status
+        );
+        assert!(app.codeql_run.is_none());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_query_history_entry_reopens_its_results() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let results = app.editor.path.clone().unwrap();
+        assert_eq!(results.extension().and_then(|e| e.to_str()), Some("csv"));
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(
+            crate::widgets::codeql::Action::OpenHistory(0),
+        ));
+        assert_eq!(app.editor.path.as_deref(), Some(results.as_path()));
+    });
 }
 
 /// Starting the tour while it runs keeps the first one: a second start
