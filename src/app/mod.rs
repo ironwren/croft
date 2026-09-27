@@ -22368,6 +22368,7 @@ impl App {
         self.show_tree = true;
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
+        self.refresh_codeql_queries();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
 
@@ -22387,9 +22388,9 @@ impl App {
         }
     }
 
-    /// Run what a CodeQL side-bar row offers. Sections fold; the language
-    /// list selects; the database, query and variant-analysis actions are
-    /// the parts of #578 that follow, and say so rather than do nothing.
+    /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
+    /// the language and database lists select; a query row runs; the actions
+    /// still to come in #578 say so rather than do nothing.
     fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
         use crate::widgets::codeql::{Action, Hit, LANGUAGES};
         match hit {
@@ -22471,6 +22472,24 @@ impl App {
                     }
                 }
             }
+            Hit::Action(Action::TogglePack(i)) => self.codeql.toggle_pack(i),
+            Hit::Action(Action::RunQuery(pack, query)) => {
+                let Some(path) = self
+                    .codeql
+                    .queries
+                    .get(pack)
+                    .and_then(|p| p.queries.get(query))
+                    .cloned()
+                else {
+                    return;
+                };
+                // A side-bar row runs the file as saved, as VS Code's
+                // Queries view does.
+                match std::fs::read_to_string(&path) {
+                    Ok(source) => self.run_codeql_file(path, &source),
+                    Err(e) => self.status = format!("{}: {e}", path.display()),
+                }
+            }
             Hit::Action(action) => {
                 let what = match action {
                     Action::CreateQuery => "Creating CodeQL queries",
@@ -22503,12 +22522,15 @@ impl App {
         self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
     }
 
-    /// Run the open `.ql` file on the current database (#578): alerts
-    /// through `database analyze` into SARIF, anything else through
-    /// `query run` into a table decoded as CSV. The run happens on a worker
-    /// thread; [`Self::drain_codeql_run`] collects it.
+    /// Find the workspace's queries for the side bar's Queries section.
+    /// Called when the view opens, not every frame: it walks the tree.
+    fn refresh_codeql_queries(&mut self) {
+        self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Run the open `.ql` file on the current database (#578), from the
+    /// buffer, not the disk: an unsaved edit is what the user means.
     fn run_codeql_query(&mut self) {
-        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         let query = match self.editor.path.clone() {
             Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
             _ => {
@@ -22516,6 +22538,16 @@ impl App {
                 return;
             }
         };
+        let source = self.editor.lines.join("\n");
+        self.run_codeql_file(query, &source);
+    }
+
+    /// Run `query`, whose text is `source`, on the current database (#578):
+    /// alerts through `database analyze` into SARIF, anything else through
+    /// `query run` into a table decoded as CSV. The run happens on a worker
+    /// thread; [`Self::drain_codeql_run`] collects it.
+    fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+        use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
             return;
@@ -22525,8 +22557,6 @@ impl App {
             self.status = String::from("Add a CodeQL database and select it first");
             return;
         };
-        // The buffer, not the disk: an unsaved edit is what the user means.
-        let source = self.editor.lines.join("\n");
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -22539,7 +22569,7 @@ impl App {
             .join("codeql")
             .join("results")
             .join(format!("{started}-{stem}"));
-        let kind = cq::output_for(&source);
+        let kind = cq::output_for(source);
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
