@@ -490,6 +490,20 @@ impl History {
         std::fs::write(path, text)
     }
 
+    /// Pin older entries that only recorded the database's `name` to its
+    /// `path`, so renaming the database does not orphan them (#578).
+    /// Returns whether anything changed.
+    pub fn adopt_legacy(&mut self, name: &str, path: &Path) -> bool {
+        let mut changed = false;
+        for e in &mut self.entries {
+            if e.database_path.is_none() && e.database == name {
+                e.database_path = Some(path.to_path_buf());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Record a new run, dropping the oldest past the cap. It goes at the
     /// top, then takes its place in the chosen order.
     pub fn push(&mut self, entry: HistoryEntry) {
@@ -643,6 +657,27 @@ mod tests {
         e.database_path = Some(tmp.path().join("x/../app"));
         assert!(e.refers_to(&db, "renamed"), "a path survives a rename");
         assert!(!e.refers_to(&tmp.path().join("other"), "app"));
+    }
+
+    /// #578: runs that only named their database get its path before a
+    /// rename, and runs that already have a path are left alone.
+    #[test]
+    fn legacy_runs_are_pinned_to_a_database_path() {
+        let mut history = History::default();
+        let mut pinned = entry(RunStatus::Succeeded);
+        pinned.database_path = Some(PathBuf::from("/dbs/elsewhere"));
+        history.entries = vec![entry(RunStatus::Succeeded), pinned.clone()];
+        let name = history.entries[0].database.clone();
+        assert!(history.adopt_legacy(&name, Path::new("/dbs/app")));
+        assert_eq!(
+            history.entries[0].database_path.as_deref(),
+            Some(Path::new("/dbs/app"))
+        );
+        assert_eq!(history.entries[1], pinned);
+        assert!(
+            !history.adopt_legacy(&name, Path::new("/dbs/app")),
+            "idempotent"
+        );
     }
 
     #[test]

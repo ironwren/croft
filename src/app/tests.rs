@@ -55821,8 +55821,10 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
             app.status,
             "Added the source of CodeQL database zipped to the workspace"
         );
-        let extracted =
-            App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(&zip_db));
+        let extracted = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
         assert_eq!(
             std::fs::read_to_string(extracted.join("proj/main.go")).unwrap(),
             "package main\n"
@@ -55839,6 +55841,29 @@ fn a_codeql_databases_source_is_added_to_the_workspace() {
         app.handle_codeql_key(w);
         assert!(has_root(&app, &extracted));
         assert!(extracted.join("mine.txt").exists());
+
+        // A database replaced at the same path has a new src.zip: it is
+        // extracted afresh and the out-of-date copy dropped.
+        app.remove_workspace_folder(extracted.canonicalize().unwrap());
+        let mut z = zip::ZipWriter::new(std::fs::File::create(zip_db.join("src.zip")).unwrap());
+        z.start_file("proj/main.go", opts).unwrap();
+        z.write_all(b"package main // v2\n").unwrap();
+        z.finish().unwrap();
+        app.set_sidebar_view(SidebarView::CodeQL);
+        app.focus = Pane::Tree;
+        app.codeql.select_database(1);
+        app.handle_codeql_key(w);
+        let fresh = App::codeql_source_cache_dir().join(crate::codeql_db::source_cache_name(
+            &zip_db,
+            &zip_db.join("src.zip"),
+        ));
+        assert_ne!(fresh, extracted);
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("proj/main.go")).unwrap(),
+            "package main // v2\n"
+        );
+        assert!(has_root(&app, &fresh));
+        assert!(!extracted.exists(), "the stale extraction is removed");
 
         app.codeql.select_database(2);
         app.handle_codeql_key(w);
@@ -55901,6 +55926,13 @@ fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
         history.save(&App::codeql_history_path()).unwrap();
 
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Renaming the database a pre-path run named pins that run to its
+        // path first, so the rename does not make it look unused.
+        app.submit_rename_codeql_database(&legacy, "legacy, renamed");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert!(history.entries.iter().any(
+            |e| e.database == "legacy" && e.database_path.as_deref() == Some(legacy.as_path())
+        ));
         app.run_command(Command::CodeqlDeleteUnusedDatabases);
         let prompt = app.input_prompt.as_ref().expect("asks first");
         assert_eq!(prompt.title, "Delete 2 unused CodeQL databases?");
@@ -55915,7 +55947,10 @@ fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
         assert_eq!(app.status, "Deleted 2 unused CodeQL databases");
         let store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
         let names: Vec<&str> = store.databases.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["used, renamed", "legacy", "current", "outside"]);
+        assert_eq!(
+            names,
+            ["used, renamed", "legacy, renamed", "current", "outside"]
+        );
         assert_eq!(store.current, Some(2), "still the current one");
         assert!(!cache.join("stale-a").exists() && !cache.join("stale-b").exists());
         for kept in [&used, &legacy, &current, &outside] {

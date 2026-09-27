@@ -22745,9 +22745,26 @@ impl App {
             self.status = String::from("That CodeQL database is no longer listed");
             return;
         };
+        let old = store.databases[i].name.clone();
         if let Err(e) = store.rename(i, value) {
             self.status = e;
             return;
+        }
+        // History from before runs recorded their database's path names it
+        // only by its old name. Pin those runs to its path first, or Delete
+        // Unused would take it for unused. With another database of the
+        // same name the runs could be either's, so they are left to match
+        // by name.
+        let same_name = store.databases.iter().filter(|d| d.name == old).count();
+        if same_name == 0 {
+            let history_path = Self::codeql_history_path();
+            let mut history = crate::codeql_query::History::load(&history_path);
+            if history.adopt_legacy(&old, path)
+                && let Err(e) = history.save(&history_path)
+            {
+                self.status = format!("Could not save the CodeQL query history: {e}");
+                return;
+            }
         }
         // Renaming can move it in a name-sorted list.
         if let Some(by) = store.sort_by {
@@ -22869,15 +22886,34 @@ impl App {
             }
             Some(DbSource::Folder(folder)) => folder,
             Some(DbSource::Zip(zip)) => {
-                let dest = Self::codeql_source_cache_dir()
-                    .join(crate::codeql_db::source_cache_name(&db.path));
+                let cache = Self::codeql_source_cache_dir();
+                let dest = cache.join(crate::codeql_db::source_cache_name(&db.path, &zip));
                 if !dest.is_dir() {
+                    // An older extraction of this database's source is out
+                    // of date: its archive changed, which is why the name
+                    // no longer matches. Drop it, unless it is open as a
+                    // workspace root.
+                    let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+                    for old in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
+                        let path = old.path();
+                        let stale = old.file_name().to_string_lossy().starts_with(&prefix);
+                        let open = path
+                            .canonicalize()
+                            .is_ok_and(|p| self.roots.iter().any(|r| r == p));
+                        if stale && !open {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
                     // Extract beside it and rename, so an interrupted
                     // extraction never passes for a finished one.
                     let partial = PathBuf::from(format!("{}.partial", dest.display()));
                     let _ = std::fs::remove_dir_all(&partial);
-                    let done = crate::codeql_db::extract_zip(&zip, &partial)
-                        .and_then(|_| std::fs::rename(&partial, &dest).map_err(|e| e.to_string()));
+                    let done = crate::codeql_db::extract_zip(
+                        &zip,
+                        &partial,
+                        Some(crate::codeql_db::SOURCE_ZIP_LIMIT),
+                    )
+                    .and_then(|_| std::fs::rename(&partial, &dest).map_err(|e| e.to_string()));
                     if let Err(e) = done {
                         let _ = std::fs::remove_dir_all(&partial);
                         self.status = format!("Could not extract {}: {e}", zip.display());
@@ -23615,7 +23651,7 @@ impl App {
 
     fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
         let dest = Self::codeql_db_cache_dir().join(name);
-        crate::codeql_db::extract_zip(zip, &dest)?;
+        crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
