@@ -1343,14 +1343,45 @@ pub fn add_to_croft_launch_json(root: &Path, draft: &ConfigDraft) -> Result<Path
     list.push(entry);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create .croft: {e}"))?;
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!("launch.json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text + "\n")
+    let (tmp, mut file) =
+        create_fresh_temp(&dir).map_err(|e| format!("Could not write .croft/launch.json: {e}"))?;
+    use std::io::Write as _;
+    file.write_all((text + "\n").as_bytes())
+        .and_then(|()| file.sync_all())
         .and_then(|()| std::fs::rename(&tmp, &path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("Could not write .croft/launch.json: {e}")
         })?;
     Ok(path)
+}
+
+/// The name [`create_fresh_temp`] tries `n`th for this process.
+fn temp_candidate(dir: &Path, n: u32) -> PathBuf {
+    dir.join(format!("launch.json.{}.{n}.tmp", std::process::id()))
+}
+
+/// A new, empty temp file beside `launch.json` that nothing else could have
+/// put there: created exclusively, so an existing path (a symlink the
+/// workspace planted at a guessable name included) is never opened or
+/// followed; the next name is tried instead.
+fn create_fresh_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for n in 0..64 {
+        let tmp = temp_candidate(dir, n);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary file name beside it",
+    ))
 }
 
 #[cfg(test)]
@@ -2700,5 +2731,29 @@ mod tests {
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "[]");
         assert!(!elsewhere.path().join("launch.json").exists());
+
+        // A link planted at the temp file's name is not written through: the
+        // real file keeps what it had until the new one replaces it whole.
+        let planted = tempfile::tempdir().unwrap();
+        let dir = planted.path().join(".croft");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut first = ConfigDraft::new("node", RequestKind::Launch);
+        first.set(DraftField::Name, "First").unwrap();
+        add_to_croft_launch_json(planted.path(), &first).unwrap();
+        let before = std::fs::read_to_string(dir.join("launch.json")).unwrap();
+        let bait = elsewhere.path().join("bait.json");
+        std::fs::write(&bait, "bait").unwrap();
+        std::os::unix::fs::symlink(&bait, temp_candidate(&dir, 0)).unwrap();
+        add_to_croft_launch_json(planted.path(), &d).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&bait).unwrap(),
+            "bait",
+            "the link is not followed"
+        );
+        let names: Vec<String> = discover_configs(planted.path())
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
     }
 }
