@@ -57182,6 +57182,33 @@ fn sarif_export_writes_the_visible_results_as_sarif_or_csv() {
 }
 
 #[test]
+fn sync_config_now_runs_the_cli_in_a_pane_for_a_plain_host_only() {
+    // #262: the palette command types `croft sync-config <host>` into a
+    // new terminal, so the host must be an alias, never shell text.
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("remote_sync_config_now"),
+        Some(Command::RemoteSyncConfigNow)
+    );
+    assert_eq!(
+        Command::RemoteSyncConfigNow.title(),
+        "Remote: Sync Config Now"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for bad in ["dev box", "x;rm -rf ~", "-oProxyCommand=x", ""] {
+        app.sync_config_to(bad);
+        assert!(
+            app.status.contains("not an ssh host alias"),
+            "{bad:?}: {}",
+            app.status
+        );
+    }
+    app.sync_config_to("user@dev-box.lan");
+    assert_eq!(app.status, "Syncing config to user@dev-box.lan");
+}
+
+#[test]
 fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     // #371: while scrubbing, the Outline lists the file as it was at the
     // commit on screen, the breadcrumbs follow the historical caret, a
