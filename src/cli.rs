@@ -307,14 +307,25 @@ pub enum CliCommand {
     /// Serve this workspace's session to a browser over WebSocket (#341).
     ///
     /// Each WebSocket connection is one participant of the running session
-    /// (`croft attach` starts it). Loopback only; the printed URL carries a
-    /// per-run token every connection must present.
+    /// (`croft attach` starts it). Every connection must present the
+    /// per-run token printed at start-up. The listener stops when the
+    /// session does.
     Web {
         /// Workspace whose session to serve (default: the current directory).
         workspace: Option<PathBuf>,
-        /// Address to listen on (default 127.0.0.1:7681). Loopback only.
+        /// Address to listen on (default 127.0.0.1:7681). A non-loopback
+        /// address is served with a warning: other machines can reach it.
         #[arg(long)]
         bind: Option<std::net::SocketAddr>,
+        /// Serve TLS with this PEM certificate chain and private key.
+        #[arg(long, num_args = 2, value_names = ["CERT", "KEY"])]
+        tls: Option<Vec<PathBuf>>,
+        /// Restart this workspace's listener with a new token.
+        #[arg(long, default_value_t = false, conflicts_with = "off")]
+        rotate_token: bool,
+        /// Stop this workspace's listener; the session keeps running.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["bind", "tls"])]
+        off: bool,
     },
     /// Open a file for editing in the croft that hosts this pane (#620).
     ///
@@ -585,12 +596,27 @@ impl Cli {
                 }
                 Ok(())
             }
-            Some(CliCommand::Web { workspace, bind }) => {
+            Some(CliCommand::Web {
+                workspace,
+                bind,
+                tls,
+                rotate_token,
+                off,
+            }) => {
                 let workspace = match workspace {
                     Some(w) => w,
                     None => std::env::current_dir()?,
                 };
-                if let Err(e) = crate::web::run(&workspace, bind) {
+                let opts = crate::web::Options {
+                    bind,
+                    tls: tls.map(|mut pair| {
+                        let key = pair.pop().unwrap_or_default();
+                        (pair.pop().unwrap_or_default(), key)
+                    }),
+                    rotate_token,
+                    off,
+                };
+                if let Err(e) = crate::web::run(&workspace, opts) {
                     eprintln!("croft web: {e:#}");
                     std::process::exit(1);
                 }
@@ -1936,17 +1962,58 @@ mod tests {
             cli.command,
             Some(CliCommand::Web {
                 workspace: None,
-                bind: None
+                bind: None,
+                tls: None,
+                rotate_token: false,
+                off: false,
             })
         ));
-        let cli = Cli::try_parse_from(["croft", "web", "/w", "--bind", "127.0.0.1:9000"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "croft",
+            "web",
+            "/w",
+            "--bind",
+            "0.0.0.0:9000",
+            "--tls",
+            "c.pem",
+            "k.pem",
+        ])
+        .unwrap();
         match cli.command {
-            Some(CliCommand::Web { workspace, bind }) => {
+            Some(CliCommand::Web {
+                workspace,
+                bind,
+                tls,
+                ..
+            }) => {
                 assert_eq!(workspace.as_deref(), Some(std::path::Path::new("/w")));
-                assert_eq!(bind, Some("127.0.0.1:9000".parse().unwrap()));
+                assert_eq!(bind, Some("0.0.0.0:9000".parse().unwrap()));
+                assert_eq!(
+                    tls,
+                    Some(vec![PathBuf::from("c.pem"), PathBuf::from("k.pem")])
+                );
             }
             other => panic!("{other:?}"),
         }
+        let cli = Cli::try_parse_from(["croft", "web", "--rotate-token"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Web {
+                rotate_token: true,
+                ..
+            })
+        ));
+        // `--tls` takes both files; `--off` stops, so it takes no listener
+        // settings and cannot also rotate.
+        assert!(Cli::try_parse_from(["croft", "web", "--tls", "c.pem"]).is_err());
+        assert!(Cli::try_parse_from(["croft", "web", "--off", "--bind", "127.0.0.1:1"]).is_err());
+        assert!(Cli::try_parse_from(["croft", "web", "--off", "--rotate-token"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["croft", "web", "--off"])
+                .unwrap()
+                .command,
+            Some(CliCommand::Web { off: true, .. })
+        ));
     }
 
     #[test]

@@ -30,16 +30,6 @@ impl Request {
         self.headers.get(name).map(String::as_str)
     }
 
-    /// A `?name=value` from the target.
-    pub fn query(&self, name: &str) -> Option<&str> {
-        let (_, query) = self.target.split_once('?')?;
-        query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v)
-    }
-
     /// A WebSocket upgrade request, with the key the reply must hash.
     pub fn websocket_key(&self) -> Option<&str> {
         let upgrade = self.header("upgrade")?.eq_ignore_ascii_case("websocket");
@@ -91,10 +81,14 @@ pub fn accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
 }
 
-/// The 101 reply that completes the upgrade.
-pub fn upgrade_response(key: &str) -> String {
+/// The 101 reply that completes the upgrade, selecting `protocol` when the
+/// client offered subprotocols.
+pub fn upgrade_response(key: &str, protocol: Option<&str>) -> String {
+    let protocol = protocol
+        .map(|p| format!("Sec-WebSocket-Protocol: {p}\r\n"))
+        .unwrap_or_default();
     format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n{protocol}\r\n",
         accept_key(key)
     )
 }
@@ -291,12 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_request_is_parsed_with_its_key_and_query() {
-        let head = "GET /ws?token=abc&x=1 HTTP/1.1\r\nHost: 127.0.0.1:7681\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: k==\r\nOrigin: http://127.0.0.1:7681\r\n\r\n";
+    fn an_upgrade_request_is_parsed_with_its_key_and_headers() {
+        let head = "GET /ws?x=1 HTTP/1.1\r\nHost: 127.0.0.1:7681\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: k==\r\nSec-WebSocket-Protocol: croft, croft.token.abc\r\nOrigin: http://127.0.0.1:7681\r\n\r\n";
         let req = read_request(&mut head.as_bytes()).unwrap();
-        assert_eq!(req.target, "/ws?token=abc&x=1");
+        assert_eq!(req.target, "/ws?x=1");
         assert_eq!(req.websocket_key(), Some("k=="));
-        assert_eq!(req.query("token"), Some("abc"));
+        assert_eq!(
+            req.header("sec-websocket-protocol"),
+            Some("croft, croft.token.abc")
+        );
         assert_eq!(req.header("origin"), Some("http://127.0.0.1:7681"));
         let plain = read_request(&mut "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes()).unwrap();
         assert_eq!(plain.websocket_key(), None);
