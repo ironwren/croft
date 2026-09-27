@@ -55,6 +55,7 @@ mod merge;
 mod merge_editor;
 mod notebook;
 mod notifications;
+mod oom;
 mod outline_syntax;
 mod output;
 mod pair;

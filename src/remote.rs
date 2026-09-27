@@ -3093,7 +3093,13 @@ fi
 # zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
 # try to run a command literally named "nice -n 19". eval re-parses the
 # assembled line, which splits correctly under both sh/bash and zsh.
-eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked &'
+# The subshell marks the build (and every rustc under it) as the kernel's
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile's own pid.
+(
+  echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'
+) &
 CROFT_BUILD_PID=$!
 printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
 wait "$CROFT_BUILD_PID"
@@ -4358,6 +4364,27 @@ Host !blocked *.internal
     // box, and even niced, a rustc compile on a small VPS wrecks the live
     // session sharing it. When a croft session is running on the box, the
     // compile must yield everything: one job and idle-class IO.
+    /// #694: the build, and every rustc under it, is the kernel's first
+    /// choice when memory runs out, and the script still parses as sh.
+    #[test]
+    fn remote_install_marks_the_build_for_the_oom_killer_first() {
+        let command = remote_install_command("abc123");
+        let adj = command
+            .find("echo 1000 > /proc/self/oom_score_adj")
+            .unwrap();
+        let install = command.find("cargo install --path").unwrap();
+        assert!(adj < install, "the score must be set before the compile");
+        let out = Command::new("sh")
+            .args(["-n", "-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn remote_install_compile_yields_to_a_live_croft_session() {
         let command = remote_install_command("abc123");
@@ -4401,7 +4428,7 @@ Host !blocked *.internal
         before("CROFT_MARK=\"$HOME/.cache/croft/building.$$\"");
         before("trap '");
         assert!(
-            command.contains(r#"eval "$CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
+            command.contains(r#"eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE""#),
             "the memory cap must wrap the compile itself"
         );
         // Little memory FREE drops to one job too, not just a small total:
