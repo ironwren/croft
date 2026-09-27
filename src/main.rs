@@ -12,6 +12,7 @@ mod cell_map;
 mod cli;
 mod clipboard;
 mod code_lens;
+mod codeql_db;
 mod collab;
 mod collab_agent;
 mod command_history;
