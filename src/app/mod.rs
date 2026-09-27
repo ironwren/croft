@@ -3895,6 +3895,14 @@ pub struct App {
     /// the local cross-build writes when it finishes shipping a newer
     /// binary, so the running croft can re-exec into it in place.
     update_watch: Option<crate::update_watch::UpdateWatch>,
+    /// True while this croft has stopped its language servers because a
+    /// source build of croft is compiling on the same host (#694), so the
+    /// servers are restarted once it ends. Only a remote-launched croft
+    /// ever sets it.
+    lsp_paused_for_build: bool,
+    /// When the build marker was last checked: it is a file read, so at
+    /// most once a second rather than every loop iteration.
+    build_marker_checked: Option<std::time::Instant>,
     /// One-shot startup probe (#242): does the repo this binary was built
     /// from now sit at a different commit/dirty state than the binary has
     /// baked in? Local-only — a remote-launched croft is re-stamped by its
@@ -5376,6 +5384,8 @@ impl App {
             connect_auth: None,
             install_session: None,
             update_watch: None,
+            lsp_paused_for_build: false,
+            build_marker_checked: None,
             drift_probe: None,
             local_drift: None,
             self_install: None,
@@ -7666,6 +7676,8 @@ impl App {
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
             dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
+            // Reopening asks for its lenses again anyway.
+            self.code_lens_requested.remove(&p);
         }
         // A closed file's problems must leave the PROBLEMS panel too.
         // Under Open Files scope the panel also depends on WHICH buffers are
@@ -9532,13 +9544,7 @@ impl App {
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for u in updates {
             touched.insert(u.path.clone());
-            let by_server = self.lsp_diagnostics.entry(u.path).or_default();
-            // An empty batch is the server saying "all clear" for its findings.
-            if u.diagnostics.is_empty() {
-                by_server.remove(&u.server);
-            } else {
-                by_server.insert(u.server, u.diagnostics);
-            }
+            store_diagnostics_update(&mut self.lsp_diagnostics, u);
         }
         let mut changed = false;
         // The active editor re-decodes when its file was touched this tick OR
@@ -31576,6 +31582,112 @@ impl App {
         ));
     }
 
+    /// Stop the language servers while croft compiles itself on this host,
+    /// and start them again once it is done (#694).
+    ///
+    /// The remote source build writes a marker while it runs. On an 8 GB
+    /// host a compile next to rust-analyzer exhausted memory, and the OOM
+    /// killer then took whatever was largest — croft, or a terminal pane.
+    /// Only a remote-launched croft watches: the build is the fallback of
+    /// `croft remote`'s update, and a local croft never runs one under it.
+    fn poll_source_build_marker(&mut self) -> bool {
+        if self.update_watch.is_none() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .build_marker_checked
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.build_marker_checked = Some(now);
+        let building = crate::update_watch::source_build_running(
+            &croft_cache_dir(),
+            crate::update_watch::boot_time(),
+            process_is_alive,
+        );
+        self.apply_source_build_state(building)
+    }
+
+    /// Pause or resume the language servers for a source build that has
+    /// started (`true`) or ended (`false`). Split from the polling so tests
+    /// drive it without a marker file or the 1 Hz gate.
+    fn apply_source_build_state(&mut self, building: bool) -> bool {
+        match (building, self.lsp_paused_for_build) {
+            (true, false) => {
+                // Nothing running is nothing to pause, and nothing to restart
+                // later either: a manager that failed to start stays down.
+                if self.lsp.is_none() {
+                    return false;
+                }
+                // Dropping the manager shuts its servers down, which is what
+                // frees the memory. Its Drop waits up to 3 s for them, so it
+                // runs off the UI thread: nothing the user did asked for a
+                // freeze (the build script waits long enough for it).
+                if let Some(old) = self.lsp.take() {
+                    fs_watch::offload_drop(old);
+                }
+                self.lsp_paused_for_build = true;
+                // A format-on-save in flight dies with the manager, and its
+                // armed save would otherwise fire on some later, unrelated
+                // format reply. Save now, unformatted, as when a reply fails.
+                if self.format_request_id.take().is_some() {
+                    self.complete_pending_save();
+                }
+                // Re-open every tab against the servers that come back. The
+                // diagnostics are kept: they are still the best answer until
+                // the restarted servers publish fresh ones.
+                self.lsp_last_seen.clear();
+                self.lsp_progress.clear();
+                let msg = "Language servers stopped while croft builds its update on this host";
+                crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
+                self.status = String::from(msg);
+                true
+            }
+            (false, true) => {
+                self.lsp_paused_for_build = false;
+                self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+                    Ok(m) => {
+                        m.set_extra_roots(
+                            self.roots.iter().skip(1).map(Path::to_path_buf).collect(),
+                        );
+                        crate::output::push(
+                            "Language Servers",
+                            crate::output::OutputLevel::Info,
+                            "Update build finished; language servers restarted",
+                        );
+                        Some(m)
+                    }
+                    Err(e) => {
+                        let msg = format!("Language servers could not restart: {e}");
+                        crate::output::push(
+                            "Language Servers",
+                            crate::output::OutputLevel::Error,
+                            &msg,
+                        );
+                        self.status = msg;
+                        None
+                    }
+                };
+                self.lsp_last_seen.clear();
+                self.lsp_progress.clear();
+                // The new manager numbers semantic replies from 0 again; the
+                // old high-water marks would reject every reply for a file
+                // until the new count caught up with the old one.
+                self.semantic_generation_seen.clear();
+                // A tab closed during the pause was never in `lsp_last_seen`
+                // again, so nothing would drop its diagnostics: drop what no
+                // open buffer owns, and let the new servers publish the rest.
+                let open = self.open_buffer_paths();
+                self.lsp_diagnostics.retain(|p, _| open.contains(p));
+                self.rebuild_problems();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Start the one-shot local drift probe (#242) on a locally-launched
     /// croft. A remote-launched croft skips it: its binary is re-stamped by
     /// the launching machine on every connect, and its baked manifest dir
@@ -31723,6 +31835,7 @@ impl App {
 
     pub fn poll_update_watch(&mut self) -> bool {
         let mut changed = self.poll_drift_probe();
+        changed |= self.poll_source_build_marker();
         changed |= self.poll_update_check();
         // Three producers share one event vocabulary; each event keeps its
         // origin so a drift rebuild's failure is never charged to the
@@ -38324,6 +38437,27 @@ impl App {
     /// Ask the local launcher (via the drop relay) to forward `port` home over
     /// the live SSH master, optionally opening the local browser once it's up.
     fn request_remote_forward(&mut self, port: u16, open: bool) {
+        // Forwarded already: reuse the tunnel. Asking again found the remote
+        // port held locally by croft's own first tunnel and fell back to a
+        // random one, so every click on the same link opened one more tunnel
+        // and one more browser tab at a new 127.0.0.1 address (#648).
+        if let Some(local) = self.ports.forwarded_local_port(port) {
+            if open {
+                self.request_remote_url_open(format!("http://127.0.0.1:{local}/"));
+                self.status = format!("Opening port {port} (forwarded to {local})");
+            } else {
+                self.status = format!("Port {port} is already forwarded to {local}");
+            }
+            return;
+        }
+        // And one request per port at a time: a second click before the
+        // first forward answered sent a duplicate.
+        if self.pending_remote_pulls.iter().any(
+            |p| matches!(p.kind, RemotePullKind::Forward { remote_port } if remote_port == port),
+        ) {
+            self.status = format!("Port {port} is already being forwarded");
+            return;
+        }
         let Some(log_path) = self.relay_log_path() else {
             self.status = String::from("Forward port: drop relay vanished");
             return;
@@ -48758,20 +48892,35 @@ impl App {
         // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
         // against the new servers; the stale diagnostics / progress from the
         // old root are dropped with it.
-        self.lsp = match crate::lsp::LspManager::new(new_root.clone()) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                // Not stderr: the TUI owns the screen here, and text written
-                // around ratatui stays on it (#537's class of leak).
-                let msg = format!("Language servers could not restart: {e}");
-                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
-                self.status = msg;
-                None
-            }
+        //
+        // Not while a source build of croft has the servers stopped (#694):
+        // starting them now would put rust-analyzer back beside the compile.
+        // The manager drops either way, and the end of the build starts one
+        // at the new root, since the resume reads `workspace_root()`.
+        self.lsp = match self.lsp_paused_for_build {
+            true => None,
+            false => match crate::lsp::LspManager::new(new_root.clone()) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    // Not stderr: the TUI owns the screen here, and text written
+                    // around ratatui stays on it (#537's class of leak).
+                    let msg = format!("Language servers could not restart: {e}");
+                    crate::output::push(
+                        "Language Servers",
+                        crate::output::OutputLevel::Error,
+                        &msg,
+                    );
+                    self.status = msg;
+                    None
+                }
+            },
         };
         self.lsp_last_seen.clear();
         self.lsp_diagnostics.clear();
         self.lsp_progress.clear();
+        // A new manager numbers semantic replies from 0 again (see the
+        // build resume, which hits the same thing).
+        self.semantic_generation_seen.clear();
         // Build diagnostics describe the OLD workspace's files; a re-root
         // that kept them showed the previous project's errors forever.
         self.build_diagnostics.clear();
@@ -55734,9 +55883,7 @@ const TERMINAL_RAIL_W: u16 = 3 + TERMINAL_RAIL_LABEL_W;
 /// remote shell). Used to throttle PTY-driven redraws further so the SSH
 /// pipe never saturates and starves input handling on the same thread.
 fn is_remote_session() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some()
-        || std::env::var_os("SSH_CLIENT").is_some()
+    crate::remote::running_over_ssh()
 }
 
 /// Status-line advisory for a remote croft session that will not survive an
@@ -56202,6 +56349,33 @@ fn mcp_tool_trust(
     Err(format!(
         "refusing to run: the '{tool}' tool definition changed since you approved it (possible rug-pull); toggle the extension off and on to re-approve"
     ))
+}
+
+/// File one server's diagnostics batch in the store. An empty batch is the
+/// server saying "all clear" for its findings; a path no server reports on
+/// any more leaves the store. Files never opened (a workspace pull, a
+/// flycheck) and deleted ones used to keep an empty entry each for the rest
+/// of the session (#694).
+fn store_diagnostics_update(
+    store: &mut std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+    >,
+    u: crate::lsp::manager::DiagnosticsUpdate,
+) {
+    if u.diagnostics.is_empty() {
+        if let Some(by_server) = store.get_mut(&u.path) {
+            by_server.remove(&u.server);
+            if by_server.is_empty() {
+                store.remove(&u.path);
+            }
+        }
+    } else {
+        store
+            .entry(u.path)
+            .or_default()
+            .insert(u.server, u.diagnostics);
+    }
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +
