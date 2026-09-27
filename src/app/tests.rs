@@ -59014,6 +59014,39 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
 }
 
+/// #264: an adapter that refuses to start the program (delve and a Go too
+/// old for it) ends the debug session with its reason in the status and
+/// the Run and Debug feedback, not "Debug session ended", and not a
+/// session left Initializing.
+#[test]
+fn a_refused_debug_launch_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let refused = r#"{"seq":1,"type":"response","request_seq":2,"success":false,"command":"launch","message":"Failed to launch","body":{"error":{"id":3000,"format":"Failed to launch /w: Go version go1.24.7 is too old for this version of Delve"}}}"#;
+    app.debug_sessions.push("go", stub_emitting(&[refused]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the refusal to end the session",
+        || {
+            app.poll_dap();
+            app.debug_sessions.is_empty()
+        },
+    );
+    assert!(
+        app.status
+            .starts_with("Could not start debugging: Failed to launch /w: Go version"),
+        "{}",
+        app.status
+    );
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.run_debug
+            .feedback
+            .as_deref()
+            .is_some_and(|f| f.contains("too old for this version of Delve"))
+    );
+}
+
 /// #345: the agent review queue, and what was marked reviewed, survive a
 /// restart and a re-root away and back; the Explorer's dots come back too.
 #[test]
