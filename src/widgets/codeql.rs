@@ -66,6 +66,10 @@ pub enum Action {
     SelectDatabase(usize),
     /// Open the results of the query history entry at this index.
     OpenHistory(usize),
+    /// Fold or unfold the query pack at this index of `queries`.
+    TogglePack(usize),
+    /// Run query `.1` of pack `.0` on the current database.
+    RunQuery(usize, usize),
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -80,6 +84,21 @@ pub const LANGUAGES: [&str; 10] = [
     "Ruby",
     "Rust",
     "Swift",
+];
+
+/// The extractor id behind each [`LANGUAGES`] entry, in the same order: what
+/// a pack's `extractor:` or `codeql/<id>-all` dependency says.
+pub const LANGUAGE_IDS: [&str; 10] = [
+    "cpp",
+    "csharp",
+    "actions",
+    "go",
+    "java",
+    "javascript",
+    "python",
+    "ruby",
+    "rust",
+    "swift",
 ];
 
 /// One painted line of the side bar.
@@ -114,6 +133,10 @@ pub struct CodeqlPanel {
     pub current_db: Option<usize>,
     /// Query history labels, newest first (#578).
     pub history: Vec<String>,
+    /// The workspace's queries by pack, from the last discovery.
+    pub queries: Vec<crate::codeql_query::QueryPack>,
+    /// Folded packs, by folder, so a fold survives rediscovery.
+    pub folded_packs: std::collections::HashSet<std::path::PathBuf>,
 }
 
 impl CodeqlPanel {
@@ -123,6 +146,33 @@ impl CodeqlPanel {
         Self {
             collapsed: std::collections::HashSet::from([Section::Language]),
             ..Self::default()
+        }
+    }
+
+    /// Whether pack `pack` shows under the selected language. A pack that
+    /// does not say its language (and the no-pack group) always shows: it
+    /// could be any language, and hiding it would hide queries.
+    pub fn pack_matches_language(&self, pack: &crate::codeql_query::QueryPack) -> bool {
+        match (self.language, pack.language.as_deref()) {
+            (Some(i), Some(lang)) => LANGUAGE_IDS[i] == lang,
+            _ => true,
+        }
+    }
+
+    /// Fold or unfold a query pack, keeping the selection on its line.
+    pub fn toggle_pack(&mut self, pack: usize) {
+        let Some(dir) = self.queries.get(pack).map(|p| p.dir.clone()) else {
+            return;
+        };
+        if !self.folded_packs.remove(&dir) {
+            self.folded_packs.insert(dir);
+        }
+        if let Some(n) = self
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::TogglePack(p), _) if *p == pack))
+        {
+            self.selected = n;
         }
     }
 
@@ -173,6 +223,38 @@ impl CodeqlPanel {
                         (Action::AddDatabaseFromGithub, "From GitHub"),
                     ] {
                         out.push(Line::Action(a, label.to_string()));
+                    }
+                }
+                Section::Queries if self.queries.iter().any(|p| self.pack_matches_language(p)) => {
+                    for (i, pack) in self.queries.iter().enumerate() {
+                        if !self.pack_matches_language(pack) {
+                            continue;
+                        }
+                        let folded = self.folded_packs.contains(&pack.dir);
+                        let chevron = if folded {
+                            crate::icons::CHEVRON_CLOSED
+                        } else {
+                            crate::icons::CHEVRON_OPEN
+                        };
+                        let lang = pack
+                            .language
+                            .as_deref()
+                            .map(|l| format!(" ({l})"))
+                            .unwrap_or_default();
+                        out.push(Line::Action(
+                            Action::TogglePack(i),
+                            format!("{chevron} {}{lang}", pack.name),
+                        ));
+                        if folded {
+                            continue;
+                        }
+                        for (j, q) in pack.queries.iter().enumerate() {
+                            let rel = q.strip_prefix(&pack.dir).unwrap_or(q);
+                            out.push(Line::Action(
+                                Action::RunQuery(i, j),
+                                format!("  {}", rel.display()),
+                            ));
+                        }
                     }
                 }
                 Section::Queries => {
@@ -470,5 +552,82 @@ mod tests {
             Action::OpenHistory(1),
             "\u{2717} b.ql \u{b7} app \u{b7} failed: x".into()
         )));
+    }
+
+    fn pack(
+        name: &str,
+        language: Option<&str>,
+        dir: &str,
+        queries: &[&str],
+    ) -> crate::codeql_query::QueryPack {
+        crate::codeql_query::QueryPack {
+            name: name.into(),
+            language: language.map(Into::into),
+            dir: dir.into(),
+            queries: queries
+                .iter()
+                .map(|q| format!("{dir}/{q}").into())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn queries_list_by_pack_and_follow_the_language() {
+        let mut p = CodeqlPanel::new();
+        assert!(
+            p.lines()
+                .contains(&Line::Text("We didn't find any CodeQL queries in"))
+        );
+        p.queries = vec![
+            pack("acme/go", Some("go"), "/w/go", &["a.ql", "sub/b.ql"]),
+            pack("acme/py", Some("python"), "/w/py", &["c.ql"]),
+        ];
+        let lines = p.lines();
+        assert!(!lines.contains(&Line::Text("We didn't find any CodeQL queries in")));
+        let open = crate::icons::CHEVRON_OPEN;
+        assert!(lines.contains(&Line::Action(
+            Action::TogglePack(0),
+            format!("{open} acme/go (go)")
+        )));
+        assert!(lines.contains(&Line::Action(Action::RunQuery(0, 1), "  sub/b.ql".into())));
+        assert!(lines.contains(&Line::Action(Action::RunQuery(1, 0), "  c.ql".into())));
+        // Python (index 6) hides the Go pack but keeps the indices stable.
+        p.language = Some(6);
+        let lines = p.lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::RunQuery(0, _), _)))
+        );
+        assert!(lines.contains(&Line::Action(Action::RunQuery(1, 0), "  c.ql".into())));
+        // Nothing in Swift: the welcome comes back.
+        p.language = Some(9);
+        assert!(
+            p.lines()
+                .contains(&Line::Text("We didn't find any CodeQL queries in"))
+        );
+        // A pack that does not say its language shows under any.
+        p.queries
+            .push(pack(crate::codeql_query::NO_PACK, None, "/w", &["x.ql"]));
+        assert!(
+            p.lines()
+                .contains(&Line::Action(Action::RunQuery(2, 0), "  x.ql".into()))
+        );
+    }
+
+    #[test]
+    fn a_pack_folds_and_keeps_the_selection_on_its_line() {
+        let mut p = CodeqlPanel::new();
+        p.queries = vec![pack("acme/go", Some("go"), "/w/go", &["a.ql"])];
+        p.toggle_pack(0);
+        assert_eq!(p.selected_hit(), Some(Hit::Action(Action::TogglePack(0))));
+        assert!(
+            !p.lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(Action::RunQuery(..), _)))
+        );
+        p.toggle_pack(0);
+        p.move_selection(true);
+        assert_eq!(p.selected_hit(), Some(Hit::Action(Action::RunQuery(0, 0))));
     }
 }

@@ -55062,6 +55062,62 @@ fn a_query_history_entry_reopens_its_results() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
+    // #578: the Queries section lists the workspace's queries by pack, and
+    // Enter on one runs it from disk on the current database, whatever the
+    // editor has open.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("pack")).unwrap();
+        std::fs::write(
+            tmp.path().join("pack/qlpack.yml"),
+            "name: acme/rust\nextractor: rust\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("pack/r.ql"),
+            "/** @kind problem */ select 1",
+        )
+        .unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        app.open_codeql_view();
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/rust", crate::codeql_query::NO_PACK]);
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(l, crate::widgets::codeql::Line::Action(
+                    crate::widgets::codeql::Action::RunQuery(0, 0),
+                    label,
+                ) if label.trim() == "r.ql")
+            })
+            .expect("the pack's query is listed");
+        app.codeql.selected = row;
+        app.focus = Pane::Tree;
+        app.handle_codeql_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status.contains("Running r.ql on app"), "{}", app.status);
+        wait_for_codeql(&mut app);
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} r.ql \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.starts_with("database analyze ") && calls.contains("pack/r.ql"),
+            "the saved file's @kind picks SARIF: {calls}"
+        );
+    });
+}
+
 /// The phone loop (#359), end to end through the App: a proposal sends one
 /// notification whose Approve link carries the proposal's token, and that
 /// token, sent back the way `croft decide` sends it, answers the hook and
