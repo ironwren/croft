@@ -1565,6 +1565,10 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// What an Agent Lane row's `+n −m` was counted from (#345): the reviewed
+/// snapshot, the agent's last write, and the file's mtime on disk.
+type LaneCountKey = (u64, u64, Option<std::time::SystemTime>);
+
 /// What a network git operation's worker hands back: the UI-thread half
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
@@ -2690,13 +2694,7 @@ pub struct App {
     pub agent_lane_panel: crate::widgets::agent_lane::AgentLanePanel,
     /// Per lane file, the `+n −m` its row shows and what it was counted
     /// from: (reviewed snapshot, last agent write, disk mtime).
-    lane_change_counts: std::collections::HashMap<
-        PathBuf,
-        (
-            (u64, u64, Option<std::time::SystemTime>),
-            Option<(usize, usize)>,
-        ),
-    >,
+    lane_change_counts: std::collections::HashMap<PathBuf, (LaneCountKey, Option<(usize, usize)>)>,
     /// The Explorer's DEPENDENCIES section: the workspace's packages, resolved
     /// off-thread per detected ecosystem. See [`DependenciesPanel`].
     pub dependencies: DependenciesPanel,

@@ -321,8 +321,6 @@ mod tests {
         assert_eq!(node_bin_dir("node"), None);
     }
 
-    /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
-    /// for an unset GOPATH, and croft's servers dir comes last.
     #[test]
     fn a_missing_delve_says_whether_go_is_there_to_install_it() {
         let with_go = dlv_missing_message(true);
@@ -336,6 +334,8 @@ mod tests {
         assert!(DLV_INSTALL.ends_with("github.com/go-delve/delve/cmd/dlv@latest"));
     }
 
+    /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
+    /// for an unset GOPATH, and croft's servers dir comes last.
     #[test]
     fn find_dlv_searches_path_then_gobin_then_gopath_then_croft() {
         let tmp = tempfile::tempdir().unwrap();
