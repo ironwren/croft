@@ -403,6 +403,67 @@ impl SarifView {
         }
     }
 
+    /// Carry the reader's place over from `old`, the view this one replaces
+    /// because its log changed on disk (#577): the logs `old` had added
+    /// (each read again from disk; one that no longer loads is dropped, and
+    /// named in the returned list), the tab, filters, query, sort, folds,
+    /// detail tab and baseline, and the selection, by the same result in the
+    /// same log (matched by rule, file, line and message) when it is still
+    /// there.
+    pub fn carry_from(&mut self, old: &SarifView) -> Vec<String> {
+        let mut dropped = Vec::new();
+        for extra in old.logs.iter().skip(1) {
+            if self.logs.iter().any(|l| l.path == extra.path) {
+                continue;
+            }
+            let reread = std::fs::read(&extra.path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| {
+                    super::load::parse_log(&String::from_utf8_lossy(&b)).map_err(|e| e.to_string())
+                });
+            match reread {
+                Ok(log) => self.logs.push(LoadedLog {
+                    path: extra.path.clone(),
+                    log,
+                }),
+                Err(_) => dropped.push(extra.path.display().to_string()),
+            }
+        }
+        self.tab = old.tab;
+        self.filters = old.filters.clone();
+        self.query_text = old.query_text.clone();
+        self.sort = old.sort;
+        self.collapsed = old.collapsed.clone();
+        self.detail_tab = old.detail_tab;
+        // The baseline by path: its index may have shifted.
+        self.baseline = old
+            .baseline
+            .and_then(|b| old.logs.get(b))
+            .and_then(|b| self.logs.iter().position(|l| l.path == b.path));
+        self.rebuild_entries();
+        // The same result by what it says, not its index: a rescan that
+        // adds or removes results shifts every index after it.
+        let same = |a: &Entry, b: &Entry| {
+            a.rule_id == b.rule_id && a.uri == b.uri && a.line == b.line && a.message == b.message
+        };
+        let key = old
+            .selected_entry()
+            .and_then(|e| old.logs.get(e.log).map(|l| (l.path.clone(), e.clone())));
+        let rows = self.rows();
+        self.selected = key
+            .and_then(|(path, want)| {
+                rows.iter().position(|r| match r {
+                    Row::Item { entry } => self.entries.get(*entry).is_some_and(|e| {
+                        same(e, &want) && self.logs.get(e.log).is_some_and(|l| l.path == path)
+                    }),
+                    Row::Group { .. } => false,
+                })
+            })
+            .unwrap_or_else(|| old.selected.min(rows.len().saturating_sub(1)));
+        self.scroll = old.scroll;
+        dropped
+    }
+
     fn selected_index_pub(&self) -> Option<usize> {
         match self.rows().get(self.selected)? {
             Row::Item { entry } => Some(*entry),

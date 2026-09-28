@@ -8976,7 +8976,13 @@ impl Editor {
         // second render after the open left a window where that render's
         // transient failure lost the reader's place (#72).
         self.pdf_restore_page = self.pdf_page().filter(|&p| p > 1);
+        // A SARIF viewer keeps the reader's place, and the logs added to
+        // it, across a rewrite of its log (#577).
+        let old_sarif = self.sarif.take();
         let result = self.open(&path);
+        if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
+            view.carry_from(old);
+        }
         // Cleared even when the open bailed before reaching `open_pdf`, so
         // the request can never leak into an unrelated later open.
         self.pdf_restore_page = None;
