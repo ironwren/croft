@@ -88,6 +88,19 @@ pub fn log_predicates_args(log: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments rendering the help of `query`, its `.qhelp` or `.md`
+/// beside it, as Markdown at `out` (VS Code's "CodeQL: Preview Query
+/// Help").
+pub fn query_help_args(query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("query-help"),
+        String::from("--format=markdown"),
+        format!("--output={}", path(out)),
+        path(query),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -1087,6 +1100,16 @@ mod tests {
             ]
         );
         assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+        assert_eq!(
+            query_help_args(q, Path::new("/cache/help/q.md")),
+            vec![
+                "generate",
+                "query-help",
+                "--format=markdown",
+                "--output=/cache/help/q.md",
+                "/w/q.ql"
+            ]
+        );
     }
 
     #[test]

@@ -3164,6 +3164,9 @@ pub struct App {
     /// The performance comparison being prepared (#578): where the rendered
     /// table (or why there is none) arrives, and the tab label to show it in.
     codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    /// The query help being rendered (#578): where the outcome arrives,
+    /// the Markdown file to preview once it lands, and the query's name.
+    codeql_query_help: Option<CodeqlQueryHelp>,
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
@@ -5467,6 +5470,7 @@ impl App {
             codeql_log_summary: None,
             codeql_log_viewer: None,
             codeql_perf_compare: None,
+            codeql_query_help: None,
             codeql_pack_job: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
@@ -25082,6 +25086,98 @@ impl App {
                 self.status = String::from("Opened the performance comparison");
             }
             Err(why) => self.status = format!("Could not compare performance: {why}"),
+        }
+        true
+    }
+
+    /// VS Code's "CodeQL: Preview Query Help" (#578): the help of the open
+    /// `.ql` query, else of the query the selected or newest history entry
+    /// ran, rendered to Markdown by `codeql generate query-help` on a worker
+    /// thread and shown in the Markdown preview.
+    fn preview_codeql_query_help(&mut self) {
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                let Some(i) = self.current_codeql_history() else {
+                    self.status = String::from("Open a .ql query to preview its help");
+                    return;
+                };
+                let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+                let Some(query) = history.entries.get(i).map(|e| e.query.clone()) else {
+                    return;
+                };
+                query
+            }
+        };
+        if self.codeql_query_help.is_some() {
+            self.status = String::from("Query help is already being rendered");
+            return;
+        }
+        let stem = query
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let help = croft_cache_dir()
+            .join("codeql")
+            .join("help")
+            .join(format!("{stem}.md"));
+        let program = self.codeql_program.clone();
+        let args = crate::codeql_query::query_help_args(&query, &help);
+        let out = help.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // An earlier preview's file must not stand in for help the CLI
+            // did not write this time.
+            let _ = std::fs::remove_file(&out);
+            let outcome = out
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|e| format!("{}: {e}", out.display()))
+                .and_then(|()| Self::codeql_command(&program, &args));
+            let _ = tx.send(outcome);
+        });
+        self.status = format!("Rendering the help of {name}\u{2026}");
+        self.codeql_query_help = Some((rx, help, name));
+    }
+
+    /// Preview rendered query help (#578), or say the query has none: the
+    /// CLI fails, or writes nothing, when there is no `.qhelp` or `.md`
+    /// beside the query.
+    pub fn drain_codeql_query_help(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_query_help.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the help rendering stopped unexpectedly"))
+            }
+        };
+        let Some((_, help, name)) = self.codeql_query_help.take() else {
+            return false;
+        };
+        let written = std::fs::metadata(&help).is_ok_and(|m| m.len() > 0);
+        match outcome {
+            Err(why) => self.status = format!("{name} has no query help: {why}"),
+            Ok(()) if !written => {
+                self.status = format!("{name} has no query help (no .qhelp or .md beside it)");
+            }
+            Ok(()) => match self.editor.open(&help) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    if self.editor.markdown_preview.is_none() {
+                        self.editor.toggle_markdown_preview();
+                    }
+                    self.focus_pane(Pane::Editor);
+                    self.status = format!("Query help for {name}");
+                }
+                Err(e) => self.status = format!("{}: {e}", help.display()),
+            },
         }
         true
     }
@@ -45770,6 +45866,7 @@ impl App {
                     self.compare_codeql_performance(i);
                 }
             }
+            Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -62901,6 +62998,14 @@ fn agent_ledger_key(root: &Path) -> String {
 /// or why it could not be read, and the version in use when it runs.
 type CodeqlCliCheck = (Result<String, String>, Option<String>);
 
+/// Query help being rendered (#578): where the outcome arrives, the
+/// Markdown file to preview, and the query's name.
+type CodeqlQueryHelp = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    PathBuf,
+    String,
+);
+
 /// A `codeql pack` install or download in flight (#578): where its outcome
 /// arrives, and the status lines for success and for failure.
 type CodeqlPackJob = (
@@ -64408,6 +64513,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_log_summary()
             | app.drain_codeql_log_viewer()
             | app.drain_codeql_perf_compare()
+            | app.drain_codeql_query_help()
             | app.drain_codeql_pack_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()

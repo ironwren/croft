@@ -56004,6 +56004,79 @@ fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
 
 #[cfg(unix)]
 #[test]
+fn codeql_query_help_is_previewed_as_markdown_or_reported_missing() {
+    // #578: VS Code's "CodeQL: Preview Query Help" renders the open
+    // query's help with `codeql generate query-help` off the UI thread and
+    // shows it in the Markdown preview; with no .ql open it takes the
+    // query of the newest history entry.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_query_help() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the query help never landed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        app.codeql_program = fake_codeql(bin.path(), "# Q\n\nFinds things.\n", 0, "");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        assert_eq!(app.status, "Rendering the help of q.ql\u{2026}");
+        wait(&mut app);
+        assert_eq!(app.status, "Query help for q.ql");
+        let help = croft_cache_dir().join("codeql/help/q.md");
+        assert_eq!(app.editor.path.as_deref(), Some(help.as_path()));
+        assert!(app.editor.markdown_preview.is_some());
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate query-help --format=markdown --output={} {}",
+                help.display(),
+                tmp.path().join("q.ql").display()
+            )
+        );
+
+        // No help beside the query: the CLI writes nothing.
+        seed_codeql_history(
+            tmp.path(),
+            &[(
+                "h.ql",
+                5,
+                crate::codeql_query::RunStatus::Succeeded,
+                App::codeql_results_dir().join("5-h/results.csv"),
+            )],
+        );
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        assert_eq!(app.status, "Rendering the help of h.ql\u{2026}");
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "h.ql has no query help (no .qhelp or .md beside it)"
+        );
+
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "ERROR: no help");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        wait(&mut app);
+        assert_eq!(app.status, "q.ql has no query help: ERROR: no help");
+        assert_eq!(
+            Command::from_id("codeql_preview_query_help"),
+            Some(Command::CodeqlPreviewQueryHelp)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn codeql_pack_commands_install_dependencies_and_download_packs() {
     // #578: "Install Pack Dependencies" runs `codeql pack install` on the
     // selected pack's folder; "Download Packs" asks which packs and runs
