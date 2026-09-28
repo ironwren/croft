@@ -885,7 +885,11 @@ fn run_all(root: &Path, tx: &EpochTx) {
         Runner::Go => run_go(tx, root, &[String::from("./...")]),
         Runner::Codeql => {
             let packs = super::codeqltest::test_packs(root, &codeql_markers());
-            run_codeql(tx, root, &super::codeqltest::all_args(root, &packs))
+            match super::codeqltest::all_args(root, &packs) {
+                Some(args) => run_codeql(tx, root, &args),
+                // No test pack: nothing to run, and nothing failed.
+                None => Some(true),
+            }
         }
     }
     .unwrap_or(false);
@@ -1313,7 +1317,8 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
         // Tests are files; listing them needs no CLI.
         Runner::Codeql => {
-            for id in super::codeqltest::discover(root) {
+            let packs = super::codeqltest::test_packs(root, &codeql_markers());
+            for id in super::codeqltest::discover(root, &packs) {
                 tx.send(TestResponse::Case(not_run(id)));
             }
         }

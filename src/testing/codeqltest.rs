@@ -136,20 +136,25 @@ pub fn id_path(id: &str) -> String {
     }
 }
 
-/// Every CodeQL test under `root`, as ids, sorted.
-pub fn discover(root: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = walk(root, None)
+/// Every CodeQL test inside the test packs `packs` (see [`test_packs`]),
+/// as ids relative to `root`, sorted. Only what a full run covers is
+/// listed, so the Testing view never shows a test "Run All" skips.
+pub fn discover(root: &Path, packs: &[PathBuf]) -> Vec<String> {
+    let mut ids: Vec<String> = packs
+        .iter()
+        .flat_map(|pack| walk(pack, None))
         .filter(|p| is_test(p))
         .map(|p| test_id(root, &p))
         .collect();
     ids.sort();
+    ids.dedup();
     ids
 }
 
 /// `codeql` arguments that run every test: each test pack, relative to
-/// `root`, or the root itself when it is the only place to look.
-pub fn all_args(root: &Path, packs: &[PathBuf]) -> Vec<String> {
-    let mut args = vec![String::from("test"), String::from("run")];
+/// `root`. `None` when there is no test pack under `root`, since then there
+/// is nothing a full run should touch.
+pub fn all_args(root: &Path, packs: &[PathBuf]) -> Option<Vec<String>> {
     let rel: Vec<String> = packs
         .iter()
         .filter_map(|p| p.strip_prefix(root).ok())
@@ -159,11 +164,11 @@ pub fn all_args(root: &Path, packs: &[PathBuf]) -> Vec<String> {
         })
         .collect();
     if rel.is_empty() {
-        args.push(String::from("."));
-    } else {
-        args.extend(rel);
+        return None;
     }
-    args
+    let mut args = vec![String::from("test"), String::from("run")];
+    args.extend(rel);
+    Some(args)
 }
 
 /// `codeql` arguments that run one test, a suite's folder, or whatever
@@ -472,14 +477,14 @@ ERROR: could not resolve type Baz (/work/queries/B.ql:2,1-4)
         assert_eq!(id_path("a/b"), "a/b", "a suite is its folder");
         assert_eq!(select_args("X.ql"), vec!["test", "run", "X.ql"]);
         assert_eq!(
-            all_args(root, &[root.join("test"), root.join("java/ql/test")]),
+            all_args(root, &[root.join("test"), root.join("java/ql/test")]).unwrap(),
             vec!["test", "run", "test", "java/ql/test"]
         );
         assert_eq!(
-            all_args(root, &[root.to_path_buf()]),
+            all_args(root, &[root.to_path_buf()]).unwrap(),
             vec!["test", "run", "."]
         );
-        assert_eq!(all_args(root, &[]), vec!["test", "run", "."]);
+        assert_eq!(all_args(root, &[]), None, "no test pack, no full run");
     }
 
     fn write(root: &Path, rel: &str, text: &str) {
@@ -512,11 +517,18 @@ ERROR: could not resolve type Baz (/work/queries/B.ql:2,1-4)
         write(root, "test/Draft/Draft.ql", "select 1");
         write(root, "test/Find/Find.testproj/x/Y.ql", "");
         write(root, "test/Find/Find.testproj/x/Y.expected", "");
+        let packs = test_packs(root, &markers());
+        assert_eq!(packs, vec![root.join("test")]);
         assert_eq!(
-            discover(root),
+            discover(root, &packs),
             vec!["test/Find::Find.qlref", "test/Inline::Inline.ql"]
         );
-        assert_eq!(test_packs(root, &markers()), vec![root.join("test")]);
+        // A test outside every test pack is not listed: "Run All" runs the
+        // packs, so it would never run.
+        write(root, "loose/Loose.ql", "select 1");
+        write(root, "loose/Loose.expected", "");
+        assert_eq!(discover(root, &packs).len(), 2);
+        assert!(discover(root, &[]).is_empty());
     }
 
     #[test]
