@@ -163,6 +163,18 @@ pub fn kept_bqrs(db: &Path, query: &Path) -> Option<PathBuf> {
         .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
 }
 
+/// `codeql` arguments dereferencing a `.qlref` test file to the query it
+/// names (#578, "open a referenced file").
+pub fn qlref_args(qlref: &Path) -> Vec<String> {
+    vec![String::from("resolve"), String::from("qlref"), path(qlref)]
+}
+
+/// The query `codeql resolve qlref` answered with: its `resolvedPath`.
+pub fn parse_qlref(json: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    v.get("resolvedPath")?.as_str().map(PathBuf::from)
+}
+
 /// `codeql` arguments listing a BQRS file's result sets as JSON.
 pub fn info_args(bqrs: &Path) -> Vec<String> {
     vec![
@@ -1155,6 +1167,18 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_qlref_resolves_to_the_query_the_cli_names() {
+        // The real `codeql resolve qlref` answer (2.27.1).
+        let json = "{\n  \"resolvedPath\" : \"/w/src/Alert.ql\",\n  \"resolvedPostprocessingPaths\" : [ ]\n}\n";
+        assert_eq!(parse_qlref(json), Some(PathBuf::from("/w/src/Alert.ql")));
+        assert_eq!(parse_qlref("{}"), None);
+        assert_eq!(
+            qlref_args(Path::new("/w/test/A.qlref")),
+            ["resolve", "qlref", "/w/test/A.qlref"]
+        );
+    }
 
     #[test]
     fn an_alert_runs_kept_results_are_found_and_interpreted_as_csv() {
