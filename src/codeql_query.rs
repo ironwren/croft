@@ -70,6 +70,24 @@ pub fn log_summary_args(log: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// The structured, one-predicate-per-line summary of the run whose results
+/// are `output`, made from its evaluator log for the log viewer.
+pub fn evaluator_log_predicates(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.predicates.jsonl")
+}
+
+/// `codeql` arguments summarising the evaluator log `log` as predicate
+/// records at `out` (VS Code's "Show Evaluator Log (Viewer)").
+pub fn log_predicates_args(log: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("log-summary"),
+        String::from("--format=predicates"),
+        path(log),
+        path(out),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -1019,6 +1037,19 @@ mod tests {
                 "--format=text",
                 "/out/evaluator-log.jsonl",
                 "/out/evaluator-log.summary.txt"
+            ]
+        );
+        assert_eq!(
+            log_predicates_args(
+                &evaluator_log(Path::new("/out/results.csv")),
+                &evaluator_log_predicates(Path::new("/out/results.csv"))
+            ),
+            vec![
+                "generate",
+                "log-summary",
+                "--format=predicates",
+                "/out/evaluator-log.jsonl",
+                "/out/evaluator-log.predicates.jsonl"
             ]
         );
         assert_eq!(
