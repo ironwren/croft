@@ -58353,6 +58353,65 @@ fn moving_the_cursor_onto_a_result_selects_it_in_the_viewer() {
 }
 
 #[test]
+fn a_missing_file_from_a_known_repository_downloads_once_its_host_is_trusted() {
+    // #577: the run's versionControlProvenance names the repository and
+    // commit; nothing is fetched until the user trusts the host.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("remote.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ci"}},
+              "versionControlProvenance":[{"repositoryUri":"https://github.com/o/r","revisionId":"c0ffee"}],
+              "results":[{"message":{"text":"m"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/gone.rs"},"region":{"startLine":2,"startColumn":3}}}]}]}]}"#,
+        )
+        .unwrap();
+        fn fake(url: &str) -> Result<Vec<u8>, String> {
+            assert_eq!(
+                url,
+                "https://raw.githubusercontent.com/o/r/c0ffee/src/gone.rs"
+            );
+            Ok(b"one\n  two\nthree\n".to_vec())
+        }
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sarif_fetch = fake;
+        app.editor.open_preview(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().selected = 1;
+        app.open_selected_sarif_result();
+        match app.input_prompt.as_ref().map(|p| &p.purpose) {
+            Some(crate::widgets::input_prompt::InputPurpose::SarifTrustHost { host, .. }) => {
+                assert_eq!(host, "github.com")
+            }
+            other => panic!("a trust prompt, not {other:?}: {}", app.status),
+        }
+        assert!(app.sarif_download.is_none(), "nothing fetched before trust");
+        // Enter on the empty field trusts the host and downloads.
+        app.submit_input_prompt();
+        assert!(crate::sarif::resolve::trusted_hosts().contains(&"github.com".to_string()));
+        let rx_wait = std::time::Instant::now();
+        while app.sarif_download.is_some() && rx_wait.elapsed().as_secs() < 10 {
+            app.poll_sarif_download();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let opened = app.editor.path.clone().expect("the download opened");
+        assert!(opened.starts_with(croft_cache_dir()), "{opened:?}");
+        assert_eq!(opened.file_name().unwrap(), "gone.rs");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 2));
+
+        // Now trusted: the next open downloads without asking.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.sarif_fetch = fake;
+        again.editor.open_preview(&log).unwrap();
+        again.editor.sarif.as_mut().unwrap().selected = 1;
+        again.open_selected_sarif_result();
+        assert!(again.input_prompt.is_none(), "{}", again.status);
+        assert!(again.sarif_download.is_some());
+    });
+}
+
+#[test]
 fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
     // #577: VS Code's Locate… prompt, with the learned prefix remembered.
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());

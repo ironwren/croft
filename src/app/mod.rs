@@ -4076,6 +4076,11 @@ pub struct App {
     /// The SARIF location a Locate prompt is open for (#577): its URI and
     /// the 1-based line and column to land on.
     sarif_locate_pending: Option<(String, i64, i64)>,
+    /// A SARIF source download in flight (#577): the location's URI, its
+    /// 1-based line and column, and the body or why it failed.
+    sarif_download: Option<std::sync::mpsc::Receiver<SarifDownload>>,
+    /// Fetches a URL's body; a field so tests can stand in for the network.
+    sarif_fetch: fn(&str) -> Result<Vec<u8>, String>,
     /// A breakpoint croft set itself at the assertion the last run failed
     /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
     /// breakpoints: it is added to the launch set, rendered hollow-red like
@@ -4936,6 +4941,37 @@ struct RemoteLaunch {
     host: String,
     path: Option<String>,
     adopted: Option<crate::remote::AdoptedMaster>,
+}
+
+/// A finished SARIF source download (#577).
+struct SarifDownload {
+    uri: String,
+    /// 1-based position to open at.
+    line: i64,
+    col: i64,
+    body: Result<Vec<u8>, String>,
+}
+
+/// GET `url`'s body, up to 64 MiB, for a SARIF location's source.
+fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let resp = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .get(url)
+        .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(404, _) => String::from("not found (a private repository?)"),
+            ureq::Error::Status(code, _) => format!("HTTP {code}"),
+            other => other.to_string(),
+        })?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(64 << 20)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 fn split_at_char_count(s: &str, count: usize) -> (String, String) {
@@ -5909,6 +5945,8 @@ impl App {
             gh_program: PathBuf::from("gh"),
             dismiss_target: None,
             sarif_locate_pending: None,
+            sarif_download: None,
+            sarif_fetch: fetch_sarif_source,
             debug_temp_breakpoint: None,
             debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
@@ -30410,6 +30448,18 @@ impl App {
             InputPurpose::SarifLocate { .. } => {
                 self.close_input_prompt();
                 self.submit_sarif_locate(&value);
+            }
+            InputPurpose::SarifTrustHost { uri, host, url } => {
+                self.close_input_prompt();
+                if value.trim().is_empty() {
+                    if let Err(e) = crate::sarif::resolve::trust_host(&host) {
+                        self.status = format!("Could not save {host} as trusted: {e}");
+                        return;
+                    }
+                    self.start_sarif_download(&uri, &url);
+                } else {
+                    self.submit_sarif_locate(&value);
+                }
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -57502,6 +57552,7 @@ impl App {
             uri,
             region: place,
             embedded,
+            remote,
             ..
         }) = self.sarif_selected_place()
         else {
@@ -57526,6 +57577,34 @@ impl App {
             // VS Code's Locate…: ask where the file is.
             let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
             self.sarif_locate_pending = Some((uri.clone(), line + 1, column + 1));
+            // The run names the repository it scanned: the file can be
+            // downloaded, once its host is trusted.
+            if let Some(remote) = remote {
+                if crate::sarif::resolve::trusted_hosts().contains(&remote.host) {
+                    self.start_sarif_download(&uri, &remote.url);
+                    return;
+                }
+                self.open_input_prompt(
+                    crate::widgets::input_prompt::InputPrompt::new(
+                        crate::widgets::input_prompt::InputPurpose::SarifTrustHost {
+                            uri: uri.clone(),
+                            host: remote.host.clone(),
+                            url: remote.url,
+                        },
+                        format!(
+                            "Download {name} from {}? Enter trusts {} for SARIF source",
+                            remote.host, remote.host
+                        ),
+                        format!("or type the path to {name} on this machine"),
+                    )
+                    .allowing_blank(),
+                );
+                self.status = format!(
+                    "{uri} is not on this machine; {} has it at the scanned commit",
+                    remote.host
+                );
+                return;
+            }
             self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                 crate::widgets::input_prompt::InputPurpose::SarifLocate { uri: uri.clone() },
                 format!("Locate {name}"),
@@ -57570,6 +57649,72 @@ impl App {
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
+    }
+
+    /// Download `url`, the source of the SARIF location `uri`, off the UI
+    /// thread; [`App::poll_sarif_download`] opens it (#577). The line and
+    /// column come from the pending Locate.
+    fn start_sarif_download(&mut self, uri: &str, url: &str) {
+        let (line, col) = self
+            .sarif_locate_pending
+            .as_ref()
+            .filter(|(u, _, _)| u == uri)
+            .map_or((1, 1), |(_, l, c)| (*l, *c));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fetch = self.sarif_fetch;
+        let (uri, url) = (uri.to_string(), url.to_string());
+        self.status = format!("Downloading {url}…");
+        std::thread::spawn(move || {
+            let body = fetch(&url);
+            let _ = tx.send(SarifDownload {
+                uri,
+                line,
+                col,
+                body,
+            });
+        });
+        self.sarif_download = Some(rx);
+    }
+
+    /// Open a finished SARIF source download read-only at its location,
+    /// or say why it failed.
+    fn poll_sarif_download(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.sarif_download.as_ref() else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.sarif_download = None;
+                return;
+            }
+        };
+        self.sarif_download = None;
+        match done.body {
+            Ok(bytes) => {
+                if self
+                    .sarif_locate_pending
+                    .as_ref()
+                    .is_some_and(|(u, _, _)| *u == done.uri)
+                {
+                    self.sarif_locate_pending = None;
+                }
+                let contents = match String::from_utf8(bytes) {
+                    Ok(t) => crate::sarif::resolve::Embedded::Text(t),
+                    Err(e) => crate::sarif::resolve::Embedded::Binary(e.into_bytes()),
+                };
+                let (line, col) = (
+                    (done.line.max(1) - 1) as usize,
+                    (done.col.max(1) - 1) as usize,
+                );
+                if let Err(e) = self.open_sarif_embedded(&done.uri, &contents, line, col) {
+                    self.status = format!("Could not open the download of {}: {e}", done.uri);
+                }
+            }
+            Err(e) => self.status = format!("Could not download {}: {e}", done.uri),
+        }
     }
 
     /// Where the selected SARIF result points, looked up in the workspace,
@@ -57624,10 +57769,19 @@ impl App {
                         format!("{} is binary; Enter opens it in the hex viewer.", p.uri),
                         None,
                     ),
-                    (None, None) => (
-                        format!("{} is not on this machine; Enter to locate it.", p.uri),
-                        None,
-                    ),
+                    (None, None) => match &p.remote {
+                        Some(r) => (
+                            format!(
+                                "{} is not on this machine; Enter downloads it from {}.",
+                                p.uri, r.host
+                            ),
+                            None,
+                        ),
+                        None => (
+                            format!("{} is not on this machine; Enter to locate it.", p.uri),
+                            None,
+                        ),
+                    },
                 };
                 match text {
                     None => empty(title),
@@ -64819,6 +64973,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_sarif_selection_to_cursor();
         app.sync_sarif_step_marks();
         app.refresh_sarif_preview();
+        app.poll_sarif_download();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
