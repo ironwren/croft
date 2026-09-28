@@ -55297,6 +55297,41 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
 }
 
 #[test]
+fn sarif_filter_words_are_highlighted_in_the_results() {
+    // Its own cache: the saved column choice (another test's) would push
+    // the message out of the row.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        // #577: the filter's words are marked where a result's message shows them.
+        let (tmp, log) = sarif_fixture();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().set_query("user");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let (y, line) = (0..buf.area.height)
+            .map(|y| {
+                let s: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                (y, s)
+            })
+            .find(|(_, s)| s.contains("Query built from user input."))
+            .expect("the row is drawn");
+        let at = line[..line.find("user input").unwrap()].chars().count() as u16;
+        let marked = |x: u16| {
+            buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        };
+        assert!((at..at + 4).all(marked), "\"user\" is marked");
+        assert!(!marked(at + 4) && !marked(at - 2), "and nothing around it");
+    });
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
