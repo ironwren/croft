@@ -399,6 +399,11 @@ pub fn run_report(run: &Submitted) -> String {
     if run.skipped > 0 {
         out.push_str(&format!("Skipped by GitHub: {}\n", run.skipped));
     }
+    if !repos_with_results(run).is_empty() {
+        out.push_str(
+            "Results: press v on the run in the CodeQL side bar, or run \"CodeQL: Open Variant Analysis Results\".\n",
+        );
+    }
     out.push_str("\n| Repository | Status | Results | Failure |\n|---|---|---|---|\n");
     let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     for r in &p.repos {
@@ -412,6 +417,137 @@ pub fn run_report(run: &Submitted) -> String {
     }
     out
 }
+
+/// `gh` arguments reading repository `nwo`'s part of run `id`: its status
+/// and where its results are.
+pub fn repo_task_args(controller: &str, id: u64, nwo: &str) -> Vec<String> {
+    vec![
+        String::from("api"),
+        format!("repos/{controller}/code-scanning/codeql/variant-analyses/{id}/repos/{nwo}"),
+    ]
+}
+
+/// Where a repository's results are, from GitHub's answer to
+/// [`repo_task_args`]: the artifact's (signed, short-lived) URL, and the
+/// commit its database was built from.
+pub fn parse_artifact(json: &str) -> Result<(String, Option<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("GitHub's answer was not JSON: {e}"))?;
+    let url = v
+        .get("artifact_url")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| String::from("GitHub has no results for it"))?;
+    let sha = v
+        .get("database_commit_sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok((url.to_string(), sha))
+}
+
+/// The repositories of `run` whose results are worth fetching: those that
+/// succeeded with at least one result.
+pub fn repos_with_results(run: &Submitted) -> Vec<String> {
+    run.progress
+        .iter()
+        .flat_map(|p| &p.repos)
+        .filter(|r| r.status == "succeeded" && r.results.unwrap_or(0) > 0)
+        .map(|r| r.nwo.clone())
+        .collect()
+}
+
+/// One repository's results: its SARIF log, or its table as CSV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoResults {
+    Sarif(String),
+    Table(String),
+}
+
+/// One SARIF log holding every repository's runs, each run marked with its
+/// repository and commit (`versionControlProvenance`) so a location that is
+/// not on this machine can be opened on GitHub.
+pub fn combine_sarif(parts: &[(String, Option<String>, String)]) -> Result<String, String> {
+    let mut runs = Vec::new();
+    for (nwo, sha, text) in parts {
+        let log: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("{nwo}'s SARIF: {e}"))?;
+        for mut run in log
+            .get("runs")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let mut provenance =
+                serde_json::json!({ "repositoryUri": format!("https://github.com/{nwo}") });
+            if let Some(sha) = sha {
+                provenance["revisionId"] = serde_json::json!(sha);
+            }
+            run["versionControlProvenance"] = serde_json::json!([provenance]);
+            run["automationDetails"] = serde_json::json!({ "id": format!("{nwo}/") });
+            runs.push(run);
+        }
+    }
+    let log = serde_json::json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": runs,
+    });
+    serde_json::to_string_pretty(&log).map_err(|e| e.to_string())
+}
+
+/// One CSV of every repository's table, a `repository` column first. The
+/// header is the first table's; each table's own header row is dropped.
+pub fn combine_csv(parts: &[(String, String)]) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut out = String::new();
+    for (i, (nwo, csv)) in parts.iter().enumerate() {
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap_or_default();
+        if i == 0 {
+            out.push_str(&format!("\"repository\",{header}\n"));
+        }
+        for line in lines.filter(|l| !l.is_empty()) {
+            out.push_str(&format!("{},{line}\n", quote(nwo)));
+        }
+    }
+    out
+}
+
+/// Whether croft fetches an artifact from `url`: GitHub hands out https
+/// links only; tests serve theirs from a local port.
+pub fn artifact_url_allowed(url: &str) -> bool {
+    url.starts_with("https://") || (cfg!(test) && url.starts_with("http://127.0.0.1:"))
+}
+
+/// The file called `name` in `dir` or a folder below it (a results
+/// archive may nest its files a level or two down), shallowest first.
+pub fn find_named(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut level = vec![dir.to_path_buf()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for d in &level {
+            let direct = d.join(name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            if let Ok(entries) = std::fs::read_dir(d) {
+                let mut dirs: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                dirs.sort();
+                next.extend(dirs);
+            }
+        }
+        level = next;
+    }
+    None
+}
+
+/// The most one repository's results archive may expand to.
+pub const ARTIFACT_LIMIT: u64 = 2 << 30;
 
 /// Replace the remembered run `id` in the file at `path` with `run`.
 pub fn update_submitted(path: &Path, run: &Submitted) -> std::io::Result<()> {
@@ -688,5 +824,72 @@ mod tests {
         let runs = load_submitted(&path);
         assert_eq!(runs.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
         assert!(runs[0].progress.as_ref().is_some_and(|p| p.is_done()));
+    }
+    #[test]
+    fn repository_results_are_found_and_combined_per_repository() {
+        let task = r#"{"analysis_status": "succeeded", "artifact_url": "https://x/a.zip", "database_commit_sha": "abc"}"#;
+        assert_eq!(
+            parse_artifact(task).unwrap(),
+            (String::from("https://x/a.zip"), Some(String::from("abc")))
+        );
+        assert!(parse_artifact(r#"{"analysis_status": "failed", "artifact_url": ""}"#).is_err());
+        assert_eq!(
+            repo_task_args("me/ctl", 7, "a/b"),
+            [
+                "api",
+                "repos/me/ctl/code-scanning/codeql/variant-analyses/7/repos/a/b"
+            ]
+        );
+
+        let mut run =
+            parse_submission(r#"{"id": 7}"#, "me/ctl", Path::new("/q.ql"), "go", 0).unwrap();
+        run.progress = parse_progress(
+            r#"{"status": "succeeded", "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 2},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "succeeded", "result_count": 0},
+                {"repository": {"full_name": "e/f"}, "analysis_status": "failed"}]}"#,
+        )
+        .ok();
+        assert_eq!(repos_with_results(&run), ["a/b"]);
+
+        let one = r#"{"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "CodeQL"}}, "results": [{"message": {"text": "x"}}]}]}"#;
+        let combined = combine_sarif(&[
+            (
+                String::from("a/b"),
+                Some(String::from("abc")),
+                one.to_string(),
+            ),
+            (String::from("c/d"), None, one.to_string()),
+        ])
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&combined).unwrap();
+        assert_eq!(v["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["runs"][0]["versionControlProvenance"][0],
+            serde_json::json!({"repositoryUri": "https://github.com/a/b", "revisionId": "abc"})
+        );
+        assert!(
+            v["runs"][1]["versionControlProvenance"][0]
+                .get("revisionId")
+                .is_none()
+        );
+        assert!(
+            crate::sarif::load::parse_log(&combined).is_ok(),
+            "the viewer reads it"
+        );
+        assert!(combine_sarif(&[(String::from("a/b"), None, String::from("{"))]).is_err());
+
+        let csv = combine_csv(&[
+            (String::from("a/b"), String::from("\"col\"\n\"1\"\n")),
+            (String::from("c/\"d"), String::from("\"col\"\n\"2\"\n\n")),
+        ]);
+        assert_eq!(
+            csv,
+            "\"repository\",\"col\"\n\"a/b\",\"1\"\n\"c/\"\"d\",\"2\"\n"
+        );
+        assert!(artifact_url_allowed(
+            "https://objects.githubusercontent.com/x"
+        ));
+        assert!(!artifact_url_allowed("http://example.com/x"));
     }
 }

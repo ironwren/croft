@@ -61020,6 +61020,214 @@ echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no
 }
 
 #[test]
+fn codeql_variant_results_are_fetched_once_and_opened_per_repository() {
+    // #578: a finished variant analysis's results. Each repository with
+    // results has its artifact downloaded (once), its alerts gathered into
+    // one SARIF log with a run per repository, its tables into one CSV.
+    use crate::codeql_submit::{parse_progress, parse_submission, record_submitted};
+    use crate::widgets::command_palette::Command;
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_of = |name: &str, body: &str| {
+            let mut out = std::io::Cursor::new(Vec::new());
+            let mut z = zip::ZipWriter::new(&mut out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            z.start_file(name, opts).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+            z.finish().unwrap();
+            out.into_inner()
+        };
+        let sarif = r#"{"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "CodeQL"}}, "results": [{"ruleId": "r", "message": {"text": "found it"}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/x.py"}, "region": {"startLine": 4}}}]}]}]}"#;
+        let files = std::sync::Arc::new(vec![
+            ("/ab.zip", zip_of("results/results.sarif", sarif)),
+            ("/cd.zip", zip_of("results.bqrs", "binary")),
+        ]);
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let (files, served) = (files.clone(), served.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                            break;
+                        }
+                    }
+                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = files
+                        .iter()
+                        .find(|(p, _)| *p == path)
+                        .map(|(_, b)| b.clone());
+                    let mut stream = stream;
+                    match body {
+                        Some(b) => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                b.len()
+                            );
+                            let _ = stream.write_all(&b);
+                        }
+                        None => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        let log = tmp.path().join("log");
+        let stub = |name: &str, body: String| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let gh = stub(
+            "gh",
+            format!(
+                r#"#!/bin/sh
+echo "gh $*" >> '{log}'
+case "$2" in
+  */repos/a/b) echo '{{"analysis_status": "succeeded", "artifact_url": "http://127.0.0.1:{port}/ab.zip", "database_commit_sha": "abc"}}' ;;
+  */repos/c/d) echo '{{"analysis_status": "succeeded", "artifact_url": "http://127.0.0.1:{port}/cd.zip"}}' ;;
+  *) echo 'HTTP 404: Not Found' >&2; exit 1 ;;
+esac
+"#,
+                log = log.display()
+            ),
+        );
+        let codeql = stub(
+            "codeql",
+            format!(
+                r#"#!/bin/sh
+echo "codeql $*" >> '{log}'
+out="${{4#--output=}}"; printf '"name","count"\n"x","1"\n' > "$out"
+"#,
+                log = log.display()
+            ),
+        );
+
+        let mut run = parse_submission(
+            r#"{"id": 9}"#,
+            "me/ctl",
+            std::path::Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        run.progress = parse_progress(
+            r#"{"status": "succeeded", "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 1},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "succeeded", "result_count": 1},
+                {"repository": {"full_name": "e/f"}, "analysis_status": "succeeded", "result_count": 4},
+                {"repository": {"full_name": "g/h"}, "analysis_status": "succeeded", "result_count": 0}]}"#,
+        )
+        .ok();
+        record_submitted(&App::codeql_variant_runs_path(), run).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh;
+        app.set_codeql_program(codeql);
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !app.drain_codeql_variant_results() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the fetch never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        app.run_command(Command::CodeqlOpenVariantResults);
+        assert!(
+            app.status
+                .starts_with("Fetching the results of 3 repositories"),
+            "{}",
+            app.status
+        );
+        finish(&mut app);
+        let dir = croft_cache_dir().join("codeql/variant-results/me-ctl-9");
+        assert!(
+            app.status
+                .starts_with("Results of 2 repositories; tables in "),
+            "{}",
+            app.status
+        );
+        assert!(
+            app.status.ends_with("; e/f failed: HTTP 404: Not Found"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(dir.join("results.sarif").as_path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("results.csv")).unwrap(),
+            "\"repository\",\"name\",\"count\"\n\"c/d\",\"x\",\"1\"\n"
+        );
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A location in another repository opens on GitHub at its commit.
+        let view = app.editor.sarif.as_mut().expect("the SARIF viewer is open");
+        assert_eq!(view.entries.len(), 1);
+        view.selected = view
+            .rows()
+            .iter()
+            .position(|r| matches!(r, crate::sarif::view::Row::Item { .. }))
+            .unwrap();
+        app.open_sarif_loc(&crate::sarif::details::LocRef {
+            label: "src/x.py".into(),
+            uri: "src/x.py".into(),
+            line: 4,
+            column: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.status,
+            "Open https://github.com/a/b/blob/abc/src/x.py#L4"
+        );
+
+        // Opening again uses the downloaded copies.
+        let gh_calls = std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("gh api")
+            .count();
+        app.run_command(Command::CodeqlOpenVariantResults);
+        finish(&mut app);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "nothing downloaded twice"
+        );
+        let again = std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("gh api")
+            .count();
+        assert_eq!(
+            again,
+            gh_calls + 1,
+            "only the failed repository is asked again"
+        );
+    });
+}
+
+#[test]
 fn codeql_code_search_adds_the_repositories_it_finds_to_the_selected_list() {
     // #578: VS Code's "Add repositories with GitHub Code Search". The search
     // runs off the UI thread, page by page, scoped to the side bar's
