@@ -57908,9 +57908,13 @@ impl App {
                 let region = physical.region.as_ref();
                 let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
                 let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
-                let place = region
-                    .cloned()
-                    .map(|r| (r, crate::sarif::region::newline_sequences(run)));
+                let place = region.cloned().map(|r| {
+                    (
+                        r,
+                        physical.context_region.clone(),
+                        crate::sarif::region::newline_sequences(run),
+                    )
+                });
                 let embedded = found
                     .is_none()
                     .then(|| crate::sarif::resolve::embedded_contents(run, artifact))
@@ -57965,9 +57969,11 @@ impl App {
             .find(|t| t.path.as_deref() == Some(path.as_path()) && !t.has_non_text_view())
             .map(|t| t.lines.join("\n"))
             .or_else(|| std::fs::read_to_string(&path).ok());
-        let located = place.zip(text).and_then(|((region, newlines), text)| {
-            crate::sarif::region::locate(&region, &text, &newlines, kind)
-        });
+        let located = place
+            .zip(text)
+            .and_then(|((region, context, newlines), text)| {
+                crate::sarif::region::locate(&region, context.as_ref(), &text, &newlines, kind)
+            });
         self.editor.pin_active();
         let (opened, line, moved) = match located {
             // Columns are code points once located.
@@ -58657,19 +58663,14 @@ impl App {
     /// as one undoable edit that stays unsaved, then mark the result fixed.
     fn apply_sarif_fix(&mut self, index: usize) {
         let root = self.workspace_root().to_path_buf();
-        let Some((log_path, run_i, result_i, run, fix)) =
+        let Some((log_path, run_i, result_i, run, result, what)) =
             self.editor.sarif.as_ref().and_then(|v| {
                 let e = v.selected_entry()?;
                 let loaded = v.logs.get(e.log)?;
                 let run = loaded.log.runs.get(e.run)?.clone();
-                let fix = run
-                    .results
-                    .as_ref()?
-                    .get(e.result)?
-                    .fixes
-                    .get(index)?
-                    .clone();
-                Some((loaded.path.clone(), e.run, e.result, run, fix))
+                let result = run.results.as_ref()?.get(e.result)?.clone();
+                let what = crate::sarif::fixes::fix_description(&result, index)?;
+                Some((loaded.path.clone(), e.run, e.result, run, result, what))
             })
         else {
             self.status = String::from("This result offers no fix");
@@ -58695,7 +58696,7 @@ impl App {
                     s
                 })
         };
-        let edits = match crate::sarif::fixes::apply_fix(&run, &fix, &resolver, &mut |p| {
+        let edits = match crate::sarif::fixes::fix_for(&run, &result, index, &resolver, &mut |p| {
             open_text(p).or_else(|| std::fs::read_to_string(p).ok())
         }) {
             Ok(e) => e,
@@ -58730,11 +58731,6 @@ impl App {
         }
         // Republish without the fixed result.
         self.sarif_diag_signature.clear();
-        let what = fix
-            .description
-            .as_ref()
-            .and_then(|m| m.text.clone())
-            .unwrap_or_else(|| String::from("the fix"));
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 
