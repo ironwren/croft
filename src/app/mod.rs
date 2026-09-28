@@ -26070,8 +26070,8 @@ impl App {
         self.status = format!("Running {name} on {}\u{2026}", db.name);
     }
 
-    /// Run `codeql` with `args` and wait. A failure is the first line it
-    /// printed on stderr, where the CLI puts the reason.
+    /// Run `codeql` with `args` and wait. A failure is the reason and the
+    /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
         let out = std::process::Command::new(program)
             .args(args)
@@ -26080,13 +26080,9 @@ impl App {
         if out.status.success() {
             return Ok(());
         }
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("codeql failed")
-            .to_string())
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
     }
 
     /// Collect a finished query run (#578): record how it went in the
