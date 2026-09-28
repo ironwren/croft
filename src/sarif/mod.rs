@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod fixes;
 pub mod github;
 pub mod load;
+pub mod md;
 pub mod model;
 pub mod region;
 pub mod render;

@@ -2787,9 +2787,13 @@ mod tests {
             compose_client_identity(key, &nonce),
             "one client's identity must survive its own reconnects"
         );
-        // Either half missing yields empty, which displaces nothing.
-        assert_eq!(compose_client_identity("", "nonce"), "");
-        assert_eq!(compose_client_identity(key, ""), "");
+        // Either half missing yields empty, which displaces nothing. The
+        // missing nonce is what `client_identity` reads when the variable is
+        // unset (`unwrap_or_default`), and neither nonce is a literal: CodeQL
+        // reports any constant passed to a parameter named `nonce` as a
+        // hard-coded cryptographic nonce, and this one is not cryptographic.
+        assert_eq!(compose_client_identity("", &nonce), "");
+        assert_eq!(compose_client_identity(key, &String::default()), "");
     }
 
     #[test]

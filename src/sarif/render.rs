@@ -435,8 +435,13 @@ fn render_details(
                     super::semantics::Segment::UriLink { text, uri } => format!("{text} <{uri}>"),
                 })
                 .collect();
-            for l in wrap(&message, w) {
-                lines.push((l, text));
+            match &d.message_markdown {
+                Some(md) => push_markdown(&mut lines, md, w, text, dim),
+                None => {
+                    for l in wrap(&message, w) {
+                        lines.push((l, text));
+                    }
+                }
             }
             lines.push((String::new(), text));
             for l in &d.locations {
@@ -453,15 +458,23 @@ fn render_details(
             }
             if !d.description.is_empty() {
                 lines.push((String::new(), text));
-                for l in wrap(&d.description, w) {
-                    lines.push((l, dim));
+                if d.description_markdown {
+                    push_markdown(&mut lines, &d.description, w, dim, dim);
+                } else {
+                    for l in wrap(&d.description, w) {
+                        lines.push((l, dim));
+                    }
                 }
             }
             if !d.help.is_empty() {
                 lines.push((String::new(), text));
                 lines.push(("help".to_string(), text.add_modifier(Modifier::BOLD)));
-                for l in wrap(&d.help, w) {
-                    lines.push((l, text));
+                if d.help_markdown {
+                    push_markdown(&mut lines, &d.help, w, text, dim);
+                } else {
+                    for l in wrap(&d.help, w) {
+                        lines.push((l, text));
+                    }
                 }
             }
             if let Some(u) = &d.help_uri {
@@ -598,6 +611,19 @@ fn render_details(
     }
 }
 
+/// Markdown laid out for the details pane: headings bold, code dim.
+fn push_markdown(lines: &mut Vec<(String, Style)>, md: &str, w: usize, text: Style, dim: Style) {
+    use super::md::LineKind;
+    for (l, kind) in super::md::lines(md, w) {
+        let style = match kind {
+            LineKind::Text => text,
+            LineKind::Heading => text.add_modifier(Modifier::BOLD),
+            LineKind::Code => dim,
+        };
+        lines.push((l, style));
+    }
+}
+
 /// Space's source preview (#577): the file, then its numbered lines with
 /// the result's line marked.
 #[allow(clippy::too_many_arguments)]
@@ -638,7 +664,7 @@ fn render_preview(
 }
 
 /// Greedy word wrap to `width` columns; a word longer than a line is split.
-fn wrap(s: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(s: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for para in s.lines() {
         let mut line = String::new();
