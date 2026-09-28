@@ -666,6 +666,43 @@ pub struct HistoryEntry {
     /// History saved before renaming existed reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// How many results a successful run produced: table rows, or SARIF
+    /// results (#578). `None` while running, after a failure, and for
+    /// history saved before counts were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<u64>,
+}
+
+/// How many results `output` holds: the rows of a CSV table (its header
+/// aside), or the results of every run of a SARIF log. `None` when it
+/// cannot be read.
+pub fn count_results(output: &Path) -> Option<u64> {
+    let is_csv = output
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    if is_csv {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_path(output)
+            .ok()?;
+        let mut n = 0u64;
+        for record in reader.records() {
+            record.ok()?;
+            n += 1;
+        }
+        return Some(n);
+    }
+    let log: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(output).ok()?).ok()?;
+    Some(
+        log.get("runs")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| r.get("results").and_then(|v| v.as_array()))
+            .map(|r| r.len() as u64)
+            .sum(),
+    )
 }
 
 impl HistoryEntry {
@@ -710,10 +747,17 @@ impl HistoryEntry {
         }
         let name = self.query_name();
         match &self.status {
-            RunStatus::Succeeded => format!(
-                "\u{2713} {name} \u{b7} {} \u{b7} {}s",
-                self.database, self.seconds
-            ),
+            RunStatus::Succeeded => {
+                let count = match self.results {
+                    Some(1) => String::from(" \u{b7} 1 result"),
+                    Some(n) => format!(" \u{b7} {n} results"),
+                    None => String::new(),
+                };
+                format!(
+                    "\u{2713} {name} \u{b7} {} \u{b7} {}s{count}",
+                    self.database, self.seconds
+                )
+            }
             RunStatus::Failed(why) => format!(
                 "\u{2717} {name} \u{b7} {} \u{b7} failed: {why}",
                 self.database
@@ -725,9 +769,8 @@ impl HistoryEntry {
     }
 }
 
-/// The orders the Query History section sorts by. VS Code also sorts by
-/// result count; croft's history does not record counts, so the third
-/// order groups runs by how they ended instead.
+/// The orders the Query History section sorts by, VS Code's three plus
+/// grouping runs by how they ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HistSort {
     /// Newest first.
@@ -736,6 +779,9 @@ pub enum HistSort {
     Name,
     /// Succeeded, then failed, then running; newest first within each.
     Status,
+    /// Most results first; runs without a count last, newest first among
+    /// equals.
+    Count,
 }
 
 impl HistSort {
@@ -744,7 +790,8 @@ impl HistSort {
         match self {
             HistSort::Date => HistSort::Name,
             HistSort::Name => HistSort::Status,
-            HistSort::Status => HistSort::Date,
+            HistSort::Status => HistSort::Count,
+            HistSort::Count => HistSort::Date,
         }
     }
 
@@ -753,6 +800,7 @@ impl HistSort {
             HistSort::Date => "date",
             HistSort::Name => "name",
             HistSort::Status => "status",
+            HistSort::Count => "result count",
         }
     }
 }
@@ -857,6 +905,9 @@ impl History {
                 };
                 (rank, Reverse(e.started))
             }),
+            HistSort::Count => self
+                .entries
+                .sort_by_key(|e| (e.results.is_none(), Reverse(e.results), Reverse(e.started))),
         }
         self.sort_by = by;
     }
@@ -1033,6 +1084,7 @@ mod tests {
             status,
             output: PathBuf::from(out),
             name: None,
+            results: None,
         };
         let history = History {
             entries: vec![
@@ -1288,6 +1340,7 @@ mod tests {
             status,
             output: PathBuf::from("/out/r.sarif"),
             name: None,
+            results: None,
         }
     }
 
@@ -1412,7 +1465,48 @@ mod tests {
         assert_eq!(History::load(&path).sort_by, HistSort::Status, "saved");
         h.sort(HistSort::Date);
         assert_eq!(started(&h), [5, 4, 3, 2, 1]);
-        assert_eq!(HistSort::Status.next(), HistSort::Date);
+        assert_eq!(HistSort::Status.next(), HistSort::Count);
+        assert_eq!(HistSort::Count.next(), HistSort::Date);
+    }
+
+    #[test]
+    fn history_sorts_by_result_count_and_labels_show_it() {
+        let mut h = History::default();
+        let counted = |q: &str, t: u64, n: Option<u64>| HistoryEntry {
+            results: n,
+            ..run(q, t, RunStatus::Succeeded)
+        };
+        h.push(counted("a.ql", 1, Some(3)));
+        h.push(counted("b.ql", 2, None));
+        h.push(counted("c.ql", 3, Some(40)));
+        h.push(counted("d.ql", 4, Some(3)));
+        h.sort(HistSort::Count);
+        assert_eq!(started(&h), [3, 4, 1, 2], "most first, uncounted last");
+        assert!(h.entries[0].label().ends_with("12s \u{b7} 40 results"));
+        assert!(h.entries[3].label().ends_with("12s"), "no count, no suffix");
+        assert!(
+            counted("e.ql", 5, Some(1))
+                .label()
+                .ends_with("\u{b7} 1 result")
+        );
+    }
+
+    #[test]
+    fn results_are_counted_from_a_table_or_a_sarif_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("results.csv");
+        std::fs::write(&csv, "col0,col1\n1,\"two\nlines\"\n3,x\n").unwrap();
+        assert_eq!(count_results(&csv), Some(2), "a quoted newline is one row");
+        std::fs::write(&csv, "col0\n").unwrap();
+        assert_eq!(count_results(&csv), Some(0));
+        let sarif = dir.path().join("results.sarif");
+        std::fs::write(
+            &sarif,
+            r#"{"version":"2.1.0","runs":[{"results":[{},{}]},{"results":[{}]},{}]}"#,
+        )
+        .unwrap();
+        assert_eq!(count_results(&sarif), Some(3));
+        assert_eq!(count_results(&dir.path().join("missing.sarif")), None);
     }
 
     #[test]
