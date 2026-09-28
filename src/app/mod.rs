@@ -30363,6 +30363,10 @@ impl App {
                 self.close_input_prompt();
                 self.submit_sarif_add_log(&value);
             }
+            InputPurpose::SarifColumns => {
+                self.close_input_prompt();
+                self.submit_sarif_columns(&value);
+            }
             InputPurpose::SarifBaseline => {
                 self.close_input_prompt();
                 self.submit_sarif_baseline(&value);
@@ -57281,6 +57285,20 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('C') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                let current = crate::sarif::view::columns_text(&view.columns);
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::SarifColumns,
+                        String::from("SARIF Columns"),
+                        String::from(
+                            "rule, level, kind, baseline, suppression, tool (empty for none)",
+                        ),
+                    )
+                    .with_value(current),
+                );
+            }
             KeyCode::Char('f') => self.apply_sarif_fix(0),
             KeyCode::Char('o') => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
@@ -58334,6 +58352,32 @@ impl App {
         }
         self.status = format!("Opened the log's own copy of {uri} (read-only)");
         Ok(())
+    }
+
+    /// Set the SARIF results list's optional columns from what the user
+    /// typed, remember them for every viewer, and apply them to each open
+    /// one (#577).
+    fn submit_sarif_columns(&mut self, value: &str) {
+        let cols = match crate::sarif::view::parse_columns(value) {
+            Ok(c) => c,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        for tab in self.editor.editors.iter_mut() {
+            if let Some(view) = tab.sarif.as_mut() {
+                view.columns = cols.clone();
+            }
+        }
+        self.status = match crate::sarif::view::save_columns(&cols) {
+            Ok(()) if cols.is_empty() => String::from("SARIF columns: position and message only"),
+            Ok(()) => format!(
+                "SARIF columns: {}",
+                crate::sarif::view::columns_text(&cols).replace(',', ", ")
+            ),
+            Err(e) => format!("Columns set, but not saved: {e}"),
+        };
     }
 
     /// The paths of the files open in editor tabs, for SARIF resolution.

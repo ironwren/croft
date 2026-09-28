@@ -121,6 +121,8 @@ pub enum InputPurpose {
     },
     /// Another SARIF log to merge into the open viewer (#577).
     SarifAddLog,
+    /// The SARIF results list's optional columns, comma-separated (#577).
+    SarifColumns,
     /// A baseline SARIF log to compare the open viewer against (#577).
     SarifBaseline,
     /// Where to write the SARIF viewer's visible results as CSV (#577).
