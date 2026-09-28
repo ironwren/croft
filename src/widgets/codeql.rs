@@ -24,17 +24,19 @@ pub enum Section {
     VariantAnalysis,
     QueryHistory,
     AstViewer,
+    EvaluatorLog,
     MethodModeling,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Language,
         Section::Databases,
         Section::Queries,
         Section::VariantAnalysis,
         Section::QueryHistory,
         Section::AstViewer,
+        Section::EvaluatorLog,
         Section::MethodModeling,
     ];
 
@@ -46,6 +48,7 @@ impl Section {
             Section::VariantAnalysis => "VARIANT ANALYSIS REPOSITORIES",
             Section::QueryHistory => "QUERY HISTORY",
             Section::AstViewer => "AST VIEWER",
+            Section::EvaluatorLog => "EVALUATOR LOG VIEWER",
             Section::MethodModeling => "METHOD MODELING",
         }
     }
@@ -65,6 +68,13 @@ pub enum Action {
     AstNode(usize),
     /// Forget the AST shown.
     ClearAst,
+    /// Predicate `.0` of the evaluator log shown, or a line under it: fold
+    /// or unfold it.
+    EvalPredicate(usize),
+    /// A dependency: go to the predicate it names, when the log has it.
+    EvalDependency(Option<usize>),
+    /// Forget the evaluator log shown.
+    ClearEvalLog,
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
@@ -176,6 +186,8 @@ pub struct CodeqlPanel {
     pub variant_runs: Vec<String>,
     /// The AST the AST Viewer section shows, once one has been read.
     pub ast: Option<crate::codeql_ast::AstView>,
+    /// The evaluator log the Evaluator Log Viewer section shows.
+    pub evallog: Option<crate::codeql_evallog::LogView>,
 }
 
 impl CodeqlPanel {
@@ -223,6 +235,16 @@ impl CodeqlPanel {
             .position(|l| matches!(l, Line::Action(Action::SelectDatabase(i), _) if *i == index))
         {
             self.selected = n;
+        }
+    }
+
+    /// Select the Evaluator Log Viewer row of predicate `i`.
+    pub fn select_evallog_predicate(&mut self, i: usize) {
+        let row = self.lines().iter().position(|l| {
+            matches!(l, Line::Action(Action::EvalPredicate(p), t) if *p == i && !t.starts_with(' '))
+        });
+        if let Some(row) = row {
+            self.selected = row;
         }
     }
 
@@ -579,6 +601,29 @@ impl CodeqlPanel {
                         out.push(Line::Text("Run 'CodeQL: View AST' on an open source"));
                         out.push(Line::Text("file from a CodeQL database."));
                         out.push(Line::Action(Action::ViewAst, "View AST".to_string()));
+                    }
+                },
+                Section::EvaluatorLog => match &self.evallog {
+                    Some(view) => {
+                        out.push(Line::Action(
+                            Action::ClearEvalLog,
+                            format!("Clear \u{b7} {}", view.query),
+                        ));
+                        use crate::codeql_evallog::LogRow;
+                        for row in view.rows() {
+                            out.push(match row {
+                                LogRow::Predicate(i, text) | LogRow::Detail(i, text) => {
+                                    Line::Action(Action::EvalPredicate(i), text)
+                                }
+                                LogRow::Dependency(_, target, text) => {
+                                    Line::Action(Action::EvalDependency(target), text)
+                                }
+                            });
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Run 'Show Evaluator Log (Viewer)' on a"));
+                        out.push(Line::Text("query history item."));
                     }
                 },
                 Section::MethodModeling => {

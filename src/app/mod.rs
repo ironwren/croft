@@ -3165,7 +3165,7 @@ pub struct App {
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
     /// The evaluator log viewer being prepared (#578): where the rendered
     /// tree (or why there is none) arrives, and the tab label to show it in.
-    codeql_log_viewer: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    codeql_log_viewer: Option<CodeqlLogViewerJob>,
     /// The performance comparison being prepared (#578): where the rendered
     /// table (or why there is none) arrives, and the tab label to show it in.
     codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
@@ -23589,6 +23589,27 @@ impl App {
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
             Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::ClearEvalLog) => {
+                self.codeql.evallog = None;
+                self.status = String::from("Cleared the evaluator log");
+            }
+            Hit::Action(Action::EvalPredicate(i)) => {
+                if let Some(view) = self.codeql.evallog.as_mut() {
+                    view.toggle(i);
+                }
+            }
+            Hit::Action(Action::EvalDependency(target)) => match target {
+                Some(i) => {
+                    if let Some(view) = self.codeql.evallog.as_mut() {
+                        view.open.insert(i);
+                    }
+                    self.codeql.select_evallog_predicate(i);
+                }
+                None => {
+                    self.status =
+                        String::from("That predicate is not in this log (it was cached or inlined)")
+                }
+            },
             Hit::Action(Action::ClearAst) => {
                 self.codeql.ast = None;
                 self.status = String::from("Cleared the AST");
@@ -25207,14 +25228,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let name = query.clone();
         std::thread::spawn(move || {
-            let tree = Self::codeql_log_predicates(&program, &log)
-                .map(|parsed| crate::codeql_evallog::render(&name, &parsed));
-            let _ = tx.send(tree);
+            let _ = tx.send(Self::codeql_log_predicates(&program, &log));
         });
         self.status = String::from("Reading the evaluator log\u{2026}");
-        self.codeql_log_viewer = Some((rx, format!("Evaluator Log ({query})")));
+        self.codeql_log_viewer = Some((rx, query));
     }
 
     /// Show a prepared evaluator log tree (#578) in a tab with every
@@ -25230,10 +25248,21 @@ impl App {
                 Err(String::from("the viewer stopped unexpectedly"))
             }
         };
-        let Some((_, label)) = self.codeql_log_viewer.take() else {
+        let Some((_, query)) = self.codeql_log_viewer.take() else {
             return false;
         };
-        match outcome.and_then(|text| {
+        let label = format!("Evaluator Log ({query})");
+        match outcome.and_then(|predicates| {
+            let text = crate::codeql_evallog::render(&query, &predicates);
+            // The side bar's Evaluator Log Viewer shows the same tree.
+            self.codeql.evallog = Some(crate::codeql_evallog::LogView {
+                query: query.clone(),
+                predicates,
+                ..Default::default()
+            });
+            self.codeql
+                .collapsed
+                .remove(&crate::widgets::codeql::Section::EvaluatorLog);
             self.editor
                 .open_text_buffer(Path::new(&label), &text)
                 .map_err(|e| e.to_string())
@@ -64615,6 +64644,13 @@ type CodeqlPackJob = (
 type CodeqlDocJob = (
     std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     String,
+    String,
+);
+
+/// An evaluator log being read for its viewer (#578): the predicates, or
+/// why not, and the query whose log it is.
+type CodeqlLogViewerJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
     String,
 );
 
