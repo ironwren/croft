@@ -880,6 +880,41 @@ impl SarifView {
         true
     }
 
+    /// The results that are not problems: `pass`, `notApplicable` and
+    /// `informational` (§3.27.9). `K` hides or shows them together.
+    pub const NON_PROBLEM_KINDS: [Kind; 3] = [Kind::Pass, Kind::NotApplicable, Kind::Informational];
+
+    /// Hide the non-problem kinds, or show them again when they are hidden
+    /// (#577). Returns whether they are hidden now.
+    pub fn toggle_non_problem_kinds(&mut self) -> bool {
+        let keep = self.selected_index();
+        let hidden = Self::NON_PROBLEM_KINDS
+            .iter()
+            .all(|k| self.filters.hidden_kinds.contains(k));
+        for k in Self::NON_PROBLEM_KINDS {
+            if hidden {
+                self.filters.hidden_kinds.remove(&k);
+            } else {
+                self.filters.hidden_kinds.insert(k);
+            }
+        }
+        self.reselect(keep);
+        !hidden
+    }
+
+    /// Close every log but the first, the one the viewer was opened on
+    /// (#577, VS Code's "close all"). Returns how many were closed.
+    pub fn close_added_logs(&mut self) -> usize {
+        let closed = self.logs.len().saturating_sub(1);
+        if closed == 0 {
+            return 0;
+        }
+        self.logs.truncate(1);
+        self.baseline = self.baseline.filter(|&b| b == 0);
+        self.rebuild_entries();
+        closed
+    }
+
     /// Close log `index`. The last log stays: closing it is closing the tab.
     pub fn remove_log(&mut self, index: usize) -> bool {
         if self.logs.len() <= 1 || index >= self.logs.len() {
@@ -1516,6 +1551,42 @@ mod tests {
     }
 
     // ── export ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn k_hides_and_shows_the_non_problem_kinds_together() {
+        let mut v = sample();
+        v.entries[1].kind = Kind::Pass;
+        v.entries[3].kind = Kind::Informational;
+        v.entries[4].kind = Kind::Review;
+        assert_eq!(v.visible().len(), 5);
+        assert!(v.toggle_non_problem_kinds());
+        let shown: Vec<usize> = v.visible().iter().map(|&i| v.entries[i].result).collect();
+        assert!(!shown.contains(&1) && !shown.contains(&3), "{shown:?}");
+        assert!(shown.contains(&4), "review is a problem kind");
+        assert!(!v.toggle_non_problem_kinds());
+        assert_eq!(v.visible().len(), 5);
+    }
+
+    #[test]
+    fn closing_the_added_logs_keeps_the_viewers_own() {
+        let log = |rule: &str| {
+            super::super::load::parse_log(&format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{{"ruleId":"{rule}","message":{{"text":"m"}}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        let mut v = SarifView::open(std::path::Path::new("/own.sarif"), log("A"));
+        assert_eq!(v.close_added_logs(), 0);
+        assert!(v.add_log(std::path::Path::new("/b.sarif"), log("B")));
+        assert!(v.add_log(std::path::Path::new("/c.sarif"), log("C")));
+        v.baseline = Some(2);
+        assert_eq!(v.entries.len(), 3);
+        assert_eq!(v.close_added_logs(), 2);
+        assert_eq!(v.logs.len(), 1);
+        assert_eq!(v.logs[0].path, std::path::Path::new("/own.sarif"));
+        assert_eq!(v.entries.len(), 1);
+        assert_eq!(v.baseline, None, "the baseline went with its log");
+    }
 
     #[test]
     fn export_csv_lists_the_visible_results_with_quoting() {
