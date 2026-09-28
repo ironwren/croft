@@ -56938,6 +56938,43 @@ fn a_successful_query_run_records_its_result_count() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_runs_query_text_is_kept_as_it_was_when_it_ran() {
+    // #578: "View Query Text" shows the query a run used, even after the
+    // file has changed.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        std::fs::write(tmp.path().join("q.ql"), "import rust\nselect 2").unwrap();
+
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_history(0);
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+        let opened = app.editor.path.clone().expect("the query text opened");
+        assert!(
+            opened.starts_with(App::codeql_results_dir()),
+            "{opened:?}: {}",
+            app.status
+        );
+        assert_eq!(opened.file_name().unwrap(), "q.ql");
+        assert_eq!(app.editor.lines, ["import rust", "select 1"]);
+        assert!(
+            app.status.contains("as it was when it ran"),
+            "{}",
+            app.status
+        );
+    });
+}
+
 #[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
