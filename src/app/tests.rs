@@ -56956,6 +56956,126 @@ fn the_ast_viewer_shows_the_open_files_tree_and_goes_to_its_code() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn view_cfg_opens_the_control_flow_at_the_cursor_as_a_document() {
+    // #578: View CFG runs the language pack's print-cfg query for the
+    // cursor's position and opens the graph as a read-only document.
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let src = tmp.path().join("app.py");
+        std::fs::write(&src, "import os\n\ndef run(cmd):\n    os.system(cmd)\n").unwrap();
+        let query = bin.path().join("printCfg.ql");
+        std::fs::write(&query, "select 1").unwrap();
+        let reply = serde_json::json!({"mermaid": {"tuples": [[
+            "flowchart TD\n1[\"Entry\"]\n2[\"Exit\"]\n3[\"os.system(cmd)\"]\n1 --> 3\n3 --> 2"
+        ]]}});
+        std::fs::write(bin.path().join("cfg.json"), reply.to_string()).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1 $2\" in 'resolve queries') echo '[\"{query}\"]'; exit 0 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{reply}' \"${{a#--output=}}\" ;; --external=selectedSourceLine=*) cp \"${{a#--external=selectedSourceLine=}}\" '{line}' ;; esac; done\nexit 0\n",
+            log = bin.path().join("calls.log").display(),
+            query = query.display(),
+            reply = bin.path().join("cfg.json").display(),
+            line = bin.path().join("line.csv").display(),
+        );
+        let program = bin.path().join("codeql");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.codeql_program = program;
+
+        app.editor.open(&src).unwrap();
+        app.editor.cursor_row = 2;
+        app.run_command(crate::widgets::command_palette::Command::CodeqlViewCfg);
+        assert_eq!(
+            app.status,
+            "Reading the control flow graph at app.py:3\u{2026}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_cfg() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.status, "Control flow graph");
+        let doc = app.editor.path.clone().unwrap();
+        assert!(doc.starts_with(croft_cache_dir()), "{doc:?}");
+        let text = app.editor.lines.join("\n");
+        assert!(
+            text.starts_with("# Control flow graph of app.py:3:1 in app"),
+            "{text}"
+        );
+        assert!(text.contains("- Entry \u{2192} os.system(cmd)"), "{text}");
+        assert!(text.contains("```mermaid"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(bin.path().join("line.csv")).unwrap(),
+            "3\n"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("calls.log")).unwrap();
+        assert!(calls.contains("print-cfg.qls"), "{calls}");
+    });
+}
+
+/// #578's View CFG against the real CLI: the control flow of a Python
+/// function, read with the cursor on its definition.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn view_cfg_reads_a_real_functions_control_flow() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("app.py");
+        std::fs::write(&file, "import os\n\ndef run(cmd):\n    os.system(cmd)\n").unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&file).unwrap();
+        app.editor.cursor_row = 2;
+        app.run_command(crate::widgets::command_palette::Command::CodeqlViewCfg);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while !app.drain_codeql_cfg() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status, "Control flow graph");
+        let text = app.editor.lines.join("\n");
+        assert!(text.contains("- Entry \u{2192} "), "{text}");
+        assert!(text.contains("Exit"), "{text}");
+    });
+}
+
 /// #578's AST Viewer against the real CLI: build a Python database, read
 /// the AST of its source file, and find the function in it. Needs a
 /// `codeql` with the codeql/python-all pack downloaded; set
