@@ -277,6 +277,24 @@ pub fn reanchor(region: &Region, lines: &Lines, kind: ColumnKind) -> Option<Text
     })
 }
 
+/// Where a result's region starts in `text`, the file as it is now, for
+/// opening it (#577): the snippet's new place when the file drifted since
+/// the log was written ([`reanchor`]), else the stated range, which also
+/// covers a region given only by `charOffset`. The bool says the snippet
+/// moved it. `None` for a region with no text position at all.
+pub fn locate(
+    region: &Region,
+    text: &str,
+    newlines: &[String],
+    kind: ColumnKind,
+) -> Option<(Pos, bool)> {
+    let lines = Lines::new(text, newlines);
+    if let Some(moved) = reanchor(region, &lines, kind) {
+        return Some((moved.start, true));
+    }
+    text_range(region, &lines, kind).map(|r| (r.start, false))
+}
+
 fn pos_of_byte(lines: &Lines, byte: usize) -> Pos {
     for (n, &(s, _, e)) in lines.spans.iter().enumerate() {
         if byte < e || (byte == e && n + 1 == lines.count() && byte == lines.text.len()) {
@@ -321,6 +339,32 @@ mod tests {
         let lines = Lines::new(text, &crlf());
         let r = text_range(&region(json), &lines, ColumnKind::UnicodeCodePoints).unwrap();
         slice(&lines, &r).to_string()
+    }
+
+    #[test]
+    fn locate_follows_offsets_and_moved_snippets() {
+        let kind = ColumnKind::UnicodeCodePoints;
+        // An offset-only region gets its line and column.
+        let (pos, moved) = locate(&region(r#"{"charOffset":7}"#), SPEC, &crlf(), kind).unwrap();
+        assert_eq!((pos, moved), (Pos { line: 1, col: 1 }, false));
+        // Two lines were inserted above since the scan: the snippet is
+        // followed to its new place.
+        let now = "new\r\nnew\r\nabcd\r\nefg\r\nhijk\r\n";
+        let r = region(r#"{"startLine":2,"startColumn":1,"endColumn":4,"snippet":{"text":"efg"}}"#);
+        assert_eq!(
+            locate(&r, now, &crlf(), kind),
+            Some((Pos { line: 3, col: 0 }, true))
+        );
+        // Unmoved, it is the stated place.
+        assert_eq!(
+            locate(&r, SPEC, &crlf(), kind),
+            Some((Pos { line: 1, col: 0 }, false))
+        );
+        // No text position at all.
+        assert_eq!(
+            locate(&region(r#"{"byteOffset":3}"#), SPEC, &crlf(), kind),
+            None
+        );
     }
 
     // ── run-level settings ──────────────────────────────────────────────
