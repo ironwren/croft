@@ -15025,6 +15025,7 @@ impl App {
                     let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
                     masked[start..end].to_vec()
                 },
+                host: t.host_socket().map(|s| s.display().to_string()),
             })
             .collect();
         let record = crate::terminal_session::SessionRecord {
@@ -15075,6 +15076,23 @@ impl App {
                     }
                 }
             };
+            // A shell still running in its pane host (croft was killed, not
+            // quit) is reattached as it is: its screen is redrawn by the
+            // host, and a lane's agent is still running in it (#694).
+            let reattached = p
+                .host
+                .as_deref()
+                .map(Path::new)
+                .filter(|s| crate::session::is_alive(s))
+                .and_then(|s| PtyTerminal::attach_hosted(s).ok());
+            if let Some(mut t) = reattached {
+                t.set_manual_name(p.name.clone());
+                if let Some(lane) = lane {
+                    lanes.insert(t.uid(), lane.clone());
+                }
+                terms.push(t);
+                continue;
+            }
             // The transcript is painted during the spawn, not after it: a
             // replay that follows the constructor races the new shell's
             // first prompt for the same grid (#249).
@@ -15114,6 +15132,16 @@ impl App {
         self.active_terminal = rec.active.min(self.terminals.len() - 1);
         self.sync_focus_flags();
         self.status = format!("Restored terminal session ({} panes)", self.terminals.len());
+        self.save_terminal_session_if_hosted();
+    }
+
+    /// Record the panel now when a pane's shell is in a pane host (#694):
+    /// the record is how a croft that crashes finds its shells again, so it
+    /// must not wait for the next split or a clean quit.
+    pub fn save_terminal_session_if_hosted(&mut self) {
+        if self.terminals.iter().any(|t| t.host_socket().is_some()) {
+            self.save_terminal_session();
+        }
     }
 
     /// Available terminal profiles as `(shell_path, label)`: the shells in
@@ -63521,6 +63549,8 @@ pub fn run(
     // Resurrect this workspace's terminal panel from the last session
     // (pane layout, cwds, names, focus) before the first frame paints.
     app.restore_terminal_session();
+    // A hosted default pane (#694) is recorded at once, restored or not.
+    app.save_terminal_session_if_hosted();
     // A launch from a .code-workspace file (#163) defines the folder set
     // exactly; otherwise the automatic per-primary store restores.
     if workspace_folders.is_empty() {
