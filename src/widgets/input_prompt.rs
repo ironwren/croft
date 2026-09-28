@@ -119,6 +119,12 @@ pub enum InputPurpose {
     SarifLocate {
         uri: String,
     },
+    /// The kind of Model Editor model `choice` of endpoint `endpoint`
+    /// (#578): `remote`, `command-injection`, `taint`, …
+    CodeqlModelKind {
+        endpoint: usize,
+        choice: usize,
+    },
     /// A missing SARIF file that can be downloaded from `host`, which is
     /// not yet trusted (#577). An empty value trusts `host` and downloads;
     /// a path locates the file instead, as [`InputPurpose::SarifLocate`].

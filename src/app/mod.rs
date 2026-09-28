@@ -23395,6 +23395,9 @@ impl App {
                     self.prompt_rename_codeql_variant_list(i);
                 }
             }
+            KeyCode::Char('m') if self.codeql.selected_model_endpoint().is_some() => {
+                self.model_codeql_endpoint(self.codeql.selected_model_endpoint());
+            }
             KeyCode::Char('c') if self.codeql.selected_variant_run().is_some() => {
                 self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run());
             }
@@ -26388,6 +26391,8 @@ impl App {
         };
         // Where the query server looks for the workspace's own packs.
         let packs: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        // The workspace's model packs (#578), which customize the run.
+        let models = crate::codeql_model::model_pack_args(self.workspace_root());
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // A fresh flag per run, so a late cancel never stops the next one.
@@ -26405,10 +26410,16 @@ impl App {
                         )
                         .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
                     }
-                    (None, Output::Sarif) => run(cq::analyze_args(&query, &db.path, &output)),
+                    (None, Output::Sarif) => {
+                        let mut args = cq::analyze_args(&query, &db.path, &output);
+                        args.extend(models.iter().cloned());
+                        run(args)
+                    }
                     (None, Output::Table) => {
                         let bqrs = dir.join("results.bqrs");
-                        run(cq::run_args(&query, &db.path, &bqrs))
+                        let mut args = cq::run_args(&query, &db.path, &bqrs);
+                        args.extend(models.iter().cloned());
+                        run(args)
                             .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
                     }
                 });
@@ -27159,6 +27170,161 @@ impl App {
         self.codeql_model_job = Some((rx, db.name, lang));
     }
 
+    /// Model endpoint `endpoint` of the Model Editor (#578): pick what it
+    /// is, as a source at its return value, a sink at an argument, or a
+    /// summary, or remove the models made for it.
+    fn model_codeql_endpoint(&mut self, endpoint: Option<usize>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(view) = self.codeql.model.as_ref() else {
+            self.status = String::from("Open the model editor first");
+            return;
+        };
+        let Some(e) = endpoint.and_then(|i| view.endpoints.get(i)) else {
+            self.status = String::from("Select an endpoint in Method Modeling first");
+            return;
+        };
+        let choices = e.choices();
+        if choices.is_empty() {
+            self.status = format!("{} is a class; model its methods", e.label());
+            return;
+        }
+        let i = endpoint.unwrap_or(0);
+        let mut rows: Vec<ListRow> = choices
+            .iter()
+            .enumerate()
+            .map(|(j, m)| ListRow {
+                id: format!("{i}:{j}"),
+                label: m.describe(),
+            })
+            .collect();
+        let path = e.access_path();
+        if view
+            .models
+            .iter()
+            .any(|m| m.ty == e.namespace && Some(&m.path) == path.as_ref())
+        {
+            rows.push(ListRow {
+                id: format!("{i}:remove"),
+                label: String::from("remove the models made for it"),
+            });
+        }
+        let title = format!("Model {}", e.label());
+        self.open_list_picker(ListPicker::new(ListPurpose::CodeqlModel, title, rows), "");
+    }
+
+    /// A model picked for an endpoint (`<endpoint>:<choice>` or
+    /// `<endpoint>:remove`): ask for its kind, or remove its models.
+    fn choose_codeql_model(&mut self, id: &str) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let Some((endpoint, choice)) = id.split_once(':') else {
+            return;
+        };
+        let Ok(endpoint) = endpoint.parse::<usize>() else {
+            return;
+        };
+        if choice == "remove" {
+            let Some(view) = self.codeql.model.as_mut() else {
+                return;
+            };
+            let Some(e) = view.endpoints.get(endpoint).cloned() else {
+                return;
+            };
+            let path = e.access_path();
+            view.models
+                .retain(|m| !(m.ty == e.namespace && Some(&m.path) == path.as_ref()));
+            self.status = match self.write_codeql_models() {
+                Ok(file) => format!(
+                    "Removed the models of {} from {}",
+                    e.label(),
+                    file.display()
+                ),
+                Err(why) => format!("Could not save the models: {why}"),
+            };
+            return;
+        }
+        let Ok(choice) = choice.parse::<usize>() else {
+            return;
+        };
+        let Some(model) = self
+            .codeql
+            .model
+            .as_ref()
+            .and_then(|v| v.endpoints.get(endpoint))
+            .and_then(|e| e.choices().into_iter().nth(choice))
+        else {
+            return;
+        };
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlModelKind { endpoint, choice },
+                format!("Kind of {}", model.describe()),
+                String::from("remote, command-injection, sql-injection, taint, value, \u{2026}"),
+            )
+            .with_value(model.which.default_kind()),
+        );
+    }
+
+    /// Save choice `choice` of endpoint `endpoint` with kind `kind` in the
+    /// database's model pack (#578).
+    fn save_codeql_model(&mut self, endpoint: usize, choice: usize, kind: &str) {
+        let kind = kind.trim();
+        if kind.is_empty() {
+            self.status = String::from("A model needs a kind");
+            return;
+        }
+        let Some(view) = self.codeql.model.as_mut() else {
+            return;
+        };
+        let Some(mut model) = view
+            .endpoints
+            .get(endpoint)
+            .and_then(|e| e.choices().into_iter().nth(choice))
+        else {
+            return;
+        };
+        model.kind = kind.to_string();
+        let label = view.endpoints[endpoint].label();
+        let described = model.describe();
+        view.models.retain(|m| *m != model);
+        view.models.push(model);
+        self.status = match self.write_codeql_models() {
+            Ok(file) => format!("Modeled {label} as a {described} in {}", file.display()),
+            Err(why) => format!("Could not save the model: {why}"),
+        };
+    }
+
+    /// Write the Model Editor's models to the database's model pack: its
+    /// pack file, the data extension CodeQL reads, and croft's own list.
+    /// Returns the data extension's path.
+    fn write_codeql_models(&mut self) -> Result<PathBuf, String> {
+        use crate::codeql_model as cm;
+        let view = self
+            .codeql
+            .model
+            .as_ref()
+            .ok_or("no model editor is open")?;
+        let (dir, name) = cm::model_pack(self.workspace_root(), &view.database, &view.language);
+        let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+        std::fs::create_dir_all(dir.join("models")).map_err(io)?;
+        std::fs::write(
+            dir.join("codeql-pack.yml"),
+            cm::pack_yml(&name, &view.language),
+        )
+        .map_err(io)?;
+        let slug = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file = dir.join("models").join(format!("{slug}.model.yml"));
+        std::fs::write(&file, cm::models_yml(&view.language, &view.models)).map_err(io)?;
+        let json = serde_json::to_string_pretty(&view.models).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("croft-models.json"), json).map_err(io)?;
+        Ok(file
+            .strip_prefix(self.workspace_root())
+            .unwrap_or(&file)
+            .to_path_buf())
+    }
+
     /// List a finished endpoints read under Method Modeling (#578), or say
     /// why there is none.
     pub fn drain_codeql_model(&mut self) -> bool {
@@ -27182,10 +27348,18 @@ impl App {
                     "{} endpoints of {database}, {modeled} modeled by CodeQL",
                     endpoints.len()
                 );
+                // The models made before, kept beside the pack.
+                let (dir, _) =
+                    crate::codeql_model::model_pack(self.workspace_root(), &database, &language);
+                let models = std::fs::read_to_string(dir.join("croft-models.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_default();
                 self.codeql.model = Some(crate::codeql_model::ModelView {
                     database,
                     language,
                     endpoints,
+                    models,
                     ..Default::default()
                 });
                 self.codeql
@@ -31708,6 +31882,10 @@ impl App {
                 self.close_input_prompt();
                 self.submit_sarif_locate(&value);
             }
+            InputPurpose::CodeqlModelKind { endpoint, choice } => {
+                self.close_input_prompt();
+                self.save_codeql_model(endpoint, choice, &value);
+            }
             InputPurpose::SarifTrustHost { uri, host, url } => {
                 self.close_input_prompt();
                 if value.trim().is_empty() {
@@ -34033,6 +34211,7 @@ impl App {
                     ));
                 }
             }
+            ListPurpose::CodeqlModel => self.choose_codeql_model(&row.id),
             ListPurpose::CodeqlResultSet => {
                 let path = PathBuf::from(&row.id);
                 match self.editor.open(&path) {
@@ -47174,6 +47353,9 @@ impl App {
             Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
             Cmd::CodeqlOpenModelEditor => self.open_codeql_model_editor(),
+            Cmd::CodeqlModelEndpoint => {
+                self.model_codeql_endpoint(self.codeql.selected_model_endpoint())
+            }
             Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
             Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
             Cmd::CodeqlViewAlertsSarif => self.view_codeql_alerts(false),
