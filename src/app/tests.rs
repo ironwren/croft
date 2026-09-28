@@ -42765,6 +42765,58 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
     );
 }
 
+/// #356's playback criterion with `agg`, the GIF converter: a recording
+/// with colour, a resize and a wrapped line converts without complaint.
+/// Set `CROFT_TEST_AGG` to an agg binary (`cargo install --git
+/// https://github.com/asciinema/agg`).
+#[test]
+#[ignore = "needs agg; set CROFT_TEST_AGG"]
+fn a_recorded_cast_converts_to_a_gif_with_agg() {
+    let agg = std::env::var("CROFT_TEST_AGG").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let size = |app: &mut App, w: u16, h: u16| {
+        app.terminals[0].last_inner = ratatui::layout::Rect {
+            x: 1,
+            y: 1,
+            width: w,
+            height: h,
+        };
+        app.terminals[0].resize(w, h);
+    };
+    size(&mut app, 60, 10);
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.terminals[0].feed_bytes_for_test(
+        b"\x1b[1;31mbold red\x1b[0m \x1b[30;42mblack on green\x1b[0m \x1b[4;34munderlined\x1b[0m\r\n",
+    );
+    app.record_active_screen();
+    size(&mut app, 40, 8);
+    app.terminals[0].feed_bytes_for_test(
+        "a line long enough to wrap at forty columns, with \u{4e00} wide text\r\n".as_bytes(),
+    );
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let cast = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let gif = tmp.path().join("out.gif");
+    let out = std::process::Command::new(&agg)
+        .arg(&cast)
+        .arg(&gif)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "agg refused the cast: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&gif).unwrap();
+    assert!(bytes.starts_with(b"GIF89a"), "a GIF was written");
+}
+
 /// A geometry change reaches the cast BEFORE the frame drawn at it (#397).
 ///
 /// `record_active_screen` emits the resize first so a player has the new
@@ -54535,6 +54587,58 @@ fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
     assert_eq!(saved["cells"][0]["outputs"][0]["text"][0], "2\n");
 }
 
+/// Acceptance for #355's figure criterion against a real kernel: a
+/// matplotlib plot arrives as an `image/png` display, is saved in the file,
+/// and the preview places it as an image block, the path Kitty and iTerm2
+/// hosts draw. Needs matplotlib next to ipykernel.
+#[test]
+#[ignore = "needs a Python with ipykernel and matplotlib; set CROFT_TEST_JUPYTER_PYTHON"]
+fn a_real_kernel_matplotlib_figure_becomes_an_inline_image() {
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_JUPYTER_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let venv = python.parent().and_then(Path::parent).unwrap();
+    std::os::unix::fs::symlink(venv, tmp.path().join(".venv")).unwrap();
+    let path = tmp.path().join("plot.ipynb");
+    std::fs::write(
+        &path,
+        NOTEBOOK_355.replace(
+            "\"print(1+1)\"",
+            "\"import matplotlib.pyplot as plt\\n\", \"plt.plot([1, 3, 2])\\n\", \"plt.show()\"",
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !app
+        .editor
+        .lines
+        .join("\n")
+        .contains("\"execution_count\": 1")
+    {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        app.poll_notebook_kernels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let images = &app.editor.markdown_preview.as_ref().unwrap().images;
+    assert_eq!(images.len(), 1, "the figure is one image block");
+    let bytes = std::fs::read(&images[0].path).unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"), "a PNG in scratch");
+    app.save();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let outputs = saved["cells"][0]["outputs"].as_array().unwrap();
+    assert!(
+        outputs
+            .iter()
+            .any(|o| o["output_type"] == "display_data" && o["data"]["image/png"].is_string()),
+        "{outputs:?}"
+    );
+}
+
 fn pr_screen(app: &mut App) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -55609,6 +55713,58 @@ fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
         use crate::widgets::command_palette::Command;
         assert_eq!(Command::from_id("show_codeql"), Some(Command::ShowCodeQL));
         assert_eq!(Command::ShowCodeQL.title(), "View: Show CodeQL");
+    });
+}
+
+#[test]
+fn codeql_focus_side_bar_and_open_results_directory_are_palette_commands() {
+    // #578: VS Code's "CodeQL: Focus Side Bar", and the results directory
+    // of the selected run (else the newest) without the side bar's `o`.
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.config_dir = tmp.path().join("config");
+        assert_eq!(
+            Command::from_id("codeql_focus_side_bar"),
+            Some(Command::CodeqlFocusSideBar)
+        );
+        assert_eq!(
+            Command::CodeqlFocusSideBar.title(),
+            "CodeQL: Focus Side Bar"
+        );
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.status, "No CodeQL query has run yet");
+
+        let newer = App::codeql_results_dir().join("200-a/results.csv");
+        let older = App::codeql_results_dir().join("100-b/results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("b.ql", 100, RunStatus::Succeeded, older.clone()),
+                ("a.ql", 200, RunStatus::Succeeded, newer.clone()),
+            ],
+        );
+        app.focus = Pane::Editor;
+        app.run_command(Command::CodeqlFocusSideBar);
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(app.focus == Pane::Tree, "the side bar takes the keys");
+
+        // Nothing selected in Query History: the newest run.
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.editor.path.as_deref(), Some(newer.as_path()));
+        // A selected run: that one.
+        app.codeql.select_history(1);
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(older.as_path()),
+            "{}",
+            app.status
+        );
     });
 }
 
