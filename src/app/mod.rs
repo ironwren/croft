@@ -3188,6 +3188,10 @@ pub struct App {
     codeql_variant_polled: Option<std::time::Instant>,
     /// The fetch of a variant analysis's results in flight (#578).
     codeql_variant_results: Option<std::sync::mpsc::Receiver<VariantResults>>,
+    /// The export of a variant analysis's results in flight (#578): where
+    /// it went (a folder's summary file or a gist's URL), how many
+    /// repositories it holds, and those whose results failed.
+    codeql_variant_export: Option<std::sync::mpsc::Receiver<Result<VariantExport, String>>>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5467,6 +5471,7 @@ impl App {
             codeql_variant_poll: None,
             codeql_variant_polled: None,
             codeql_variant_results: None,
+            codeql_variant_export: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23127,7 +23132,7 @@ impl App {
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
     /// opens the selected repository or owner on GitHub; on a submitted run,
-    /// Enter opens its report and `v` its results; Enter selects what a run
+    /// Enter opens its report, `v` its results and `x` exports them; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23189,6 +23194,9 @@ impl App {
                 if let Some(i) = db {
                     self.add_codeql_database_source(i);
                 }
+            }
+            KeyCode::Char('x') if self.codeql.selected_variant_run().is_some() => {
+                self.prompt_export_codeql_variant_results(self.codeql.selected_variant_run());
             }
             KeyCode::Char('v') if self.codeql.selected_variant_run().is_some() => {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run());
@@ -25362,6 +25370,186 @@ impl App {
             files.repos,
             if files.repos == 1 { "y" } else { "ies" }
         );
+        true
+    }
+
+    /// Ask where to export the results of remembered variant analysis
+    /// `index` (the newest when `None`): a folder, offered as one in the
+    /// workspace, or `gist` (#578, VS Code's "Export results").
+    fn prompt_export_codeql_variant_results(&mut self, index: Option<usize>) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let runs = crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path());
+        let Some(i) = index.or(runs.len().checked_sub(1)) else {
+            self.status = String::from("No variant analysis has been submitted yet");
+            return;
+        };
+        let Some(run) = runs.get(i) else {
+            return;
+        };
+        if crate::codeql_submit::repos_with_results(run).is_empty() {
+            self.status = format!("Variant analysis {} has no results to export", run.id);
+            return;
+        }
+        let folder = self
+            .workspace_root()
+            .join(format!("codeql-variant-analysis-{}", run.id));
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlExportVariantResults { index: i },
+                format!("Export Variant Analysis {} Results", run.id),
+                "a folder for the Markdown files, or gist for a secret gist",
+            )
+            .with_value(folder.display().to_string()),
+        );
+    }
+
+    /// Export on a worker thread: fetch the results as
+    /// [`Self::open_codeql_variant_results`] does (downloaded copies are
+    /// reused), write them as Markdown, and for `gist` post the files with
+    /// `gh gist create`.
+    fn start_export_codeql_variant_results(&mut self, index: usize, value: &str) {
+        use crate::codeql_submit as cs;
+        if self.codeql_variant_export.is_some() {
+            self.status = String::from("Variant analysis results are already being exported");
+            return;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            self.status = String::from("Give a folder, or gist");
+            return;
+        }
+        let runs = cs::load_submitted(&Self::codeql_variant_runs_path());
+        let Some(run) = runs.get(index).cloned() else {
+            self.status = String::from("That variant analysis is no longer remembered");
+            return;
+        };
+        let gist = value.eq_ignore_ascii_case("gist");
+        let base = croft_cache_dir()
+            .join("codeql")
+            .join("variant-results")
+            .join(format!("{}-{}", run.controller.replace('/', "-"), run.id));
+        let target = if gist {
+            base.join("export")
+        } else {
+            self.typed_path(value)
+        };
+        let repos = cs::repos_with_results(&run);
+        let gh = self.gh_program.to_string_lossy().into_owned();
+        let program = self.codeql_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = (|| {
+                let files =
+                    Self::fetch_codeql_variant_results(&gh, &program, &root, &run, &repos, &base)?;
+                if files.repos == 0 {
+                    let why = files.failed.first().map_or("", |(_, w)| w.as_str());
+                    return Err(format!("no repository's results could be fetched: {why}"));
+                }
+                let read = |p: &Option<PathBuf>| -> Result<Option<String>, String> {
+                    p.as_ref()
+                        .map(|p| {
+                            std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))
+                        })
+                        .transpose()
+                };
+                let markdown = cs::export_markdown(
+                    &run,
+                    read(&files.sarif)?.as_deref(),
+                    read(&files.csv)?.as_deref(),
+                )?;
+                if gist {
+                    let _ = std::fs::remove_dir_all(&target);
+                }
+                std::fs::create_dir_all(&target)
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                let mut written = Vec::new();
+                for (name, text) in &markdown {
+                    let path = target.join(name);
+                    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+                    written.push(path);
+                }
+                let url = match gist {
+                    false => None,
+                    true => {
+                        let name = run
+                            .query
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let desc = format!(
+                            "{name} (variant analysis {} of {} repositories)",
+                            run.id, files.repos
+                        );
+                        let out = crate::pr_review::run_gh(
+                            &gh,
+                            &cs::gist_args(&desc, &written),
+                            &root,
+                            crate::pr_review::GH_TIMEOUT,
+                        )?;
+                        Some(
+                            out.lines()
+                                .rev()
+                                .find(|l| l.starts_with("https://"))
+                                .ok_or_else(|| String::from("gh made no gist"))?
+                                .trim()
+                                .to_string(),
+                        )
+                    }
+                };
+                Ok(VariantExport {
+                    summary: (!gist).then(|| target.join("_summary.md")),
+                    gist: url,
+                    repos: files.repos,
+                    failed: files.failed,
+                })
+            })();
+            let _ = tx.send(outcome);
+        });
+        self.codeql_variant_export = Some(rx);
+        self.status = String::from("Exporting the variant analysis results\u{2026}");
+    }
+
+    /// Report a finished export: open a folder export's summary, or name
+    /// the gist.
+    pub fn drain_codeql_variant_export(&mut self) -> bool {
+        let Some(rx) = self.codeql_variant_export.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the export stopped without answering"))
+            }
+        };
+        self.codeql_variant_export = None;
+        let done = match outcome {
+            Ok(done) => done,
+            Err(why) => {
+                self.status = format!("Could not export the variant analysis results: {why}");
+                return true;
+            }
+        };
+        let failed = match done.failed.as_slice() {
+            [] => String::new(),
+            [(nwo, why)] => format!("; {nwo} left out: {why}"),
+            [(nwo, why), rest @ ..] => format!("; {nwo} left out: {why} (and {} more)", rest.len()),
+        };
+        let plural = if done.repos == 1 { "y" } else { "ies" };
+        self.status = match (done.gist, done.summary) {
+            (Some(url), _) => format!("Exported {} repositor{plural} to {url}{failed}", done.repos),
+            (None, Some(summary)) => {
+                if self.editor.open(&summary).is_ok() {
+                    self.sync_open_file_poll_mtime();
+                    self.focus_pane(Pane::Editor);
+                }
+                let dir = summary.parent().unwrap_or(&summary).display().to_string();
+                format!("Exported {} repositor{plural} to {dir}{failed}", done.repos)
+            }
+            (None, None) => String::from("Exported nothing"),
+        };
         true
     }
 
@@ -29963,6 +30151,10 @@ impl App {
             InputPurpose::CodeqlDownloadPacks => {
                 self.close_input_prompt();
                 self.submit_download_codeql_packs(&value);
+            }
+            InputPurpose::CodeqlExportVariantResults { index } => {
+                self.close_input_prompt();
+                self.start_export_codeql_variant_results(index, &value);
             }
             InputPurpose::CodeqlVariantCodeSearch { list } => {
                 self.close_input_prompt();
@@ -45386,6 +45578,9 @@ impl App {
             Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
             Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
             Cmd::CodeqlRunVariantAnalysis => self.run_codeql_variant_analysis(),
+            Cmd::CodeqlExportVariantResults => {
+                self.prompt_export_codeql_variant_results(self.codeql.selected_variant_run())
+            }
             Cmd::CodeqlOpenVariantResults => {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
@@ -62535,6 +62730,16 @@ struct VariantResultFiles {
 
 type VariantResults = Result<VariantResultFiles, String>;
 
+/// Where an export of variant analysis results went (#578).
+struct VariantExport {
+    /// The summary file of a folder export.
+    summary: Option<PathBuf>,
+    /// The gist a gist export made.
+    gist: Option<String>,
+    repos: usize,
+    failed: Vec<(String, String)>,
+}
+
 /// One unfinished variant analysis and what reading its progress gave.
 type CodeqlRunPoll = (
     crate::codeql_submit::Submitted,
@@ -64005,7 +64210,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_code_search()
             | app.drain_codeql_variant_submit()
             | app.poll_codeql_variant_runs()
-            | app.drain_codeql_variant_results();
+            | app.drain_codeql_variant_results()
+            | app.drain_codeql_variant_export();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
