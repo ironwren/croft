@@ -56004,6 +56004,67 @@ fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
+    // #578: VS Code's "CodeQL: Run Query Suite" runs the open .qls on the
+    // selected database; a suite only runs through `database analyze`, so
+    // its results are SARIF whatever its queries' kinds.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert_eq!(app.status, "Open a .qls query suite to run it");
+        assert!(app.codeql_run.is_none());
+
+        let suite = tmp.path().join("s.qls");
+        std::fs::write(&suite, "- queries: .\n").unwrap();
+        app.editor.open(&suite).unwrap();
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert!(
+            app.status.contains("Running s.qls on app"),
+            "{}",
+            app.status
+        );
+        wait_for_codeql(&mut app);
+        let opened = app.editor.path.clone().expect("the results open");
+        assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("sarif"));
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} s.qls \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.starts_with(&format!(
+                "database analyze {} {} --format=sarif-latest ",
+                tmp.path().join("dbs/app").display(),
+                suite.display()
+            )),
+            "{calls}"
+        );
+
+        // "Run Query on Selected Database" takes a suite too.
+        app.editor.open(&suite).unwrap();
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(
+            app.status.contains("Running s.qls on app"),
+            "{}",
+            app.status
+        );
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_run_query_suite"),
+            Some(Command::CodeqlRunQuerySuite)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn codeql_query_help_is_previewed_as_markdown_or_reported_missing() {
     // #578: VS Code's "CodeQL: Preview Query Help" renders the open
     // query's help with `codeql generate query-help` off the UI thread and

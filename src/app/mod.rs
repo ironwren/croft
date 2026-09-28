@@ -26004,13 +26004,14 @@ impl App {
         true
     }
 
-    /// Run the open `.ql` file on the current database (#578), from the
-    /// buffer, not the disk: an unsaved edit is what the user means.
+    /// Run the open `.ql` query or `.qls` suite on the current database
+    /// (#578), from the buffer, not the disk: an unsaved edit is what the
+    /// user means.
     fn run_codeql_query(&mut self) {
         let query = match self.editor.path.clone() {
-            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            Some(p) if p.extension().is_some_and(|e| e == "ql" || e == "qls") => p,
             _ => {
-                self.status = String::from("Open a .ql query to run it");
+                self.status = String::from("Open a .ql query or .qls suite to run it");
                 return;
             }
         };
@@ -26018,10 +26019,26 @@ impl App {
         self.run_codeql_file(query, &source);
     }
 
+    /// VS Code's "CodeQL: Run Query Suite" (#578): the open `.qls` suite on
+    /// the current database, through `database analyze` into SARIF.
+    fn run_codeql_query_suite(&mut self) {
+        if !self
+            .editor
+            .path
+            .as_deref()
+            .is_some_and(crate::codeql_query::is_suite)
+        {
+            self.status = String::from("Open a .qls query suite to run it");
+            return;
+        }
+        self.run_codeql_query();
+    }
+
     /// Run `query`, whose text is `source`, on the current database (#578):
-    /// alerts through `database analyze` into SARIF, anything else through
-    /// `query run` into a table decoded as CSV. The run happens on a worker
-    /// thread; [`Self::drain_codeql_run`] collects it.
+    /// alerts, and every query of a `.qls` suite, through `database
+    /// analyze` into SARIF, anything else through `query run` into a table
+    /// decoded as CSV. The run happens on a worker thread;
+    /// [`Self::drain_codeql_run`] collects it.
     fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
@@ -26054,7 +26071,7 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = cq::output_for(source);
+        let kind = cq::output_of(&query, source);
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
@@ -45867,6 +45884,7 @@ impl App {
                 }
             }
             Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
+            Cmd::CodeqlRunQuerySuite => self.run_codeql_query_suite(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),

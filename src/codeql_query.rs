@@ -42,6 +42,23 @@ pub fn output_for(source: &str) -> Output {
     }
 }
 
+/// Whether `query` is a query suite (`.qls`), which `database analyze`
+/// runs whole.
+pub fn is_suite(query: &Path) -> bool {
+    query.extension().is_some_and(|e| e == "qls")
+}
+
+/// How the file `query`, whose text is `source`, is run and read: a suite
+/// always through `database analyze` into SARIF, since only that runs one;
+/// a single query by its `@kind`.
+pub fn output_of(query: &Path, source: &str) -> Output {
+    if is_suite(query) {
+        Output::Sarif
+    } else {
+        output_for(source)
+    }
+}
+
 fn path(p: &Path) -> String {
     p.display().to_string()
 }
@@ -1034,6 +1051,16 @@ mod tests {
         assert_eq!(output_for("/** @kind problem */ select 1"), Output::Sarif);
         assert_eq!(output_for("/** @kind graph */ select 1"), Output::Table);
         assert_eq!(output_for("select 1"), Output::Table);
+    }
+
+    #[test]
+    fn a_suite_always_reads_as_sarif() {
+        let suite = "- queries: .\n- include:\n    kind: table\n";
+        assert!(is_suite(Path::new("/w/s.qls")));
+        assert!(!is_suite(Path::new("/w/q.ql")));
+        assert_eq!(output_of(Path::new("/w/s.qls"), suite), Output::Sarif);
+        assert_eq!(output_of(Path::new("/w/q.ql"), "select 1"), Output::Table);
+        assert_eq!(output_of(Path::new("/w/q.ql"), PROBLEM), Output::Sarif);
     }
 
     #[test]
