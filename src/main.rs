@@ -12,6 +12,7 @@ mod cell_map;
 mod cli;
 mod clipboard;
 mod code_lens;
+mod codeql_ast;
 mod codeql_cli;
 mod codeql_db;
 mod codeql_evallog;
