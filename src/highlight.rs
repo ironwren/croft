@@ -346,6 +346,24 @@ const RUST_LOCALS_QUERY: &str = r#"
 
 /// Overlay query for Lua: maps tree-sitter-lua's fine-grained captures
 /// (@conditional, @repeat, @field, @method, @parameter, @preproc) onto
+/// Highlights for CodeQL `.dbscheme` files (#578). The grammar crate ships
+/// no query, so this one is croft's: table and column names, `@types`,
+/// the column types, annotations, and QLDoc and comments.
+const DBSCHEME_HIGHLIGHTS_QUERY: &str = r##"
+[(line_comment) (block_comment) (qldoc)] @comment
+(tableName) @function
+(column colName: (simpleId) @property)
+(caseDecl discriminator: (simpleId) @property)
+(dbtype) @type
+[(int) (float) (boolean) (date) (string) (varchar)] @type.builtin
+[(unique) (ref) "case" "of"] @keyword
+(annotation "#" @attribute)
+(annotName) @attribute
+(integer) @number
+["(" ")" "[" "]"] @punctuation.bracket
+["," ":" ";" "." "|" "="] @punctuation.delimiter
+"##;
+
 /// Croft's standard HIGHLIGHT_NAMES captures under the last-match-wins rule.
 const LUA_OVERLAY_QUERY: &str = r#"
 (if_statement [ "if" "elseif" "else" "then" "end" ] @keyword)
@@ -602,6 +620,8 @@ pub enum LangKind {
     Cpp,
     Lua,
     Ql,
+    /// A CodeQL database schema (`.dbscheme`, #578).
+    Dbscheme,
 }
 
 /// The bare tree-sitter grammar handle for `kind` — the parser the
@@ -628,6 +648,7 @@ pub fn language_for(kind: LangKind) -> tree_sitter::Language {
         LangKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         LangKind::Lua => tree_sitter_lua::LANGUAGE.into(),
         LangKind::Ql => tree_sitter_ql::LANGUAGE.into(),
+        LangKind::Dbscheme => tree_sitter_ql_dbscheme::LANGUAGE.into(),
     }
 }
 
@@ -652,6 +673,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "lua" => LangKind::Lua,
         // CodeQL queries and libraries (#578).
         "ql" | "qll" => LangKind::Ql,
+        "dbscheme" => LangKind::Dbscheme,
         _ => return None,
     })
 }
@@ -902,6 +924,14 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             tree_sitter_ql::LANGUAGE.into(),
             "ql",
             tree_sitter_ql::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        )
+        .ok()?,
+        LangKind::Dbscheme => HighlightConfiguration::new(
+            tree_sitter_ql_dbscheme::LANGUAGE.into(),
+            "ql_dbscheme",
+            DBSCHEME_HIGHLIGHTS_QUERY,
             "",
             "",
         )
@@ -2349,5 +2379,29 @@ def f() -> Config:\n\
         assert_ne!(keyword.style, class.style);
         assert_eq!(lang_for_extension("ql"), Some(LangKind::Ql));
         assert_eq!(lang_for_extension("qll"), Some(LangKind::Ql));
+    }
+
+    #[test]
+    fn a_codeql_dbscheme_highlights_tables_types_and_comments() {
+        let mut reg = LangRegistry::new();
+        let src = "// files\n#keyset[id]\nfiles(unique int id: @file, string name: string ref);\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let p = SyntaxPalette::BASE16;
+        let h =
+            highlight_text_with_palette(&mut reg, LangKind::Dbscheme, src.as_bytes(), &ls, &p).0;
+        let lines: Vec<&str> = src.lines().collect();
+        let style = |line: usize, text: &str| {
+            span_at(&h[line], lines[line], text)
+                .unwrap_or_else(|| panic!("no span for {text}"))
+                .style
+        };
+        assert_eq!(style(0, "// files"), palette_style_for_name(&p, "comment"));
+        assert_eq!(style(1, "keyset"), palette_style_for_name(&p, "attribute"));
+        assert_eq!(style(2, "files"), palette_style_for_name(&p, "function"));
+        assert_eq!(style(2, "unique"), palette_style_for_name(&p, "keyword"));
+        assert_eq!(style(2, "int"), palette_style_for_name(&p, "type.builtin"));
+        assert_eq!(style(2, "@file"), palette_style_for_name(&p, "type"));
+        assert_eq!(style(2, "name"), palette_style_for_name(&p, "property"));
+        assert_eq!(lang_for_extension("dbscheme"), Some(LangKind::Dbscheme));
     }
 }

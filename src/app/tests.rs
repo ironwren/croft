@@ -55561,6 +55561,269 @@ fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar()
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
+    // #578: every run writes an evaluator log beside its results. "Show
+    // Evaluator Log (Raw JSON)" opens it; "(Summary Text)" runs `codeql
+    // generate log-summary` once and opens the text it wrote.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = App::codeql_results_dir().join("1-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 1, RunStatus::Succeeded, out.clone())],
+        );
+        app.run_command(Command::CodeqlShowEvaluatorLog);
+        assert_eq!(app.status, "q.ql has no evaluator log");
+
+        let log = crate::codeql_query::evaluator_log(&out);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "{\"type\":\"LOG_HEADER\"}\n").unwrap();
+        app.run_command(Command::CodeqlShowEvaluatorLog);
+        assert_eq!(app.editor.path.as_deref(), Some(log.as_path()));
+
+        // The fake CLI writes its reply to the path after the log.
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace(
+                "exit 0",
+                "[ \"$1\" = generate ] && echo 'Summary' > \"$5\"\nexit 0",
+            ),
+        )
+        .unwrap();
+        app.run_command(Command::CodeqlShowEvaluatorLogSummary);
+        assert_eq!(app.status, "Summarising the evaluator log\u{2026}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_log_summary() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the summary never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let summary = crate::codeql_query::evaluator_log_summary(&out);
+        assert_eq!(app.status, "Opened the evaluator log summary");
+        assert_eq!(app.editor.path.as_deref(), Some(summary.as_path()));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate log-summary --format=text {} {}",
+                log.display(),
+                summary.display()
+            )
+        );
+        // Made once: the second request opens the file without the CLI.
+        app.run_command(Command::CodeqlShowEvaluatorLogSummary);
+        assert!(app.codeql_log_summary.is_none());
+        assert_eq!(app.editor.path.as_deref(), Some(summary.as_path()));
+        assert_eq!(
+            Command::from_id("codeql_show_evaluator_log_summary"),
+            Some(Command::CodeqlShowEvaluatorLogSummary)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn codeql_pack_commands_install_dependencies_and_download_packs() {
+    // #578: "Install Pack Dependencies" runs `codeql pack install` on the
+    // selected pack's folder; "Download Packs" asks which packs and runs
+    // `codeql pack download` on them. Both off the UI thread.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("pack")).unwrap();
+        std::fs::write(tmp.path().join("pack/qlpack.yml"), "name: acme/rust\n").unwrap();
+        std::fs::write(tmp.path().join("pack/a.ql"), "select 1").unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "Select a query pack or one of its queries in the CodeQL side bar first"
+        );
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(
+                        crate::widgets::codeql::Action::RunQuery(0, 0),
+                        _
+                    )
+                )
+            })
+            .expect("a.ql is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "Installing the dependencies of acme/rust\u{2026}"
+        );
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "A CodeQL pack install or download is already running"
+        );
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_pack_job() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pack job never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait(&mut app);
+        assert_eq!(app.status, "Installed the dependencies of acme/rust");
+
+        app.run_command(Command::CodeqlDownloadPacks);
+        for c in "codeql/java-queries codeql/python-all@1.0.0".chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "Downloaded codeql/java-queries, codeql/python-all@1.0.0"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            vec![
+                format!("pack install {}", tmp.path().join("pack").display()),
+                String::from("pack download codeql/java-queries codeql/python-all@1.0.0"),
+            ]
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: no such pack");
+        app.run_command(Command::CodeqlDownloadPacks);
+        for c in "acme/missing".chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not download acme/missing: ERROR: no such pack"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_quick_query_opens_for_the_databases_language() {
+    // #578: VS Code's "CodeQL: Quick Query". The first time, croft writes
+    // a scratch pack for the selected database's language and installs its
+    // library; later it reopens the same file, edits and all.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlQuickQuery);
+        let query = app.editor.path.clone().expect("the quick query is open");
+        assert!(
+            query.ends_with("quick-query/rust/quick-query.ql"),
+            "{}",
+            query.display()
+        );
+        assert!(app.editor.lines.iter().any(|l| l == "import rust"));
+        let dir = query.parent().unwrap().to_path_buf();
+        assert!(
+            std::fs::read_to_string(dir.join("qlpack.yml"))
+                .unwrap()
+                .contains("codeql/rust-all")
+        );
+        assert_eq!(
+            app.status,
+            "Installing codeql/rust-all for the quick query\u{2026}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_pack_job() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the install never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.status,
+            "Quick query ready: codeql/rust-all is installed"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls.trim(), format!("pack install {}", dir.display()));
+
+        // A real install leaves a lock file, which says it is done.
+        std::fs::write(dir.join("codeql-pack.lock.yml"), "lockVersion: 1.0.0\n").unwrap();
+        std::fs::write(&query, "import rust\nselect 2\n").unwrap();
+        app.run_command(Command::CodeqlQuickQuery);
+        assert_eq!(app.status, "Opened the rust quick query");
+        assert!(app.editor.lines.iter().any(|l| l == "select 2"));
+        assert!(app.codeql_pack_job.is_none(), "no second install");
+    });
+}
+
+#[test]
+fn comparing_codeql_results_opens_the_rows_one_run_has_alone() {
+    // #578: VS Code's "Compare Results". The newest run's table is set
+    // against the previous run of the same query; the rows only one of
+    // them has open as a CSV beside the newer results.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = |n: &str| App::codeql_results_dir().join(n).join("results.csv");
+        seed_codeql_history(tmp.path(), &[("q.ql", 1, RunStatus::Succeeded, out("1-q"))]);
+        app.run_command(Command::CodeqlCompareResults);
+        assert_eq!(
+            app.status,
+            "There is no earlier successful run of q.ql to compare with"
+        );
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("q.ql", 1, RunStatus::Succeeded, out("1-q")),
+                ("q.ql", 2, RunStatus::Succeeded, out("2-q")),
+            ],
+        );
+        for (dir, body) in [("1-q", "f\na\nb\n"), ("2-q", "f\nb\nc\n")] {
+            std::fs::create_dir_all(out(dir).parent().unwrap()).unwrap();
+            std::fs::write(out(dir), body).unwrap();
+        }
+        app.run_command(Command::CodeqlCompareResults);
+        assert_eq!(app.status, "2 rows differ between the runs");
+        let compared = out("2-q").with_file_name("compare-1.csv");
+        assert_eq!(app.editor.path.as_deref(), Some(compared.as_path()));
+        let text = std::fs::read_to_string(&compared).unwrap();
+        assert!(text.starts_with("run,f\n"), "{text}");
+        assert!(text.contains(",a\n") && text.contains(",c\n"), "{text}");
+    });
+}
+
 #[test]
 fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -56059,6 +56322,164 @@ fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn codeql_run_tests_runs_the_test_pack_through_the_testing_view() {
+    // #578: "CodeQL: Run Tests" runs every CodeQL test with the app's
+    // `codeql`, and the results land in the Testing view; outside a
+    // CodeQL test workspace it says why nothing ran.
+    use crate::testing::model::TestStatus;
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        Command::from_id("codeql_run_tests"),
+        Some(Command::CodeqlRunTests)
+    );
+    assert_eq!(Command::CodeqlRunTests.title(), "CodeQL: Run Tests");
+
+    let plain = tempfile::tempdir().unwrap();
+    let mut app = App::new(plain.path().to_path_buf()).unwrap();
+    app.run_command(Command::CodeqlRunTests);
+    assert!(
+        app.status.starts_with("No CodeQL tests here"),
+        "{}",
+        app.status
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Bad")).unwrap();
+    std::fs::write(
+        root.join("test/qlpack.yml"),
+        "name: acme/tests\nextractor: rust\ntests: .\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("test/Bad/Bad.ql"), "select 1").unwrap();
+    std::fs::write(root.join("test/Bad/Bad.expected"), "").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("calls.log");
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+             echo '[1/1 comp 1s eval 9ms] FAILED(RESULT) {root}/test/Bad/Bad.ql'\n\
+             echo '--- expected'\necho '+++ actual'\necho '+| 1 |'\n\
+             echo '0 tests passed; 1 tests failed:'\nexit 1\n",
+            log = log.display(),
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program.clone());
+    app.run_command(Command::CodeqlRunTests);
+    assert_eq!(app.status, "Running CodeQL tests");
+    assert!(app.sidebar_view == SidebarView::Testing);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if !app.testing.is_busy()
+            && app
+                .testing
+                .cases_for_test()
+                .contains(&(String::from("test/Bad::Bad.ql"), TestStatus::Failed))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CodeQL run never reported; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.testing.failed_count(), 1);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "test run test\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_test_clicked_in_the_tree_runs_with_the_configured_codeql() {
+    // #578: the test worker learns the app's `codeql` when it starts and
+    // whenever it changes, so a tree click runs the configured program
+    // (never PATH's) without "CodeQL: Run Tests" having run first.
+    use crate::testing::model::TestStatus;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Find")).unwrap();
+    std::fs::write(root.join("test/qlpack.yml"), "name: acme/tests\ntests: .\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.expected"), "").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("calls.log");
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+             echo '[1/1 comp 1s eval 9ms] PASSED {root}/test/Find/Find.qlref'\nexit 0\n",
+            log = log.display(),
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program);
+    app.run_test(String::from("test/Find::Find.qlref"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if app.testing.status_of("test/Find::Find.qlref") == Some(TestStatus::Passed) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clicked test never ran with the configured codeql; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "test run test/Find/Find.qlref\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_codeql_version_copies_croft_the_cli_and_the_platform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+    // The fake prints nothing on stdout; give it a version to report.
+    let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+    std::fs::write(
+        &app.codeql_program,
+        script.replace("exit 0", "echo 2.19.3\nexit 0"),
+    )
+    .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::CodeqlCopyVersion);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_version() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the version check never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "Copied CodeQL version information");
+    let clip = crate::clipboard::read_string().unwrap();
+    assert!(clip.contains(concat!("croft version: ", env!("CARGO_PKG_VERSION"))));
+    assert!(clip.contains("CodeQL CLI version: 2.19.3"));
+    let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+    assert_eq!(calls.trim(), "version --format=terse");
+}
+
 /// Drain the database upgrade until it lands, or fail after a few seconds.
 fn wait_for_codeql_upgrade(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -56131,6 +56552,80 @@ fn upgrading_a_codeql_database_runs_the_cli_off_the_ui_thread() {
         assert_eq!(
             Command::CodeqlUpgradeDatabase.title(),
             "CodeQL: Upgrade Database"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn the_codeql_cache_commands_clean_up_the_selected_database() {
+    // #578: VS Code's "CodeQL: Clear Cache", "Trim Cache" and "Trim Cache
+    // to Overlay Base" run `codeql database cleanup` on the selected
+    // database, one job at a time and never beside a query run.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.codeql.select_database(0);
+        let db = tmp.path().join("dbs/app");
+        app.run_command(Command::CodeqlClearCache);
+        assert_eq!(
+            app.status,
+            "Clearing the cache of CodeQL database app\u{2026}"
+        );
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        assert_eq!(
+            app.status,
+            "A CodeQL database cache cleanup is already running"
+        );
+        app.run_command(Command::CodeqlRunQuery);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL database cache cleanup to finish"
+        );
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Cleared the cache of CodeQL database app");
+        app.run_command(Command::CodeqlTrimCache);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Trimmed the cache of CodeQL database app");
+        app.run_command(Command::CodeqlTrimCacheToOverlay);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Trimmed the cache of CodeQL database app to its overlay base"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let expected: Vec<String> = ["clear", "trim", "overlay"]
+            .iter()
+            .map(|m| format!("database cleanup --cache-cleanup={m} {}", db.display()))
+            .collect();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: the cache is locked");
+        app.run_command(Command::CodeqlTrimCache);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not clean up the cache of CodeQL database app: ERROR: the cache is locked"
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        app.run_command(Command::CodeqlClearCache);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL query run to finish before cleaning up the cache"
+        );
+        assert!(app.codeql_upgrade.is_none());
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_trim_cache_to_overlay_base"),
+            Some(Command::CodeqlTrimCacheToOverlay)
         );
     });
 }
@@ -59838,6 +60333,145 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
         assert_eq!(
             Command::from_id("codeql_set_up_controller_repository"),
             Some(Command::CodeqlSetUpController)
+        );
+    });
+}
+
+#[test]
+fn codeql_code_search_adds_the_repositories_it_finds_to_the_selected_list() {
+    // #578: VS Code's "Add repositories with GitHub Code Search". The search
+    // runs off the UI thread, page by page, scoped to the side bar's
+    // language, and its distinct repositories join the selected list.
+    use crate::codeql_variant::{Item, VariantConfig};
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        // Page 1 is full (100 results over 60 repositories, one already
+        // listed in another case); page 2 is short, so page 3 is never
+        // asked for. A query with "broken" in it fails; one with "cut"
+        // fills page 1 and then hits the rate limit.
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *broken*) echo 'gh: Validation Failed (HTTP 422)' >&2; exit 1 ;;
+  *cut*" page=1 "*) i=0; while [ $i -lt 100 ]; do echo "c/r$i"; i=$((i+1)); done ;;
+  *cut*) echo 'API rate limit exceeded' >&2; exit 1 ;;
+  *" page=1 "*) i=0; while [ $i -lt 100 ]; do echo "o/r$((i % 60))"; i=$((i+1)); done; echo "A/B" ;;
+  *" page=2 "*) echo o/extra ;;
+  *) echo "asked for a page past the short one" >&2; exit 1 ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh.clone();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !app.drain_codeql_code_search() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the search never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
+
+        // With no list selected there is nowhere to put the results.
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        assert!(app.input_prompt.is_none());
+        assert!(
+            app.status.contains("Select a repository list"),
+            "{}",
+            app.status
+        );
+
+        app.codeql
+            .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
+        press(&mut app, KeyCode::Char('l'));
+        type_in(&mut app, "found");
+        press(&mut app, KeyCode::Char('a'));
+        type_in(&mut app, "a/b");
+        // The language first: it filters rows, which moves the selection.
+        app.codeql.language = crate::widgets::codeql::LANGUAGE_IDS
+            .iter()
+            .position(|l| *l == "python");
+        app.codeql.select_variant_item(Item::List(0));
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().title,
+            "Add Repositories to found with GitHub Code Search"
+        );
+        type_in(&mut app, "import torch");
+        assert!(
+            app.status.starts_with("Searching GitHub code"),
+            "{}",
+            app.status
+        );
+        finish(&mut app);
+
+        let repos = saved().lists[0].repos.clone();
+        assert_eq!(repos.len(), 1 + 60 + 1, "{repos:?}");
+        assert_eq!(repos[..2], ["a/b", "o/r0"]);
+        assert_eq!(repos.last().map(String::as_str), Some("o/extra"));
+        assert_eq!(
+            app.status, "Added 61 repositories to found (1 already there)",
+            "{}",
+            app.status
+        );
+        let asked = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(asked.lines().count(), 2, "stops at the short page: {asked}");
+        assert!(asked.contains("q=import torch language:python"), "{asked}");
+
+        // A failed search says why and changes nothing.
+        app.codeql.select_variant_item(Item::List(0));
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        type_in(&mut app, "broken");
+        finish(&mut app);
+        assert!(
+            app.status.contains("GitHub Code Search failed"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("Validation Failed"), "{}", app.status);
+        assert_eq!(saved().lists[0].repos, repos);
+
+        // A later page failing keeps the earlier pages and says so.
+        app.codeql.select_variant_item(Item::List(0));
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        type_in(&mut app, "cut");
+        finish(&mut app);
+        assert_eq!(saved().lists[0].repos.len(), repos.len() + 100);
+        assert!(
+            app.status.starts_with("Added 100 repositories to found; the search stopped early, page 2 failed: API rate limit exceeded"),
+            "{}",
+            app.status
         );
     });
 }

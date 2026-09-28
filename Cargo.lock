@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.1.1158"
+version = "0.1.1161"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -677,6 +677,7 @@ dependencies = [
  "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-ql",
+ "tree-sitter-ql-dbscheme",
  "tree-sitter-rust",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
@@ -3963,6 +3964,16 @@ name = "tree-sitter-ql"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80b7bcaf39acefbb199417a6ec2fd0c038083ba115da3e4f4426c820dc76d386"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ql-dbscheme"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60ccef99d727a4bdd51dd7d259e3d15b1329c972583a09d56a673a60cae54877"
 dependencies = [
  "cc",
  "tree-sitter-language",
