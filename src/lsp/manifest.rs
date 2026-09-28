@@ -56,6 +56,9 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/test-jest/extension.toml"),
     include_str!("../../assets/extensions/test-pytest/extension.toml"),
     include_str!("../../assets/extensions/test-go/extension.toml"),
+    // Last: a CodeQL repo often carries other projects' marker files too,
+    // and those runners should keep claiming them.
+    include_str!("../../assets/extensions/test-codeql/extension.toml"),
     include_str!("../../assets/extensions/themes/extension.toml"),
 ];
 
@@ -260,6 +263,8 @@ pub enum RunnerKindDecl {
     Jest,
     /// `go test -json` event stream (Go).
     Go,
+    /// `codeql test run` text output (CodeQL test packs).
+    Codeql,
 }
 
 /// One `[[themes]]` entry: a complete IDE color palette. All colors are
@@ -987,6 +992,7 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             "test-vitest",
             "test-jest",
             "test-go",
+            "test-codeql",
         ] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }

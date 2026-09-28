@@ -46,6 +46,30 @@ fn path(p: &Path) -> String {
     p.display().to_string()
 }
 
+/// The evaluator log of the run whose results are `output`: every run
+/// writes one into its own folder, beside its results.
+pub fn evaluator_log(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.jsonl")
+}
+
+/// The human-readable summary of the run whose results are `output`, made
+/// from its evaluator log on first request.
+pub fn evaluator_log_summary(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.summary.txt")
+}
+
+/// `codeql` arguments summarising the evaluator log `log` as text at `out`
+/// (VS Code's "Show Evaluator Log (Summary Text)").
+pub fn log_summary_args(log: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("log-summary"),
+        String::from("--format=text"),
+        path(log),
+        path(out),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -57,6 +81,7 @@ pub fn analyze_args(query: &Path, db: &Path, out: &Path) -> Vec<String> {
         path(query),
         String::from("--format=sarif-latest"),
         format!("--output={}", path(out)),
+        format!("--evaluator-log={}", path(&evaluator_log(out))),
         String::from("--rerun"),
     ]
 }
@@ -68,6 +93,7 @@ pub fn run_args(query: &Path, db: &Path, bqrs: &Path) -> Vec<String> {
         String::from("run"),
         format!("--database={}", path(db)),
         format!("--output={}", path(bqrs)),
+        format!("--evaluator-log={}", path(&evaluator_log(bqrs))),
         path(query),
     ]
 }
@@ -87,6 +113,208 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
 /// "CodeQL: Upgrade Database").
 pub fn upgrade_args(db: &Path) -> Vec<String> {
     vec![String::from("database"), String::from("upgrade"), path(db)]
+}
+
+/// A job that rewrites a database in place (#578): VS Code's "CodeQL:
+/// Upgrade Database" and its three cache commands, which all run `codeql
+/// database cleanup` with a different `--cache-cleanup` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbJob {
+    Upgrade,
+    ClearCache,
+    TrimCache,
+    TrimCacheToOverlay,
+}
+
+impl DbJob {
+    /// The `codeql` arguments running this job on `db`.
+    pub fn args(self, db: &Path) -> Vec<String> {
+        let mode = match self {
+            DbJob::Upgrade => return upgrade_args(db),
+            DbJob::ClearCache => "clear",
+            DbJob::TrimCache => "trim",
+            DbJob::TrimCacheToOverlay => "overlay",
+        };
+        vec![
+            String::from("database"),
+            String::from("cleanup"),
+            format!("--cache-cleanup={mode}"),
+            path(db),
+        ]
+    }
+
+    /// What the job is, for "already running" and "wait for" messages.
+    pub fn noun(self) -> &'static str {
+        match self {
+            DbJob::Upgrade => "upgrade",
+            _ => "cache cleanup",
+        }
+    }
+
+    /// What the job does, after "before" in the message refusing it while a
+    /// query runs.
+    pub fn gerund(self) -> &'static str {
+        match self {
+            DbJob::Upgrade => "upgrading",
+            _ => "cleaning up the cache",
+        }
+    }
+
+    /// The status line while the job runs on database `name`.
+    pub fn running(self, name: &str) -> String {
+        match self {
+            DbJob::Upgrade => format!("Upgrading CodeQL database {name}\u{2026}"),
+            DbJob::ClearCache => format!("Clearing the cache of CodeQL database {name}\u{2026}"),
+            DbJob::TrimCache | DbJob::TrimCacheToOverlay => {
+                format!("Trimming the cache of CodeQL database {name}\u{2026}")
+            }
+        }
+    }
+
+    /// The status line once the job has finished: `Ok` or the CLI's error.
+    pub fn finished(self, name: &str, outcome: Result<(), String>) -> String {
+        match (self, outcome) {
+            (DbJob::Upgrade, Ok(())) => format!("Upgraded CodeQL database {name}"),
+            (DbJob::ClearCache, Ok(())) => format!("Cleared the cache of CodeQL database {name}"),
+            (DbJob::TrimCache, Ok(())) => format!("Trimmed the cache of CodeQL database {name}"),
+            (DbJob::TrimCacheToOverlay, Ok(())) => {
+                format!("Trimmed the cache of CodeQL database {name} to its overlay base")
+            }
+            (DbJob::Upgrade, Err(why)) => {
+                format!("Could not upgrade CodeQL database {name}: {why}")
+            }
+            (_, Err(why)) => {
+                format!("Could not clean up the cache of CodeQL database {name}: {why}")
+            }
+        }
+    }
+}
+
+/// `codeql` arguments installing the dependencies of the pack in `dir` (VS
+/// Code's "CodeQL: Install Pack Dependencies").
+pub fn pack_install_args(dir: &Path) -> Vec<String> {
+    vec![String::from("pack"), String::from("install"), path(dir)]
+}
+
+/// `codeql` arguments downloading `packs` from the registry (VS Code's
+/// "CodeQL: Download Packs").
+pub fn pack_download_args(packs: &[String]) -> Vec<String> {
+    let mut args = vec![String::from("pack"), String::from("download")];
+    args.extend(packs.iter().cloned());
+    args
+}
+
+/// The pack references in what the user typed: separated by spaces or
+/// commas, each `scope/name`, optionally with `@version`.
+pub fn parse_pack_list(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The pack file and query of VS Code's "CodeQL: Quick Query" for the
+/// library `module` (see [`language_module`]): a throwaway pack depending on
+/// `codeql/<module>-all`, and a query importing it that selects nothing yet.
+pub fn quick_query(module: &str) -> (String, String) {
+    let pack = format!(
+        "name: croft/quick-query-{module}\nversion: 0.0.0\ndependencies:\n  codeql/{module}-all: \"*\"\n"
+    );
+    let query = format!(
+        "/**\n * A quick query: edit it and run \"CodeQL: Run Query on Selected Database\".\n */\n\nimport {module}\n\nselect \"\"\n"
+    );
+    (pack, query)
+}
+
+/// VS Code's "Compare Results" for two result tables: the rows of `old`
+/// that `new` lacks and those `new` has that `old` did not, as one CSV
+/// whose first column names the run each row is from. Rows are compared
+/// whole and counted, so a duplicated row that lost a copy still shows.
+/// Tables with different columns cannot be compared.
+pub fn compare_tables(
+    old: &str,
+    new: &str,
+    old_label: &str,
+    new_label: &str,
+) -> Result<String, String> {
+    fn read(text: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+        let mut r = csv::ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(text.as_bytes());
+        let header = r
+            .headers()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(str::to_string)
+            .collect();
+        let rows = r
+            .records()
+            .map(|rec| rec.map(|rec| rec.iter().map(str::to_string).collect()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok((header, rows))
+    }
+    let (old_header, old_rows) = read(old)?;
+    let (new_header, new_rows) = read(new)?;
+    if old_header != new_header {
+        return Err(String::from("the two runs' result columns differ"));
+    }
+    // Everything in `a` beyond what `b` has, row for row.
+    fn missing<'a>(a: &'a [Vec<String>], b: &[Vec<String>]) -> Vec<&'a Vec<String>> {
+        let mut left: std::collections::HashMap<&Vec<String>, usize> =
+            std::collections::HashMap::new();
+        for row in b {
+            *left.entry(row).or_default() += 1;
+        }
+        a.iter()
+            .filter(|row| match left.get_mut(row) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect()
+    }
+    let mut w = csv::Writer::from_writer(Vec::new());
+    let io = |e: csv::Error| e.to_string();
+    w.write_record(std::iter::once("run").chain(old_header.iter().map(String::as_str)))
+        .map_err(io)?;
+    for (label, row) in missing(&old_rows, &new_rows)
+        .into_iter()
+        .map(|r| (old_label, r))
+        .chain(
+            missing(&new_rows, &old_rows)
+                .into_iter()
+                .map(|r| (new_label, r)),
+        )
+    {
+        w.write_record(std::iter::once(label).chain(row.iter().map(String::as_str)))
+            .map_err(io)?;
+    }
+    let bytes = w.into_inner().map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+/// `codeql` arguments printing the CLI's bare version number.
+pub fn version_args() -> Vec<String> {
+    vec![String::from("version"), String::from("--format=terse")]
+}
+
+/// The text "CodeQL: Copy Version Information" puts on the clipboard: croft's
+/// version, the CodeQL CLI's (or why it could not be read) and the platform,
+/// one per line, ready to paste into a bug report.
+pub fn version_information(croft: &str, cli: &Result<String, String>) -> String {
+    let cli = match cli {
+        Ok(v) => v.trim().to_string(),
+        Err(why) => format!("unavailable ({why})"),
+    };
+    format!(
+        "croft version: {croft}\nCodeQL CLI version: {cli}\nPlatform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
 }
 
 /// The queries in one CodeQL pack, as the side bar's Queries section groups
@@ -572,6 +800,25 @@ impl History {
         self.entries.iter().position(|e| e.output == output)
     }
 
+    /// The run "Compare Results" sets entry `index` against: the latest
+    /// earlier successful run of the same query with the same kind of
+    /// results, on any database.
+    pub fn compare_partner(&self, index: usize) -> Option<usize> {
+        let this = self.entries.get(index)?;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| {
+                i != index
+                    && e.query == this.query
+                    && e.status == RunStatus::Succeeded
+                    && e.output.extension() == this.output.extension()
+                    && e.started <= this.started
+            })
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+
     /// The index of the most recent run, whatever the order.
     pub fn newest(&self) -> Option<usize> {
         self.entries
@@ -585,6 +832,132 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_jobs_run_database_cleanup_in_their_mode() {
+        let db = Path::new("/dbs/app");
+        assert_eq!(DbJob::Upgrade.args(db), upgrade_args(db));
+        for (job, mode) in [
+            (DbJob::ClearCache, "clear"),
+            (DbJob::TrimCache, "trim"),
+            (DbJob::TrimCacheToOverlay, "overlay"),
+        ] {
+            assert_eq!(
+                job.args(db),
+                vec![
+                    String::from("database"),
+                    String::from("cleanup"),
+                    format!("--cache-cleanup={mode}"),
+                    String::from("/dbs/app"),
+                ]
+            );
+            assert_eq!(job.noun(), "cache cleanup");
+        }
+        assert_eq!(
+            DbJob::TrimCacheToOverlay.finished("app", Ok(())),
+            "Trimmed the cache of CodeQL database app to its overlay base"
+        );
+        assert_eq!(
+            DbJob::TrimCache.finished("app", Err(String::from("locked"))),
+            "Could not clean up the cache of CodeQL database app: locked"
+        );
+    }
+
+    #[test]
+    fn pack_commands_install_the_packs_dependencies_or_download_the_named_packs() {
+        assert_eq!(
+            pack_install_args(Path::new("/w/pack")),
+            vec!["pack", "install", "/w/pack"]
+        );
+        let packs = parse_pack_list(" codeql/java-queries, codeql/python-all@1.0.0 ,,");
+        assert_eq!(
+            packs,
+            vec!["codeql/java-queries", "codeql/python-all@1.0.0"]
+        );
+        assert_eq!(
+            pack_download_args(&packs),
+            vec![
+                "pack",
+                "download",
+                "codeql/java-queries",
+                "codeql/python-all@1.0.0"
+            ]
+        );
+        assert!(parse_pack_list("  , ").is_empty());
+    }
+
+    #[test]
+    fn a_quick_query_imports_its_languages_library() {
+        let (pack, query) = quick_query("python");
+        assert!(pack.contains("name: croft/quick-query-python\n"));
+        assert!(pack.contains("  codeql/python-all: \"*\"\n"));
+        assert!(query.contains("\nimport python\n"));
+        assert_eq!(output_for(&query), Output::Table);
+    }
+
+    #[test]
+    fn comparing_tables_lists_the_rows_each_run_has_alone() {
+        let old = "name,line\na,1\nb,2\nb,2\n";
+        let new = "name,line\nb,2\nc,3\n";
+        assert_eq!(
+            compare_tables(old, new, "old", "new").unwrap(),
+            "run,name,line\nold,a,1\nold,b,2\nnew,c,3\n"
+        );
+        assert_eq!(
+            compare_tables(old, old, "old", "new").unwrap(),
+            "run,name,line\n"
+        );
+        assert!(compare_tables(old, "other\nx\n", "old", "new").is_err());
+    }
+
+    #[test]
+    fn a_runs_compare_partner_is_the_latest_earlier_success_of_the_same_query() {
+        let entry = |query: &str, started: u64, status: RunStatus, out: &str| HistoryEntry {
+            query: PathBuf::from(query),
+            database: String::from("db"),
+            database_path: None,
+            started,
+            seconds: 1,
+            status,
+            output: PathBuf::from(out),
+            name: None,
+        };
+        let history = History {
+            entries: vec![
+                entry("q.ql", 4, RunStatus::Succeeded, "/r/4/results.csv"),
+                entry(
+                    "q.ql",
+                    3,
+                    RunStatus::Failed(String::from("x")),
+                    "/r/3/results.csv",
+                ),
+                entry("other.ql", 3, RunStatus::Succeeded, "/r/3o/results.csv"),
+                entry("q.ql", 2, RunStatus::Succeeded, "/r/2/results.sarif"),
+                entry("q.ql", 1, RunStatus::Succeeded, "/r/1/results.csv"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(history.compare_partner(0), Some(4));
+        assert_eq!(history.compare_partner(4), None);
+        assert_eq!(history.compare_partner(2), None);
+    }
+
+    #[test]
+    fn version_information_names_croft_the_cli_and_the_platform() {
+        let text = version_information("0.1.9", &Ok(String::from("2.19.3\n")));
+        let platform = format!(
+            "Platform: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        assert_eq!(
+            text,
+            format!("croft version: 0.1.9\nCodeQL CLI version: 2.19.3\n{platform}")
+        );
+        let missing = version_information("0.1.9", &Err(String::from("not on PATH")));
+        assert!(missing.contains("CodeQL CLI version: unavailable (not on PATH)"));
+        assert_eq!(version_args(), ["version", "--format=terse"]);
+    }
 
     const PROBLEM: &str = "/**\n * @name SQL injection\n * @kind path-problem\n * @id rust/sql\n */\nimport rust\nselect 1";
 
@@ -620,6 +993,7 @@ mod tests {
                 "/w/q.ql",
                 "--format=sarif-latest",
                 "--output=/out/r.sarif",
+                "--evaluator-log=/out/evaluator-log.jsonl",
                 "--rerun"
             ]
         );
@@ -630,7 +1004,21 @@ mod tests {
                 "run",
                 "--database=/dbs/app",
                 "--output=/out/r.bqrs",
+                "--evaluator-log=/out/evaluator-log.jsonl",
                 "/w/q.ql"
+            ]
+        );
+        assert_eq!(
+            log_summary_args(
+                &evaluator_log(Path::new("/out/results.csv")),
+                &evaluator_log_summary(Path::new("/out/results.csv"))
+            ),
+            vec![
+                "generate",
+                "log-summary",
+                "--format=text",
+                "/out/evaluator-log.jsonl",
+                "/out/evaluator-log.summary.txt"
             ]
         );
         assert_eq!(

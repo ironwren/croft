@@ -11791,7 +11791,8 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Go)
         | Some(LangKind::C)
         | Some(LangKind::Cpp)
-        | Some(LangKind::Ql) => Some("//"),
+        | Some(LangKind::Ql)
+        | Some(LangKind::Dbscheme) => Some("//"),
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
@@ -11815,7 +11816,8 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::C)
         | Some(LangKind::Cpp)
         | Some(LangKind::Css)
-        | Some(LangKind::Ql) => Some(("/*", "*/")),
+        | Some(LangKind::Ql)
+        | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         // Python has no true block comment; VS Code's language config maps
@@ -12421,6 +12423,7 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Cpp) => "C++",
         Some(LangKind::Lua) => "Lua",
         Some(LangKind::Ql) => "CodeQL",
+        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
     }
 }
 
@@ -12448,6 +12451,7 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Cpp) => "cpp",
         Some(LangKind::Lua) => "lua",
         Some(LangKind::Ql) => "ql",
+        Some(LangKind::Dbscheme) => "dbscheme",
     }
 }
 
@@ -12471,6 +12475,7 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Cpp,
     LangKind::Lua,
     LangKind::Ql,
+    LangKind::Dbscheme,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
