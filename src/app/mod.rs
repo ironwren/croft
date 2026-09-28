@@ -25179,16 +25179,36 @@ impl App {
             return;
         }
         let dest = self.typed_path(value);
-        if dest.exists() {
-            self.status = format!(
-                "{} already exists; export the results to a new file",
-                dest.display()
-            );
-            return;
-        }
-        self.status = match std::fs::copy(output, &dest) {
+        // `create_new` refuses an existing file (or a dangling symlink) in
+        // the same step that creates it, so nothing can slip in between a
+        // check and the copy.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.status = format!(
+                    "{} already exists; export the results to a new file",
+                    dest.display()
+                );
+                return;
+            }
+            Err(e) => {
+                self.status = format!("Could not export the results to {}: {e}", dest.display());
+                return;
+            }
+        };
+        let copied =
+            std::fs::File::open(output).and_then(|mut src| std::io::copy(&mut src, &mut file));
+        self.status = match copied {
             Ok(_) => format!("Exported results to {}", dest.display()),
-            Err(e) => format!("Could not export the results to {}: {e}", dest.display()),
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&dest);
+                format!("Could not export the results to {}: {e}", dest.display())
+            }
         };
     }
 
@@ -26107,8 +26127,8 @@ impl App {
     }
 
     /// Run the open `.ql` query or `.qls` suite on the current database
-    /// (#578), from the buffer, not the disk: an unsaved edit is what the
-    /// user means.
+    /// (#578). The CLI reads the file from disk, so an unsaved buffer is
+    /// refused rather than silently running the saved text.
     fn run_codeql_query(&mut self) {
         let query = match self.editor.path.clone() {
             Some(p) if p.extension().is_some_and(|e| e == "ql" || e == "qls") => p,
@@ -26117,6 +26137,14 @@ impl App {
                 return;
             }
         };
+        if self.editor.dirty {
+            let name = query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.status = format!("Save {name} before running it: CodeQL reads it from disk");
+            return;
+        }
         let source = self.editor.lines.join("\n");
         self.run_codeql_file(query, &source, None);
     }

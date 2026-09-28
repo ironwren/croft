@@ -56184,6 +56184,18 @@ fn codeql_results_are_exported_to_a_new_file_only() {
             )
         );
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        // A dangling symlink is refused too, not followed and written.
+        #[cfg(unix)]
+        {
+            let link = app.workspace_root().join("link.csv");
+            let target = app.workspace_root().join("nowhere.csv");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            app.run_command(Command::CodeqlExportResults);
+            app.input_prompt.as_mut().unwrap().value = link.display().to_string();
+            app.submit_input_prompt();
+            assert!(app.status.contains("already exists"), "{}", app.status);
+            assert!(!target.exists(), "the link's target was not created");
+        }
         assert_eq!(
             Command::from_id("codeql_export_results"),
             Some(Command::CodeqlExportResults)
@@ -56304,6 +56316,15 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         let suite = tmp.path().join("s.qls");
         std::fs::write(&suite, "- queries: .\n").unwrap();
         app.editor.open(&suite).unwrap();
+        // The CLI reads the saved suite, so unsaved edits are refused.
+        app.editor.dirty = true;
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert_eq!(
+            app.status,
+            "Save s.qls before running it: CodeQL reads it from disk"
+        );
+        assert!(app.codeql_run.is_none());
+        app.editor.dirty = false;
         app.run_command(Command::CodeqlRunQuerySuite);
         assert!(
             app.status.contains("Running s.qls on app"),
