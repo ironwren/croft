@@ -55055,95 +55055,123 @@ fn screen_lower(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Stri
 fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
     // #578: VS Code's CodeQL extension adds a QL entry to the activity bar;
     // croft's sits directly below Testing and opens the CodeQL side bar.
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let ql = app.sidebar_areas.codeql_icon;
-    let testing = app.sidebar_areas.testing_icon;
-    assert!(ql.width > 0, "the QL icon lays out on a tall bar");
-    assert_eq!(ql.y, testing.y + testing.height, "directly below Testing");
-    left_click(&mut app, ql.x, ql.y);
-    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
-    term.draw(|f| app.render(f)).unwrap();
-    let screen = screen_lower(&term);
-    for section in [
-        "language",
-        "databases",
-        "queries",
-        "variant analysis",
-        "query history",
-        "ast viewer",
-        "method modeling",
-    ] {
-        assert!(
-            screen.contains(section),
-            "section {section:?} listed:\n{screen}"
-        );
-    }
-    // The Databases welcome offers VS Code's four ways to add one.
-    for action in [
-        "from a folder",
-        "from an archive",
-        "from a url",
-        "from github",
-    ] {
-        assert!(screen.contains(action), "{action:?} offered:\n{screen}");
-    }
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let ql = app.sidebar_areas.codeql_icon;
+        let testing = app.sidebar_areas.testing_icon;
+        assert!(ql.width > 0, "the QL icon lays out on a tall bar");
+        assert_eq!(ql.y, testing.y + testing.height, "directly below Testing");
+        left_click(&mut app, ql.x, ql.y);
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_lower(&term);
+        for section in [
+            "language",
+            "databases",
+            "queries",
+            "variant analysis",
+            "query history",
+            "ast viewer",
+            "method modeling",
+        ] {
+            assert!(
+                screen.contains(section),
+                "section {section:?} listed:\n{screen}"
+            );
+        }
+        // The Databases welcome offers VS Code's four ways to add one.
+        for action in [
+            "from a folder",
+            "from an archive",
+            "from a url",
+            "from github",
+        ] {
+            assert!(screen.contains(action), "{action:?} offered:\n{screen}");
+        }
+    });
 }
 
 #[test]
 fn codeql_view_label_round_trips_for_session_restore() {
-    assert_eq!(sidebar_view_label(SidebarView::CodeQL), "CodeQL");
-    assert_eq!(sidebar_view_from_label("CodeQL"), Some(SidebarView::CodeQL));
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        assert_eq!(sidebar_view_label(SidebarView::CodeQL), "CodeQL");
+        assert_eq!(sidebar_view_from_label("CodeQL"), Some(SidebarView::CodeQL));
+    });
 }
 
 #[test]
 fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
-    let summaries = crate::lsp::manifest::summaries(crate::lsp::manifest::BUNDLED_MANIFESTS);
-    assert!(
-        summaries.iter().any(|s| s.id == "codeql"),
-        "a built-in CodeQL row in the Extensions panel"
-    );
-    use crate::widgets::command_palette::Command;
-    assert_eq!(Command::from_id("show_codeql"), Some(Command::ShowCodeQL));
-    assert_eq!(Command::ShowCodeQL.title(), "View: Show CodeQL");
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let summaries = crate::lsp::manifest::summaries(crate::lsp::manifest::BUNDLED_MANIFESTS);
+        assert!(
+            summaries.iter().any(|s| s.id == "codeql"),
+            "a built-in CodeQL row in the Extensions panel"
+        );
+        use crate::widgets::command_palette::Command;
+        assert_eq!(Command::from_id("show_codeql"), Some(Command::ShowCodeQL));
+        assert_eq!(Command::ShowCodeQL.title(), "View: Show CodeQL");
+    });
 }
 
 #[test]
 fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // Never write the developer's real ~/.config/croft from a test.
-    app.config_dir = tmp.path().join("config");
-    app.open_codeql_view();
-    assert_eq!(app.sidebar_view, SidebarView::CodeQL);
-    app.set_extension_enabled("codeql", false);
-    assert_eq!(
-        app.sidebar_view,
-        SidebarView::Explorer,
-        "a disabled feature's view does not stay open"
-    );
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon is gone");
-    assert!(
-        app.sidebar_areas.settings_icon.width > 0,
-        "the gear still lays out"
-    );
-    app.open_codeql_view();
-    assert_ne!(
-        app.sidebar_view,
-        SidebarView::CodeQL,
-        "cannot open while disabled"
-    );
-    assert!(app.status.contains("disabled"), "{}", app.status);
-    app.set_extension_enabled("codeql", true);
-    term.draw(|f| app.render(f)).unwrap();
-    assert!(
-        app.sidebar_areas.codeql_icon.width > 0,
-        "re-enabling restores it"
-    );
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Never write the developer's real ~/.config/croft from a test.
+        app.config_dir = tmp.path().join("config");
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        app.set_extension_enabled("codeql", false);
+        assert_eq!(
+            app.sidebar_view,
+            SidebarView::Explorer,
+            "a disabled feature's view does not stay open"
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon is gone");
+        assert!(
+            app.sidebar_areas.settings_icon.width > 0,
+            "the gear still lays out"
+        );
+        app.open_codeql_view();
+        assert_ne!(
+            app.sidebar_view,
+            SidebarView::CodeQL,
+            "cannot open while disabled"
+        );
+        assert!(app.status.contains("disabled"), "{}", app.status);
+        app.set_extension_enabled("codeql", true);
+        term.draw(|f| app.render(f)).unwrap();
+        assert!(
+            app.sidebar_areas.codeql_icon.width > 0,
+            "re-enabling restores it"
+        );
+    });
 }
 
 fn make_codeql_db(root: &std::path::Path, name: &str, lang: &str) -> std::path::PathBuf {
@@ -56328,75 +56356,82 @@ fn codeql_run_tests_runs_the_test_pack_through_the_testing_view() {
     // #578: "CodeQL: Run Tests" runs every CodeQL test with the app's
     // `codeql`, and the results land in the Testing view; outside a
     // CodeQL test workspace it says why nothing ran.
-    use crate::testing::model::TestStatus;
-    use crate::widgets::command_palette::Command;
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        Command::from_id("codeql_run_tests"),
-        Some(Command::CodeqlRunTests)
-    );
-    assert_eq!(Command::CodeqlRunTests.title(), "CodeQL: Run Tests");
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        use crate::testing::model::TestStatus;
+        use crate::widgets::command_palette::Command;
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            Command::from_id("codeql_run_tests"),
+            Some(Command::CodeqlRunTests)
+        );
+        assert_eq!(Command::CodeqlRunTests.title(), "CodeQL: Run Tests");
 
-    let plain = tempfile::tempdir().unwrap();
-    let mut app = App::new(plain.path().to_path_buf()).unwrap();
-    app.run_command(Command::CodeqlRunTests);
-    assert!(
-        app.status.starts_with("No CodeQL tests here"),
-        "{}",
-        app.status
-    );
+        let plain = tempfile::tempdir().unwrap();
+        let mut app = App::new(plain.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlRunTests);
+        assert!(
+            app.status.starts_with("No CodeQL tests here"),
+            "{}",
+            app.status
+        );
 
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    std::fs::create_dir_all(root.join("test/Bad")).unwrap();
-    std::fs::write(
-        root.join("test/qlpack.yml"),
-        "name: acme/tests\nextractor: rust\ntests: .\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("test/Bad/Bad.ql"), "select 1").unwrap();
-    std::fs::write(root.join("test/Bad/Bad.expected"), "").unwrap();
-    let bin = tempfile::tempdir().unwrap();
-    let log = bin.path().join("calls.log");
-    let program = bin.path().join("codeql");
-    std::fs::write(
-        &program,
-        format!(
-            "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("test/Bad")).unwrap();
+        std::fs::write(
+            root.join("test/qlpack.yml"),
+            "name: acme/tests\nextractor: rust\ntests: .\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("test/Bad/Bad.ql"), "select 1").unwrap();
+        std::fs::write(root.join("test/Bad/Bad.expected"), "").unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("calls.log");
+        let program = bin.path().join("codeql");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\n\
              echo '[1/1 comp 1s eval 9ms] FAILED(RESULT) {root}/test/Bad/Bad.ql'\n\
              echo '--- expected'\necho '+++ actual'\necho '+| 1 |'\n\
              echo '0 tests passed; 1 tests failed:'\nexit 1\n",
-            log = log.display(),
-            root = root.display(),
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut app = App::new(root.clone()).unwrap();
-    app.set_codeql_program(program.clone());
-    app.run_command(Command::CodeqlRunTests);
-    assert_eq!(app.status, "Running CodeQL tests");
-    assert!(app.sidebar_view == SidebarView::Testing);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let _ = app.test_worker.drain(&mut app.testing);
-        if !app.testing.is_busy()
-            && app
-                .testing
-                .cases_for_test()
-                .contains(&(String::from("test/Bad::Bad.ql"), TestStatus::Failed))
-        {
-            break;
+                log = log.display(),
+                root = root.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.set_codeql_program(program.clone());
+        app.run_command(Command::CodeqlRunTests);
+        assert_eq!(app.status, "Running CodeQL tests");
+        assert!(app.sidebar_view == SidebarView::Testing);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _ = app.test_worker.drain(&mut app.testing);
+            if !app.testing.is_busy()
+                && app
+                    .testing
+                    .cases_for_test()
+                    .contains(&(String::from("test/Bad::Bad.ql"), TestStatus::Failed))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the CodeQL run never reported; cases: {:?}",
+                app.testing.cases_for_test()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the CodeQL run never reported; cases: {:?}",
-            app.testing.cases_for_test()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(app.testing.failed_count(), 1);
-    assert_eq!(std::fs::read_to_string(&log).unwrap(), "test run test\n");
+        assert_eq!(app.testing.failed_count(), 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "test run test\n");
+    });
 }
 
 #[cfg(unix)]
@@ -56452,32 +56487,39 @@ fn a_codeql_test_clicked_in_the_tree_runs_with_the_configured_codeql() {
 #[cfg(unix)]
 #[test]
 fn copy_codeql_version_copies_croft_the_cli_and_the_platform() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.codeql_program = fake_codeql(bin.path(), "", 0, "");
-    // The fake prints nothing on stdout; give it a version to report.
-    let script = std::fs::read_to_string(&app.codeql_program).unwrap();
-    std::fs::write(
-        &app.codeql_program,
-        script.replace("exit 0", "echo 2.19.3\nexit 0"),
-    )
-    .unwrap();
-    app.run_command(crate::widgets::command_palette::Command::CodeqlCopyVersion);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.drain_codeql_version() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the version check never finished"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(app.status, "Copied CodeQL version information");
-    let clip = crate::clipboard::read_string().unwrap();
-    assert!(clip.contains(concat!("croft version: ", env!("CARGO_PKG_VERSION"))));
-    assert!(clip.contains("CodeQL CLI version: 2.19.3"));
-    let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
-    assert_eq!(calls.trim(), "version --format=terse");
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        // The fake prints nothing on stdout; give it a version to report.
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace("exit 0", "echo 2.19.3\nexit 0"),
+        )
+        .unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlCopyVersion);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_version() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the version check never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.status, "Copied CodeQL version information");
+        let clip = crate::clipboard::read_string().unwrap();
+        assert!(clip.contains(concat!("croft version: ", env!("CARGO_PKG_VERSION"))));
+        assert!(clip.contains("CodeQL CLI version: 2.19.3"));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls.trim(), "version --format=terse");
+    });
 }
 
 /// Drain the database upgrade until it lands, or fail after a few seconds.
