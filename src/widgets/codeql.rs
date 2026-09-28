@@ -247,6 +247,14 @@ impl CodeqlPanel {
         }
     }
 
+    /// The Model Editor endpoint whose row is selected.
+    pub fn selected_model_endpoint(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::ModelEndpoint(i))) => Some(i),
+            _ => None,
+        }
+    }
+
     /// Select the Evaluator Log Viewer row of predicate `i`.
     pub fn select_evallog_predicate(&mut self, i: usize) {
         let row = self.lines().iter().position(|l| {
