@@ -59973,3 +59973,116 @@ fn a_launch_json_node_attach_config_attaches_by_port() {
     });
     assert!(label.contains("tick "), "{label}");
 }
+
+/// #263: the open file rewritten on disk under a clean buffer dims its
+/// coverage marks, as an edit in the buffer does: they describe old text.
+#[test]
+fn an_external_rewrite_of_the_open_file_dims_its_coverage() {
+    use crate::testing::coverage::Coverage;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("f.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.testing.on_coverage(Ok(Coverage::from_lcov(
+        "SF:f.rs\nDA:1,3\nDA:2,0\nend_of_record\n",
+        &root,
+    )));
+    assert!(app.sync_coverage());
+    assert!(!app.editor.coverage.as_ref().unwrap().stale);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "fn b() {}\n\nfn a() {}\n").unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    app.sync_coverage();
+    assert!(
+        app.editor.coverage.as_ref().unwrap().stale,
+        "the reloaded file's marks are stale"
+    );
+}
+
+/// #263: a watched scope reruns on a source save, but not on a save of a
+/// file git ignores (build output, a `.env`).
+#[test]
+fn a_save_of_an_ignored_file_does_not_rerun_watched_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(root.join(".gitignore"), "*.log\nout/\n").unwrap();
+    std::fs::create_dir_all(root.join("out")).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.active_test_root = root.clone();
+    app.testing
+        .watch
+        .toggle(crate::testing::watch::WatchScope::All);
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for ignored in ["run.log", "out/gen.rs"] {
+        app.record_history_snapshot_of(&root.join(ignored), Default::default(), None);
+        assert_eq!(
+            app.testing.watch.take_due(later, false),
+            None,
+            "{ignored} is ignored"
+        );
+    }
+    app.record_history_snapshot_of(&root.join("lib.rs"), Default::default(), None);
+    assert_eq!(
+        app.testing.watch.take_due(later, false),
+        Some(crate::testing::watch::WatchScope::All),
+        "a source save reruns"
+    );
+}
+
+/// #263 against a real cargo-llvm-cov: "Run All Tests with Coverage" on a
+/// crate marks the lines its test ran green and a function no test calls
+/// red, with a percentage between. Needs `cargo llvm-cov` (and the
+/// `llvm-tools-preview` component it drives).
+#[test]
+#[ignore = "needs cargo-llvm-cov"]
+fn a_real_cargo_llvm_cov_run_marks_the_covered_file() {
+    use crate::testing::coverage::LineCov;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn unused() -> i32 {\n    0\n}\n\n\
+         #[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&root.join("src/lib.rs")).unwrap();
+    app.run_all_tests_with_coverage();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while app.editor.coverage.is_none() {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        let _ = app.test_worker.drain(&mut app.testing);
+        app.sync_coverage();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let lens = app.editor.coverage.clone().unwrap();
+    assert_eq!(lens.lines.get(&1), Some(&LineCov::Covered), "`a + b` ran");
+    assert_eq!(
+        lens.lines.get(&5),
+        Some(&LineCov::Uncovered),
+        "`unused`'s body never ran: {:?}",
+        lens.lines
+    );
+    assert!(
+        lens.percent.is_some_and(|p| p > 0.0 && p < 100.0),
+        "{:?}",
+        lens.percent
+    );
+}

@@ -7138,6 +7138,14 @@ impl App {
         if report.is_empty() {
             return false;
         }
+        // The active file changed on disk under a clean buffer: its coverage
+        // marks describe the old text now, so they dim like an edit's (#263).
+        if let Some(active) = self.editor.path.as_ref()
+            && report.reloaded.contains(active)
+            && let Some(lens) = self.editor.coverage.as_mut()
+        {
+            lens.stale = true;
+        }
         self.refresh_git_status_debounced();
         match (
             report.reloaded.len(),
@@ -51835,10 +51843,17 @@ impl App {
         described: Option<Vec<u8>>,
     ) {
         // Every save lands here, so this is where a watched test scope
-        // hears about it (#263).
-        self.testing
-            .watch
-            .on_saved(path, &self.active_test_root, std::time::Instant::now());
+        // hears about it (#263). A file git ignores (build output, a `.env`)
+        // is not source, so its save reruns nothing; git is only asked while
+        // something is watched.
+        if self.testing.watch.scope().is_some()
+            && path.starts_with(&self.active_test_root)
+            && !crate::git::is_ignored(&self.active_test_root, path)
+        {
+            self.testing
+                .watch
+                .on_saved(path, &self.active_test_root, std::time::Instant::now());
+        }
         self.spawn_history_record(path, seats, described, false);
         // Every save passes through here: breakpoints that followed edits in
         // the buffer are handed to running sessions now that the file on disk
