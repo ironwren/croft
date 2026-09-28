@@ -26531,6 +26531,16 @@ impl App {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
+        // As for a single run: CodeQL reads the saved file, so a batch
+        // would silently run the text before the unsaved edits.
+        if self.editor.dirty {
+            let name = query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.status = format!("Save {name} before running it: CodeQL reads it from disk");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         if store.databases.is_empty() {
             self.status = String::from("Add a CodeQL database first");

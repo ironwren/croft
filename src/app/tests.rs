@@ -56715,6 +56715,16 @@ fn a_codeql_query_runs_on_each_named_database_with_its_own_history_entry() {
             app.submit_input_prompt();
         };
 
+        // Unsaved edits would be ignored by the CLI, so the batch refuses.
+        app.editor.dirty = true;
+        app.run_command(Command::CodeqlRunQueryOnMultipleDatabases);
+        assert_eq!(
+            app.status,
+            "Save q.ql before running it: CodeQL reads it from disk"
+        );
+        assert!(app.input_prompt.is_none());
+        app.editor.dirty = false;
+
         ask(&mut app, "app, web");
         assert_eq!(app.status, "There is no CodeQL database called web");
         assert!(app.codeql_run.is_none());
