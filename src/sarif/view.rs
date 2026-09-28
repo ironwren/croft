@@ -414,6 +414,39 @@ fn term_hits(t: &Term, e: &Entry) -> bool {
     hit != t.negated
 }
 
+/// Where the filter's words appear in `message`, as byte ranges, for
+/// highlighting (#577): every positive term that searches messages (no
+/// field, or `msg:`), matched case-insensitively. Overlapping matches merge.
+pub fn highlight_ranges(query: &Query, message: &str) -> Vec<(usize, usize)> {
+    let lower = message.to_lowercase();
+    // Lowercasing can change byte lengths outside ASCII; ranges are only
+    // kept when they map back onto the same bytes.
+    if lower.len() != message.len() {
+        return Vec::new();
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for t in query.clauses.iter().flatten() {
+        if t.negated || t.needle.is_empty() || !matches!(t.field, None | Some(Field::Message)) {
+            continue;
+        }
+        for (at, _) in lower.match_indices(&t.needle) {
+            ranges.push((at, at + t.needle.len()));
+        }
+    }
+    ranges.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in ranges {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+        .into_iter()
+        .filter(|(a, b)| message.is_char_boundary(*a) && message.is_char_boundary(*b))
+        .collect()
+}
+
 /// The CWE number in `s`: `89` alone, or after `cwe` and an optional `-`
 /// (`CWE-89`, `external/cwe/cwe-089`). Leading zeros do not matter.
 pub fn cwe_number(s: &str) -> Option<u32> {
@@ -1761,6 +1794,20 @@ mod tests {
         }
         // A bar with nothing on one side is not an empty alternative.
         assert_eq!(parse_query("header |"), parse_query("header"));
+    }
+
+    #[test]
+    fn the_filters_message_words_are_the_highlighted_ranges() {
+        let h = |q: &str, m: &str| highlight_ranges(&parse_query(q), m);
+        assert_eq!(h("sql", "SQL built from SQL"), [(0, 3), (15, 18)]);
+        assert_eq!(h("built | from", "SQL built from"), [(4, 9), (10, 14)]);
+        assert_eq!(h("msg:from", "SQL built from"), [(10, 14)]);
+        // Negated terms and other fields do not mark the message.
+        assert!(h("-sql rule:sql", "SQL built").is_empty());
+        // Overlaps merge.
+        assert_eq!(h("buil uilt", "built"), [(0, 5)]);
+        // Lowercasing that changes lengths is not guessed at.
+        assert!(h("i", "İstanbul").is_empty());
     }
 
     #[test]
