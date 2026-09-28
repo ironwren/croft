@@ -56186,6 +56186,37 @@ fn a_codeql_test_clicked_in_the_tree_runs_with_the_configured_codeql() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn copy_codeql_version_copies_croft_the_cli_and_the_platform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+    // The fake prints nothing on stdout; give it a version to report.
+    let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+    std::fs::write(
+        &app.codeql_program,
+        script.replace("exit 0", "echo 2.19.3\nexit 0"),
+    )
+    .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::CodeqlCopyVersion);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_version() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the version check never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.status, "Copied CodeQL version information");
+    let clip = crate::clipboard::read_string().unwrap();
+    assert!(clip.contains(concat!("croft version: ", env!("CARGO_PKG_VERSION"))));
+    assert!(clip.contains("CodeQL CLI version: 2.19.3"));
+    let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+    assert_eq!(calls.trim(), "version --format=terse");
+}
+
 /// Drain the database upgrade until it lands, or fail after a few seconds.
 fn wait_for_codeql_upgrade(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

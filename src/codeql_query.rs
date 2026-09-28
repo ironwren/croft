@@ -89,6 +89,26 @@ pub fn upgrade_args(db: &Path) -> Vec<String> {
     vec![String::from("database"), String::from("upgrade"), path(db)]
 }
 
+/// `codeql` arguments printing the CLI's bare version number.
+pub fn version_args() -> Vec<String> {
+    vec![String::from("version"), String::from("--format=terse")]
+}
+
+/// The text "CodeQL: Copy Version Information" puts on the clipboard: croft's
+/// version, the CodeQL CLI's (or why it could not be read) and the platform,
+/// one per line, ready to paste into a bug report.
+pub fn version_information(croft: &str, cli: &Result<String, String>) -> String {
+    let cli = match cli {
+        Ok(v) => v.trim().to_string(),
+        Err(why) => format!("unavailable ({why})"),
+    };
+    format!(
+        "croft version: {croft}\nCodeQL CLI version: {cli}\nPlatform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
 /// The queries in one CodeQL pack, as the side bar's Queries section groups
 /// them (#578).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +605,23 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_information_names_croft_the_cli_and_the_platform() {
+        let text = version_information("0.1.9", &Ok(String::from("2.19.3\n")));
+        let platform = format!(
+            "Platform: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        assert_eq!(
+            text,
+            format!("croft version: 0.1.9\nCodeQL CLI version: 2.19.3\n{platform}")
+        );
+        let missing = version_information("0.1.9", &Err(String::from("not on PATH")));
+        assert!(missing.contains("CodeQL CLI version: unavailable (not on PATH)"));
+        assert_eq!(version_args(), ["version", "--format=terse"]);
+    }
 
     const PROBLEM: &str = "/**\n * @name SQL injection\n * @kind path-problem\n * @id rust/sql\n */\nimport rust\nselect 1";
 

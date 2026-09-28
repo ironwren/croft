@@ -3152,6 +3152,9 @@ pub struct App {
     codeql_batch: (usize, usize),
     /// The database upgrade in flight (#578).
     codeql_upgrade: Option<CodeqlUpgrade>,
+    /// The `codeql version` call behind "CodeQL: Copy Version Information"
+    /// (#578): its bare version number, or why it could not be read.
+    codeql_version: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5417,6 +5420,7 @@ impl App {
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
             codeql_upgrade: None,
+            codeql_version: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23886,6 +23890,60 @@ impl App {
         self.status = match outcome {
             Ok(()) => format!("Upgraded CodeQL database {name}"),
             Err(why) => format!("Could not upgrade CodeQL database {name}: {why}"),
+        };
+        true
+    }
+
+    /// Ask the CodeQL CLI for its version on a worker thread (#578, VS
+    /// Code's "CodeQL: Copy Version Information");
+    /// [`Self::drain_codeql_version`] copies the report.
+    fn copy_codeql_version(&mut self) {
+        if self.codeql_version.is_some() {
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&program)
+                .args(crate::codeql_query::version_args())
+                .output();
+            let _ = tx.send(match out {
+                Ok(o) if o.status.success() => {
+                    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                }
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("codeql failed")
+                    .to_string()),
+                Err(e) => Err(format!("could not run codeql: {e}")),
+            });
+        });
+        self.status = String::from("Reading the CodeQL CLI version\u{2026}");
+        self.codeql_version = Some(rx);
+    }
+
+    /// Copy the version report once the CLI has answered (#578). A missing
+    /// CLI still copies croft's version and the platform, saying why the
+    /// CLI's could not be read.
+    pub fn drain_codeql_version(&mut self) -> bool {
+        let Some(rx) = self.codeql_version.as_ref() else {
+            return false;
+        };
+        let cli = match rx.try_recv() {
+            Ok(cli) => cli,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the version check stopped unexpectedly"))
+            }
+        };
+        self.codeql_version = None;
+        let text = crate::codeql_query::version_information(env!("CARGO_PKG_VERSION"), &cli);
+        copy_to_clipboard(&text);
+        self.status = match cli {
+            Ok(_) => String::from("Copied CodeQL version information"),
+            Err(why) => format!("Copied version information; the CodeQL CLI is unavailable: {why}"),
         };
         true
     }
@@ -44129,6 +44187,7 @@ impl App {
                 }
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
+            Cmd::CodeqlCopyVersion => self.copy_codeql_version(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -62689,7 +62748,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run() | app.drain_codeql_upgrade();
+        let codeql_changed =
+            app.drain_codeql_run() | app.drain_codeql_upgrade() | app.drain_codeql_version();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
