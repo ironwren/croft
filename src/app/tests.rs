@@ -60392,11 +60392,23 @@ esac
             format!(
                 r#"#!/bin/sh
 echo "gh $*" >> '{log}'
+case "$2" in
+  */variant-analyses/4242)
+    # The first read finds the run going, every later one finished.
+    if [ -e '{polls}' ]; then
+      echo '{{"status": "succeeded", "scanned_repositories": [{{"repository": {{"full_name": "a/b"}}, "analysis_status": "succeeded", "result_count": 3}}, {{"repository": {{"full_name": "c/d"}}, "analysis_status": "succeeded", "result_count": 2}}]}}'
+    else
+      touch '{polls}'
+      echo '{{"status": "in_progress", "scanned_repositories": [{{"repository": {{"full_name": "a/b"}}, "analysis_status": "succeeded", "result_count": 3}}, {{"repository": {{"full_name": "c/d"}}, "analysis_status": "in_progress"}}]}}'
+    fi
+    exit 0 ;;
+esac
 while [ $# -gt 0 ]; do [ "$1" = --input ] && cp "$2" '{body}'; shift; done
 echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no_codeql_db_repos": {{"repository_count": 1}}}}}}'
 "#,
                 log = log.display(),
-                body = body.display()
+                body = body.display(),
+                polls = tmp.path().join("polled").display()
             ),
         );
 
@@ -60487,7 +60499,75 @@ echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no
             "the work folder is cleaned up"
         );
 
+        // The run shows in the side bar and is followed until it finishes.
+        assert_eq!(app.codeql.variant_runs, ["Find.ql · submitted"]);
+        let poll = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            app.poll_codeql_variant_runs();
+            assert!(app.codeql_variant_poll.is_some(), "a read started");
+            while !app.poll_codeql_variant_runs() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the read never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        poll(&mut app);
+        assert_eq!(
+            app.codeql.variant_runs,
+            ["Find.ql · running · 1/2 repos · 3 results"]
+        );
+        app.poll_codeql_variant_runs();
+        assert!(
+            app.codeql_variant_poll.is_none(),
+            "not again before the interval"
+        );
+        app.codeql_variant_polled = None;
+        poll(&mut app);
+        assert_eq!(
+            app.status,
+            "Variant analysis 4242 of Find.ql succeeded: 2/2 repositories, 5 results"
+        );
+        assert_eq!(
+            app.codeql.variant_runs,
+            ["Find.ql · succeeded · 2/2 repos · 5 results"]
+        );
+        let reads = |log: &std::path::Path| {
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter(|l| l.ends_with("variant-analyses/4242"))
+                .count()
+        };
+        assert_eq!(reads(&log), 2);
+        app.codeql_variant_polled = None;
+        app.poll_codeql_variant_runs();
+        assert!(
+            app.codeql_variant_poll.is_none(),
+            "a finished run is not read"
+        );
+        assert_eq!(reads(&log), 2);
+
+        // Enter on the run's row opens its report.
+        app.open_codeql_view();
+        app.codeql
+            .select_action(crate::widgets::codeql::Action::VariantRun(0));
+        app.focus = Pane::Tree;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let report = app.editor.lines.join("\n");
+        assert!(
+            report.starts_with("# Variant analysis 4242 of Find.ql"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| [c/d](https://github.com/c/d) | succeeded | 2 |  |"),
+            "{report}"
+        );
+
         // An unsaved query is not sent as its last saved version.
+        app.editor.open(&query).unwrap();
         app.editor.dirty = true;
         app.run_command(Command::CodeqlRunVariantAnalysis);
         assert!(app.status.contains("Save the query"), "{}", app.status);

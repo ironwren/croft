@@ -249,6 +249,182 @@ pub struct Submitted {
     #[serde(default)]
     pub skipped: usize,
     pub submitted_at: u64,
+    /// The last progress read back from GitHub, when it has been.
+    #[serde(default)]
+    pub progress: Option<RunProgress>,
+}
+
+/// How far one repository of a run has got.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoProgress {
+    pub nwo: String,
+    /// GitHub's `analysis_status`: `pending`, `in_progress`, `succeeded`,
+    /// `failed`, `canceled` or `timed_out`.
+    pub status: String,
+    #[serde(default)]
+    pub results: Option<u64>,
+    #[serde(default)]
+    pub failure: Option<String>,
+}
+
+/// A run's progress as GitHub reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunProgress {
+    /// The run's own `status`: `in_progress`, `succeeded`, `failed` or
+    /// `cancelled`.
+    pub status: String,
+    #[serde(default)]
+    pub failure: Option<String>,
+    pub repos: Vec<RepoProgress>,
+}
+
+/// Repository statuses that will not change again.
+fn repo_finished(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "canceled" | "timed_out")
+}
+
+impl RunProgress {
+    /// Whether GitHub will report nothing new for the run.
+    pub fn is_done(&self) -> bool {
+        self.status != "in_progress"
+    }
+
+    /// Repositories finished, and those the run covers.
+    pub fn counts(&self) -> (usize, usize) {
+        let done = self
+            .repos
+            .iter()
+            .filter(|r| repo_finished(&r.status))
+            .count();
+        (done, self.repos.len())
+    }
+
+    /// Results across the repositories that reported a count.
+    pub fn results(&self) -> u64 {
+        self.repos.iter().filter_map(|r| r.results).sum()
+    }
+}
+
+/// `gh` arguments reading run `id`'s progress from `controller`.
+pub fn progress_args(controller: &str, id: u64) -> Vec<String> {
+    vec![
+        String::from("api"),
+        format!("repos/{controller}/code-scanning/codeql/variant-analyses/{id}"),
+    ]
+}
+
+/// The progress in GitHub's answer to [`progress_args`].
+pub fn parse_progress(json: &str) -> Result<RunProgress, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("GitHub's answer was not JSON: {e}"))?;
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| String::from("GitHub's answer gave the run no status"))?
+        .to_string();
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let repos = v
+        .get("scanned_repositories")
+        .and_then(|r| r.as_array())
+        .map(|repos| {
+            repos
+                .iter()
+                .filter_map(|r| {
+                    Some(RepoProgress {
+                        nwo: r.get("repository")?.get("full_name")?.as_str()?.to_string(),
+                        status: text(r, "analysis_status")
+                            .unwrap_or_else(|| String::from("pending")),
+                        results: r.get("result_count").and_then(|c| c.as_u64()),
+                        failure: text(r, "failure_message"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(RunProgress {
+        status,
+        failure: text(&v, "failure_reason"),
+        repos,
+    })
+}
+
+/// The side bar's line for `run`.
+pub fn run_label(run: &Submitted) -> String {
+    let name = run.query.file_name().unwrap_or_default().to_string_lossy();
+    match &run.progress {
+        None => format!("{name} · submitted"),
+        Some(p) => {
+            let (done, total) = p.counts();
+            let state = match p.status.as_str() {
+                "in_progress" => "running",
+                other => other,
+            };
+            format!(
+                "{name} · {state} · {done}/{total} repos · {} results",
+                p.results()
+            )
+        }
+    }
+}
+
+/// A Markdown report of `run`: its status, then a row per repository with
+/// its status, result count and any failure, each repository linked.
+pub fn run_report(run: &Submitted) -> String {
+    let name = run.query.file_name().unwrap_or_default().to_string_lossy();
+    let mut out = format!(
+        "# Variant analysis {} of {name}\n\nController: {}  \nLanguage: {}  \nRun: {}\n\n",
+        run.id,
+        run.controller,
+        run.language,
+        run.url()
+    );
+    let Some(p) = &run.progress else {
+        out.push_str("No progress read from GitHub yet.\n");
+        return out;
+    };
+    let (done, total) = p.counts();
+    out.push_str(&format!(
+        "Status: {} · {done}/{total} repositories · {} results\n",
+        p.status,
+        p.results()
+    ));
+    if let Some(why) = &p.failure {
+        out.push_str(&format!("Failure: {why}\n"));
+    }
+    if run.skipped > 0 {
+        out.push_str(&format!("Skipped by GitHub: {}\n", run.skipped));
+    }
+    out.push_str("\n| Repository | Status | Results | Failure |\n|---|---|---|---|\n");
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    for r in &p.repos {
+        out.push_str(&format!(
+            "| [{nwo}](https://github.com/{nwo}) | {} | {} | {} |\n",
+            r.status,
+            r.results.map(|n| n.to_string()).unwrap_or_default(),
+            r.failure.as_deref().map(cell).unwrap_or_default(),
+            nwo = r.nwo
+        ));
+    }
+    out
+}
+
+/// Replace the remembered run `id` in the file at `path` with `run`.
+pub fn update_submitted(path: &Path, run: &Submitted) -> std::io::Result<()> {
+    let mut runs = load_submitted(path);
+    match runs
+        .iter_mut()
+        .find(|r| r.id == run.id && r.controller == run.controller)
+    {
+        Some(slot) => *slot = run.clone(),
+        None => runs.push(run.clone()),
+    }
+    let text = serde_json::to_string_pretty(&runs).map_err(std::io::Error::other)?;
+    std::fs::write(path, text)
 }
 
 impl Submitted {
@@ -295,6 +471,7 @@ pub fn parse_submission(
         workflow_run: v.get("actions_workflow_run_id").and_then(|r| r.as_u64()),
         skipped,
         submitted_at,
+        progress: None,
     })
 }
 
@@ -438,5 +615,78 @@ mod tests {
         }
         let ids: Vec<u64> = load_submitted(&path).iter().map(|r| r.id).collect();
         assert_eq!(ids, [5, 6]);
+    }
+    #[test]
+    fn a_runs_progress_counts_finished_repositories_and_results() {
+        let json = r#"{"id": 7, "status": "in_progress",
+            "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 3},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "failed", "failure_message": "no | db\nhere"},
+                {"repository": {"full_name": "e/f"}, "analysis_status": "in_progress"},
+                {"repository": {"full_name": "g/h"}, "analysis_status": "succeeded", "result_count": 0}
+            ]}"#;
+        let p = parse_progress(json).unwrap();
+        assert!(!p.is_done());
+        assert_eq!((p.counts(), p.results()), ((3, 4), 3));
+        let mut run = parse_submission(
+            r#"{"id": 7, "actions_workflow_run_id": 1}"#,
+            "me/ctl",
+            Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        assert_eq!(run_label(&run), "Find.ql · submitted");
+        assert!(run_report(&run).contains("No progress read"));
+        run.progress = Some(p);
+        assert_eq!(run_label(&run), "Find.ql · running · 3/4 repos · 3 results");
+        let report = run_report(&run);
+        assert!(
+            report.contains("| [a/b](https://github.com/a/b) | succeeded | 3 |  |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| failed |  | no \\| db here |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Run: https://github.com/me/ctl/actions/runs/1"),
+            "{report}"
+        );
+
+        let done = parse_progress(r#"{"status": "cancelled", "failure_reason": ""}"#).unwrap();
+        assert!(done.is_done() && done.repos.is_empty() && done.failure.is_none());
+        assert!(parse_progress(r#"{"message": "Not Found"}"#).is_err());
+        assert_eq!(
+            progress_args("me/ctl", 7),
+            [
+                "api",
+                "repos/me/ctl/code-scanning/codeql/variant-analyses/7"
+            ]
+        );
+    }
+
+    #[test]
+    fn updating_a_remembered_run_replaces_it_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runs.json");
+        let run = |id: u64| {
+            parse_submission(
+                &format!(r#"{{"id": {id}}}"#),
+                "a/b",
+                Path::new("/q.ql"),
+                "go",
+                0,
+            )
+            .unwrap()
+        };
+        record_submitted(&path, run(1)).unwrap();
+        record_submitted(&path, run(2)).unwrap();
+        let mut first = run(1);
+        first.progress = parse_progress(r#"{"status": "succeeded"}"#).ok();
+        update_submitted(&path, &first).unwrap();
+        let runs = load_submitted(&path);
+        assert_eq!(runs.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+        assert!(runs[0].progress.as_ref().is_some_and(|p| p.is_done()));
     }
 }
