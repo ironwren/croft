@@ -56088,6 +56088,7 @@ fn seed_codeql_history(
             status: status.clone(),
             output: output.clone(),
             name: None,
+            results: None,
         });
     }
     history.save(&App::codeql_history_path()).unwrap();
@@ -56909,6 +56910,30 @@ fn a_failed_query_run_is_recorded_with_codeqls_own_words() {
         assert!(
             calls.starts_with("query run "),
             "a table query runs as a query: {calls}"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_successful_query_run_records_its_result_count() {
+    // #578: Query History shows how many results a run produced, and can
+    // sort by it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n2\n", 0, "");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(history.entries[0].results, Some(2), "{}", app.status);
+        assert!(
+            app.codeql.history[0].ends_with("\u{b7} 2 results"),
+            "{}",
+            app.codeql.history[0]
         );
     });
 }
@@ -57869,6 +57894,7 @@ fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
                 status: crate::codeql_query::RunStatus::Succeeded,
                 output: db.join("unused-output.csv"),
                 name: None,
+                results: None,
             });
         }
         history.save(&App::codeql_history_path()).unwrap();
@@ -57945,6 +57971,7 @@ fn renaming_one_of_two_same_named_databases_keeps_both_protected() {
             status: crate::codeql_query::RunStatus::Succeeded,
             output: tmp.path().join("r.csv"),
             name: None,
+            results: None,
         });
         history.save(&App::codeql_history_path()).unwrap();
 

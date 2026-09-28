@@ -26053,6 +26053,7 @@ impl App {
             status: RunStatus::Running,
             output: output.clone(),
             name: None,
+            results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
@@ -26141,6 +26142,9 @@ impl App {
         };
         entry.status = status.clone();
         entry.seconds = seconds;
+        entry.results = (status == RunStatus::Succeeded)
+            .then(|| crate::codeql_query::count_results(&entry.output))
+            .flatten();
         let output = entry.output.clone();
         let name = entry
             .query
