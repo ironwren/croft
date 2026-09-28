@@ -60504,6 +60504,145 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
     });
 }
 
+#[test]
+fn codeql_code_search_adds_the_repositories_it_finds_to_the_selected_list() {
+    // #578: VS Code's "Add repositories with GitHub Code Search". The search
+    // runs off the UI thread, page by page, scoped to the side bar's
+    // language, and its distinct repositories join the selected list.
+    use crate::codeql_variant::{Item, VariantConfig};
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh-args");
+        let gh = tmp.path().join("gh");
+        // Page 1 is full (100 results over 60 repositories, one already
+        // listed in another case); page 2 is short, so page 3 is never
+        // asked for. A query with "broken" in it fails; one with "cut"
+        // fills page 1 and then hits the rate limit.
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *broken*) echo 'gh: Validation Failed (HTTP 422)' >&2; exit 1 ;;
+  *cut*" page=1 "*) i=0; while [ $i -lt 100 ]; do echo "c/r$i"; i=$((i+1)); done ;;
+  *cut*) echo 'API rate limit exceeded' >&2; exit 1 ;;
+  *" page=1 "*) i=0; while [ $i -lt 100 ]; do echo "o/r$((i % 60))"; i=$((i+1)); done; echo "A/B" ;;
+  *" page=2 "*) echo o/extra ;;
+  *) echo "asked for a page past the short one" >&2; exit 1 ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = gh.clone();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        };
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                    .unwrap();
+            }
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !app.drain_codeql_code_search() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the search never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
+
+        // With no list selected there is nowhere to put the results.
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        assert!(app.input_prompt.is_none());
+        assert!(
+            app.status.contains("Select a repository list"),
+            "{}",
+            app.status
+        );
+
+        app.codeql
+            .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
+        press(&mut app, KeyCode::Char('l'));
+        type_in(&mut app, "found");
+        press(&mut app, KeyCode::Char('a'));
+        type_in(&mut app, "a/b");
+        // The language first: it filters rows, which moves the selection.
+        app.codeql.language = crate::widgets::codeql::LANGUAGE_IDS
+            .iter()
+            .position(|l| *l == "python");
+        app.codeql.select_variant_item(Item::List(0));
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().title,
+            "Add Repositories to found with GitHub Code Search"
+        );
+        type_in(&mut app, "import torch");
+        assert!(
+            app.status.starts_with("Searching GitHub code"),
+            "{}",
+            app.status
+        );
+        finish(&mut app);
+
+        let repos = saved().lists[0].repos.clone();
+        assert_eq!(repos.len(), 1 + 60 + 1, "{repos:?}");
+        assert_eq!(repos[..2], ["a/b", "o/r0"]);
+        assert_eq!(repos.last().map(String::as_str), Some("o/extra"));
+        assert_eq!(
+            app.status, "Added 61 repositories to found (1 already there)",
+            "{}",
+            app.status
+        );
+        let asked = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(asked.lines().count(), 2, "stops at the short page: {asked}");
+        assert!(asked.contains("q=import torch language:python"), "{asked}");
+
+        // A failed search says why and changes nothing.
+        app.codeql.select_variant_item(Item::List(0));
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        type_in(&mut app, "broken");
+        finish(&mut app);
+        assert!(
+            app.status.contains("GitHub Code Search failed"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("Validation Failed"), "{}", app.status);
+        assert_eq!(saved().lists[0].repos, repos);
+
+        // A later page failing keeps the earlier pages and says so.
+        app.codeql.select_variant_item(Item::List(0));
+        app.run_command(Command::CodeqlVariantCodeSearch);
+        type_in(&mut app, "cut");
+        finish(&mut app);
+        assert_eq!(saved().lists[0].repos.len(), repos.len() + 100);
+        assert!(
+            app.status.starts_with("Added 100 repositories to found; the search stopped early, page 2 failed: API rate limit exceeded"),
+            "{}",
+            app.status
+        );
+    });
+}
+
 /// A recorded row's width as a player draws it: its characters with the
 /// SGR and cursor escapes (#356) taken out, since those occupy no column.
 fn visible_width(row: &str) -> usize {

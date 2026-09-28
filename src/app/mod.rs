@@ -3176,6 +3176,9 @@ pub struct App {
     codeql_cli_check: Option<std::sync::mpsc::Receiver<CodeqlCliCheck>>,
     /// The network calls behind those two, replaced in tests.
     codeql_cli_net: crate::codeql_cli::Net,
+    /// The GitHub Code Search in flight: the list its repositories go
+    /// into, and its outcome (#578).
+    codeql_code_search: Option<CodeqlCodeSearch>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5450,6 +5453,7 @@ impl App {
             codeql_cli_download: None,
             codeql_cli_check: None,
             codeql_cli_net: crate::codeql_cli::Net::default(),
+            codeql_code_search: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23107,8 +23111,9 @@ impl App {
     /// when there is one. `r` on a pack or one of its queries runs every
     /// query in the pack; Esc then first cancels the ones still queued.
     /// In the Variant Analysis Repositories section `a` adds a repository
-    /// (into the selected list), `l` a list, `o` an owner and `g` opens the
-    /// selected repository or owner on GitHub; Enter selects what a run
+    /// (into the selected list), `l` a list, `o` an owner, `s` adds the
+    /// repositories a GitHub Code Search finds to the selected list and `g`
+    /// opens the selected repository or owner on GitHub; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23154,6 +23159,7 @@ impl App {
             KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
             KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
             KeyCode::Char('o') if in_va => self.prompt_add_codeql_variant_owner(),
+            KeyCode::Char('s') if in_va => self.prompt_codeql_variant_code_search(),
             KeyCode::Char('g') if in_va => self.open_codeql_variant_on_github(),
             KeyCode::Char('e') => {
                 if let Some(i) = db {
@@ -23465,6 +23471,145 @@ impl App {
             }
             self.codeql.select_variant_item(item);
         }
+    }
+
+    /// Ask for a GitHub Code Search query whose repositories go into the
+    /// selected list (#578, VS Code's "Add repositories with GitHub Code
+    /// Search"). The side bar's language scopes the search.
+    fn prompt_codeql_variant_code_search(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        if self.codeql_code_search.is_some() {
+            self.status = String::from("A GitHub Code Search is already running");
+            return;
+        }
+        let Some(list) = self
+            .codeql
+            .selected_variant_list()
+            .and_then(|i| self.codeql.variant.lists.get(i))
+            .map(|l| l.name.clone())
+        else {
+            self.status =
+                String::from("Select a repository list for the Code Search results (l adds one)");
+            return;
+        };
+        let hint = match self.codeql_search_language() {
+            Some(lang) if lang != "actions" => format!("a GitHub Code Search query ({lang} only)"),
+            _ => String::from("a GitHub Code Search query"),
+        };
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlVariantCodeSearch { list: list.clone() },
+            format!("Add Repositories to {list} with GitHub Code Search"),
+            &hint,
+        ));
+    }
+
+    /// The CodeQL id of the side bar's language, when one is picked.
+    fn codeql_search_language(&self) -> Option<&'static str> {
+        self.codeql
+            .language
+            .and_then(|i| crate::widgets::codeql::LANGUAGE_IDS.get(i).copied())
+    }
+
+    /// Run the Code Search off the UI thread; [`Self::drain_codeql_code_search`]
+    /// adds what it finds to `list`.
+    fn start_codeql_variant_code_search(&mut self, list: String, value: &str) {
+        if value.trim().is_empty() {
+            self.status = String::from("A Code Search query cannot be empty");
+            return;
+        }
+        let query = crate::codeql_variant::code_search_query(value, self.codeql_search_language());
+        let gh = self.gh_program.to_string_lossy().into_owned();
+        let root = self.active_workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let search = query.clone();
+        std::thread::spawn(move || {
+            use crate::codeql_variant::{CODE_SEARCH_LIMIT, CODE_SEARCH_PAGE, code_search_args};
+            let mut out = String::new();
+            let mut cut = None;
+            // Page by page up to the API's last, stopping at a short page.
+            // A later page's failure (Code Search allows ten requests a
+            // minute) keeps what the earlier ones found and says so.
+            for page in 1..=CODE_SEARCH_LIMIT / CODE_SEARCH_PAGE {
+                let text = match crate::pr_review::run_gh(
+                    &gh,
+                    &code_search_args(&search, page),
+                    &root,
+                    crate::pr_review::GH_TIMEOUT,
+                ) {
+                    Ok(text) => text,
+                    Err(why) if page == 1 => {
+                        let _ = tx.send(Err(why));
+                        return;
+                    }
+                    Err(why) => {
+                        cut = Some(format!("page {page} failed: {why}"));
+                        break;
+                    }
+                };
+                out.push_str(&text);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if text.lines().count() < CODE_SEARCH_PAGE {
+                    break;
+                }
+            }
+            let _ = tx.send(Ok((crate::codeql_variant::parse_code_search(&out), cut)));
+        });
+        self.status = format!("Searching GitHub code for {query}…");
+        self.codeql_code_search = Some((list, rx));
+    }
+
+    /// Add a finished Code Search's repositories to its list. Returns true
+    /// when one finished.
+    pub fn drain_codeql_code_search(&mut self) -> bool {
+        let Some((_, rx)) = self.codeql_code_search.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the search stopped without answering"))
+            }
+        };
+        let Some((list, _)) = self.codeql_code_search.take() else {
+            return false;
+        };
+        let (found, cut) = match outcome {
+            Ok((found, _)) if found.is_empty() => {
+                self.status = String::from("GitHub Code Search found no repositories");
+                return true;
+            }
+            Ok(outcome) => outcome,
+            Err(why) => {
+                self.status = format!("GitHub Code Search failed: {why}");
+                return true;
+            }
+        };
+        let mut index = None;
+        let saved = self.edit_codeql_variant(|c| {
+            let i = c
+                .list_index(&list)
+                .ok_or_else(|| format!("The list {list} is no longer there"))?;
+            let (added, had) = c.add_repos(i, &found)?;
+            index = Some(i);
+            let plural = |n: usize| if n == 1 { "repository" } else { "repositories" };
+            let mut message = format!("Added {added} {} to {list}", plural(added));
+            if had > 0 {
+                message.push_str(&format!(" ({had} already there)"));
+            }
+            if let Some(why) = &cut {
+                message.push_str(&format!("; the search stopped early, {why}"));
+            }
+            Ok(message)
+        });
+        if let (true, Some(i)) = (saved, index) {
+            self.codeql.folded_lists.remove(&list);
+            self.codeql
+                .select_variant_item(crate::codeql_variant::Item::List(i));
+        }
+        true
     }
 
     fn prompt_add_codeql_variant_list(&mut self) {
@@ -29307,6 +29452,10 @@ impl App {
             InputPurpose::CodeqlDownloadPacks => {
                 self.close_input_prompt();
                 self.submit_download_codeql_packs(&value);
+            }
+            InputPurpose::CodeqlVariantCodeSearch { list } => {
+                self.close_input_prompt();
+                self.start_codeql_variant_code_search(list, &value);
             }
             InputPurpose::CodeqlRenameVariantList { name } => {
                 self.close_input_prompt();
@@ -44722,6 +44871,7 @@ impl App {
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
             Cmd::CodeqlAddVariantOwner => self.prompt_add_codeql_variant_owner(),
+            Cmd::CodeqlVariantCodeSearch => self.prompt_codeql_variant_code_search(),
             Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
             Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
             Cmd::CodeqlRunVariantAnalysis => {
@@ -61855,6 +62005,14 @@ type CodeqlUpgrade = (
     PathBuf,
 );
 
+/// A GitHub Code Search in flight: the variant analysis list its
+/// repositories go into, and its outcome: the repositories found, and why
+/// a page after the first failed, cutting the results short.
+type CodeqlCodeSearch = (
+    String,
+    std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
+);
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -63301,7 +63459,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_log_summary()
             | app.drain_codeql_pack_job()
             | app.drain_codeql_cli_download()
-            | app.drain_codeql_cli_check();
+            | app.drain_codeql_cli_check()
+            | app.drain_codeql_code_search();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
