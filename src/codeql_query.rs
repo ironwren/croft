@@ -48,6 +48,38 @@ pub fn is_suite(query: &Path) -> bool {
     query.extension().is_some_and(|e| e == "qls")
 }
 
+/// `codeql` arguments listing the queries a suite selects, as JSON.
+pub fn resolve_suite_args(suite: &Path) -> Vec<String> {
+    vec![
+        String::from("resolve"),
+        String::from("queries"),
+        String::from("--format=json"),
+        path(suite),
+    ]
+}
+
+/// The file names of the queries in `resolved` (the JSON array `codeql
+/// resolve queries` prints) whose results are not alerts, going by each
+/// file's text as `read` gives it. `database analyze`, the only way to run
+/// a suite, cannot produce their tables, so a suite holding any is refused
+/// up front rather than failing inside the CLI.
+pub fn table_queries_in_suite(
+    resolved: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<PathBuf> = serde_json::from_str(resolved)
+        .map_err(|e| format!("could not read the suite's queries: {e}"))?;
+    Ok(paths
+        .iter()
+        .filter(|p| read(p).is_some_and(|src| output_for(&src) == Output::Table))
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
 /// How the file `query`, whose text is `source`, is run and read: a suite
 /// always through `database analyze` into SARIF, since only that runs one;
 /// a single query by its `@kind`.
@@ -286,9 +318,24 @@ pub fn parse_database_selection(input: &str, names: &[String]) -> Result<Vec<usi
     if input.trim() == "*" {
         return Ok((0..names.len()).collect());
     }
+    // A name matching more than one database cannot say which it means.
+    let only = |name: &str| -> Result<Option<usize>, String> {
+        let mut hits = names.iter().enumerate().filter(|(_, n)| n.as_str() == name);
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => Ok(Some(i)),
+            (Some(_), Some(_)) => Err(format!(
+                "Several CodeQL databases are called {name}; rename one to pick it"
+            )),
+            _ => Ok(None),
+        }
+    };
+    // The whole input first, so a name holding a comma can still be picked.
+    if let Some(i) = only(input.trim())? {
+        return Ok(vec![i]);
+    }
     let mut picked = Vec::new();
     for name in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let Some(i) = names.iter().position(|n| n == name) else {
+        let Some(i) = only(name)? else {
             return Err(format!("There is no CodeQL database called {name}"));
         };
         if !picked.contains(&i) {
@@ -1034,6 +1081,42 @@ mod tests {
         assert_eq!(
             parse_database_selection(" , ", &names),
             Err(String::from("Name at least one database, or * for all"))
+        );
+        // A name with a comma is picked whole; a shared name is refused.
+        let names = vec![
+            String::from("a, b"),
+            String::from("twin"),
+            String::from("twin"),
+        ];
+        assert_eq!(parse_database_selection("a, b", &names), Ok(vec![0]));
+        assert_eq!(
+            parse_database_selection("twin", &names),
+            Err(String::from(
+                "Several CodeQL databases are called twin; rename one to pick it"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_suite_holding_table_queries_is_found_out() {
+        let read = |p: &Path| -> Option<String> {
+            Some(match p.file_name()?.to_str()? {
+                "Alert.ql" => String::from("/** @kind problem */ select 1"),
+                _ => String::from("select 1"),
+            })
+        };
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql","/q/Table.ql"]"#, read),
+            Ok(vec![String::from("Table.ql")])
+        );
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql"]"#, read),
+            Ok(vec![])
+        );
+        assert!(table_queries_in_suite("not json", read).is_err());
+        assert_eq!(
+            resolve_suite_args(Path::new("/s.qls")),
+            ["resolve", "queries", "--format=json", "/s.qls"]
         );
     }
 

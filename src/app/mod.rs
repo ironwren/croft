@@ -3148,7 +3148,7 @@ pub struct App {
     /// Queries "Run Queries in Pack" and "Run Query on Multiple Databases"
     /// have yet to start, in order, each with the database it runs on: the
     /// current one when `None` (#578).
-    codeql_run_queue: std::collections::VecDeque<(PathBuf, Option<PathBuf>)>,
+    codeql_run_queue: std::collections::VecDeque<CodeqlQueued>,
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
@@ -26270,6 +26270,10 @@ impl App {
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
                 .and_then(|()| match kind {
+                    Output::Sarif if cq::is_suite(&query) => {
+                        Self::check_codeql_suite(&program, &query)
+                            .and_then(|()| run(cq::analyze_args(&query, &db.path, &output)))
+                    }
                     Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
                     Output::Table => {
                         let bqrs = dir.join("results.bqrs");
@@ -26284,6 +26288,35 @@ impl App {
         });
         self.codeql_run = Some((rx, std::time::Instant::now()));
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// Refuse suite `suite` when it selects a query whose results are not
+    /// alerts (#578): `database analyze` cannot produce those tables.
+    fn check_codeql_suite(program: &Path, suite: &Path) -> Result<(), String> {
+        let out = std::process::Command::new(program)
+            .args(crate::codeql_query::resolve_suite_args(suite))
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(err
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("codeql could not resolve the suite")
+                .to_string());
+        }
+        let tables = crate::codeql_query::table_queries_in_suite(
+            &String::from_utf8_lossy(&out.stdout),
+            |p| std::fs::read_to_string(p).ok(),
+        )?;
+        if tables.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "the suite selects queries that are not alert queries ({}); run those on their own",
+            tables.join(", ")
+        ))
     }
 
     /// Run `codeql` with `args` and wait. A failure is the first line it
@@ -26391,7 +26424,7 @@ impl App {
             return;
         }
         self.codeql_batch = (queries.len(), 0);
-        self.codeql_run_queue = queries.into_iter().map(|q| (q, None)).collect();
+        self.codeql_run_queue = queries.into_iter().map(|q| (q, None, None)).collect();
         self.start_next_queued_codeql();
     }
 
@@ -26446,10 +26479,25 @@ impl App {
                 return;
             }
         };
+        // Every run of the batch must be the same query: its text now is
+        // what each later run checks the file against.
+        let source = match std::fs::read_to_string(query) {
+            Ok(source) => source,
+            Err(e) => {
+                self.status = format!("{}: {e}", query.display());
+                return;
+            }
+        };
         self.codeql_batch = (picked.len(), 0);
         self.codeql_run_queue = picked
             .into_iter()
-            .map(|i| (query.to_path_buf(), Some(store.databases[i].path.clone())))
+            .map(|i| {
+                (
+                    query.to_path_buf(),
+                    Some(store.databases[i].path.clone()),
+                    Some(source.clone()),
+                )
+            })
             .collect();
         self.start_next_queued_codeql();
     }
@@ -26461,7 +26509,7 @@ impl App {
     fn start_next_queued_codeql(&mut self) {
         let (total, _) = self.codeql_batch;
         while self.codeql_run.is_none() {
-            let Some((path, db)) = self.codeql_run_queue.pop_front() else {
+            let Some((path, db, pinned)) = self.codeql_run_queue.pop_front() else {
                 let failed = self.codeql_batch.1;
                 self.codeql_batch = (0, 0);
                 let queries = if total == 1 { "query" } else { "queries" };
@@ -26480,6 +26528,20 @@ impl App {
                     continue;
                 }
             };
+            if pinned.as_ref().is_some_and(|p| *p != source) {
+                // Saved mid-batch: the rest would run a different query
+                // under the same name, so the batch stops here.
+                let done = n - 1;
+                self.codeql_run_queue.clear();
+                self.codeql_batch = (0, 0);
+                self.status = format!(
+                    "{} changed during the batch; stopped after {done} of {total} runs",
+                    path.file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                );
+                return;
+            }
             self.run_codeql_file(path, &source, db.as_deref());
             if self.codeql_run.is_none() {
                 // Refused (the database went away meanwhile): the rest
@@ -63538,6 +63600,11 @@ type CodeqlQueryHelp = (
     PathBuf,
     String,
 );
+
+/// A query waiting in the batch queue (#578): its file, the database to
+/// run it on (`None`: the current one), and for a multi-database batch the
+/// text the file had when the batch began, which every run must still see.
+type CodeqlQueued = (PathBuf, Option<PathBuf>, Option<String>);
 
 /// A `codeql pack` install or download in flight (#578): where its outcome
 /// arrives, and the status lines for success and for failure.

@@ -56521,6 +56521,20 @@ fn a_codeql_query_runs_on_each_named_database_with_its_own_history_entry() {
         let history = crate::codeql_query::History::load(&App::codeql_history_path());
         assert_eq!(history.entries.len(), 3);
         assert_eq!(history.entries[history.newest().unwrap()].database, "lib");
+
+        // Saving the query mid-batch stops the batch: the later runs would
+        // be a different query under the same name.
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        ask(&mut app, "*");
+        std::fs::write(tmp.path().join("q.ql"), "select 2").unwrap();
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            app.status,
+            "q.ql changed during the batch; stopped after 1 of 2 runs"
+        );
+        assert!(app.codeql_run_queue.is_empty());
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(history.entries.len(), 4, "only the first run happened");
         assert_eq!(
             Command::from_id("codeql_run_query_on_multiple_databases"),
             Some(Command::CodeqlRunQueryOnMultipleDatabases)
@@ -56542,6 +56556,25 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         let bin = tempfile::tempdir().unwrap();
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        // `resolve queries` answers with the suite's queries: one alert
+        // query, listed in a file the test can switch to a table query.
+        let alert = tmp.path().join("Alert.ql");
+        std::fs::write(&alert, "/** @kind problem */ select 1").unwrap();
+        let listed = bin.path().join("resolved.json");
+        std::fs::write(&listed, format!("[\"{}\"]", alert.display())).unwrap();
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replacen(
+                "\n",
+                &format!(
+                    "\n[ \"$1\" = resolve ] && {{ cat '{}'; exit 0; }}\n",
+                    listed.display()
+                ),
+                1,
+            ),
+        )
+        .unwrap();
         app.run_command(Command::CodeqlRunQuerySuite);
         assert_eq!(app.status, "Open a .qls query suite to run it");
         assert!(app.codeql_run.is_none());
@@ -56574,12 +56607,30 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         );
         let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
         assert!(
-            calls.starts_with(&format!(
+            calls.contains(&format!(
                 "database analyze {} {} --format=sarif-latest ",
                 tmp.path().join("dbs/app").display(),
                 suite.display()
             )),
             "{calls}"
+        );
+
+        // A suite selecting a table query is refused before the analysis:
+        // `database analyze` cannot produce its results.
+        let table = tmp.path().join("Table.ql");
+        std::fs::write(&table, "select 1").unwrap();
+        std::fs::write(
+            &listed,
+            format!("[\"{}\",\"{}\"]", alert.display(), table.display()),
+        )
+        .unwrap();
+        app.editor.open(&suite).unwrap();
+        app.run_command(Command::CodeqlRunQuerySuite);
+        wait_for_codeql(&mut app);
+        assert!(
+            app.codeql.history[0].contains("Table.ql"),
+            "the refusal names the table query: {:?}",
+            app.codeql.history
         );
 
         // "Run Query on Selected Database" takes a suite too.
