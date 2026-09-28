@@ -57077,6 +57077,96 @@ fn view_cfg_reads_a_real_functions_control_flow() {
 }
 
 #[test]
+fn walking_a_codeql_results_table_opens_each_results_code() {
+    // #578: `codeQLQueryResults` up/down/left/right. The walk moves the
+    // table's cursor and opens the cell's entity; it goes on after the
+    // code has the focus, and a sorted table still leads to the right row.
+    use crate::codeql_query::{CellLoc, RowLocs};
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("app.py");
+        std::fs::write(&src, "a = 1\nb = 2\ndef f():\n    pass\n").unwrap();
+        let csv = tmp.path().join("results.csv");
+        std::fs::write(
+            &csv,
+            "\"x\",\"n\"\n\"Name b\",\"2\"\n\"Function f\",\"3\"\n\"plain\",\"9\"\n",
+        )
+        .unwrap();
+        let at = |line: u32, column: u32| {
+            Some(CellLoc {
+                path: src.clone(),
+                line,
+                column,
+            })
+        };
+        let rows = vec![
+            RowLocs {
+                cells: vec!["Name b".into(), "2".into()],
+                locs: vec![at(2, 1), None],
+            },
+            RowLocs {
+                cells: vec!["Function f".into(), "3".into()],
+                locs: vec![at(3, 5), None],
+            },
+            RowLocs {
+                cells: vec!["plain".into(), "9".into()],
+                locs: vec![None, None],
+            },
+        ];
+        std::fs::write(
+            crate::codeql_query::locations_path(&csv),
+            serde_json::to_string(&rows).unwrap(),
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(app.status, "Open a CodeQL results table first");
+        app.editor.open(&csv).unwrap();
+
+        // Down from the first row: row 2, "Function f" at 3:5.
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(src.as_path()),
+            "{}",
+            app.status
+        );
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+        // The code has the focus; the walk goes on in the table: back up.
+        app.run_command(Command::CodeqlResultsUp);
+        assert_eq!(app.editor.cursor_row, 1, "{}", app.status);
+        // Right onto the number column: no location there, so the row's
+        // entity.
+        app.run_command(Command::CodeqlResultsRight);
+        assert_eq!(app.editor.cursor_row, 1, "{}", app.status);
+        // A row with no entity says so.
+        app.run_command(Command::CodeqlResultsDown);
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(app.status, "Result 3 has no location");
+
+        // Sorted by the name column (descending: plain, Name b, Function
+        // f), the first row still leads to its own code.
+        app.editor.open(&csv).unwrap();
+        let data = &mut app.editor.sheet.as_mut().unwrap().sheets[0];
+        data.cur_col = 0;
+        data.sort_by_column(0);
+        data.sort_by_column(0);
+        data.cur_row = 0;
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(src.as_path()),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.editor.cursor_row, 1, "Name b is on line 2");
+    });
+}
+
+#[test]
 fn a_csv_sheet_sorts_by_the_cursors_column_from_the_palette() {
     // #578: raw results as a sortable table. Any CSV sheet sorts.
     use crate::widgets::command_palette::Command;
@@ -57780,6 +57870,108 @@ fn quick_evaluation_against_a_real_query_server() {
         );
         let counts = run(&mut app, Command::CodeqlQuickEvalCount);
         assert!(counts.contains("\"Total tuples\",3"), "{counts}");
+    });
+}
+
+/// #578's results walk against the real CLI: a table run keeps where its
+/// entities are, and walking the table opens their code.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn a_real_results_table_is_walked_into_the_code() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("app.py");
+        std::fs::write(
+            &file,
+            "import os\n\ndef run(cmd):\n    print(cmd)\n\ndef go():\n    run(input())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let pack = tmp.path().join("q");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("qlpack.yml"),
+            "name: me/q\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n",
+        )
+        .unwrap();
+        let installed = std::process::Command::new(&codeql)
+            .args(["pack", "install"])
+            .arg(&pack)
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let query = pack.join("Functions.ql");
+        std::fs::write(
+            &query,
+            "import python\nfrom Function f\nselect f, f.getName()\n",
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&query).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while app.codeql_run.is_some() {
+            app.drain_codeql_run();
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let table = app.editor.path.clone().unwrap();
+        assert!(
+            crate::codeql_query::locations_path(&table).is_file(),
+            "{}",
+            app.status
+        );
+        let data = &mut app.editor.sheet.as_mut().expect("the table").sheets[0];
+        data.cur_col = 0;
+        data.sort_by_column(1); // by name: go, run
+        data.cur_row = 0;
+        // Right, then Left: back on the first row's entity, `def go`.
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsRight);
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsLeft);
+        assert_eq!(
+            app.editor.path.as_ref().map(|p| p.canonicalize().unwrap()),
+            Some(file.canonicalize().unwrap()),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.editor.cursor_row, 5, "def go is on line 6");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsDown);
+        assert_eq!(app.editor.cursor_row, 2, "def run is on line 3");
     });
 }
 
