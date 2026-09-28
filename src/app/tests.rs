@@ -2958,19 +2958,6 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     );
 }
 
-/// A `path:line` printed in a RENDERED ANSI log is Ctrl+clickable, the
-/// same as one printed in a terminal pane (#257).
-///
-/// The reference is scanned against the text the user SEES. The fixture is
-/// built so that matters: the second path sits after a 36-character SGR run
-/// with no printed width, so its visible column falls INSIDE an escape
-/// sequence in the raw bytes. A raw-bytes scan finds no reference at that
-/// column at all, which is what makes this test turn on the mapping rather
-/// than merely coexist with it.
-///
-/// Ctrl is what separates it from a selection drag: `begin_log_selection`
-/// runs before the editor's Ctrl handling, so without the guard the modifier
-/// click would just start a selection.
 #[test]
 fn ctrl_click_on_a_line_range_selects_the_range() {
     // #804: `path:62-69` opens with lines 62 to 69 selected, the view on 62.
@@ -3002,6 +2989,19 @@ fn ctrl_click_on_a_line_range_selects_the_range() {
     assert!(app.status.ends_with(":2-4"), "{}", app.status);
 }
 
+/// A `path:line` printed in a RENDERED ANSI log is Ctrl+clickable, the
+/// same as one printed in a terminal pane (#257).
+///
+/// The reference is scanned against the text the user SEES. The fixture is
+/// built so that matters: the second path sits after a 36-character SGR run
+/// with no printed width, so its visible column falls INSIDE an escape
+/// sequence in the raw bytes. A raw-bytes scan finds no reference at that
+/// column at all, which is what makes this test turn on the mapping rather
+/// than merely coexist with it.
+///
+/// Ctrl is what separates it from a selection drag: `begin_log_selection`
+/// runs before the editor's Ctrl handling, so without the guard the modifier
+/// click would just start a selection.
 #[test]
 fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
     let tmp = tempfile::tempdir().unwrap();
