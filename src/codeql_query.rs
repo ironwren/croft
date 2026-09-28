@@ -656,8 +656,10 @@ pub fn scaffold_query(
 pub enum RunStatus {
     Running,
     Succeeded,
-    /// The first line of what `codeql` said.
+    /// Why, in what `codeql` said.
     Failed(String),
+    /// Stopped by the user before it finished (#578).
+    Cancelled,
 }
 
 /// One query history entry.
@@ -756,6 +758,7 @@ impl HistoryEntry {
             let mark = match self.status {
                 RunStatus::Succeeded => '\u{2713}',
                 RunStatus::Failed(_) => '\u{2717}',
+                RunStatus::Cancelled => '\u{2298}',
                 RunStatus::Running => '\u{2026}',
             };
             return format!("{mark} {custom}");
@@ -780,6 +783,9 @@ impl HistoryEntry {
             RunStatus::Running => {
                 format!("\u{2026} {name} \u{b7} {} \u{b7} running", self.database)
             }
+            RunStatus::Cancelled => {
+                format!("\u{2298} {name} \u{b7} {} \u{b7} cancelled", self.database)
+            }
         }
     }
 }
@@ -792,7 +798,7 @@ pub enum HistSort {
     #[default]
     Date,
     Name,
-    /// Succeeded, then failed, then running; newest first within each.
+    /// Succeeded, then failed, cancelled, running; newest first within each.
     Status,
     /// Most results first; runs without a count last, newest first among
     /// equals.
@@ -916,7 +922,8 @@ impl History {
                 let rank = match e.status {
                     RunStatus::Succeeded => 0,
                     RunStatus::Failed(_) => 1,
-                    RunStatus::Running => 2,
+                    RunStatus::Cancelled => 2,
+                    RunStatus::Running => 3,
                 };
                 (rank, Reverse(e.started))
             }),

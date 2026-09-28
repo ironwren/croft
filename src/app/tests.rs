@@ -56975,6 +56975,191 @@ fn a_runs_query_text_is_kept_as_it_was_when_it_ran() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn codeql_accept_test_output_accepts_the_open_test_or_the_failed_ones() {
+    // #578: accept a failing CodeQL test's actual output as expected,
+    // through `codeql test accept`.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("test/Find");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(tmp.path().join("test/qlpack.yml"), "name: t\ntests: .\n").unwrap();
+        std::fs::write(dir.join("Find.qlref"), "Find.ql\n").unwrap();
+        std::fs::write(dir.join("Find.expected"), "old\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_codeql_program(fake_codeql(bin.path(), "", 0, ""));
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_pack_job() {
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        assert_eq!(
+            Command::from_id("codeql_accept_test_output"),
+            Some(Command::CodeqlAcceptTestOutput)
+        );
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        assert!(
+            app.status.starts_with("No CodeQL test to accept"),
+            "{}",
+            app.status
+        );
+
+        // The open file's test, but no run has left output yet.
+        app.editor.open(&dir.join("Find.expected")).unwrap();
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        assert!(app.status.starts_with("No actual output"), "{}", app.status);
+
+        std::fs::write(dir.join("Find.actual"), "new\n").unwrap();
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        wait(&mut app);
+        assert_eq!(app.status, "Accepted the output of Find.qlref as expected");
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!("test accept {}", dir.join("Find.qlref").display())
+        );
+
+        // With no test file open: the tests the last run failed.
+        app.editor
+            .open(&tmp.path().join("test/qlpack.yml"))
+            .unwrap();
+        app.testing.apply_case(crate::testing::model::TestCase {
+            name: String::from("test/Find::Find.qlref"),
+            status: crate::testing::model::TestStatus::Failed,
+        });
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        wait(&mut app);
+        assert_eq!(app.status, "Accepted the output of Find.qlref as expected");
+    });
+}
+
+#[test]
+fn a_variant_runs_repository_list_is_copied_and_its_logs_opened() {
+    // #578: for a variant analysis run, copy the repository list and view
+    // its logs, which live on the controller's GitHub Actions run.
+    use crate::codeql_submit::{parse_progress, parse_submission, record_submitted};
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(app.status, "No variant analysis has been submitted yet");
+
+        let run = parse_submission(
+            r#"{"id": 9}"#,
+            "me/ctl",
+            std::path::Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        record_submitted(&App::codeql_variant_runs_path(), run.clone()).unwrap();
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(
+            app.status,
+            "Variant analysis 9 has not reported its repositories yet"
+        );
+        app.run_command(Command::CodeqlViewVariantLogs);
+        assert!(
+            app.status.contains("has no Actions run yet"),
+            "{}",
+            app.status
+        );
+
+        let mut later = run;
+        later.id = 10;
+        later.workflow_run = Some(777);
+        later.progress = parse_progress(
+            r#"{"status": "in_progress", "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 1},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "pending"}]}"#,
+        )
+        .ok();
+        record_submitted(&App::codeql_variant_runs_path(), later).unwrap();
+        // With no run selected in the side bar: the newest.
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(
+            app.status,
+            "Copied the 2 repositories of variant analysis 10"
+        );
+        assert_eq!(crate::clipboard::read_string().unwrap(), "a/b\nc/d");
+        app.run_command(Command::CodeqlViewVariantLogs);
+        assert_eq!(
+            app.status,
+            "Open https://github.com/me/ctl/actions/runs/777"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_running_codeql_query_shows_in_the_status_bar_and_a_click_cancels_it() {
+    // #578: progress and cancellation in the status bar. The run is killed
+    // mid-flight and recorded as cancelled, not failed.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.run_command(Command::CodeqlCancelRunningQuery);
+        assert_eq!(app.status, "No CodeQL query is running");
+
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace("exit 0", "exec sleep 30"),
+        )
+        .unwrap();
+        app.run_command(Command::CodeqlRunQuery);
+        let started = std::time::Instant::now();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("CodeQL q.ql 0:0"), "{screen}");
+        let chip = app.status_codeql_rect;
+        assert!(chip.width > 0, "the chip is a click target");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x + 1,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.status.starts_with("Cancelling"), "{}", app.status);
+        wait_for_codeql(&mut app);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "killed, not waited out"
+        );
+        assert_eq!(app.status, "q.ql cancelled");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(
+            history.entries[0].status,
+            crate::codeql_query::RunStatus::Cancelled
+        );
+        assert!(
+            app.codeql.history[0].ends_with("cancelled"),
+            "{}",
+            app.codeql.history[0]
+        );
+        term.draw(|f| app.render(f)).unwrap();
+        assert!(!screen_text(&term).contains("CodeQL q.ql"), "the chip goes");
+        assert_eq!(app.status_codeql_rect, ratatui::layout::Rect::default());
+    });
+}
+
 #[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
