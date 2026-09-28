@@ -57042,6 +57042,66 @@ fn codeql_accept_test_output_accepts_the_open_test_or_the_failed_ones() {
 }
 
 #[test]
+fn a_variant_runs_repository_list_is_copied_and_its_logs_opened() {
+    // #578: for a variant analysis run, copy the repository list and view
+    // its logs, which live on the controller's GitHub Actions run.
+    use crate::codeql_submit::{parse_progress, parse_submission, record_submitted};
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(app.status, "No variant analysis has been submitted yet");
+
+        let run = parse_submission(
+            r#"{"id": 9}"#,
+            "me/ctl",
+            std::path::Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        record_submitted(&App::codeql_variant_runs_path(), run.clone()).unwrap();
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(
+            app.status,
+            "Variant analysis 9 has not reported its repositories yet"
+        );
+        app.run_command(Command::CodeqlViewVariantLogs);
+        assert!(
+            app.status.contains("has no Actions run yet"),
+            "{}",
+            app.status
+        );
+
+        let mut later = run;
+        later.id = 10;
+        later.workflow_run = Some(777);
+        later.progress = parse_progress(
+            r#"{"status": "in_progress", "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 1},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "pending"}]}"#,
+        )
+        .ok();
+        record_submitted(&App::codeql_variant_runs_path(), later).unwrap();
+        // With no run selected in the side bar: the newest.
+        app.run_command(Command::CodeqlCopyVariantRepoList);
+        assert_eq!(
+            app.status,
+            "Copied the 2 repositories of variant analysis 10"
+        );
+        assert_eq!(crate::clipboard::read_string().unwrap(), "a/b\nc/d");
+        app.run_command(Command::CodeqlViewVariantLogs);
+        assert_eq!(
+            app.status,
+            "Open https://github.com/me/ctl/actions/runs/777"
+        );
+    });
+}
+
+#[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
