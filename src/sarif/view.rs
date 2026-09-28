@@ -166,6 +166,125 @@ pub enum Column {
     Level,
 }
 
+/// A column the results list can show between a row's position and its
+/// message (#577). The row always shows the level glyph, position and
+/// message; these add to them, in the order the user chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraColumn {
+    Rule,
+    Level,
+    Kind,
+    Baseline,
+    Suppression,
+    Tool,
+}
+
+impl ExtraColumn {
+    pub const ALL: [ExtraColumn; 6] = [
+        ExtraColumn::Rule,
+        ExtraColumn::Level,
+        ExtraColumn::Kind,
+        ExtraColumn::Baseline,
+        ExtraColumn::Suppression,
+        ExtraColumn::Tool,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ExtraColumn::Rule => "rule",
+            ExtraColumn::Level => "level",
+            ExtraColumn::Kind => "kind",
+            ExtraColumn::Baseline => "baseline",
+            ExtraColumn::Suppression => "suppression",
+            ExtraColumn::Tool => "tool",
+        }
+    }
+
+    /// Cells are cut to this many characters.
+    pub fn width(self) -> usize {
+        match self {
+            ExtraColumn::Rule => 16,
+            ExtraColumn::Level => 7,
+            ExtraColumn::Kind => 13,
+            ExtraColumn::Baseline => 11,
+            ExtraColumn::Suppression => 14,
+            ExtraColumn::Tool => 12,
+        }
+    }
+
+    pub fn cell(self, e: &Entry) -> String {
+        use super::render::{baseline_label, suppression_label};
+        match self {
+            ExtraColumn::Rule => e.rule_id.clone(),
+            ExtraColumn::Level => e.level.as_str().to_string(),
+            ExtraColumn::Kind => kind_label(e.kind).to_string(),
+            ExtraColumn::Baseline => baseline_label(e.baseline).to_string(),
+            ExtraColumn::Suppression => suppression_label(e.suppression).to_string(),
+            ExtraColumn::Tool => e.tool.clone(),
+        }
+    }
+}
+
+fn kind_label(k: Kind) -> &'static str {
+    match k {
+        Kind::Fail => "fail",
+        Kind::Pass => "pass",
+        Kind::Open => "open",
+        Kind::Review => "review",
+        Kind::NotApplicable => "notApplicable",
+        Kind::Informational => "informational",
+    }
+}
+
+/// The columns `text` names, separated by commas or spaces, in order and
+/// once each; an unknown name is an error naming the choices.
+pub fn parse_columns(text: &str) -> Result<Vec<ExtraColumn>, String> {
+    let mut out = Vec::new();
+    for word in text
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+    {
+        let col = ExtraColumn::ALL
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(word))
+            .ok_or_else(|| {
+                let names: Vec<&str> = ExtraColumn::ALL.iter().map(|c| c.name()).collect();
+                format!("No column {word:?}: choose from {}", names.join(", "))
+            })?;
+        if !out.contains(&col) {
+            out.push(col);
+        }
+    }
+    Ok(out)
+}
+
+/// The column choice as written back: comma-separated names.
+pub fn columns_text(cols: &[ExtraColumn]) -> String {
+    cols.iter().map(|c| c.name()).collect::<Vec<_>>().join(",")
+}
+
+/// Where the column choice is kept, so every viewer opens with it.
+fn columns_path() -> PathBuf {
+    crate::app::croft_cache_dir().join("sarif-columns")
+}
+
+/// The saved column choice; none when unset or unreadable.
+pub fn load_columns() -> Vec<ExtraColumn> {
+    std::fs::read_to_string(columns_path())
+        .ok()
+        .and_then(|t| parse_columns(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_columns(cols: &[ExtraColumn]) -> std::io::Result<()> {
+    let path = columns_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, columns_text(cols))
+}
+
 /// Row-level filters (the chips). A value is hidden when it is in the set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filters {
@@ -373,6 +492,8 @@ pub struct SarifView {
     /// Index into `logs` of the baseline the others are compared against;
     /// only its absent results are listed.
     pub baseline: Option<usize>,
+    /// The optional columns shown, in order (#577).
+    pub columns: Vec<ExtraColumn>,
 }
 
 impl SarifView {
@@ -400,6 +521,7 @@ impl SarifView {
             raw_cache: None,
             fix_cache: None,
             baseline: None,
+            columns: load_columns(),
         }
     }
 
@@ -435,6 +557,7 @@ impl SarifView {
         self.sort = old.sort;
         self.collapsed = old.collapsed.clone();
         self.detail_tab = old.detail_tab;
+        self.columns = old.columns.clone();
         // The baseline by path: its index may have shifted.
         self.baseline = old
             .baseline
