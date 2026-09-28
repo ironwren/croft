@@ -187,6 +187,164 @@ pub fn render(query: &str, predicates: &[Predicate]) -> String {
     out
 }
 
+/// Which of two runs evaluated a predicate in a performance comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    OnlyOld,
+    OnlyNew,
+    Both,
+}
+
+/// One predicate in VS Code's "Compare Performance": its time and result
+/// size in each run (0 in a run that did not evaluate it) and how much
+/// slower the newer run was (negative when it got faster).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    /// The newer run's name for it when both have it.
+    pub name: String,
+    pub presence: Presence,
+    pub old_millis: u64,
+    pub new_millis: u64,
+    pub delta: i64,
+    pub old_rows: u64,
+    pub new_rows: u64,
+}
+
+/// `name` without the `#hash` CodeQL appends to it, which changes whenever
+/// the predicate or anything it depends on does.
+fn unhashed(name: &str) -> &str {
+    name.rsplit_once('#').map_or(name, |(base, _)| base)
+}
+
+/// Set the predicates of two runs side by side, biggest change in time
+/// first (ties by name). Predicates pair up by full name, then the rest by
+/// name without the `#hash` where that pairs one with one; anything left
+/// ran in one run only.
+pub fn compare(old: &[Predicate], new: &[Predicate]) -> Vec<Row> {
+    use std::collections::HashMap;
+    let mut pair: Vec<Option<usize>> = vec![None; new.len()];
+    let mut taken = vec![false; old.len()];
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, p) in old.iter().enumerate().rev() {
+        by_name.entry(p.name.as_str()).or_default().push(i);
+    }
+    for (j, p) in new.iter().enumerate() {
+        if let Some(i) = by_name.get_mut(p.name.as_str()).and_then(Vec::pop) {
+            pair[j] = Some(i);
+            taken[i] = true;
+        }
+    }
+    // The fallback: a hash-less name held by one leftover on each side.
+    let mut old_bases: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, p) in old.iter().enumerate().filter(|&(i, _)| !taken[i]) {
+        old_bases.entry(unhashed(&p.name)).or_default().push(i);
+    }
+    let mut new_bases: HashMap<&str, usize> = HashMap::new();
+    for (p, _) in new.iter().zip(&pair).filter(|(_, i)| i.is_none()) {
+        *new_bases.entry(unhashed(&p.name)).or_default() += 1;
+    }
+    for (j, p) in new.iter().enumerate() {
+        let base = unhashed(&p.name);
+        if pair[j].is_some() || new_bases.get(base) != Some(&1) {
+            continue;
+        }
+        if let Some(&[i]) = old_bases.get(base).map(Vec::as_slice) {
+            pair[j] = Some(i);
+            taken[i] = true;
+        }
+    }
+    let row = |name: &str, presence, old: Option<&Predicate>, new: Option<&Predicate>| {
+        let old_millis = old.map_or(0, |p| p.millis);
+        let new_millis = new.map_or(0, |p| p.millis);
+        Row {
+            name: name.to_string(),
+            presence,
+            old_millis,
+            new_millis,
+            delta: new_millis as i64 - old_millis as i64,
+            old_rows: old.map_or(0, |p| p.result_size),
+            new_rows: new.map_or(0, |p| p.result_size),
+        }
+    };
+    let mut rows: Vec<Row> = new
+        .iter()
+        .zip(&pair)
+        .map(|(p, i)| match i {
+            Some(i) => row(&p.name, Presence::Both, Some(&old[*i]), Some(p)),
+            None => row(&p.name, Presence::OnlyNew, None, Some(p)),
+        })
+        .chain(
+            old.iter()
+                .zip(&taken)
+                .filter(|(_, t)| !**t)
+                .map(|(p, _)| row(&p.name, Presence::OnlyOld, Some(p), None)),
+        )
+        .collect();
+    rows.sort_by(|a, b| {
+        b.delta
+            .unsigned_abs()
+            .cmp(&a.delta.unsigned_abs())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
+}
+
+/// A signed change in time: "+1,200 ms", "-30 ms", "±0 ms".
+fn signed_millis(delta: i64) -> String {
+    let sign = match delta.signum() {
+        1 => "+",
+        -1 => "-",
+        _ => "\u{b1}",
+    };
+    format!("{sign}{} ms", grouped(delta.unsigned_abs()))
+}
+
+/// The comparison's text: a title, the total time in each run with the
+/// change, then one line per predicate with its change right-aligned. A
+/// run that did not evaluate a predicate shows "–" for it.
+pub fn render_comparison(old_label: &str, new_label: &str, rows: &[Row]) -> String {
+    let old_total: u64 = rows.iter().map(|r| r.old_millis).sum();
+    let new_total: u64 = rows.iter().map(|r| r.new_millis).sum();
+    let count = |presence| rows.iter().filter(|r| r.presence == presence).count();
+    let s = if rows.len() == 1 { "" } else { "s" };
+    let mut out = format!(
+        "Performance: {old_label} \u{2192} {new_label}\n\
+         {} \u{2192} {} ms in all ({}), {} predicate{s}: {} in both, {} only before, {} only after\n",
+        grouped(old_total),
+        grouped(new_total),
+        signed_millis(new_total as i64 - old_total as i64),
+        rows.len(),
+        count(Presence::Both),
+        count(Presence::OnlyOld),
+        count(Presence::OnlyNew),
+    );
+    if !rows.is_empty() {
+        out.push('\n');
+    }
+    let deltas: Vec<String> = rows.iter().map(|r| signed_millis(r.delta)).collect();
+    let width = deltas.iter().map(|d| d.chars().count()).max().unwrap_or(0);
+    for (r, delta) in rows.iter().zip(&deltas) {
+        let side = |present: bool, n: u64| {
+            if present {
+                grouped(n)
+            } else {
+                String::from("\u{2013}")
+            }
+        };
+        let old = r.presence != Presence::OnlyNew;
+        let new = r.presence != Presence::OnlyOld;
+        out.push_str(&format!(
+            "{delta:>width$}  {} \u{2192} {} ms  {} \u{2192} {} rows  {}\n",
+            side(old, r.old_millis),
+            side(new, r.new_millis),
+            side(old, r.old_rows),
+            side(new, r.new_rows),
+            r.name,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +445,91 @@ Evaluator log for q.ql: 3 predicates, 6,234 ms in all, slowest first
         assert_eq!(text, expected);
         assert_eq!(grouped(1_234_567), "1,234,567");
         assert_eq!(grouped(999), "999");
+    }
+
+    fn timed(name: &str, millis: u64, result_size: u64) -> Predicate {
+        Predicate {
+            name: name.to_string(),
+            strategy: String::from("COMPUTE_SIMPLE"),
+            millis,
+            result_size,
+            iterations: 0,
+            pipelines: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn comparing_pairs_predicates_by_name_then_without_the_hash() {
+        let old = [
+            timed("Foo::bar#abc", 3400, 12),
+            timed("Gone::p#111", 500, 4),
+            timed("Same::q#222", 10, 1),
+            // Two leftovers share a hash-less name, so neither pairs up.
+            timed("Twin::t#a", 40, 1),
+            timed("Twin::t#b", 50, 1),
+        ];
+        let new = [
+            timed("Foo::bar#abc", 4600, 15),
+            timed("Same::q#333", 12, 1),
+            timed("Added::r#444", 900, 7),
+            timed("Twin::t#c", 45, 1),
+        ];
+        let rows = compare(&old, &new);
+        let summary: Vec<(&str, Presence, u64, u64, i64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.presence,
+                    r.old_millis,
+                    r.new_millis,
+                    r.delta,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Foo::bar#abc", Presence::Both, 3400, 4600, 1200),
+                ("Added::r#444", Presence::OnlyNew, 0, 900, 900),
+                ("Gone::p#111", Presence::OnlyOld, 500, 0, -500),
+                ("Twin::t#b", Presence::OnlyOld, 50, 0, -50),
+                ("Twin::t#c", Presence::OnlyNew, 0, 45, 45),
+                ("Twin::t#a", Presence::OnlyOld, 40, 0, -40),
+                ("Same::q#333", Presence::Both, 10, 12, 2),
+            ]
+        );
+        assert_eq!((rows[0].old_rows, rows[0].new_rows), (12, 15));
+        assert!(compare(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn renders_the_comparison_as_a_table() {
+        let old = [
+            timed("Foo::bar#abc", 3400, 12),
+            timed("Gone::p#1", 500, 4),
+            timed("Same::q#2", 10, 1),
+        ];
+        let new = [
+            timed("Foo::bar#abc", 4600, 15),
+            timed("Same::q#3", 10, 1),
+            timed("Added::r", 90, 7),
+        ];
+        let text = render_comparison("earlier (app)", "later (app)", &compare(&old, &new));
+        let expected = "\
+Performance: earlier (app) \u{2192} later (app)
+3,910 \u{2192} 4,700 ms in all (+790 ms), 4 predicates: 2 in both, 1 only before, 1 only after
+
++1,200 ms  3,400 \u{2192} 4,600 ms  12 \u{2192} 15 rows  Foo::bar#abc
+  -500 ms  500 \u{2192} \u{2013} ms  4 \u{2192} \u{2013} rows  Gone::p#1
+   +90 ms  \u{2013} \u{2192} 90 ms  \u{2013} \u{2192} 7 rows  Added::r
+    \u{b1}0 ms  10 \u{2192} 10 ms  1 \u{2192} 1 rows  Same::q#3
+";
+        assert_eq!(text, expected);
+        assert_eq!(
+            render_comparison("a", "b", &[]),
+            "Performance: a \u{2192} b\n0 \u{2192} 0 ms in all (\u{b1}0 ms), 0 predicates: 0 in both, 0 only before, 0 only after\n"
+        );
     }
 }

@@ -837,6 +837,24 @@ impl History {
             .map(|(i, _)| i)
     }
 
+    /// The run "Compare Performance" sets entry `index` against: the latest
+    /// earlier successful run of the same query, whatever kind of results
+    /// either wrote, on any database.
+    pub fn perf_partner(&self, index: usize) -> Option<usize> {
+        let this = self.entries.get(index)?;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| {
+                i != index
+                    && e.query == this.query
+                    && e.status == RunStatus::Succeeded
+                    && e.started <= this.started
+            })
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+
     /// The index of the most recent run, whatever the order.
     pub fn newest(&self) -> Option<usize> {
         self.entries
@@ -958,6 +976,12 @@ mod tests {
         assert_eq!(history.compare_partner(0), Some(4));
         assert_eq!(history.compare_partner(4), None);
         assert_eq!(history.compare_partner(2), None);
+        // Performance compares any kind of results: the SARIF run counts.
+        assert_eq!(history.perf_partner(0), Some(3));
+        assert_eq!(history.perf_partner(3), Some(4));
+        assert_eq!(history.perf_partner(4), None);
+        assert_eq!(history.perf_partner(2), None);
+        assert_eq!(history.perf_partner(9), None);
     }
 
     #[test]
