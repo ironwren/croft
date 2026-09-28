@@ -25779,7 +25779,9 @@ impl App {
                     .ok_or_else(|| String::from("its results hold neither SARIF nor BQRS"))?;
                 let csv = repo_dir.join("results.csv");
                 if !csv.is_file() {
-                    Self::codeql_command(program, &crate::codeql_query::decode_args(&bqrs, &csv))?;
+                    Self::codeql_decode_sets(program, &bqrs, &csv, &|args| {
+                        Self::codeql_command(program, &args)
+                    })?;
                 }
                 let text = std::fs::read_to_string(&csv).map_err(|e| e.to_string())?;
                 Ok((sha, RepoResults::Table(text)))
@@ -26305,7 +26307,7 @@ impl App {
                     Output::Table => {
                         let bqrs = dir.join("results.bqrs");
                         run(cq::run_args(&query, &db.path, &bqrs))
-                            .and_then(|()| run(cq::decode_args(&bqrs, &output)))
+                            .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
                     }
                 });
             let _ = tx.send(match outcome {
@@ -26382,6 +26384,73 @@ impl App {
             0 => String::from("Cancelling the running CodeQL query\u{2026}"),
             n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
         };
+    }
+
+    /// Decode `bqrs` to CSV, one file per result set (#578): the main set
+    /// (`#select`) to `out`, each other beside it as `results-<set>.csv`.
+    /// `bqrs decode` without a set writes them all into one CSV, header
+    /// rows and all, so that is only the fallback for a BQRS whose sets
+    /// cannot be listed. `run` runs each decode.
+    fn codeql_decode_sets(
+        program: &Path,
+        bqrs: &Path,
+        out: &Path,
+        run: &dyn Fn(Vec<String>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        use crate::codeql_query as cq;
+        let sets = Self::codeql_stdout(program, &cq::info_args(bqrs))
+            .map(|json| cq::parse_result_sets(&json))
+            .unwrap_or_default();
+        let Some(main) = cq::main_result_set(&sets).map(str::to_string) else {
+            return run(cq::decode_args(bqrs, out));
+        };
+        for (name, _) in &sets {
+            let file = cq::result_set_file(out, name, *name == main);
+            run(cq::decode_set_args(bqrs, &file, name))?;
+        }
+        Ok(())
+    }
+
+    /// CodeQL: Show Result Set (#578): pick which result set of the Query
+    /// History run selected (else the newest) to open.
+    fn show_codeql_result_sets(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = self
+            .codeql
+            .selected_history()
+            .or_else(|| history.newest())
+            .and_then(|i| history.entries.get(i))
+            .cloned()
+        else {
+            self.status = String::from("No CodeQL query has run yet");
+            return;
+        };
+        let name = entry.query_name();
+        if entry.output.extension().is_none_or(|e| e != "csv") {
+            self.status = format!("{name} found alerts, which open in the SARIF viewer");
+            return;
+        }
+        let sets = crate::codeql_query::result_set_files(&entry.output);
+        if sets.len() < 2 {
+            self.status = format!("{name} has one result set");
+            return;
+        }
+        let rows = sets
+            .into_iter()
+            .map(|(set, path)| ListRow {
+                id: path.display().to_string(),
+                label: set,
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::CodeqlResultSet,
+                format!("Result sets of {name}"),
+                rows,
+            ),
+            "No result sets",
+        );
     }
 
     /// Run `codeql` with `args` and return what it printed on stdout; a
@@ -26714,6 +26783,12 @@ impl App {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
                     self.status = format!("{name} finished in {seconds}s");
+                    let sets = crate::codeql_query::result_set_files(&output).len();
+                    if sets > 1 && output.extension().is_some_and(|e| e == "csv") {
+                        self.status.push_str(&format!(
+                            "; {sets} result sets, see CodeQL: Show Result Set"
+                        ));
+                    }
                 }
                 Err(e) => self.status = format!("{}: {e}", output.display()),
             },
@@ -33379,6 +33454,13 @@ impl App {
                         format!("Dismiss Alert #{number}"),
                         String::from("comment (optional)"),
                     ));
+                }
+            }
+            ListPurpose::CodeqlResultSet => {
+                let path = PathBuf::from(&row.id);
+                match self.editor.open(&path) {
+                    Ok(()) => self.status = format!("Result set {}", row.label),
+                    Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
             ListPurpose::CodeScanningAnalysis => {
@@ -46505,6 +46587,7 @@ impl App {
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlShowResultSet => self.show_codeql_result_sets(),
             Cmd::CodeqlViewCfg => self.view_codeql_cfg(),
             Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
             Cmd::CodeqlRunSelectedQueries => self.run_selected_codeql_queries(),
