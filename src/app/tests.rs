@@ -55099,6 +55099,56 @@ fn sarif_enter_opens_the_location_and_keeps_the_viewer_tab() {
 }
 
 #[test]
+fn sarif_space_previews_the_code_around_the_result_without_leaving_the_list() {
+    // #577: Space shows the lines around the selected result in the
+    // details pane; the viewer keeps the keys and Space again hides it.
+    let (tmp, log) = sarif_fixture();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.handle_sarif_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_sarif_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.refresh_sarif_preview();
+    let view = app.editor.sarif.as_ref().expect("still on the viewer");
+    let p = view.current_preview().expect("a preview").clone();
+    assert!(p.title.ends_with("a.rs"), "{}", p.title);
+    assert_eq!((p.first, p.target), (1, 2));
+    assert_eq!(p.lines[1], "    let q = format!(\"{}\", id);");
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_text(&term);
+    assert!(screen.contains("Preview · "), "{screen}");
+    assert!(screen.contains("2     let q = format!"), "{screen}");
+
+    // On a group row there is no result to preview.
+    app.handle_sarif_key(key(KeyCode::Up, KeyModifiers::NONE));
+    app.refresh_sarif_preview();
+    assert!(
+        app.editor
+            .sarif
+            .as_ref()
+            .unwrap()
+            .current_preview()
+            .is_none()
+    );
+    // Back on the result it comes back; Space turns it off.
+    app.handle_sarif_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.refresh_sarif_preview();
+    assert!(
+        app.editor
+            .sarif
+            .as_ref()
+            .unwrap()
+            .current_preview()
+            .is_some()
+    );
+    app.handle_sarif_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.refresh_sarif_preview();
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert!(!view.previewing && view.current_preview().is_none());
+}
+
+#[test]
 fn a_sarif_result_whose_file_is_only_in_the_log_opens_the_logs_copy() {
     // #577: `artifacts[].contents` is the file when it is not on this
     // machine: text opens read-only at the result, binary in the hex viewer.
