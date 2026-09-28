@@ -2972,6 +2972,37 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
 /// runs before the editor's Ctrl handling, so without the guard the modifier
 /// click would just start a selection.
 #[test]
+fn ctrl_click_on_a_line_range_selects_the_range() {
+    // #804: `path:62-69` opens with lines 62 to 69 selected, the view on 62.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.py");
+    std::fs::write(&file, "l1\nl2\nl3\nline four\nl5\nl6\n").unwrap();
+    let log = tmp.path().join("agent.log");
+    // An escape makes it a rendered log, where Ctrl+click follows references.
+    std::fs::write(&log, "\x1b[1mt.py:2-4\x1b[0m has the case\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "the log opens in the rendered view"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: body.x + 6,
+        row: body.y,
+        modifiers: KeyModifiers::CONTROL,
+    });
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    let sel = app.editor.selection.expect("the range is selected");
+    assert_eq!(sel.normalised(), ((1, 0), (3, 9)), "lines 2 to 4, whole");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    assert!(app.status.ends_with(":2-4"), "{}", app.status);
+}
+
+#[test]
 fn a_file_reference_in_a_rendered_log_is_ctrl_clickable() {
     let tmp = tempfile::tempdir().unwrap();
     let first = tmp.path().join("first.rs");
@@ -3866,11 +3897,13 @@ fn side_by_side_diff_link_records_one_go_back_entry() {
         path: left.to_string_lossy().into_owned(),
         line: 1,
         column: None,
+        end_line: None,
     };
     let rref = crate::file_ref::FileRef {
         path: right.to_string_lossy().into_owned(),
         line: 1,
         column: None,
+        end_line: None,
     };
     assert!(app.open_side_by_side(&lref, &rref), "both sides open");
 

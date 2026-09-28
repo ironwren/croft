@@ -40273,7 +40273,7 @@ impl App {
         if !abs.is_file() {
             return false;
         }
-        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+        self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line)
     }
 
     /// Extend a live log drag and finish it on release.
@@ -43107,7 +43107,7 @@ impl App {
         let Some(abs) = self.resolve_pane_path(self.active_terminal, &fr.path) else {
             return false;
         };
-        self.open_resolved_file_ref(&abs, fr.line, fr.column)
+        self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line)
     }
 
     /// A path printed in pane `idx`, made absolute: `~` against $HOME, a
@@ -43188,7 +43188,7 @@ impl App {
             .and_then(|fr| self.resolve_pane_path(idx, &fr.path).map(|abs| (abs, fr)))
             .filter(|(abs, _)| abs.is_file());
         let opened = match referenced {
-            Some((abs, fr)) => self.open_resolved_file_ref(&abs, fr.line, fr.column),
+            Some((abs, fr)) => self.open_resolved_file_ref(&abs, fr.line, fr.column, fr.end_line),
             None => false,
         };
         let Some(file) = self
@@ -43376,15 +43376,17 @@ impl App {
     }
 
     /// Jump the editor to an absolute `path:line[:col]`, recording where the
-    /// user was so Back returns to it, exactly like go-to-definition. False
-    /// when the file doesn't exist or won't open.
+    /// user was so Back returns to it, exactly like go-to-definition. With
+    /// `end_line`, a `path:line-end` range, the lines `line..=end_line` are
+    /// selected (#804). False when the file doesn't exist or won't open.
     fn open_resolved_file_ref(
         &mut self,
         abs: &std::path::Path,
         line: u32,
         column: Option<u32>,
+        end_line: Option<u32>,
     ) -> bool {
-        self.open_resolved_file_ref_inner(abs, line, column, true)
+        self.open_resolved_file_ref_inner(abs, line, column, end_line, true)
     }
 
     /// [`Self::open_resolved_file_ref`], but `record_nav` false skips the jump
@@ -43396,6 +43398,7 @@ impl App {
         abs: &std::path::Path,
         line: u32,
         column: Option<u32>,
+        end_line: Option<u32>,
         record_nav: bool,
     ) -> bool {
         if !abs.is_file() {
@@ -43415,7 +43418,26 @@ impl App {
                 // `explorer.autoReveal` analogue, as quick-open does: sync
                 // the tree to the landed file without stealing editor focus.
                 self.tree.reveal_path(abs);
-                self.status = format!("{}:{}", self.status_path(abs), line);
+                let range = end_line.filter(|&e| e > line).and_then(|end| {
+                    let last = self.editor.lines.len().checked_sub(1)?;
+                    let end0 = (end as usize - 1).min(last);
+                    (line0 <= end0).then_some((end0, end))
+                });
+                self.status = match range {
+                    Some((end0, end)) => {
+                        // The whole lines, caret at the top so the view
+                        // opens on the start of the range.
+                        let len = self.editor.lines[end0].chars().count();
+                        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                            anchor: (end0, len),
+                            head: (line0, 0),
+                        });
+                        self.editor.cursor_row = line0;
+                        self.editor.cursor_col = 0;
+                        format!("{}:{}-{}", self.status_path(abs), line, end)
+                    }
+                    None => format!("{}:{}", self.status_path(abs), line),
+                };
                 true
             }
             Err(_) => false,
@@ -43449,7 +43471,7 @@ impl App {
             });
         }
         self.focus_editor_group(true);
-        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, false) {
+        if !self.open_resolved_file_ref_inner(&lp, left.line, left.column, None, false) {
             return false;
         }
         if self.editor_layout.is_split() {
@@ -43459,7 +43481,7 @@ impl App {
             // as a preview tab; opening the right file swaps into it.
             self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
         }
-        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, false) {
+        if !self.open_resolved_file_ref_inner(&rp, right.line, right.column, None, false) {
             return false;
         }
         self.status = format!(
@@ -43497,7 +43519,7 @@ impl App {
             // file click. An unresolvable link falls through to the web-only
             // rule so its refusal still shows the real URI.
             let path = std::path::PathBuf::from(&fr.path);
-            if self.open_resolved_file_ref(&path, fr.line, fr.column) {
+            if self.open_resolved_file_ref(&path, fr.line, fr.column, fr.end_line) {
                 return;
             }
         }
