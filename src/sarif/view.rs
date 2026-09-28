@@ -736,7 +736,7 @@ impl SarifView {
                 let loaded = self.logs.get(e.log)?;
                 let run = loaded.log.runs.get(e.run)?;
                 let result = run.results.as_ref()?.get(e.result)?;
-                if result.fixes.is_empty() {
+                if super::fixes::fix_count(result) == 0 {
                     return Some(vec![String::from("This result offers no fix.")]);
                 }
                 let mut roots = Vec::new();
@@ -751,14 +751,10 @@ impl SarifView {
                     ..Default::default()
                 };
                 let mut out = Vec::new();
-                for (i, fix) in result.fixes.iter().enumerate() {
-                    let what = fix
-                        .description
-                        .as_ref()
-                        .and_then(|m| m.text.clone())
-                        .unwrap_or_else(|| String::from("(no description)"));
+                for i in 0..super::fixes::fix_count(result) {
+                    let what = super::fixes::fix_description(result, i).unwrap_or_default();
                     out.push(format!("Fix {}: {what}", i + 1));
-                    match super::fixes::apply_fix(run, fix, &resolver, &mut |p| {
+                    match super::fixes::fix_for(run, result, i, &resolver, &mut |p| {
                         std::fs::read_to_string(p).ok()
                     }) {
                         Ok(edits) => out.extend(super::fixes::preview(&edits)),

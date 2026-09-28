@@ -55332,6 +55332,66 @@ fn sarif_filter_words_are_highlighted_in_the_results() {
 }
 
 #[test]
+fn a_sarif_results_steps_are_drawn_in_their_own_files_only() {
+    // #577: the selected result's analysis steps appear after their lines,
+    // in the file each step is in and no other.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/a.rs"),
+        "fn a() {\n    let x = input();\n    sink(x);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/b.rs"),
+        "fn input() -> String {\n    read()\n}\n",
+    )
+    .unwrap();
+    let step = |uri: &str, line: u32, msg: &str| {
+        format!(
+            r#"{{"location":{{"message":{{"text":"{msg}"}},"physicalLocation":{{"artifactLocation":{{"uri":"{uri}"}},"region":{{"startLine":{line}}}}}}}}}"#
+        )
+    };
+    let log = tmp.path().join("flow.sarif");
+    std::fs::write(
+        &log,
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{{"ruleId":"R1","message":{{"text":"tainted"}},
+              "locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"src/a.rs"}},"region":{{"startLine":3}}}}}}],
+              "codeFlows":[{{"threadFlows":[{{"locations":[{},{},{}]}}]}}]}}]}}]}}"#,
+            step("src/b.rs", 2, "source"),
+            step("src/a.rs", 2, "assigned"),
+            step("src/a.rs", 3, "sink")
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.open_selected_sarif_result();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/a.rs").as_path())
+    );
+    app.sync_sarif_step_marks();
+    let labels = |app: &App, line: usize| -> Vec<String> {
+        app.editor
+            .inlay_spans_for_test(line)
+            .iter()
+            .map(|(_, l, _)| l.trim().to_string())
+            .collect()
+    };
+    assert_eq!(labels(&app, 1), ["\u{25c2} step 2: assigned"]);
+    assert_eq!(labels(&app, 2), ["\u{25c2} step 3: sink"]);
+    assert!(
+        labels(&app, 0).is_empty(),
+        "b.rs's step is not drawn in a.rs"
+    );
+    // The mark sits after the line's text.
+    let (col, _, _) = &app.editor.inlay_spans_for_test(1)[0];
+    assert_eq!(*col, "    let x = input();".chars().count());
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
