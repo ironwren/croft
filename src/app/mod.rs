@@ -23283,7 +23283,8 @@ impl App {
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
     /// opens the selected repository or owner on GitHub; on a submitted run,
-    /// Enter opens its report, `v` its results and `x` exports them; Enter selects what a run
+    /// Enter opens its report, `v` its results, `x` exports them, `c` copies
+    /// its repository list and `l` opens its logs on GitHub Actions; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23325,6 +23326,12 @@ impl App {
                 } else if let Some(Item::List(i)) = va_item {
                     self.prompt_rename_codeql_variant_list(i);
                 }
+            }
+            KeyCode::Char('c') if self.codeql.selected_variant_run().is_some() => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run());
+            }
+            KeyCode::Char('l') if self.codeql.selected_variant_run().is_some() => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run());
             }
             KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
             KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
@@ -25524,6 +25531,59 @@ impl App {
         });
         self.codeql_variant_poll = Some(rx);
         false
+    }
+
+    /// The submitted variant analysis run `index`, else the newest; says
+    /// so when none has been submitted.
+    fn codeql_variant_run(
+        &mut self,
+        index: Option<usize>,
+    ) -> Option<crate::codeql_submit::Submitted> {
+        let runs = crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path());
+        let run = index.map_or(runs.last(), |i| runs.get(i)).cloned();
+        if run.is_none() {
+            self.status = String::from("No variant analysis has been submitted yet");
+        }
+        run
+    }
+
+    /// Copy the repositories variant analysis run `index` (else the newest)
+    /// covers, one per line (#578).
+    fn copy_codeql_variant_repo_list(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        self.status = match crate::codeql_submit::repository_list(&run) {
+            Some(list) => {
+                copy_to_clipboard(&list);
+                format!(
+                    "Copied the {} repositories of variant analysis {}",
+                    list.lines().count(),
+                    run.id
+                )
+            }
+            None => format!(
+                "Variant analysis {} has not reported its repositories yet",
+                run.id
+            ),
+        };
+    }
+
+    /// Open the GitHub Actions run of variant analysis run `index` (else
+    /// the newest), where its logs are (#578).
+    fn view_codeql_variant_logs(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        match crate::codeql_submit::workflow_run_url(&run) {
+            Some(url) => self.open_url_for_user(&url),
+            None => {
+                self.status = format!(
+                    "Variant analysis {} has no Actions run yet; GitHub starts one shortly",
+                    run.id
+                )
+            }
+        }
     }
 
     /// Fetch the results of remembered variant analysis `index` (the newest
@@ -45987,6 +46047,12 @@ impl App {
             Cmd::CodeqlRunVariantAnalysis => self.run_codeql_variant_analysis(),
             Cmd::CodeqlExportVariantResults => {
                 self.prompt_export_codeql_variant_results(self.codeql.selected_variant_run())
+            }
+            Cmd::CodeqlCopyVariantRepoList => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run())
+            }
+            Cmd::CodeqlViewVariantLogs => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlOpenVariantResults => {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
