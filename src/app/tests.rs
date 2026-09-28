@@ -58628,6 +58628,227 @@ fn the_model_editor_lists_a_databases_endpoints_by_group() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn modeling_an_endpoint_writes_a_model_pack_that_runs_use() {
+    // #578: the Model Editor models sources, sinks and summaries. A model
+    // lands in a model pack under .github/codeql/extensions, and query
+    // runs pass it as a model pack.
+    use crate::widgets::codeql::{Action, Line};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.codeql.model = Some(crate::codeql_model::ModelView {
+            database: String::from("lib"),
+            language: String::from("python"),
+            endpoints: crate::codeql_model::parse_endpoints(
+                r#"{"tuples":[[{"label":"Function run"},"mylib","core","run","(cmd,shell)",false,"core.py","",{"label":"Function"}]]}"#,
+            ),
+            ..Default::default()
+        });
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::ModelEndpoint(0), _)))
+            .unwrap();
+        app.codeql.selected = row;
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        let picker = app.list_picker.as_ref().expect("what to model it as");
+        assert_eq!(picker.title, "Model run(cmd,shell)");
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "source ReturnValue (remote)",
+                "sink Argument[0,cmd:] (command-injection)",
+                "sink Argument[1,shell:] (command-injection)",
+                "summary Argument[0,cmd:] \u{2192} ReturnValue (taint)",
+                "summary Argument[1,shell:] \u{2192} ReturnValue (taint)",
+            ]
+        );
+        app.list_picker.as_mut().unwrap().selected = 1;
+        app.confirm_list_picker();
+        let prompt = app.input_prompt.as_ref().expect("its kind");
+        assert_eq!(prompt.value, "command-injection");
+        app.submit_input_prompt();
+        let pack = tmp.path().join(".github/codeql/extensions/lib-python");
+        assert!(
+            app.status
+                .starts_with("Modeled run(cmd,shell) as a sink Argument[0,cmd:]"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(pack.join("models/lib-python.model.yml")).unwrap(),
+            "extensions:\n  - addsTo:\n      pack: codeql/python-all\n      extensible: sinkModel\n    data:\n      - ['mylib', 'Member[core].Member[run].Argument[0,cmd:]', 'command-injection']\n"
+        );
+        assert!(
+            std::fs::read_to_string(pack.join("codeql-pack.yml"))
+                .unwrap()
+                .starts_with("name: croft/lib-python\n")
+        );
+        assert!(
+            app.codeql.lines().iter().any(|l| matches!(
+                l,
+                Line::Action(Action::ModelEndpoint(0), t) if t == "  \u{25cf} run(cmd,shell)"
+            )),
+            "marked as modeled by you"
+        );
+
+        // A query run now uses the pack.
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(calls.contains("--model-packs=croft/lib-python"), "{calls}");
+
+        // Removing its models empties the extension.
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.selected = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::ModelEndpoint(0), _)))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        let rows = &app.list_picker.as_ref().unwrap().rows;
+        let remove = rows
+            .iter()
+            .position(|r| r.id == "0:remove")
+            .expect("remove is offered");
+        app.list_picker.as_mut().unwrap().selected = remove;
+        app.confirm_list_picker();
+        assert!(
+            app.status
+                .starts_with("Removed the models of run(cmd,shell)"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(pack.join("models/lib-python.model.yml")).unwrap(),
+            "extensions:\n  []\n"
+        );
+    });
+}
+
+/// #578's Model Editor end to end against the real CLI: model a library
+/// function as a source and another as a sink, and the command-injection
+/// query, run through croft, finds the flow it misses without them.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-queries; set CROFT_TEST_CODEQL"]
+fn real_models_made_in_the_model_editor_change_what_a_query_finds() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("mylib")).unwrap();
+        std::fs::write(src.join("mylib/__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("mylib/core.py"),
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n\ndef fetch():\n    return \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "from mylib.core import run, fetch\nrun(fetch())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("lib"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let resolved = std::process::Command::new(&codeql)
+            .args([
+                "resolve",
+                "queries",
+                "--format=json",
+                "codeql/python-queries:Security/CWE-078/CommandInjection.ql",
+            ])
+            .output()
+            .unwrap();
+        let query = crate::codeql_ast::first_query(&String::from_utf8_lossy(&resolved.stdout))
+            .expect("the command-injection query");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        let run_query = |app: &mut App| -> String {
+            app.editor.open(&query).unwrap();
+            app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            while app.codeql_run.is_some() {
+                app.drain_codeql_run();
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let history = crate::codeql_query::History::load(&App::codeql_history_path());
+            std::fs::read_to_string(&history.entries[history.newest().unwrap()].output)
+                .unwrap_or_else(|e| panic!("{e}: {}", app.status))
+        };
+        let before = run_query(&mut app);
+        assert!(before.contains("\"results\":[]"), "no flow yet: {before}");
+
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let find = |app: &App, f: &str| {
+            app.codeql
+                .model
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}", app.status))
+                .endpoints
+                .iter()
+                .position(|e| e.function == f)
+                .unwrap()
+        };
+        let (fetch, run) = (find(&app, "fetch"), find(&app, "run"));
+        app.choose_codeql_model(&format!("{fetch}:0"));
+        app.submit_input_prompt(); // remote source at ReturnValue
+        app.choose_codeql_model(&format!("{run}:1"));
+        app.submit_input_prompt(); // command-injection sink at Argument[0,cmd:]
+        let after = run_query(&mut app);
+        assert!(
+            after.contains("\"ruleId\":\"py/command-line-injection\""),
+            "{after}"
+        );
+    });
+}
+
 /// #578's Model Editor against the real CLI: a Python library's
 /// framework-mode endpoints, read from a database built in the test.
 #[cfg(unix)]
