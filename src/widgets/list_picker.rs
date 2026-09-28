@@ -89,6 +89,8 @@ pub enum ListPurpose {
     /// Why a code scanning alert is dismissed: `id` is `<alert>:<reason>`,
     /// the reason an index into `DismissReason::ALL`.
     DismissAlert,
+    /// A result set of a CodeQL query run (#578): `id` is its CSV.
+    CodeqlResultSet,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.

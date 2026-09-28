@@ -11,10 +11,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// A query suite selecting the print-AST query of `lang`'s library pack.
-pub fn print_ast_suite(lang: &str) -> String {
+/// A query suite selecting `lang`'s library-pack query tagged
+/// `ide-contextual-queries/<tag>`, the way VS Code finds its contextual
+/// queries.
+pub fn contextual_suite(lang: &str, tag: &str) -> String {
     format!(
-        "- from: codeql/{lang}-all\n  queries: .\n- include:\n    kind: graph\n    tags contain: ide-contextual-queries/print-ast\n"
+        "- from: codeql/{lang}-all\n  queries: .\n- include:\n    kind: graph\n    tags contain: ide-contextual-queries/{tag}\n"
     )
 }
 
@@ -382,7 +384,7 @@ mod tests {
     #[test]
     fn the_print_ast_query_is_found_by_its_tag_in_the_language_pack() {
         assert_eq!(
-            print_ast_suite("python"),
+            contextual_suite("python", "print-ast"),
             "- from: codeql/python-all\n  queries: .\n- include:\n    kind: graph\n    tags contain: ide-contextual-queries/print-ast\n"
         );
         assert_eq!(

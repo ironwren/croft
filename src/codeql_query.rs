@@ -206,6 +206,146 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments writing the alerts `query` found in `db` as CSV at
+/// `out`, from the results the database keeps (#578, "View Alerts (CSV)").
+pub fn interpret_csv_args(db: &Path, query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("database"),
+        String::from("interpret-results"),
+        String::from("--format=csv"),
+        format!("--output={}", path(out)),
+        path(db),
+        path(query),
+    ]
+}
+
+/// The BQRS `db` keeps for `query` from its last analysis: the newest
+/// `<stem>.bqrs` under its `results` folder, which the CLI files by pack.
+pub fn kept_bqrs(db: &Path, query: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, want: &std::ffi::OsStr, depth: usize, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 12 {
+                    walk(&p, want, depth + 1, out);
+                }
+            } else if p.file_name() == Some(want) {
+                out.push(p);
+            }
+        }
+    }
+    let want = std::ffi::OsString::from(format!("{}.bqrs", query.file_stem()?.to_string_lossy()));
+    let mut found = Vec::new();
+    walk(&db.join("results"), &want, 0, &mut found);
+    found
+        .into_iter()
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+}
+
+/// `codeql` arguments dereferencing a `.qlref` test file to the query it
+/// names (#578, "open a referenced file").
+pub fn qlref_args(qlref: &Path) -> Vec<String> {
+    vec![String::from("resolve"), String::from("qlref"), path(qlref)]
+}
+
+/// The query `codeql resolve qlref` answered with: its `resolvedPath`.
+pub fn parse_qlref(json: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    v.get("resolvedPath")?.as_str().map(PathBuf::from)
+}
+
+/// `codeql` arguments listing a BQRS file's result sets as JSON.
+pub fn info_args(bqrs: &Path) -> Vec<String> {
+    vec![
+        String::from("bqrs"),
+        String::from("info"),
+        String::from("--format=json"),
+        path(bqrs),
+    ]
+}
+
+/// The result sets `codeql bqrs info --format=json` lists, as (name, rows),
+/// in its order.
+pub fn parse_result_sets(json: &str) -> Vec<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    v.get("result-sets")
+        .and_then(|s| s.as_array())
+        .map(|sets| {
+            sets.iter()
+                .filter_map(|s| {
+                    Some((
+                        s.get("name")?.as_str()?.to_string(),
+                        s.get("rows").and_then(|r| r.as_u64()).unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The result set a run's results show first: `#select`, else the first.
+pub fn main_result_set(sets: &[(String, u64)]) -> Option<&str> {
+    sets.iter()
+        .find(|(n, _)| n == "#select")
+        .or(sets.first())
+        .map(|(n, _)| n.as_str())
+}
+
+/// Where result set `set` of a run whose main table is `output` is
+/// decoded: `output` itself for the main set, else `results-<set>.csv`
+/// beside it (#578). A decoded file per set, since `bqrs decode` without a
+/// set writes them all into one CSV, header rows and all.
+pub fn result_set_file(output: &Path, set: &str, main: bool) -> PathBuf {
+    if main {
+        return output.to_path_buf();
+    }
+    let name: String = set
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    output.with_file_name(format!("results-{name}.csv"))
+}
+
+/// `codeql` arguments decoding result set `set` of `bqrs` to CSV at `out`.
+pub fn decode_set_args(bqrs: &Path, out: &Path, set: &str) -> Vec<String> {
+    let mut args = decode_args(bqrs, out);
+    args.insert(3, format!("--result-set={set}"));
+    args
+}
+
+/// A finished table run's result sets, as (name, file), the main one
+/// first: the files [`result_set_file`] names that exist.
+pub fn result_set_files(output: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    if output.is_file() {
+        out.push((String::from("#select"), output.to_path_buf()));
+    }
+    let mut others: Vec<(String, PathBuf)> = output
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let set = name
+                .strip_prefix("results-")?
+                .strip_suffix(".csv")?
+                .to_string();
+            Some((set, e.path()))
+        })
+        .collect();
+    others.sort();
+    out.extend(others);
+    out
+}
+
 /// `codeql` arguments upgrading `db` to the CLI's current schema (VS Code's
 /// "CodeQL: Upgrade Database").
 pub fn upgrade_args(db: &Path) -> Vec<String> {
@@ -1193,6 +1333,90 @@ pub fn export_file_name(query: &Path, output: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_qlref_resolves_to_the_query_the_cli_names() {
+        // The real `codeql resolve qlref` answer (2.27.1).
+        let json = "{\n  \"resolvedPath\" : \"/w/src/Alert.ql\",\n  \"resolvedPostprocessingPaths\" : [ ]\n}\n";
+        assert_eq!(parse_qlref(json), Some(PathBuf::from("/w/src/Alert.ql")));
+        assert_eq!(parse_qlref("{}"), None);
+        assert_eq!(
+            qlref_args(Path::new("/w/test/A.qlref")),
+            ["resolve", "qlref", "/w/test/A.qlref"]
+        );
+    }
+
+    #[test]
+    fn an_alert_runs_kept_results_are_found_and_interpreted_as_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        // Where the CLI keeps them: results/<pack scope>/<pack>/<query>.bqrs.
+        let kept = db.join("results/me/q/Alert.bqrs");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "").unwrap();
+        std::fs::write(db.join("results/me/q/Other.bqrs"), "").unwrap();
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Alert.ql")), Some(kept));
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Gone.ql")), None);
+        assert_eq!(
+            interpret_csv_args(&db, Path::new("/w/q/Alert.ql"), Path::new("/r/alerts.csv")),
+            [
+                "database",
+                "interpret-results",
+                "--format=csv",
+                "--output=/r/alerts.csv",
+                &db.display().to_string(),
+                "/w/q/Alert.ql"
+            ]
+        );
+    }
+
+    #[test]
+    fn each_result_set_gets_its_own_csv() {
+        // The real `codeql bqrs info --format=json` shape (2.27.1).
+        let sets = parse_result_sets(
+            r##"{"result-sets":[{"name":"calls","rows":3,"columns":[]},{"name":"#select","rows":1,"columns":[]}],"compatible-query-kinds":["Table"]}"##,
+        );
+        assert_eq!(sets, [("calls".to_string(), 3), ("#select".to_string(), 1)]);
+        assert_eq!(main_result_set(&sets), Some("#select"));
+        assert_eq!(
+            main_result_set(&sets[..1]),
+            Some("calls"),
+            "no #select: the first"
+        );
+        assert!(parse_result_sets("oops").is_empty());
+        let out = Path::new("/r/1-q/results.csv");
+        assert_eq!(result_set_file(out, "#select", true), out);
+        assert_eq!(
+            result_set_file(out, "calls/x", false),
+            Path::new("/r/1-q/results-calls_x.csv")
+        );
+        assert_eq!(
+            decode_set_args(Path::new("/r/b.bqrs"), out, "calls"),
+            [
+                "bqrs",
+                "decode",
+                "--format=csv",
+                "--result-set=calls",
+                "--output=/r/1-q/results.csv",
+                "/r/b.bqrs"
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("results.csv");
+        for f in [
+            "results.csv",
+            "results-zeta.csv",
+            "results-alpha.csv",
+            "results.bqrs",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let names: Vec<String> = result_set_files(&main)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["#select", "alpha", "zeta"]);
+    }
 
     #[test]
     fn queries_in_takes_ql_files_and_walks_folders() {
