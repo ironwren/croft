@@ -58264,19 +58264,14 @@ impl App {
     /// as one undoable edit that stays unsaved, then mark the result fixed.
     fn apply_sarif_fix(&mut self, index: usize) {
         let root = self.workspace_root().to_path_buf();
-        let Some((log_path, run_i, result_i, run, fix)) =
+        let Some((log_path, run_i, result_i, run, result, what)) =
             self.editor.sarif.as_ref().and_then(|v| {
                 let e = v.selected_entry()?;
                 let loaded = v.logs.get(e.log)?;
                 let run = loaded.log.runs.get(e.run)?.clone();
-                let fix = run
-                    .results
-                    .as_ref()?
-                    .get(e.result)?
-                    .fixes
-                    .get(index)?
-                    .clone();
-                Some((loaded.path.clone(), e.run, e.result, run, fix))
+                let result = run.results.as_ref()?.get(e.result)?.clone();
+                let what = crate::sarif::fixes::fix_description(&result, index)?;
+                Some((loaded.path.clone(), e.run, e.result, run, result, what))
             })
         else {
             self.status = String::from("This result offers no fix");
@@ -58302,7 +58297,7 @@ impl App {
                     s
                 })
         };
-        let edits = match crate::sarif::fixes::apply_fix(&run, &fix, &resolver, &mut |p| {
+        let edits = match crate::sarif::fixes::fix_for(&run, &result, index, &resolver, &mut |p| {
             open_text(p).or_else(|| std::fs::read_to_string(p).ok())
         }) {
             Ok(e) => e,
@@ -58337,11 +58332,6 @@ impl App {
         }
         // Republish without the fixed result.
         self.sarif_diag_signature.clear();
-        let what = fix
-            .description
-            .as_ref()
-            .and_then(|m| m.text.clone())
-            .unwrap_or_else(|| String::from("the fix"));
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 

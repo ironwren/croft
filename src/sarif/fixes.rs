@@ -5,7 +5,7 @@
 //! file on disk) and applies the result, so a fix lands as one undoable edit
 //! in the editor rather than a silent write to disk.
 
-use super::model::{Fix, Run};
+use super::model::{Fix, Run, SarifResult};
 use super::region::{Lines, byte_span, column_kind, newline_sequences, text_range};
 use super::resolve::Resolver;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,204 @@ pub fn apply_fix(
     Ok(out)
 }
 
+/// A result's fixes: its `fixes[]`, then a unified diff in its property bag
+/// (`properties.diff`, #577), which some analyzers attach instead.
+pub fn fix_count(result: &SarifResult) -> usize {
+    result.fixes.len() + usize::from(property_diff(result).is_some())
+}
+
+/// Fix `index`'s description, for the Fix tab.
+pub fn fix_description(result: &SarifResult, index: usize) -> Option<String> {
+    match result.fixes.get(index) {
+        Some(f) => Some(
+            f.description
+                .as_ref()
+                .and_then(|m| m.text.clone())
+                .unwrap_or_else(|| String::from("(no description)")),
+        ),
+        None if index == result.fixes.len() => {
+            property_diff(result).map(|_| String::from("the patch in properties.diff"))
+        }
+        None => None,
+    }
+}
+
+fn property_diff(result: &SarifResult) -> Option<&str> {
+    result
+        .properties
+        .get("diff")
+        .and_then(|d| d.as_str())
+        .filter(|d| d.contains("@@"))
+}
+
+/// Compute fix `index` of `result` ([`fix_count`] orders them).
+pub fn fix_for(
+    run: &Run,
+    result: &SarifResult,
+    index: usize,
+    resolver: &Resolver,
+    read: &mut dyn FnMut(&Path) -> Option<String>,
+) -> Result<Vec<FileEdit>, String> {
+    if let Some(fix) = result.fixes.get(index) {
+        return apply_fix(run, fix, resolver, read);
+    }
+    match property_diff(result) {
+        Some(diff) if index == result.fixes.len() => apply_diff(run, diff, resolver, read),
+        _ => Err(String::from("no such fix")),
+    }
+}
+
+/// One file's part of a unified diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilePatch {
+    path: String,
+    hunks: Vec<PatchHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchHunk {
+    /// 1-based line the hunk starts at in the old file.
+    old_start: usize,
+    /// Context and removed lines, as the old file has them.
+    old: Vec<String>,
+    /// Context and added lines, as the new file has them.
+    new: Vec<String>,
+}
+
+/// The files and hunks of a unified diff (`git diff` or `diff -u`). A path
+/// loses git's `a/`/`b/` prefix; `/dev/null` (a created or deleted file)
+/// is refused, as is a hunk whose line counts do not add up.
+fn parse_unified(diff: &str) -> Result<Vec<FilePatch>, String> {
+    let mut files: Vec<FilePatch> = Vec::new();
+    let mut lines = diff.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(target) = line.strip_prefix("+++ ") {
+            let target = target.split('\t').next().unwrap_or(target).trim();
+            if target == "/dev/null" {
+                return Err(String::from(
+                    "the patch deletes a file, which is not applied",
+                ));
+            }
+            let path = target.strip_prefix("b/").unwrap_or(target).to_string();
+            files.push(FilePatch {
+                path,
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+        let Some(header) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let file = files
+            .last_mut()
+            .ok_or_else(|| String::from("a hunk comes before any file header"))?;
+        let bad = || format!("unreadable hunk header: {line}");
+        let old_spec = header.split_whitespace().next().ok_or_else(bad)?;
+        let new_spec = header.split_whitespace().nth(1).ok_or_else(bad)?;
+        let counts = |spec: &str, sign: char| -> Option<(usize, usize)> {
+            let spec = spec.strip_prefix(sign)?;
+            let (start, len) = spec.split_once(',').unwrap_or((spec, "1"));
+            Some((start.parse().ok()?, len.parse().ok()?))
+        };
+        let (old_start, old_len) = counts(old_spec, '-').ok_or_else(bad)?;
+        let (_, new_len) = counts(new_spec, '+').ok_or_else(bad)?;
+        let mut hunk = PatchHunk {
+            old_start,
+            old: Vec::new(),
+            new: Vec::new(),
+        };
+        while hunk.old.len() < old_len || hunk.new.len() < new_len {
+            let Some(body) = lines.next() else { break };
+            match body.chars().next() {
+                Some('-') => hunk.old.push(body[1..].to_string()),
+                Some('+') => hunk.new.push(body[1..].to_string()),
+                Some('\\') => {}
+                Some(' ') => {
+                    hunk.old.push(body[1..].to_string());
+                    hunk.new.push(body[1..].to_string());
+                }
+                // An empty context line whose leading space was trimmed.
+                None => {
+                    hunk.old.push(String::new());
+                    hunk.new.push(String::new());
+                }
+                Some(_) => return Err(format!("unreadable hunk line: {body}")),
+            }
+        }
+        if hunk.old.len() != old_len || hunk.new.len() != new_len {
+            return Err(format!("a hunk's lines do not match its header: {line}"));
+        }
+        file.hunks.push(hunk);
+    }
+    if files.iter().all(|f| f.hunks.is_empty()) {
+        return Err(String::from("the patch changes nothing"));
+    }
+    Ok(files)
+}
+
+/// How far from its stated line a hunk may have moved and still apply.
+const DIFF_FUZZ_LINES: usize = 50;
+
+/// Apply a unified diff (§3.55's alternative some analyzers put in
+/// `properties.diff`) to the files it names, each resolved like an artifact
+/// location. Every hunk's context and removed lines must match the file
+/// exactly, at its stated line or the nearest place within
+/// [`DIFF_FUZZ_LINES`]; otherwise nothing is changed.
+pub fn apply_diff(
+    run: &Run,
+    diff: &str,
+    resolver: &Resolver,
+    read: &mut dyn FnMut(&Path) -> Option<String>,
+) -> Result<Vec<FileEdit>, String> {
+    let mut out = Vec::new();
+    for patch in parse_unified(diff)? {
+        let loc = super::model::ArtifactLocation {
+            uri: Some(patch.path.clone()),
+            ..Default::default()
+        };
+        let path = resolver
+            .resolve(run, &loc, &|p| p.is_file())
+            .ok_or_else(|| format!("{} is not on this machine", patch.path))?;
+        let before = read(&path).ok_or_else(|| format!("{} could not be read", path.display()))?;
+        let trailing_newline = before.ends_with('\n');
+        let mut lines: Vec<String> = before.lines().map(str::to_string).collect();
+        // Later hunks first, so earlier line numbers stay put.
+        let mut hunks = patch.hunks.clone();
+        hunks.sort_by_key(|h| std::cmp::Reverse(h.old_start));
+        for h in &hunks {
+            let stated = h.old_start.saturating_sub(1);
+            let fits = |at: usize| {
+                at + h.old.len() <= lines.len()
+                    && lines[at..at + h.old.len()]
+                        .iter()
+                        .zip(&h.old)
+                        .all(|(a, b)| a.trim_end_matches('\r') == b.trim_end_matches('\r'))
+            };
+            let at = (0..=DIFF_FUZZ_LINES)
+                .flat_map(|d| [stated.checked_add(d), stated.checked_sub(d)])
+                .flatten()
+                .find(|&at| fits(at))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: the patch no longer matches the file near line {}",
+                        patch.path, h.old_start
+                    )
+                })?;
+            lines.splice(at..at + h.old.len(), h.new.iter().cloned());
+        }
+        let mut after = lines.join("\n");
+        if trailing_newline && !after.is_empty() {
+            after.push('\n');
+        }
+        out.push(FileEdit {
+            path,
+            before,
+            after,
+        });
+    }
+    Ok(out)
+}
+
 /// A short line diff of what a fix does, for the Fix tab.
 pub fn preview(edits: &[FileEdit]) -> Vec<String> {
     use crate::widgets::diff::{DiffRow, build_diff_rows};
@@ -126,6 +324,86 @@ mod tests {
             roots: vec![root.to_path_buf()],
             ..Resolver::default()
         }
+    }
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -2,3 +2,3 @@ fn main() {\n     let id = read();\n-    let q = format!(\"{}\", id);\n+    let q = escape(&id);\n     run(q);\n";
+
+    fn diff_result(diff: &str) -> (Run, SarifResult) {
+        let log = parse_log(&format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},
+                "results":[{{"message":{{"text":"m"}},"properties":{{"diff":{}}}}}]}}]}}"#,
+            serde_json::to_string(diff).unwrap()
+        ))
+        .unwrap();
+        let run = log.runs.into_iter().next().unwrap();
+        let result = run.results.as_ref().unwrap()[0].clone();
+        (run, result)
+    }
+
+    #[test]
+    fn a_property_diff_is_a_fix_applied_where_its_context_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let file = tmp.path().join("src/a.rs");
+        // Two lines were added above since the scan: the hunk moved.
+        std::fs::write(
+            &file,
+            "// new\n// new\nfn main() {\n    let id = read();\n    let q = format!(\"{}\", id);\n    run(q);\n}\n",
+        )
+        .unwrap();
+        let (run, result) = diff_result(DIFF);
+        assert_eq!(fix_count(&result), 1);
+        assert_eq!(
+            fix_description(&result, 0).as_deref(),
+            Some("the patch in properties.diff")
+        );
+        let edits = fix_for(&run, &result, 0, &resolver(tmp.path()), &mut |p| {
+            std::fs::read_to_string(p).ok()
+        })
+        .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, file);
+        assert_eq!(
+            edits[0].after,
+            "// new\n// new\nfn main() {\n    let id = read();\n    let q = escape(&id);\n    run(q);\n}\n"
+        );
+        assert!(fix_for(&run, &result, 1, &resolver(tmp.path()), &mut |_| None).is_err());
+
+        // A file that no longer matches is refused, changing nothing.
+        std::fs::write(&file, "fn main() {\n    let q = other();\n}\n").unwrap();
+        let err = fix_for(&run, &result, 0, &resolver(tmp.path()), &mut |p| {
+            std::fs::read_to_string(p).ok()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("no longer matches the file near line 2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_unified_diff_is_parsed_file_by_file_and_checked() {
+        let two = format!("{DIFF}--- a/b.rs\n+++ b/b.rs\n@@ -1 +1,2 @@\n x\n+y\n");
+        let files = parse_unified(&two).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].hunks[0].old_start, 2);
+        assert_eq!(files[0].hunks[0].old.len(), 3);
+        assert_eq!(files[1].path, "b.rs");
+        assert_eq!(files[1].hunks[0].new, ["x", "y"]);
+        assert!(parse_unified("--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n").is_err());
+        assert!(
+            parse_unified("@@ -1 +1 @@\n-x\n+y\n").is_err(),
+            "no file header"
+        );
+        assert!(
+            parse_unified("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-x\n+y\n").is_err(),
+            "short hunk"
+        );
+        assert!(parse_unified("just text").is_err());
+        // A result whose property is not a patch offers no fix.
+        let (_, result) = diff_result("not a diff");
+        assert_eq!(fix_count(&result), 0);
     }
 
     #[test]
