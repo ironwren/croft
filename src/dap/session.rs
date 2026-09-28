@@ -2266,6 +2266,106 @@ while True:
         s.disconnect();
     }
 
+    /// #264 against a real delve, the first criterion's parity checks:
+    /// slice, map and struct locals expand to their elements, the debug
+    /// console evaluates Go, and step in / out / over move where Go does.
+    /// Needs Go and `dlv`, so it is ignored by default.
+    #[test]
+    #[ignore]
+    fn delve_expands_evaluates_and_steps() {
+        let (_tmp, main) = go_program(
+            "package main\n\nimport \"fmt\"\n\ntype point struct{ X, Y int }\n\n\
+             func double(n int) int {\n\treturn n * 2\n}\n\n\
+             func main() {\n\txs := []int{1, 2, 3}\n\tm := map[string]int{\"a\": 1}\n\
+             \tp := point{X: 4, Y: 5}\n\td := double(p.X)\n\tfmt.Println(xs, m, p, d)\n}\n",
+        );
+        let mut bps = BTreeMap::new();
+        bps.insert(main.clone(), vec![SourceBreakpoint::plain(15)]);
+        let mut s = DapSession::launch_delve(
+            &test_dlv(),
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            bps,
+        )
+        .expect("delve starts");
+        let mut out = Vec::new();
+        poll_delve_until(&mut s, &mut out, |s| s.lookup_local("p").is_some());
+        assert_eq!(s.current_location.clone().map(|l| l.1), Some(15));
+
+        // Each composite local expands to its own children.
+        let children = |s: &mut DapSession, out: &mut Vec<String>, name: &str| {
+            let r = s.lookup_local(name).expect(name).variables_ref;
+            assert!(r > 0, "{name} is expandable");
+            s.expand_variable(r);
+            poll_delve_until(s, out, |s| s.variables.contains_key(&r));
+            s.variables[&r]
+                .iter()
+                .map(|v| (v.name.clone(), v.value.clone()))
+                .collect::<Vec<_>>()
+        };
+        let xs = children(&mut s, &mut out, "xs");
+        assert_eq!(
+            xs.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"],
+            "{xs:?}"
+        );
+        let m = children(&mut s, &mut out, "m");
+        assert!(m.iter().any(|(k, v)| k.contains("a") && v == "1"), "{m:?}");
+        let p = children(&mut s, &mut out, "p");
+        assert!(p.contains(&("X".into(), "4".into())), "{p:?}");
+        assert!(p.contains(&("Y".into(), "5".into())), "{p:?}");
+
+        // The debug console evaluates a Go expression in the stopped frame.
+        s.evaluate("p.X + len(xs)", "repl");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut result = None;
+        while result.is_none() && std::time::Instant::now() < deadline {
+            for ev in s.poll() {
+                if let DapEvent::Evaluated {
+                    result: r, success, ..
+                } = ev
+                {
+                    result = Some((r, success));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(result, Some((String::from("7"), true)));
+
+        // Step in lands in `double`, step out returns to the call, step over
+        // finishes the assignment.
+        let step = |s: &mut DapSession, out: &mut Vec<String>, cmd: &str| {
+            s.step(cmd);
+            poll_delve_until(s, out, |s| {
+                s.phase == SessionPhase::Running || s.current_location.is_none()
+            });
+            poll_delve_until(s, out, |s| s.current_location.is_some());
+            s.current_location.clone().map(|l| l.1)
+        };
+        // Delve's unoptimised build stops on the `func` line first.
+        let into = step(&mut s, &mut out, "stepIn");
+        assert!(matches!(into, Some(7) | Some(8)), "into double: {into:?}");
+        poll_delve_until(&mut s, &mut out, |s| !s.stack_frames.is_empty());
+        assert_eq!(
+            s.stack_frames.first().map(|f| f.name.as_str()),
+            Some("main.double")
+        );
+        let back = step(&mut s, &mut out, "stepOut");
+        assert!(
+            matches!(back, Some(15) | Some(16)),
+            "back in main: {back:?}"
+        );
+        if back == Some(15) {
+            assert_eq!(step(&mut s, &mut out, "next"), Some(16));
+        }
+        poll_delve_until(&mut s, &mut out, |s| s.lookup_local("d").is_some());
+        assert_eq!(
+            s.lookup_local("d").map(|v| v.value.clone()).as_deref(),
+            Some("8")
+        );
+        s.disconnect();
+    }
+
     #[test]
     fn run_to_cursor_stops_even_on_a_logpoint_line() {
         let src = PathBuf::from("/w/app.py");

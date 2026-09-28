@@ -133,6 +133,17 @@ fn query_ignored(root: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
+/// Whether git ignores `path` under the repository at `root`: one
+/// `check-ignore` call, for a single path's verdict (#263: a save of build
+/// output or a `.env` does not rerun watched tests). Outside a repository,
+/// or when git cannot answer, nothing is ignored.
+pub fn is_ignored(root: &Path, path: &Path) -> bool {
+    let mut stdin = path.as_os_str().as_encoded_bytes().to_vec();
+    stdin.push(0);
+    git_raw(root, &["check-ignore", "-z", "--stdin"], Some(&stdin))
+        .is_some_and(|out| out.iter().any(|b| *b != 0))
+}
+
 /// Join a raw `-z` path (trailing `/` stripped) onto `root` without passing
 /// through `str`: a filename is bytes, and on unix it need not be UTF-8.
 fn join_raw(root: &Path, raw: &[u8]) -> PathBuf {
@@ -2806,6 +2817,29 @@ mod tests {
             s.ignored
         );
         assert!(s.ignored.contains(&p.join("zz.log")));
+    }
+
+    #[test]
+    fn one_paths_ignore_verdict_matches_the_rules() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(p)
+            .args(["init", "-q", "-b", "main"])
+            .output();
+        std::fs::write(p.join(".gitignore"), "*.log\nout/\n").unwrap();
+        assert!(is_ignored(p, &p.join("a.log")));
+        assert!(
+            is_ignored(p, &p.join("out/deep/gen.rs")),
+            "under an ignored dir"
+        );
+        assert!(!is_ignored(p, &p.join("src/lib.rs")));
+        let bare = TempDir::new().unwrap();
+        assert!(
+            !is_ignored(bare.path(), &bare.path().join("a.log")),
+            "no repo"
+        );
     }
 
     #[test]
