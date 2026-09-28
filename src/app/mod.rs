@@ -3172,11 +3172,11 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
-    /// The AST being read for the AST Viewer (#578): the tree or why not,
-    /// and the view it fills in.
     /// The control flow graph being read for View CFG (#578): the
     /// document it writes, or why not.
     codeql_cfg_job: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// The AST being read for the AST Viewer (#578): the tree or why not,
+    /// and the view it fills in.
     codeql_ast_job: Option<(
         std::sync::mpsc::Receiver<Result<crate::codeql_ast::AstTree, String>>,
         crate::codeql_ast::AstView,
