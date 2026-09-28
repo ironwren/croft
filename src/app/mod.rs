@@ -57515,9 +57515,13 @@ impl App {
                 let region = physical.region.as_ref();
                 let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
                 let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
-                let place = region
-                    .cloned()
-                    .map(|r| (r, crate::sarif::region::newline_sequences(run)));
+                let place = region.cloned().map(|r| {
+                    (
+                        r,
+                        physical.context_region.clone(),
+                        crate::sarif::region::newline_sequences(run),
+                    )
+                });
                 let embedded = found
                     .is_none()
                     .then(|| crate::sarif::resolve::embedded_contents(run, artifact))
@@ -57572,9 +57576,11 @@ impl App {
             .find(|t| t.path.as_deref() == Some(path.as_path()) && !t.has_non_text_view())
             .map(|t| t.lines.join("\n"))
             .or_else(|| std::fs::read_to_string(&path).ok());
-        let located = place.zip(text).and_then(|((region, newlines), text)| {
-            crate::sarif::region::locate(&region, &text, &newlines, kind)
-        });
+        let located = place
+            .zip(text)
+            .and_then(|((region, context, newlines), text)| {
+                crate::sarif::region::locate(&region, context.as_ref(), &text, &newlines, kind)
+            });
         self.editor.pin_active();
         let (opened, line, moved) = match located {
             // Columns are code points once located.
