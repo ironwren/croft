@@ -6343,16 +6343,16 @@ impl Editor {
     /// wrapped row segmentation knows nothing about hint cells.
     /// ponytail: hints skip wrap mode; code files don't wrap by default, and
     /// Markdown (the wrapping default) has no hint-serving server.
-    #[cfg(test)]
-    pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
-        self.row_inlay_spans(line)
-    }
-
     fn row_inlay_spans(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         if self.wrap_enabled() {
             return &[];
         }
         self.inlay_spans.get(line).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
+        self.row_inlay_spans(line)
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when
