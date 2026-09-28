@@ -202,6 +202,21 @@ Updates** compares the latest release with the CLI in use; a newer one is
 what the next download installs. User config only: it names a program to
 run.
 
+## Persistent terminal panes
+
+`"terminal_persistent_panes": true` keeps each terminal pane's shell in a
+process of its own, `croft pane-host` (#694), instead of in croft. When croft
+is killed or crashes (the OOM killer tends to pick it, being the largest
+process), the shells and whatever they are running carry on, and the next
+croft in the workspace reattaches to them: the same shell, with its screen and
+recent scrollback redrawn, including what it printed while croft was down.
+
+- Closing a pane, or quitting croft normally, still ends its shell.
+- A host no croft has reattached to for a week ends its shell.
+- It applies to shell panes opened after the change, not to task or run
+  panes, and only on Linux.
+- A pane whose host cannot start is an ordinary pane.
+
 ## Notification sinks
 
 A `notifications` list forwards events croft already notices to somewhere
