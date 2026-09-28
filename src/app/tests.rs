@@ -56443,6 +56443,46 @@ fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
         );
         assert!(app.editor.lines.iter().any(|l| l == "        files"));
         assert!(app.editor.is_line_hidden(3), "predicates start folded");
+        // The side bar's Evaluator Log Viewer section holds the same tree.
+        {
+            use crate::widgets::codeql::{Action, Hit, Line};
+            let rows = |app: &App| -> Vec<(Action, String)> {
+                app.codeql
+                    .lines()
+                    .into_iter()
+                    .filter_map(|l| match l {
+                        Line::Action(
+                            a @ (Action::EvalPredicate(_)
+                            | Action::EvalDependency(_)
+                            | Action::ClearEvalLog),
+                            t,
+                        ) => Some((a, t)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let folded = rows(&app);
+            assert_eq!(folded.len(), 3, "{folded:?}");
+            assert_eq!(folded[0].1, "Clear \u{b7} q.ql");
+            assert!(folded[1].1.contains("Foo::slow#b"), "slowest first");
+            assert!(folded[2].1.contains("Foo::fast#a"));
+            app.activate_codeql(Hit::Action(Action::EvalPredicate(1)));
+            let open = rows(&app);
+            assert!(open[2].1.starts_with("\u{25be}"), "{open:?}");
+            assert!(
+                open.iter().any(|(_, t)| t == "  Pipeline pipeline"),
+                "{open:?}"
+            );
+            let dep = open
+                .iter()
+                .find(|(a, _)| matches!(a, Action::EvalDependency(_)))
+                .expect("the dependency row");
+            assert_eq!(dep.1, "  \u{2192} files");
+            app.activate_codeql(Hit::Action(dep.0));
+            assert!(app.status.contains("not in this log"), "{}", app.status);
+            app.activate_codeql(Hit::Action(Action::ClearEvalLog));
+            assert!(app.codeql.evallog.is_none());
+        }
         let predicates = crate::codeql_query::evaluator_log_predicates(&out);
         let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
         assert_eq!(
@@ -57527,6 +57567,125 @@ fn view_cfg_reads_a_real_functions_control_flow() {
 }
 
 #[test]
+fn walking_a_codeql_results_table_opens_each_results_code() {
+    // #578: `codeQLQueryResults` up/down/left/right. The walk moves the
+    // table's cursor and opens the cell's entity; it goes on after the
+    // code has the focus, and a sorted table still leads to the right row.
+    use crate::codeql_query::{CellLoc, RowLocs};
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("app.py");
+        std::fs::write(&src, "a = 1\nb = 2\ndef f():\n    pass\n").unwrap();
+        let csv = tmp.path().join("results.csv");
+        std::fs::write(
+            &csv,
+            "\"x\",\"n\"\n\"Name b\",\"2\"\n\"Function f\",\"3\"\n\"plain\",\"9\"\n",
+        )
+        .unwrap();
+        let at = |line: u32, column: u32| {
+            Some(CellLoc {
+                path: src.clone(),
+                line,
+                column,
+            })
+        };
+        let rows = vec![
+            RowLocs {
+                cells: vec!["Name b".into(), "2".into()],
+                locs: vec![at(2, 1), None],
+            },
+            RowLocs {
+                cells: vec!["Function f".into(), "3".into()],
+                locs: vec![at(3, 5), None],
+            },
+            RowLocs {
+                cells: vec!["plain".into(), "9".into()],
+                locs: vec![None, None],
+            },
+        ];
+        std::fs::write(
+            crate::codeql_query::locations_path(&csv),
+            serde_json::to_string(&rows).unwrap(),
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(app.status, "Open a CodeQL results table first");
+        app.editor.open(&csv).unwrap();
+
+        // Down from the first row: row 2, "Function f" at 3:5.
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(src.as_path()),
+            "{}",
+            app.status
+        );
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+        // The code has the focus; the walk goes on in the table: back up.
+        app.run_command(Command::CodeqlResultsUp);
+        assert_eq!(app.editor.cursor_row, 1, "{}", app.status);
+        // Right onto the number column: no location there, so the row's
+        // entity.
+        app.run_command(Command::CodeqlResultsRight);
+        assert_eq!(app.editor.cursor_row, 1, "{}", app.status);
+        // A row with no entity says so.
+        app.run_command(Command::CodeqlResultsDown);
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(app.status, "Result 3 has no location");
+
+        // Sorted by the name column (descending: plain, Name b, Function
+        // f), the first row still leads to its own code.
+        app.editor.open(&csv).unwrap();
+        let data = &mut app.editor.sheet.as_mut().unwrap().sheets[0];
+        data.cur_col = 0;
+        data.sort_by_column(0);
+        data.sort_by_column(0);
+        data.cur_row = 0;
+        app.run_command(Command::CodeqlResultsDown);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(src.as_path()),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.editor.cursor_row, 1, "Name b is on line 2");
+    });
+}
+
+#[test]
+fn a_csv_sheet_sorts_by_the_cursors_column_from_the_palette() {
+    // #578: raw results as a sortable table. Any CSV sheet sorts.
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("results.csv");
+    std::fs::write(&csv, "name,count\nb,10\nA,9\nc,100\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Open a CSV or TSV file to sort it");
+    app.editor.open(&csv).unwrap();
+    let sheet = app.editor.sheet.as_mut().expect("a CSV opens as a sheet");
+    sheet.sheets[0].cur_col = 1;
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Sorted by count, ascending");
+    let rows = |app: &App| -> Vec<String> {
+        app.editor.sheet.as_ref().unwrap().sheets[0]
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect()
+    };
+    assert_eq!(rows(&app), ["9", "10", "100"]);
+    assert!(app.editor.dirty, "a reorder is an edit");
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Sorted by count, descending");
+    assert_eq!(rows(&app), ["100", "10", "9"]);
+}
+
+#[test]
 fn a_runs_result_sets_are_picked_from_a_list() {
     // #578: raw results with a result-set picker. Each set is its own CSV.
     use crate::codeql_query::RunStatus;
@@ -58110,6 +58269,72 @@ fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() 
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn debugging_a_codeql_query_stops_at_its_first_breakpoint() {
+    // #578: Debug Query quick-evaluates the predicate at the first
+    // breakpoint; with none it runs the whole query.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
+        );
+        app.codeql_program = fake_query_server(
+            bin.path(),
+            r#"{"resultType": 0, "message": "", "evaluationTime": 1}"#,
+            "\"c\"\n",
+        );
+        let query = tmp.path().join("q.ql");
+        // A breakpoint on a line with no predicate is refused with why.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(7);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert!(
+            app.status
+                .starts_with("No predicate at the breakpoint on line 7"),
+            "{}",
+            app.status
+        );
+        // On the `where` line: the called predicate.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(6);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(
+            app.status,
+            "Running Quick evaluation of isCall (breakpoint on line 6) on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        let requests = std::fs::read_to_string(bin.path().join("requests.jsonl")).unwrap();
+        let run: serde_json::Value =
+            serde_json::from_str(requests.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["line"],
+            6
+        );
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["column"],
+            7
+        );
+        // Without breakpoints the whole query runs, as Run Query does.
+        app.editor.open(&query).unwrap();
+        app.editor.breakpoints.clear();
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(app.status, "Running q.ql on app\u{2026}");
+        wait_for_codeql(&mut app);
+    });
+}
+
 /// #578's quick evaluation against the real CLI's query server: a
 /// predicate's tuples, and their count.
 #[cfg(unix)]
@@ -58201,6 +58426,108 @@ fn quick_evaluation_against_a_real_query_server() {
         );
         let counts = run(&mut app, Command::CodeqlQuickEvalCount);
         assert!(counts.contains("\"Total tuples\",3"), "{counts}");
+    });
+}
+
+/// #578's results walk against the real CLI: a table run keeps where its
+/// entities are, and walking the table opens their code.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn a_real_results_table_is_walked_into_the_code() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("app.py");
+        std::fs::write(
+            &file,
+            "import os\n\ndef run(cmd):\n    print(cmd)\n\ndef go():\n    run(input())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let pack = tmp.path().join("q");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("qlpack.yml"),
+            "name: me/q\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n",
+        )
+        .unwrap();
+        let installed = std::process::Command::new(&codeql)
+            .args(["pack", "install"])
+            .arg(&pack)
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let query = pack.join("Functions.ql");
+        std::fs::write(
+            &query,
+            "import python\nfrom Function f\nselect f, f.getName()\n",
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&query).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while app.codeql_run.is_some() {
+            app.drain_codeql_run();
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let table = app.editor.path.clone().unwrap();
+        assert!(
+            crate::codeql_query::locations_path(&table).is_file(),
+            "{}",
+            app.status
+        );
+        let data = &mut app.editor.sheet.as_mut().expect("the table").sheets[0];
+        data.cur_col = 0;
+        data.sort_by_column(1); // by name: go, run
+        data.cur_row = 0;
+        // Right, then Left: back on the first row's entity, `def go`.
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsRight);
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsLeft);
+        assert_eq!(
+            app.editor.path.as_ref().map(|p| p.canonicalize().unwrap()),
+            Some(file.canonicalize().unwrap()),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.editor.cursor_row, 5, "def go is on line 6");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlResultsDown);
+        assert_eq!(app.editor.cursor_row, 2, "def run is on line 3");
     });
 }
 

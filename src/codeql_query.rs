@@ -254,6 +254,90 @@ pub fn parse_qlref(json: &str) -> Option<PathBuf> {
     v.get("resolvedPath")?.as_str().map(PathBuf::from)
 }
 
+/// `codeql` arguments decoding result set `set` of `bqrs` as JSON with each
+/// entity's label and location, for navigating the results (#578).
+pub fn decode_locations_args(bqrs: &Path, out: &Path, set: &str) -> Vec<String> {
+    vec![
+        String::from("bqrs"),
+        String::from("decode"),
+        String::from("--format=json"),
+        String::from("--entities=url,string"),
+        format!("--result-set={set}"),
+        format!("--output={}", path(out)),
+        path(bqrs),
+    ]
+}
+
+/// Where the locations of a results CSV's cells are kept: beside it, as
+/// `<name>.locations.json`.
+pub fn locations_path(csv: &Path) -> PathBuf {
+    csv.with_extension("locations.json")
+}
+
+/// Where a result cell's entity is: a file and a 1-based line and column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CellLoc {
+    pub path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// One result row: each cell's text as the CSV shows it, and where each
+/// cell's entity is, if it is an entity with a location.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowLocs {
+    pub cells: Vec<String>,
+    pub locs: Vec<Option<CellLoc>>,
+}
+
+/// Read a result set decoded by [`decode_locations_args`] into rows.
+pub fn parse_row_locations(json: &str) -> Vec<RowLocs> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let cell = |c: &serde_json::Value| -> (String, Option<CellLoc>) {
+        match c {
+            serde_json::Value::Object(o) => {
+                let text = o
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let loc = o.get("url").and_then(|u| {
+                    let uri = u.get("uri")?.as_str()?;
+                    let rest = uri.strip_prefix("file://")?;
+                    Some(CellLoc {
+                        path: PathBuf::from(crate::sarif::resolve::percent_decode(rest)),
+                        line: u.get("startLine")?.as_u64()? as u32,
+                        column: u.get("startColumn").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
+                    })
+                });
+                (text, loc)
+            }
+            serde_json::Value::String(s) => (s.clone(), None),
+            other => (other.to_string(), None),
+        }
+    };
+    v.get("tuples")
+        .and_then(|t| t.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_array())
+                .map(|r| {
+                    let (cells, locs) = r.iter().map(cell).unzip();
+                    RowLocs { cells, locs }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The locations of the row whose cells read `cells`, found by content
+/// rather than position, so a sorted table still leads to the right code.
+pub fn row_locations<'a>(rows: &'a [RowLocs], cells: &[String]) -> Option<&'a [Option<CellLoc>]> {
+    rows.iter()
+        .find(|r| r.cells == cells)
+        .map(|r| r.locs.as_slice())
+}
+
 /// `codeql` arguments listing a BQRS file's result sets as JSON.
 pub fn info_args(bqrs: &Path) -> Vec<String> {
     vec![
@@ -1333,6 +1417,37 @@ pub fn export_file_name(query: &Path, output: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_cells_lead_to_their_entities_code() {
+        // The real `bqrs decode --format=json --entities=url,string
+        // --result-set=#select` shape (2.27.1).
+        let json = r#"{"columns":[{"name":"f","kind":"Entity"},{"kind":"String"}],
+          "tuples":[[{"label":"Function run","url":{"uri":"file:///w/my%20app.py","startLine":3,"startColumn":1,"endLine":3,"endColumn":13}},"run"],
+                    [{"label":"Function go"},7]]}"#;
+        let rows = parse_row_locations(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cells, ["Function run", "run"]);
+        assert_eq!(
+            rows[0].locs[0],
+            Some(CellLoc {
+                path: PathBuf::from("/w/my app.py"),
+                line: 3,
+                column: 1
+            })
+        );
+        assert_eq!(rows[0].locs[1], None, "a string has no location");
+        assert_eq!(rows[1].cells, ["Function go", "7"]);
+        assert_eq!(rows[1].locs, [None, None], "an entity without a url");
+        let found = row_locations(&rows, &["Function run".to_string(), "run".to_string()]);
+        assert_eq!(found.map(|l| l[0].as_ref().map(|c| c.line)), Some(Some(3)));
+        assert!(row_locations(&rows, &["nope".to_string()]).is_none());
+        assert_eq!(
+            locations_path(Path::new("/r/results-calls.csv")),
+            Path::new("/r/results-calls.locations.json")
+        );
+        assert_eq!(parse_row_locations("oops"), []);
+    }
 
     #[test]
     fn a_qlref_resolves_to_the_query_the_cli_names() {

@@ -3167,7 +3167,7 @@ pub struct App {
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
     /// The evaluator log viewer being prepared (#578): where the rendered
     /// tree (or why there is none) arrives, and the tab label to show it in.
-    codeql_log_viewer: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    codeql_log_viewer: Option<CodeqlLogViewerJob>,
     /// The performance comparison being prepared (#578): where the rendered
     /// table (or why there is none) arrives, and the tab label to show it in.
     codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
@@ -3181,6 +3181,9 @@ pub struct App {
     /// views): the file it writes or why not, and the status lines for
     /// each.
     codeql_doc_job: Option<CodeqlDocJob>,
+    /// The CodeQL results table last walked (#578), so the walk goes on
+    /// once the code it opened has the focus.
+    codeql_results_walk: Option<PathBuf>,
     /// The AST being read for the AST Viewer (#578): the tree or why not,
     /// and the view it fills in.
     codeql_ast_job: Option<(
@@ -5535,6 +5538,7 @@ impl App {
             codeql_pack_job: None,
             codeql_ast_job: None,
             codeql_doc_job: None,
+            codeql_results_walk: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -23591,6 +23595,27 @@ impl App {
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
             Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::ClearEvalLog) => {
+                self.codeql.evallog = None;
+                self.status = String::from("Cleared the evaluator log");
+            }
+            Hit::Action(Action::EvalPredicate(i)) => {
+                if let Some(view) = self.codeql.evallog.as_mut() {
+                    view.toggle(i);
+                }
+            }
+            Hit::Action(Action::EvalDependency(target)) => match target {
+                Some(i) => {
+                    if let Some(view) = self.codeql.evallog.as_mut() {
+                        view.open.insert(i);
+                    }
+                    self.codeql.select_evallog_predicate(i);
+                }
+                None => {
+                    self.status =
+                        String::from("That predicate is not in this log (it was cached or inlined)")
+                }
+            },
             Hit::Action(Action::ClearAst) => {
                 self.codeql.ast = None;
                 self.status = String::from("Cleared the AST");
@@ -25241,14 +25266,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let name = query.clone();
         std::thread::spawn(move || {
-            let tree = Self::codeql_log_predicates(&program, &log)
-                .map(|parsed| crate::codeql_evallog::render(&name, &parsed));
-            let _ = tx.send(tree);
+            let _ = tx.send(Self::codeql_log_predicates(&program, &log));
         });
         self.status = String::from("Reading the evaluator log\u{2026}");
-        self.codeql_log_viewer = Some((rx, format!("Evaluator Log ({query})")));
+        self.codeql_log_viewer = Some((rx, query));
     }
 
     /// Show a prepared evaluator log tree (#578) in a tab with every
@@ -25264,10 +25286,21 @@ impl App {
                 Err(String::from("the viewer stopped unexpectedly"))
             }
         };
-        let Some((_, label)) = self.codeql_log_viewer.take() else {
+        let Some((_, query)) = self.codeql_log_viewer.take() else {
             return false;
         };
-        match outcome.and_then(|text| {
+        let label = format!("Evaluator Log ({query})");
+        match outcome.and_then(|predicates| {
+            let text = crate::codeql_evallog::render(&query, &predicates);
+            // The side bar's Evaluator Log Viewer shows the same tree.
+            self.codeql.evallog = Some(crate::codeql_evallog::LogView {
+                query: query.clone(),
+                predicates,
+                ..Default::default()
+            });
+            self.codeql
+                .collapsed
+                .remove(&crate::widgets::codeql::Section::EvaluatorLog);
             self.editor
                 .open_text_buffer(Path::new(&label), &text)
                 .map_err(|e| e.to_string())
@@ -26677,6 +26710,59 @@ impl App {
         );
     }
 
+    /// CodeQL: Debug Query (#578): evaluate the open query up to its first
+    /// breakpoint, the way VS Code's CodeQL debugger stops at one: the
+    /// predicate the breakpoint's line defines or calls is quick-evaluated.
+    /// With no breakpoints the whole query runs.
+    fn debug_codeql_query(&mut self) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to debug it");
+            return;
+        };
+        let lines: Vec<usize> = self
+            .editor
+            .breakpoints
+            .get(&query)
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            self.run_codeql_query();
+            return;
+        }
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let target = lines.iter().find_map(|&line| {
+            let text = self.editor.lines.get(line.checked_sub(1)?)?;
+            crate::codeql_qs::breakpoint_target(text, line as u32)
+        });
+        let Some((span, name)) = target else {
+            self.status = format!(
+                "No predicate at the breakpoint on line {}: put it on a line that defines or calls one",
+                lines[0]
+            );
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        let label = format!("{name} (breakpoint on line {})", span.line);
+        self.run_codeql_file_with(
+            query,
+            &source,
+            None,
+            Some(crate::codeql_qs::QuickEval {
+                span,
+                count: false,
+                label,
+            }),
+        );
+    }
+
     /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
     /// raised (#578). Its output is drained on threads of its own, so a
     /// chatty CLI never blocks on a full pipe while this polls.
@@ -26742,6 +26828,107 @@ impl App {
         };
     }
 
+    /// Walk a CodeQL results table (#578, VS Code's `codeQLQueryResults`
+    /// up/down/left/right): move its cursor by (`rows`, `cols`) and open
+    /// the code of the cell's entity, else of the first entity in its row.
+    /// The table is the active results sheet, else the one walked last,
+    /// so the walk goes on once the code has the focus.
+    fn walk_codeql_results(&mut self, rows: isize, cols: isize) {
+        use crate::codeql_query as cq;
+        let active = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| self.editor.sheet.is_some() && cq::locations_path(p).is_file());
+        let on_table = active.is_some();
+        let Some(table) = active.or_else(|| self.codeql_results_walk.clone()) else {
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        // The active tab when it is the table, else a tab showing it.
+        let tab = if on_table {
+            Some(&mut *self.editor)
+        } else {
+            self.editor
+                .editors
+                .iter_mut()
+                .find(|t| t.path.as_deref() == Some(table.as_path()) && t.sheet.is_some())
+        };
+        let Some(sheet) = tab.and_then(|t| t.sheet.as_mut()) else {
+            self.codeql_results_walk = None;
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        if data.rows.is_empty() {
+            self.status = String::from("The results table is empty");
+            return;
+        }
+        let step = |at: usize, by: isize, len: usize| -> usize {
+            (at as isize + by).clamp(0, len.saturating_sub(1) as isize) as usize
+        };
+        data.cur_row = step(data.cur_row, rows, data.rows.len());
+        data.cur_col = step(data.cur_col, cols, data.col_widths.len().max(1));
+        let (cells, col) = (data.rows[data.cur_row].clone(), data.cur_col);
+        let row = data.cur_row + 1;
+        self.codeql_results_walk = Some(table.clone());
+        let saved: Vec<cq::RowLocs> = std::fs::read_to_string(cq::locations_path(&table))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let Some(locs) = cq::row_locations(&saved, &cells) else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(loc) = locs
+            .get(col)
+            .cloned()
+            .flatten()
+            .or_else(|| locs.iter().flatten().next().cloned())
+        else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(path) = self.codeql_source_file(&loc.path) else {
+            self.status = format!("{} is not on this machine", loc.path.display());
+            return;
+        };
+        if self.editor.path.as_deref() == Some(table.as_path()) {
+            self.editor.pin_active();
+        }
+        let (line, column) = (loc.line.max(1) - 1, loc.column.max(1) - 1);
+        self.status = match self.open_at(&path, line as usize, column as usize) {
+            Ok(()) => format!("Result {row}: {}:{}", path.display(), loc.line),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
+    }
+
+    /// A source file a CodeQL result names, on this machine: the path
+    /// itself, else its copy in an extracted source archive or in a
+    /// database's `src` folder, which both mirror the original paths.
+    fn codeql_source_file(&self, path: &Path) -> Option<PathBuf> {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let extracted = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path());
+        let src = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path())
+            .databases
+            .into_iter()
+            .map(|d| d.path.join("src"));
+        extracted
+            .chain(src)
+            .map(|root| root.join(rel))
+            .find(|p| p.is_file())
+    }
+
     /// Decode `bqrs` to CSV, one file per result set (#578): the main set
     /// (`#select`) to `out`, each other beside it as `results-<set>.csv`.
     /// `bqrs decode` without a set writes them all into one CSV, header
@@ -26763,6 +26950,16 @@ impl App {
         for (name, _) in &sets {
             let file = cq::result_set_file(out, name, *name == main);
             run(cq::decode_set_args(bqrs, &file, name))?;
+            // Where each cell's entity is, for walking the results in the
+            // code. Optional: a table without it still opens.
+            let raw = file.with_extension("entities.json");
+            if run(cq::decode_locations_args(bqrs, &raw, name)).is_ok()
+                && let Ok(text) = std::fs::read_to_string(&raw)
+                && let Ok(json) = serde_json::to_string(&cq::parse_row_locations(&text))
+            {
+                let _ = std::fs::write(cq::locations_path(&file), json);
+            }
+            let _ = std::fs::remove_file(&raw);
         }
         Ok(())
     }
@@ -47241,6 +47438,13 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlDebugQuery => self.debug_codeql_query(),
+            Cmd::CodeqlDebugSelection => self.quick_eval_codeql(false),
+            Cmd::CodeqlResultsUp => self.walk_codeql_results(-1, 0),
+            Cmd::CodeqlResultsDown => self.walk_codeql_results(1, 0),
+            Cmd::CodeqlResultsLeft => self.walk_codeql_results(0, -1),
+            Cmd::CodeqlResultsRight => self.walk_codeql_results(0, 1),
+            Cmd::SheetSortByColumn => self.sort_sheet_by_column(),
             Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
             Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
@@ -57828,6 +58032,43 @@ impl App {
         }
     }
 
+    /// Sheet: Sort by Column (#578): sort the open CSV/TSV sheet's rows by
+    /// the cursor's column, reversing when it is already sorted that way.
+    /// A reorder is an edit, as in a spreadsheet: it marks the sheet
+    /// unsaved. xlsx is left out, since its edits are written back by
+    /// row, and so are the read-only kinds.
+    fn sort_sheet_by_column(&mut self) {
+        let Some(sheet) = self.editor.sheet.as_mut() else {
+            self.status = String::from("Open a CSV or TSV file to sort it");
+            return;
+        };
+        if !matches!(
+            sheet.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        ) {
+            self.status = String::from("Sorting is for CSV and TSV sheets");
+            return;
+        }
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        let col = data.cur_col;
+        let name = data
+            .headers
+            .get(col)
+            .filter(|h| !h.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        let ascending = data.sort_by_column(col);
+        sheet.dirty = true;
+        self.editor.dirty = true;
+        self.status = format!(
+            "Sorted by {name}, {}",
+            if ascending { "ascending" } else { "descending" }
+        );
+    }
+
     fn handle_sheet_key(&mut self, key: KeyEvent) {
         let visible = sheet_visible_rows(self.editor.last_inner);
         let Some(sheet) = self.editor.sheet.as_mut() else {
@@ -64831,6 +65072,13 @@ type CodeqlPackJob = (
 type CodeqlDocJob = (
     std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     String,
+    String,
+);
+
+/// An evaluator log being read for its viewer (#578): the predicates, or
+/// why not, and the query whose log it is.
+type CodeqlLogViewerJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
     String,
 );
 
