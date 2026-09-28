@@ -2958,6 +2958,37 @@ fn the_swallow_guard_reads_the_clicked_terminal_not_the_active_one() {
     );
 }
 
+#[test]
+fn ctrl_click_on_a_line_range_selects_the_range() {
+    // #804: `path:62-69` opens with lines 62 to 69 selected, the view on 62.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("t.py");
+    std::fs::write(&file, "l1\nl2\nl3\nline four\nl5\nl6\n").unwrap();
+    let log = tmp.path().join("agent.log");
+    // An escape makes it a rendered log, where Ctrl+click follows references.
+    std::fs::write(&log, "\x1b[1mt.py:2-4\x1b[0m has the case\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&log).unwrap();
+    assert!(
+        app.editor.log.is_some(),
+        "the log opens in the rendered view"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let body = app.editor.log.as_ref().unwrap().last_body;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: body.x + 6,
+        row: body.y,
+        modifiers: KeyModifiers::CONTROL,
+    });
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    let sel = app.editor.selection.expect("the range is selected");
+    assert_eq!(sel.normalised(), ((1, 0), (3, 9)), "lines 2 to 4, whole");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    assert!(app.status.ends_with(":2-4"), "{}", app.status);
+}
+
 /// A `path:line` printed in a RENDERED ANSI log is Ctrl+clickable, the
 /// same as one printed in a terminal pane (#257).
 ///
@@ -3866,11 +3897,13 @@ fn side_by_side_diff_link_records_one_go_back_entry() {
         path: left.to_string_lossy().into_owned(),
         line: 1,
         column: None,
+        end_line: None,
     };
     let rref = crate::file_ref::FileRef {
         path: right.to_string_lossy().into_owned(),
         line: 1,
         column: None,
+        end_line: None,
     };
     assert!(app.open_side_by_side(&lref, &rref), "both sides open");
 
@@ -54504,6 +54537,58 @@ fn a_real_kernel_runs_a_cell_and_save_persists_the_output() {
     assert_eq!(saved["cells"][0]["outputs"][0]["text"][0], "2\n");
 }
 
+/// Acceptance for #355's figure criterion against a real kernel: a
+/// matplotlib plot arrives as an `image/png` display, is saved in the file,
+/// and the preview places it as an image block, the path Kitty and iTerm2
+/// hosts draw. Needs matplotlib next to ipykernel.
+#[test]
+#[ignore = "needs a Python with ipykernel and matplotlib; set CROFT_TEST_JUPYTER_PYTHON"]
+fn a_real_kernel_matplotlib_figure_becomes_an_inline_image() {
+    let python = std::path::PathBuf::from(std::env::var("CROFT_TEST_JUPYTER_PYTHON").unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let venv = python.parent().and_then(Path::parent).unwrap();
+    std::os::unix::fs::symlink(venv, tmp.path().join(".venv")).unwrap();
+    let path = tmp.path().join("plot.ipynb");
+    std::fs::write(
+        &path,
+        NOTEBOOK_355.replace(
+            "\"print(1+1)\"",
+            "\"import matplotlib.pyplot as plt\\n\", \"plt.plot([1, 3, 2])\\n\", \"plt.show()\"",
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    click_first_cell_glyph(&mut app, &mut term);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !app
+        .editor
+        .lines
+        .join("\n")
+        .contains("\"execution_count\": 1")
+    {
+        assert!(std::time::Instant::now() < end, "status: {}", app.status);
+        app.poll_notebook_kernels();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    term.draw(|f| app.render(f)).unwrap();
+    let images = &app.editor.markdown_preview.as_ref().unwrap().images;
+    assert_eq!(images.len(), 1, "the figure is one image block");
+    let bytes = std::fs::read(&images[0].path).unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"), "a PNG in scratch");
+    app.save();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let outputs = saved["cells"][0]["outputs"].as_array().unwrap();
+    assert!(
+        outputs
+            .iter()
+            .any(|o| o["output_type"] == "display_data" && o["data"]["image/png"].is_string()),
+        "{outputs:?}"
+    );
+}
+
 fn pr_screen(app: &mut App) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -58777,6 +58862,65 @@ fn moving_the_cursor_onto_a_result_selects_it_in_the_viewer() {
         .unwrap();
     let view = app.editor.editors[viewer].sarif.as_ref().unwrap();
     assert_eq!(view.selected_entry().unwrap().message, "second");
+}
+
+#[test]
+fn a_missing_file_from_a_known_repository_downloads_once_its_host_is_trusted() {
+    // #577: the run's versionControlProvenance names the repository and
+    // commit; nothing is fetched until the user trusts the host.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("remote.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ci"}},
+              "versionControlProvenance":[{"repositoryUri":"https://github.com/o/r","revisionId":"c0ffee"}],
+              "results":[{"message":{"text":"m"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/gone.rs"},"region":{"startLine":2,"startColumn":3}}}]}]}]}"#,
+        )
+        .unwrap();
+        fn fake(url: &str) -> Result<Vec<u8>, String> {
+            assert_eq!(
+                url,
+                "https://raw.githubusercontent.com/o/r/c0ffee/src/gone.rs"
+            );
+            Ok(b"one\n  two\nthree\n".to_vec())
+        }
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sarif_fetch = fake;
+        app.editor.open_preview(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().selected = 1;
+        app.open_selected_sarif_result();
+        match app.input_prompt.as_ref().map(|p| &p.purpose) {
+            Some(crate::widgets::input_prompt::InputPurpose::SarifTrustHost { host, .. }) => {
+                assert_eq!(host, "github.com")
+            }
+            other => panic!("a trust prompt, not {other:?}: {}", app.status),
+        }
+        assert!(app.sarif_download.is_none(), "nothing fetched before trust");
+        // Enter on the empty field trusts the host and downloads.
+        app.submit_input_prompt();
+        assert!(crate::sarif::resolve::trusted_hosts().contains(&"github.com".to_string()));
+        let rx_wait = std::time::Instant::now();
+        while app.sarif_download.is_some() && rx_wait.elapsed().as_secs() < 10 {
+            app.poll_sarif_download();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let opened = app.editor.path.clone().expect("the download opened");
+        assert!(opened.starts_with(croft_cache_dir()), "{opened:?}");
+        assert_eq!(opened.file_name().unwrap(), "gone.rs");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 2));
+
+        // Now trusted: the next open downloads without asking.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.sarif_fetch = fake;
+        again.editor.open_preview(&log).unwrap();
+        again.editor.sarif.as_mut().unwrap().selected = 1;
+        again.open_selected_sarif_result();
+        assert!(again.input_prompt.is_none(), "{}", again.status);
+        assert!(again.sarif_download.is_some());
+    });
 }
 
 #[test]

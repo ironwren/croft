@@ -127,6 +127,14 @@ pub enum InputPurpose {
     SarifLocate {
         uri: String,
     },
+    /// A missing SARIF file that can be downloaded from `host`, which is
+    /// not yet trusted (#577). An empty value trusts `host` and downloads;
+    /// a path locates the file instead, as [`InputPurpose::SarifLocate`].
+    SarifTrustHost {
+        uri: String,
+        host: String,
+        url: String,
+    },
     /// Another SARIF log to merge into the open viewer (#577).
     SarifAddLog,
     /// The SARIF results list's optional columns, comma-separated (#577).
