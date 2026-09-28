@@ -55768,6 +55768,66 @@ fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_runs_query_log_opens_the_newest_log_in_its_logs_folder() {
+    // #578: VS Code's "Show Query Log". Every run passes `--logdir` so
+    // `codeql` writes its log beside the results; the newest one opens.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = App::codeql_results_dir().join("1-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 1, RunStatus::Succeeded, out.clone())],
+        );
+        // A run from before croft kept query logs.
+        app.run_command(Command::CodeqlShowQueryLog);
+        assert_eq!(app.status, "q.ql has no query log");
+
+        let logs = crate::codeql_query::query_log_dir(&out);
+        std::fs::create_dir_all(&logs).unwrap();
+        let at = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        for (name, secs) in [
+            ("execute-new.log", 20),
+            ("execute-old.log", 10),
+            ("x.txt", 30),
+        ] {
+            let f = std::fs::File::create(logs.join(name)).unwrap();
+            f.set_modified(at(secs)).unwrap();
+        }
+        app.run_command(Command::CodeqlShowQueryLog);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(logs.join("execute-new.log").as_path())
+        );
+        assert_eq!(
+            Command::from_id("codeql_show_query_log"),
+            Some(Command::CodeqlShowQueryLog)
+        );
+
+        // A real run asks `codeql` for a log in its own folder.
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let run = &history.entries[history.newest().unwrap()];
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let logdir = format!(
+            "--logdir={}",
+            crate::codeql_query::query_log_dir(&run.output).display()
+        );
+        assert!(calls.starts_with("query run "), "{calls}");
+        assert!(calls.contains(&logdir), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
     // #578: "Show Evaluator Log (Viewer)" runs `codeql generate log-summary
     // --format=predicates` once, keeps the file beside the log, and shows

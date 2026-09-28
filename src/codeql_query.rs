@@ -69,6 +69,21 @@ pub fn evaluator_log(output: &Path) -> PathBuf {
     output.with_file_name("evaluator-log.jsonl")
 }
 
+/// The folder the run whose results are `output` writes its query log into
+/// (`--logdir`), beside its results.
+pub fn query_log_dir(output: &Path) -> PathBuf {
+    output.with_file_name("logs")
+}
+
+/// The newest of `logs`, each a `*.log` file with its modification time:
+/// the latest time wins, the greater file name breaks a tie.
+pub fn newest_query_log(logs: Vec<(PathBuf, std::time::SystemTime)>) -> Option<PathBuf> {
+    logs.into_iter()
+        .filter(|(p, _)| p.extension().is_some_and(|e| e == "log"))
+        .max_by(|(a, at), (b, bt)| at.cmp(bt).then_with(|| a.file_name().cmp(&b.file_name())))
+        .map(|(p, _)| p)
+}
+
 /// The human-readable summary of the run whose results are `output`, made
 /// from its evaluator log on first request.
 pub fn evaluator_log_summary(output: &Path) -> PathBuf {
@@ -130,6 +145,7 @@ pub fn analyze_args(query: &Path, db: &Path, out: &Path) -> Vec<String> {
         String::from("--format=sarif-latest"),
         format!("--output={}", path(out)),
         format!("--evaluator-log={}", path(&evaluator_log(out))),
+        format!("--logdir={}", path(&query_log_dir(out))),
         String::from("--rerun"),
     ]
 }
@@ -142,6 +158,7 @@ pub fn run_args(query: &Path, db: &Path, bqrs: &Path) -> Vec<String> {
         format!("--database={}", path(db)),
         format!("--output={}", path(bqrs)),
         format!("--evaluator-log={}", path(&evaluator_log(bqrs))),
+        format!("--logdir={}", path(&query_log_dir(bqrs))),
         path(query),
     ]
 }
@@ -1167,6 +1184,31 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_query_log_is_the_latest_log_file() {
+        let t = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let p = |s: &str| PathBuf::from(format!("/out/logs/{s}"));
+        assert_eq!(newest_query_log(Vec::new()), None);
+        assert_eq!(newest_query_log(vec![(p("notes.txt"), t(9))]), None);
+        assert_eq!(
+            newest_query_log(vec![
+                (p("execute-b.log"), t(2)),
+                (p("execute-a.log"), t(3)),
+                (p("later.txt"), t(4)),
+            ]),
+            Some(p("execute-a.log"))
+        );
+        assert_eq!(
+            newest_query_log(vec![(p("execute-b.log"), t(3)), (p("execute-a.log"), t(3))]),
+            Some(p("execute-b.log")),
+            "a tie goes to the greater name"
+        );
+        assert_eq!(
+            query_log_dir(Path::new("/out/r.sarif")),
+            Path::new("/out/logs")
+        );
+    }
+
+    #[test]
     fn argument_lists_name_the_database_query_and_output() {
         let (q, db) = (Path::new("/w/q.ql"), Path::new("/dbs/app"));
         assert_eq!(
@@ -1179,6 +1221,7 @@ mod tests {
                 "--format=sarif-latest",
                 "--output=/out/r.sarif",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "--rerun"
             ]
         );
@@ -1190,6 +1233,7 @@ mod tests {
                 "--database=/dbs/app",
                 "--output=/out/r.bqrs",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "/w/q.ql"
             ]
         );

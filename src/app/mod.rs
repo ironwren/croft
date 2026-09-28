@@ -24879,6 +24879,38 @@ impl App {
         }
     }
 
+    /// VS Code's "Show Query Log" for history entry `index`: the newest
+    /// log `codeql` wrote into the run's `logs` folder. Runs croft made
+    /// before it passed `--logdir` have none.
+    fn show_codeql_query_log(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        if entry.status == crate::codeql_query::RunStatus::Running {
+            self.status = format!("{} is still running", entry.query_name());
+            return;
+        }
+        let logs = std::fs::read_dir(crate::codeql_query::query_log_dir(&entry.output))
+            .map(|dir| {
+                dir.flatten()
+                    .filter_map(|e| {
+                        let meta = e.metadata().ok().filter(|m| m.is_file())?;
+                        Some((e.path(), meta.modified().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(log) = crate::codeql_query::newest_query_log(logs) else {
+            self.status = format!("{} has no query log", entry.query_name());
+            return;
+        };
+        match self.editor.open(&log) {
+            Ok(()) => self.sync_open_file_poll_mtime(),
+            Err(e) => self.status = format!("{}: {e}", log.display()),
+        }
+    }
+
     /// VS Code's "Show Evaluator Log (Summary Text)" for history entry
     /// `index`: `codeql generate log-summary` on a worker thread the first
     /// time, then the summary it wrote beside the log.
@@ -46015,6 +46047,11 @@ impl App {
             Cmd::CodeqlShowEvaluatorLog => {
                 if let Some(i) = self.current_codeql_history() {
                     self.show_codeql_evaluator_log(i);
+                }
+            }
+            Cmd::CodeqlShowQueryLog => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_query_log(i);
                 }
             }
             Cmd::CodeqlShowEvaluatorLogSummary => {
