@@ -31,10 +31,6 @@
 //! [`IDLE_LIMIT`] ends its shell, so hosts of a workspace never reopened do
 //! not run forever.
 
-// The pane side (#694's second part) is what starts, attaches to and
-// resizes hosts; until it lands, some of this has no caller.
-#![allow(dead_code)]
-
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -68,7 +64,10 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct PaneSpec {
     pub socket: PathBuf,
     pub cwd: Option<PathBuf>,
-    /// Variables set for the shell, on top of the host's own environment.
+    /// The shell's environment. [`spawn`] gives it to the host process,
+    /// whose shell inherits it: never as arguments, which any user on the
+    /// machine can read (`ps`), and the environment can hold tokens. When
+    /// the host is run directly, `--env` adds to its own environment.
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
@@ -88,10 +87,6 @@ pub fn host_argv(spec: &PaneSpec) -> Vec<String> {
     if let Some(cwd) = &spec.cwd {
         argv.push(String::from("--cwd"));
         argv.push(cwd.display().to_string());
-    }
-    for (k, v) in &spec.env {
-        argv.push(String::from("--env"));
-        argv.push(format!("{k}={v}"));
     }
     argv.push(String::from("--"));
     argv.extend(spec.argv.iter().cloned());
@@ -116,8 +111,11 @@ pub fn parse_env(s: &str) -> Option<(String, String)> {
 pub fn spawn(spec: &PaneSpec) -> Result<()> {
     let exe = std::env::current_exe().context("resolving croft binary path")?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(host_argv(spec))
-        .stdin(std::process::Stdio::null())
+    cmd.args(host_argv(spec));
+    if !spec.env.is_empty() {
+        cmd.env_clear().envs(spec.env.iter().map(|(k, v)| (k, v)));
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     unsafe {
@@ -456,6 +454,18 @@ pub fn socket_for(pane_id: &str) -> PathBuf {
     crate::session::sessions_dir().join(format!("pane-{pane_id}.sock"))
 }
 
+/// A fresh id for a pane's host socket: this process, the time and a
+/// counter, so two croft instances and two panes never collide.
+pub fn new_pane_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos:x}-{n}", std::process::id())
+}
+
 /// A client's connection to a pane host.
 pub struct PaneClient {
     stream: UnixStream,
@@ -476,21 +486,24 @@ impl PaneClient {
         Ok(Self { stream })
     }
 
+    /// The connection itself, for a pane that drives it directly.
+    pub fn into_stream(self) -> UnixStream {
+        self.stream
+    }
+
     /// A second handle on the connection, for a reader thread.
+    #[cfg(test)]
     pub fn try_clone_stream(&self) -> Result<UnixStream> {
         Ok(self.stream.try_clone()?)
     }
 
+    #[cfg(test)]
     pub fn write_input(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.stream.write_all(&encode_bytes_frame(data))
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
-        self.stream
-            .write_all(&encode_control_frame(&Control::Resize { cols, rows }))
-    }
-
     /// Ask the host to end the shell (closing the pane).
+    #[cfg(test)]
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.stream.write_all(&encode_control_frame(&Control::Kill))
     }
@@ -557,12 +570,11 @@ mod tests {
                 "100x30",
                 "--cwd",
                 "/w",
-                "--env",
-                "TERM=xterm-256color",
                 "--",
                 "zsh",
                 "-l"
-            ]
+            ],
+            "the environment never goes on the command line"
         );
     }
 

@@ -29607,12 +29607,14 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
         crate::terminal_session::SessionRecord {
             panes: vec![
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
                     lane: None,
                 },
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b_sub.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
@@ -29653,12 +29655,14 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
         crate::terminal_session::SessionRecord {
             panes: vec![
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
                     lane: None,
                 },
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
@@ -29709,12 +29713,14 @@ fn change_workspace_root_keeps_live_panes_when_the_terminal_was_touched() {
         crate::terminal_session::SessionRecord {
             panes: vec![
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b.display().to_string(),
                     name: None,
                     transcript: Vec::new(),
                     lane: None,
                 },
                 crate::terminal_session::PaneRecord {
+                    host: None,
                     cwd: b.display().to_string(),
                     name: Some(String::from("srv")),
                     transcript: Vec::new(),
@@ -49430,6 +49436,100 @@ fn a_lane_without_a_configured_agent_opens_a_plain_shell_and_says_so() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restore_reattaches_a_shell_still_running_in_its_pane_host() {
+    // #694: croft was killed, not quit, so the pane's host still holds its
+    // shell. Restoring reattaches to it (same shell, its screen redrawn)
+    // instead of starting a fresh one; a pane whose host is gone falls back
+    // to a fresh shell as before. The record keeps naming the live host, so
+    // a second crash finds it again.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let spec = crate::pane_host::PaneSpec {
+        socket: tmp.path().join("pane.sock"),
+        cwd: Some(root.clone()),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        argv: ["sh", "-c", "echo still-$((6*7)); exec sh"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+    };
+    let socket = spec.socket.clone();
+    let host = std::thread::spawn(move || crate::pane_host::serve(&spec));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the host never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let root_key = root.display().to_string();
+    let pane = |name: &str, host: Option<String>| crate::terminal_session::PaneRecord {
+        cwd: root_key.clone(),
+        name: Some(String::from(name)),
+        lane: None,
+        transcript: vec![String::from("old transcript")],
+        host,
+    };
+    let session = tmp.path().join("sessions.json");
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            pane("kept", Some(socket.display().to_string())),
+            pane(
+                "gone",
+                Some(tmp.path().join("dead.sock").display().to_string()),
+            ),
+        ],
+        active: 0,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+
+    let mut app = App::new(root.clone()).unwrap();
+    app.terminal_session_path = session.clone();
+    app.restore_terminal_session();
+    assert_eq!(app.terminals.len(), 2);
+    let kept = &app.terminals[0];
+    assert_eq!(kept.host_socket(), Some(socket.as_path()), "reattached");
+    assert_eq!(kept.manual_name(), Some("kept"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        let (lines, _) = kept.grid_lines();
+        if lines.iter().any(|l| l.contains("still-42")) {
+            assert!(
+                !lines.iter().any(|l| l.contains("old transcript")),
+                "the live screen, not the saved transcript: {lines:?}"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{lines:?}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let gone = &app.terminals[1];
+    assert_eq!(
+        gone.host_socket(),
+        None,
+        "a dead host falls back to a fresh shell"
+    );
+    assert_eq!(gone.manual_name(), Some("gone"));
+
+    let saved = crate::terminal_session::load(&session);
+    let saved = &saved[&root_key];
+    assert_eq!(
+        saved.panes[0].host.as_deref(),
+        Some(socket.to_str().unwrap())
+    );
+    assert_eq!(saved.panes[1].host, None);
+
+    // Quitting closes the panes, which ends the reattached shell too.
+    drop(app);
+    host.join().unwrap().unwrap();
+}
+
 #[test]
 fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
     // The association survives a relaunch (#348): the saved lane record
@@ -49446,12 +49546,14 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
     let rec = crate::terminal_session::SessionRecord {
         panes: vec![
             crate::terminal_session::PaneRecord {
+                host: None,
                 cwd: root_key.clone(),
                 name: None,
                 transcript: Vec::new(),
                 lane: None,
             },
             crate::terminal_session::PaneRecord {
+                host: None,
                 cwd: lane_dir.display().to_string(),
                 name: Some(String::from("Lane: fix-login")),
                 transcript: Vec::new(),
@@ -49463,6 +49565,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
                 }),
             },
             crate::terminal_session::PaneRecord {
+                host: None,
                 cwd: root_key.clone(),
                 name: Some(String::from("Lane: gone")),
                 transcript: Vec::new(),
@@ -49543,12 +49646,14 @@ fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered(
     let rec = crate::terminal_session::SessionRecord {
         panes: vec![
             crate::terminal_session::PaneRecord {
+                host: None,
                 cwd: elsewhere.display().to_string(),
                 name: Some(String::from("Lane: fix-login")),
                 transcript: Vec::new(),
                 lane: Some(lane("probe-a")),
             },
             crate::terminal_session::PaneRecord {
+                host: None,
                 cwd: vanished.display().to_string(),
                 name: Some(String::from("Lane: fix-login")),
                 transcript: Vec::new(),
