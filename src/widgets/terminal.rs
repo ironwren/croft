@@ -483,7 +483,8 @@ pub struct PtyTerminal {
     /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
     /// The app drains this each tick to feed the PORTS panel and the toast.
     port_rx: std::sync::mpsc::Receiver<crate::port_detect::PortHit>,
-    master: Box<dyn MasterPty + Send>,
+    /// Who holds the pane's PTY: croft itself, or a pane host (#694).
+    backend: PaneBackend,
     /// Bytes for the child's stdin, written by this pane's writer thread.
     /// The user-input path (`write_input`, `paste_*`, `cd_into`, mouse
     /// reports) and the responder that ships alacritty's replies both send
@@ -491,7 +492,6 @@ pub struct PtyTerminal {
     /// on the UI thread froze all of croft when a large paste met a program
     /// that was not reading its stdin.
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// The PTY reader thread's handle, joined in `Drop` after the child is
     /// killed so a dropped terminal never leaves a live shell + blocked
     /// reader behind. Across the test suite that leak piled up into resource
@@ -1853,27 +1853,32 @@ impl PtyTerminal {
         run_label: Option<String>,
         preamble: &[u8],
     ) -> Result<Self> {
-        let pty_system = native_pty_system();
-        let cols = 80u16;
-        let rows = 24u16;
-        let pair = pty_system
-            .openpty(PtySize {
-                cols,
-                rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty")?;
-
         apply_pane_env(
             &mut cmd,
             crate::view_ipc::SOCK_PATH.get().map(|p| p.as_path()),
         );
-        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
-        let shell_pid = child.process_id().map(|p| p as i32);
-        drop(pair.slave);
+        // An interactive shell may live in a pane host (#694); a task or
+        // run pane is croft's own.
+        let hosted = run_label.is_none() && persistent_panes_enabled();
+        Self::spawn_from(PaneSource::Spawn { cmd, hosted }, run_label, preamble)
+    }
 
-        let mut writer: Box<dyn Write + Send> = pair.master.take_writer().context("take writer")?;
+    /// Reattach to the pane host at `socket` (#694): a pane whose shell
+    /// outlived the croft that opened it. The host redraws the screen.
+    pub fn attach_hosted(socket: &std::path::Path) -> Result<Self> {
+        Self::spawn_from(PaneSource::Attach(socket.to_path_buf()), None, &[])
+    }
+
+    fn spawn_from(source: PaneSource, run_label: Option<String>, preamble: &[u8]) -> Result<Self> {
+        let cols = 80u16;
+        let rows = 24u16;
+        let PaneLink {
+            mut writer,
+            mut reader,
+            poll_fd: pty_fd,
+            shell_pid,
+            backend,
+        } = PaneLink::open(source, cols, rows)?;
         let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         // Ends once every sender is gone (the pane and its responder), or
         // when the child stops taking input.
@@ -1884,7 +1889,6 @@ impl PtyTerminal {
                 }
             }
         });
-        let mut reader = pair.master.try_clone_reader().context("clone reader")?;
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let cfg = Config {
@@ -1957,10 +1961,6 @@ impl PtyTerminal {
         // Shutdown pipe + master fd for the reader's poll gate: the reader
         // must be wakeable without depending on the pty ever reaching EOF.
         let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
-        let pty_fd = pair
-            .master
-            .as_raw_fd()
-            .context("pty master has no raw fd")?;
         // Taken BEFORE the rewind registration below, which has no `?` after
         // it: an early return past a registered buffer would leave every
         // other pane trimmed to a share nobody is using.
@@ -2319,9 +2319,8 @@ impl PtyTerminal {
             last_output_ms,
             agent: None,
             port_rx,
-            master: pair.master,
+            backend,
             input_tx,
-            _child: child,
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
             shell_pid,
@@ -2565,7 +2564,7 @@ impl PtyTerminal {
     /// The pane's foreground process group leader pid (what owns the tty now):
     /// the shell at a prompt, or a running command. `None` if unavailable.
     pub fn foreground_pid(&self) -> Option<i32> {
-        self.master.process_group_leader()
+        self.backend.process_group_leader()
     }
 
     /// The shell's own pid, stable for this pane's lifetime (the key the app
@@ -3021,7 +3020,16 @@ impl PtyTerminal {
     /// platform exposes one. Used to look up the live cwd so a new split
     /// inherits the directory the user has `cd`'d into.
     pub fn pid(&self) -> Option<u32> {
-        self._child.process_id()
+        self.backend.pid()
+    }
+
+    /// The pane host holding this pane's shell, when one does (#694): what
+    /// a saved session records so the next croft can reattach.
+    pub fn host_socket(&self) -> Option<&std::path::Path> {
+        match &self.backend {
+            PaneBackend::Hosted { socket, .. } => Some(socket),
+            PaneBackend::Local { .. } => None,
+        }
     }
 
     /// Read the dirty flag without clearing it. Lets the main loop decide
@@ -3856,7 +3864,7 @@ impl PtyTerminal {
     /// claims the tty) means nothing has grabbed input, so a `cd` is
     /// still safe. `tcgetpgrp` is identical on macOS and Linux.
     pub fn foreground_is_shell(&self) -> bool {
-        match (self.master.process_group_leader(), self.shell_pid) {
+        match (self.backend.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
             _ if self.input_seen => {
                 // A pane that has received input CAN be running a launched
@@ -3869,7 +3877,7 @@ impl PtyTerminal {
                 // answer FALSE: every consumer fails safe on false (seed
                 // suppressed, task pane not reused, no prompt arrows).
                 std::thread::sleep(std::time::Duration::from_millis(5));
-                match (self.master.process_group_leader(), self.shell_pid) {
+                match (self.backend.process_group_leader(), self.shell_pid) {
                     (Some(fg), Some(pid)) => fg == pid,
                     _ => false,
                 }
@@ -3906,7 +3914,7 @@ impl PtyTerminal {
     /// (#186); gate preconditions on `Some(..)` instead.
     #[cfg(test)]
     pub fn foreground_resolved_for_test(&self) -> Option<bool> {
-        match (self.master.process_group_leader(), self.shell_pid) {
+        match (self.backend.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => Some(fg == pid),
             _ => None,
         }
@@ -4037,14 +4045,274 @@ impl PtyTerminal {
         let mut term = self.term.lock();
         let size = TermSize::new(cols as usize, rows as usize);
         term.resize(size);
-        let _ = self.master.resize(PtySize {
-            cols,
-            rows,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        self.backend.resize(cols, rows);
         drop(term);
         self.pty_dirty.store(true, Ordering::Release);
+    }
+}
+
+/// Where a pane's shell comes from.
+enum PaneSource {
+    /// Start `cmd`: on a PTY croft holds, or in a new pane host.
+    Spawn { cmd: CommandBuilder, hosted: bool },
+    /// Reattach to the pane host at this socket (#694).
+    Attach(std::path::PathBuf),
+}
+
+/// Who holds a pane's PTY.
+enum PaneBackend {
+    /// croft: the PTY dies with croft.
+    Local {
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    },
+    /// A pane host (#694): the shell outlives croft. `conn` carries input,
+    /// resizes and the kill; the pid comes from the host's greeting.
+    Hosted {
+        conn: Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
+        socket: std::path::PathBuf,
+        pid: Option<u32>,
+    },
+}
+
+impl PaneBackend {
+    fn pid(&self) -> Option<u32> {
+        match self {
+            PaneBackend::Local { child, .. } => child.process_id(),
+            PaneBackend::Hosted { pid, .. } => *pid,
+        }
+    }
+
+    /// The terminal's foreground process group: `tcgetpgrp` on a PTY croft
+    /// holds, the shell's `tpgid` from `/proc` for a hosted one (the same
+    /// value, read without the master).
+    fn process_group_leader(&self) -> Option<i32> {
+        match self {
+            PaneBackend::Local { master, .. } => master.process_group_leader(),
+            PaneBackend::Hosted { pid, .. } => pid.and_then(|p| foreground_group_of(p as i32)),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        match self {
+            PaneBackend::Local { master, .. } => {
+                let _ = master.resize(PtySize {
+                    cols,
+                    rows,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+            PaneBackend::Hosted { conn, .. } => {
+                let frame = crate::session_host::encode_control_frame(
+                    &crate::session_host::Control::Resize { cols, rows },
+                );
+                let _ = conn.lock().unwrap().write_all(&frame);
+            }
+        }
+    }
+
+    /// End the shell: kill and reap it, or ask its host to (which ends the
+    /// host too), then drop the connection so the demux thread ends.
+    fn end(&mut self) {
+        match self {
+            PaneBackend::Local { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            PaneBackend::Hosted { conn, .. } => {
+                let frame =
+                    crate::session_host::encode_control_frame(&crate::session_host::Control::Kill);
+                let conn = conn.lock().unwrap();
+                let _ = (&*conn).write_all(&frame);
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// The foreground process group of the terminal `pid` (a session leader)
+/// controls: field 8 (`tpgid`) of `/proc/<pid>/stat`. Linux only, which is
+/// where hosted panes run.
+fn foreground_group_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_tpgid(&stat)
+}
+
+/// `tpgid` from a `/proc/<pid>/stat` line. The command name is in
+/// parentheses and may hold spaces or parentheses itself, so the fields
+/// are counted from the LAST `)`.
+fn parse_tpgid(stat: &str) -> Option<i32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // state ppid pgrp session tty_nr tpgid
+    let tpgid: i32 = rest.split_whitespace().nth(5)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid)
+}
+
+/// Whether new shell panes go in pane hosts (#694): the
+/// `terminal_persistent_panes` setting, on Linux, where a hosted pane can
+/// still read its foreground process group.
+fn persistent_panes_enabled() -> bool {
+    cfg!(target_os = "linux") && crate::prefs::Prefs::load_or_default().terminal_persistent_panes
+}
+
+/// What a pane needs from wherever its shell runs: bytes to it, bytes from
+/// it with an fd to poll for them, and the shell's pid.
+struct PaneLink {
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn Read + Send>,
+    poll_fd: std::os::fd::RawFd,
+    shell_pid: Option<i32>,
+    backend: PaneBackend,
+}
+
+/// Input for a hosted pane: each write is one bytes frame.
+struct HostInput(Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>);
+
+impl Write for HostInput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let frame = crate::session_host::encode_bytes_frame(buf);
+        (&*self.0.lock().unwrap()).write_all(&frame)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl PaneLink {
+    fn open(source: PaneSource, cols: u16, rows: u16) -> Result<Self> {
+        match source {
+            PaneSource::Spawn { cmd, hosted: true } => {
+                let spec = crate::pane_host::PaneSpec {
+                    socket: crate::pane_host::socket_for(&crate::pane_host::new_pane_id()),
+                    cwd: cmd.get_cwd().map(std::path::PathBuf::from),
+                    env: cmd
+                        .iter_full_env_as_str()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    cols,
+                    rows,
+                    argv: cmd
+                        .get_argv()
+                        .iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect(),
+                };
+                // A host that cannot start (no socket dir, a sandbox) must
+                // not cost the user a terminal: the pane is croft's instead.
+                match crate::pane_host::spawn(&spec)
+                    .and_then(|()| Self::attach(&spec.socket, cols, rows))
+                {
+                    Ok(link) => Ok(link),
+                    // Nothing to print from here: a write to stderr would
+                    // land on croft's own screen (#537).
+                    Err(_) => Self::local(cmd, cols, rows),
+                }
+            }
+            PaneSource::Spawn { cmd, hosted: false } => Self::local(cmd, cols, rows),
+            PaneSource::Attach(socket) => Self::attach(&socket, cols, rows),
+        }
+    }
+
+    fn local(cmd: CommandBuilder, cols: u16, rows: u16) -> Result<Self> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty")?;
+        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        let shell_pid = child.process_id().map(|p| p as i32);
+        drop(pair.slave);
+        let writer = pair.master.take_writer().context("take writer")?;
+        let reader = pair.master.try_clone_reader().context("clone reader")?;
+        let poll_fd = pair
+            .master
+            .as_raw_fd()
+            .context("pty master has no raw fd")?;
+        Ok(Self {
+            writer,
+            reader,
+            poll_fd,
+            shell_pid,
+            backend: PaneBackend::Local {
+                master: pair.master,
+                child,
+            },
+        })
+    }
+
+    /// Attach to a pane host: read its greeting for the shell's pid, then
+    /// hand the pane a pipe a demux thread fills with the shell's bytes
+    /// (the redraw first), so the reader reads it exactly as it reads a
+    /// PTY. The pipe closes when the host says the shell exited or the
+    /// connection ends, which the reader sees as the PTY's EOF.
+    fn attach(socket: &std::path::Path, cols: u16, rows: u16) -> Result<Self> {
+        use crate::session_host::{Control, Frame, FrameReader};
+        use std::os::fd::AsRawFd;
+        let stream = crate::pane_host::PaneClient::connect(socket, cols, rows)?.into_stream();
+        let mut rd = stream
+            .try_clone()
+            .context("cloning the pane host connection")?;
+        rd.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut frames = FrameReader::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut pid = None;
+        let mut buf = [0u8; 65536];
+        while pid.is_none() {
+            let n = rd
+                .read(&mut buf)
+                .context("reading the pane host's greeting")?;
+            anyhow::ensure!(n > 0, "the pane host at {} closed", socket.display());
+            for frame in frames.push(&buf[..n]) {
+                match frame {
+                    Frame::Control(Control::PaneInfo { pid: p }) => pid = Some(p),
+                    Frame::Bytes(b) => pending.extend_from_slice(&b),
+                    _ => {}
+                }
+            }
+        }
+        rd.set_read_timeout(None)?;
+        let (pipe_r, mut pipe_w) = std::io::pipe().context("pane host pipe")?;
+        std::thread::spawn(move || {
+            if pipe_w.write_all(&pending).is_err() {
+                return;
+            }
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = match rd.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                for frame in frames.push(&buf[..n]) {
+                    match frame {
+                        Frame::Bytes(b) => {
+                            if pipe_w.write_all(&b).is_err() {
+                                return;
+                            }
+                        }
+                        Frame::Control(Control::Exit { .. }) => return,
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let conn = Arc::new(std::sync::Mutex::new(stream));
+        Ok(Self {
+            writer: Box::new(HostInput(conn.clone())),
+            poll_fd: pipe_r.as_raw_fd(),
+            reader: Box::new(pipe_r),
+            shell_pid: pid.map(|p| p as i32),
+            backend: PaneBackend::Hosted {
+                conn,
+                socket: socket.to_path_buf(),
+                pid,
+            },
+        })
     }
 }
 
@@ -4093,8 +4361,11 @@ impl Drop for PtyTerminal {
         // without the `wait` every such closed pane left a zombie for the
         // life of the process. The responder thread ends on its own once
         // `self.term` (holding its channel sender) drops with this struct.
-        let _ = self._child.kill();
-        let _ = self._child.wait();
+        //
+        // A hosted pane (#694) asks its host to end the shell the same way:
+        // closing a pane or quitting ends it, and only a croft that dies
+        // without dropping its panes leaves hosts to reattach to.
+        self.backend.end();
         // Free the rewind buffer now and hand its share of the budget back
         // to the other panes (#694). Not left to the Arc: the reader thread
         // holds a clone until it is joined below.
@@ -6688,6 +6959,83 @@ mod tests {
             !run.is_pristine(),
             "a launched-program pane is doing user work despite having seen no input"
         );
+    }
+
+    #[test]
+    fn tpgid_is_read_past_a_command_name_with_spaces_and_parens() {
+        let stat = "4242 (my (odd) sh) S 1 4242 4242 34816 5151 4194560 0 0";
+        assert_eq!(parse_tpgid(stat), Some(5151));
+        assert_eq!(
+            parse_tpgid("1 (init) S 0 1 1 0 -1 4194560"),
+            None,
+            "no terminal"
+        );
+        assert_eq!(parse_tpgid("garbage"), None);
+    }
+
+    /// A pane host for `argv` on a socket in `dir`, served on a thread.
+    #[cfg(target_os = "linux")]
+    fn serve_pane(
+        dir: &std::path::Path,
+        argv: &[&str],
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<Result<i32>>) {
+        let spec = crate::pane_host::PaneSpec {
+            socket: dir.join("pane.sock"),
+            cwd: Some(dir.to_path_buf()),
+            env: vec![(String::from("TERM"), String::from("xterm-256color"))],
+            cols: 80,
+            rows: 24,
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+        };
+        let socket = spec.socket.clone();
+        let host = std::thread::spawn(move || crate::pane_host::serve(&spec));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::session::is_alive(&socket) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host never listened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (socket, host)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hosted_pane_outlives_a_croft_that_never_closed_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (socket, host) = serve_pane(tmp.path(), &["sh"]);
+        let mut pane = PtyTerminal::attach_hosted(&socket).unwrap();
+        assert_eq!(pane.host_socket(), Some(socket.as_path()));
+        let pid = pane.pid().expect("the host names its shell");
+        assert_eq!(pane.shell_pid(), Some(pid as i32));
+        pane.write_input(b"echo first-$((40+2))\r");
+        wait_for_grid(&pane, |l| l.iter().any(|l| l.contains("first-42")));
+        // The shell owns its terminal at the prompt, read without a master.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while pane.foreground_pid() != Some(pid as i32) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                pane.foreground_pid()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // croft dies without dropping its panes (the OOM killer): the pane
+        // is never closed, so its shell must keep running.
+        std::mem::forget(pane);
+        let mut again = PtyTerminal::attach_hosted(&socket).unwrap();
+        assert_eq!(again.pid(), Some(pid), "the same shell");
+        wait_for_grid(&again, |l| l.iter().any(|l| l.contains("first-42")));
+        again.resize(100, 30);
+        again.write_input(b"stty size\r");
+        wait_for_grid(&again, |l| l.iter().any(|l| l.trim() == "30 100"));
+
+        // Closing the pane ends the shell and its host.
+        drop(again);
+        host.join().unwrap().unwrap();
+        assert!(!socket.exists());
     }
 
     /// Poll `grid_lines` until a predicate matches or 4s elapse.
