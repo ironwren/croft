@@ -282,6 +282,7 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
     })
 }
 
+impl SheetData {
     /// Sort the body rows by column `col` (#578, a sortable results
     /// table): ascending, or descending when they already are ascending,
     /// so sorting the same column again reverses it. Cells that both read
@@ -317,7 +318,6 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         ascending
     }
 
-impl SheetData {
     /// Overwrite one body cell (#177), growing a short row (the csv
     /// reader is `flexible`, so ragged rows are real) and refreshing the
     /// column widths so the grid re-lays-out immediately.
