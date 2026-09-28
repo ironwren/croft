@@ -446,6 +446,23 @@ pub fn pack_download_args(packs: &[String]) -> Vec<String> {
     args
 }
 
+/// The pack a "Run Queries in Published Pack" reference names (#578):
+/// `scope/name`, optionally `@version`, without a `:path` into the pack,
+/// which `pack download` does not take. `None` when it names no pack.
+pub fn published_pack(reference: &str) -> Option<&str> {
+    let pack = reference.split(':').next()?.trim();
+    let name = pack.split('@').next()?;
+    let (scope, rest) = name.split_once('/')?;
+    // Pack scopes and names are lowercase letters, digits and hyphens.
+    let ok = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    (ok(scope) && ok(rest)).then_some(pack)
+}
+
 /// The pack references in what the user typed: separated by spaces or
 /// commas, each `scope/name`, optionally with `@version`.
 pub fn parse_pack_list(input: &str) -> Vec<String> {
@@ -1488,6 +1505,31 @@ mod tests {
             ]
         );
         assert!(parse_pack_list("  , ").is_empty());
+    }
+
+    #[test]
+    fn a_published_pack_reference_names_the_pack_to_download() {
+        assert_eq!(
+            published_pack("codeql/python-queries"),
+            Some("codeql/python-queries")
+        );
+        assert_eq!(published_pack(" acme/q@1.2.0 "), Some("acme/q@1.2.0"));
+        assert_eq!(
+            published_pack("codeql/python-queries:Security/CWE-078"),
+            Some("codeql/python-queries")
+        );
+        assert_eq!(published_pack("acme/q@~1.0:x.ql"), Some("acme/q@~1.0"));
+        for bad in [
+            "",
+            "python-queries",
+            "/q",
+            "acme/",
+            "a b/c",
+            "../x",
+            "Acme/q",
+        ] {
+            assert_eq!(published_pack(bad), None, "{bad}");
+        }
     }
 
     #[test]

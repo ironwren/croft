@@ -26322,7 +26322,32 @@ impl App {
         source: &str,
         quick: Option<crate::codeql_qs::QuickEval>,
     ) {
-        self.run_codeql_file_on(query, source, quick, None);
+        let mode = match quick {
+            Some(q) => CodeqlRunMode::Quick(q),
+            None => CodeqlRunMode::Whole,
+        };
+        self.run_codeql_file_on(query, source, mode, None);
+    }
+
+    /// CodeQL: Run Queries in Published Pack (#578): ask which pack.
+    fn prompt_run_codeql_published_pack(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlRunPublishedPack,
+            String::from("Run Queries in Published Pack"),
+            "e.g. codeql/python-queries, scope/name@1.0.0, scope/name:path/in/pack",
+        ));
+    }
+
+    /// Download the pack `reference` names and run it, or the part of it
+    /// after `:`, on the current database into SARIF (#578).
+    fn run_codeql_published_pack(&mut self, reference: &str) {
+        let reference = reference.trim();
+        if crate::codeql_query::published_pack(reference).is_none() {
+            self.status = format!("{reference:?} is not a pack: write scope/name");
+            return;
+        }
+        self.run_codeql_file_on(PathBuf::from(reference), "", CodeqlRunMode::Pack, None);
     }
 
     /// [`Self::run_codeql_file_with`] on the database at `database`, or on
@@ -26331,7 +26356,7 @@ impl App {
         &mut self,
         query: PathBuf,
         source: &str,
-        quick: Option<crate::codeql_qs::QuickEval>,
+        mode: CodeqlRunMode,
         database: Option<&Path>,
     ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
@@ -26372,9 +26397,10 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = match quick {
-            Some(_) => Output::Table,
-            None => cq::output_for(source),
+        let kind = match mode {
+            CodeqlRunMode::Quick(_) => Output::Table,
+            CodeqlRunMode::Pack => Output::Sarif,
+            CodeqlRunMode::Whole => cq::output_for(source),
         };
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
@@ -26384,7 +26410,8 @@ impl App {
         // or go before anyone looks back at this run. Read-only, since
         // editing it would change nothing.
         let text = cq::query_text_path(&output, &query);
-        if let Some(parent) = text.parent()
+        if !matches!(mode, CodeqlRunMode::Pack)
+            && let Some(parent) = text.parent()
             && std::fs::create_dir_all(parent).is_ok()
             && std::fs::write(&text, source).is_ok()
         {
@@ -26400,14 +26427,18 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
-            name: quick.as_ref().map(|q| q.title()),
+            name: match &mode {
+                CodeqlRunMode::Quick(q) => Some(q.title()),
+                _ => None,
+            },
             results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
-        let name = match &quick {
-            Some(q) => q.title(),
-            None => query
+        let name = match &mode {
+            CodeqlRunMode::Quick(q) => q.title(),
+            CodeqlRunMode::Pack => query.display().to_string(),
+            CodeqlRunMode::Whole => query
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -26425,20 +26456,29 @@ impl App {
             let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
-                .and_then(|()| match (quick, kind) {
-                    (Some(q), _) => {
+                .and_then(|()| match (mode, kind) {
+                    (CodeqlRunMode::Quick(q), _) => {
                         let bqrs = dir.join("results.bqrs");
                         crate::codeql_qs::run_quick_eval(
                             &program, &db.path, &query, &bqrs, &packs, q.span, q.count, &cancel,
                         )
                         .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
                     }
-                    (None, Output::Sarif) => {
+                    (CodeqlRunMode::Pack, _) => {
+                        let reference = query.to_string_lossy();
+                        let pack = cq::published_pack(&reference).unwrap_or_default();
+                        run(cq::pack_download_args(&[pack.to_string()])).and_then(|()| {
+                            let mut args = cq::analyze_args(&query, &db.path, &output);
+                            args.extend(models.iter().cloned());
+                            run(args)
+                        })
+                    }
+                    (CodeqlRunMode::Whole, Output::Sarif) => {
                         let mut args = cq::analyze_args(&query, &db.path, &output);
                         args.extend(models.iter().cloned());
                         run(args)
                     }
-                    (None, Output::Table) => {
+                    (CodeqlRunMode::Whole, Output::Table) => {
                         let bqrs = dir.join("results.bqrs");
                         let mut args = cq::run_args(&query, &db.path, &bqrs);
                         args.extend(models.iter().cloned());
@@ -27543,11 +27583,15 @@ impl App {
             .then(|| crate::codeql_query::count_results(&entry.output))
             .flatten();
         let output = entry.output.clone();
-        let name = entry
-            .query
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // A published pack's run names the pack by its reference.
+        let name = match entry.query.is_relative() {
+            true => entry.query.display().to_string(),
+            false => entry
+                .query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
         match status {
@@ -27791,7 +27835,7 @@ impl App {
                 },
             };
             if let Some(database) = next.database {
-                self.run_codeql_file_on(path, &source, None, Some(&database));
+                self.run_codeql_file_on(path, &source, CodeqlRunMode::Whole, Some(&database));
                 if self.codeql_run.is_none() {
                     // That database went away meanwhile: the others may
                     // still be there.
@@ -32004,6 +32048,10 @@ impl App {
             InputPurpose::CodeqlDownloadPacks => {
                 self.close_input_prompt();
                 self.submit_download_codeql_packs(&value);
+            }
+            InputPurpose::CodeqlRunPublishedPack => {
+                self.close_input_prompt();
+                self.run_codeql_published_pack(&value);
             }
             InputPurpose::CodeqlExportVariantResults { index } => {
                 self.close_input_prompt();
@@ -47461,6 +47509,7 @@ impl App {
                 }
             },
             Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
+            Cmd::CodeqlRunPublishedPack => self.prompt_run_codeql_published_pack(),
             Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
             Cmd::CodeqlCompareResults => {
                 if let Some(i) = self.current_codeql_history() {
@@ -65114,6 +65163,14 @@ fn agent_ledger_key(root: &Path) -> String {
         .unwrap_or_else(|_| root.to_path_buf())
         .display()
         .to_string()
+}
+
+/// What a CodeQL run evaluates (#578): the whole query, a quick
+/// evaluation of part of it, or a published pack named by its reference.
+enum CodeqlRunMode {
+    Whole,
+    Quick(crate::codeql_qs::QuickEval),
+    Pack,
 }
 
 /// What "CodeQL: Check for CLI Updates" learns (#578): the latest release,

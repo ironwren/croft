@@ -56855,6 +56855,152 @@ fn wait_for_codeql(app: &mut App) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_published_codeql_pack_is_downloaded_and_run_on_the_database() {
+    // #578: "Run Queries in Published Pack": download the pack, analyze
+    // the database with it (or the part after `:`), open its SARIF.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"runs":[{"results":[{}]}]}"#, 0, "");
+
+        app.run_command(Command::CodeqlRunPublishedPack);
+        let prompt = app.input_prompt.as_mut().expect("which pack");
+        prompt.value = String::from("python-queries");
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            "\"python-queries\" is not a pack: write scope/name"
+        );
+        assert!(app.codeql_run.is_none());
+
+        app.run_command(Command::CodeqlRunPublishedPack);
+        app.input_prompt.as_mut().unwrap().value =
+            String::from("codeql/python-queries@1.8.11:Security/CWE-078");
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            "Running codeql/python-queries@1.8.11:Security/CWE-078 on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        assert!(
+            app.status
+                .starts_with("codeql/python-queries@1.8.11:Security/CWE-078 finished in "),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls[0], "pack download codeql/python-queries@1.8.11");
+        assert!(
+            calls[1].starts_with(&format!(
+                "database analyze {} codeql/python-queries@1.8.11:Security/CWE-078 --format=sarif-latest",
+                tmp.path().join("dbs/app").display()
+            )),
+            "{}",
+            calls[1]
+        );
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let entry = &history.entries[history.newest().unwrap()];
+        assert_eq!(entry.status, crate::codeql_query::RunStatus::Succeeded);
+        assert_eq!(entry.results, Some(1));
+        assert_eq!(
+            app.editor.path.as_ref(),
+            Some(&entry.output),
+            "its SARIF is open"
+        );
+
+        // A failed download stops before the analysis.
+        let bin = tempfile::tempdir().unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "A fatal error occurred: no such pack");
+        app.run_command(Command::CodeqlRunPublishedPack);
+        app.input_prompt.as_mut().unwrap().value = String::from("acme/missing");
+        app.submit_input_prompt();
+        wait_for_codeql(&mut app);
+        assert!(
+            app.status.starts_with("acme/missing failed: "),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls, "pack download acme/missing\n");
+    });
+}
+
+/// Run a published pack's command-injection query through croft against the
+/// real CLI and registry (#578), on a Flask app that runs a request argument.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and the pack registry; set CROFT_TEST_CODEQL"]
+fn real_published_pack_runs_on_the_selected_database() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "import os\nfrom flask import Flask, request\napp = Flask(__name__)\n\n@app.route(\"/\")\ndef index():\n    os.system(request.args[\"cmd\"])\n    return \"\"\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("flask"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.run_codeql_published_pack("codeql/python-queries:Security/CWE-078/CommandInjection.ql");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while app.codeql_run.is_some() {
+            app.drain_codeql_run();
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let entry = &history.entries[history.newest().unwrap()];
+        assert_eq!(
+            entry.status,
+            crate::codeql_query::RunStatus::Succeeded,
+            "{}",
+            app.status
+        );
+        let sarif = std::fs::read_to_string(&entry.output).unwrap();
+        assert!(
+            sarif.contains("\"ruleId\":\"py/command-line-injection\""),
+            "{sarif}"
+        );
+        assert_eq!(entry.results, Some(1));
+    });
+}
+
 /// A workspace with `q.ql` open and database "app" current.
 fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     let db = tmp.join("dbs/app");
