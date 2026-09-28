@@ -494,6 +494,8 @@ pub struct SarifView {
     pub baseline: Option<usize>,
     /// The optional columns shown, in order (#577).
     pub columns: Vec<ExtraColumn>,
+    /// When each added log was last read, to notice it change on disk.
+    added_stamps: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>,
 }
 
 impl SarifView {
@@ -522,6 +524,7 @@ impl SarifView {
             fix_cache: None,
             baseline: None,
             columns: load_columns(),
+            added_stamps: std::collections::HashMap::new(),
         }
     }
 
@@ -544,10 +547,16 @@ impl SarifView {
                     super::load::parse_log(&String::from_utf8_lossy(&b)).map_err(|e| e.to_string())
                 });
             match reread {
-                Ok(log) => self.logs.push(LoadedLog {
-                    path: extra.path.clone(),
-                    log,
-                }),
+                Ok(log) => {
+                    let stamp = std::fs::metadata(&extra.path)
+                        .and_then(|m| m.modified())
+                        .ok();
+                    self.added_stamps.insert(extra.path.clone(), stamp);
+                    self.logs.push(LoadedLog {
+                        path: extra.path.clone(),
+                        log,
+                    })
+                }
                 Err(_) => dropped.push(extra.path.display().to_string()),
             }
         }
@@ -564,27 +573,77 @@ impl SarifView {
             .and_then(|b| old.logs.get(b))
             .and_then(|b| self.logs.iter().position(|l| l.path == b.path));
         self.rebuild_entries();
-        // The same result by what it says, not its index: a rescan that
-        // adds or removes results shifts every index after it.
-        let same = |a: &Entry, b: &Entry| {
-            a.rule_id == b.rule_id && a.uri == b.uri && a.line == b.line && a.message == b.message
-        };
-        let key = old
-            .selected_entry()
-            .and_then(|e| old.logs.get(e.log).map(|l| (l.path.clone(), e.clone())));
-        let rows = self.rows();
-        self.selected = key
-            .and_then(|(path, want)| {
-                rows.iter().position(|r| match r {
-                    Row::Item { entry } => self.entries.get(*entry).is_some_and(|e| {
-                        same(e, &want) && self.logs.get(e.log).is_some_and(|l| l.path == path)
-                    }),
-                    Row::Group { .. } => false,
-                })
-            })
-            .unwrap_or_else(|| old.selected.min(rows.len().saturating_sub(1)));
+        let key = old.selection_key();
+        if !self.select_by_key(key) {
+            self.selected = old.selected.min(self.rows().len().saturating_sub(1));
+        }
         self.scroll = old.scroll;
         dropped
+    }
+
+    /// The selected result as its log's path and what it says, to find it
+    /// again after its log is read anew.
+    fn selection_key(&self) -> Option<(PathBuf, Entry)> {
+        let e = self.selected_entry()?;
+        Some((self.logs.get(e.log)?.path.clone(), e.clone()))
+    }
+
+    /// Select the result `key` names, matched by what it says rather than
+    /// its index: a rescan that adds or removes results shifts every index
+    /// after it. Returns whether it is still there.
+    fn select_by_key(&mut self, key: Option<(PathBuf, Entry)>) -> bool {
+        let Some((path, want)) = key else {
+            return false;
+        };
+        let rows = self.rows();
+        let found = rows.iter().position(|r| match r {
+            Row::Item { entry } => self.entries.get(*entry).is_some_and(|e| {
+                e.rule_id == want.rule_id
+                    && e.uri == want.uri
+                    && e.line == want.line
+                    && e.message == want.message
+                    && self.logs.get(e.log).is_some_and(|l| l.path == path)
+            }),
+            Row::Group { .. } => false,
+        });
+        if let Some(n) = found {
+            self.selected = n;
+        }
+        found.is_some()
+    }
+
+    /// Read again every added log whose file changed on disk since it was
+    /// read (#577): the viewer's own log is the editor's to reload, but
+    /// the ones added with `o` were read once and never again. The
+    /// selection stays on the same result. A log that no longer parses is
+    /// kept as it was. Returns the paths read again.
+    pub fn refresh_added_logs(&mut self) -> Vec<PathBuf> {
+        let mut changed = Vec::new();
+        for i in 1..self.logs.len() {
+            let path = self.logs[i].path.clone();
+            let now = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let seen = self.added_stamps.get(&path).copied().flatten();
+            if now.is_none() || now == seen {
+                continue;
+            }
+            self.added_stamps.insert(path.clone(), now);
+            let Ok(log) = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| {
+                    super::load::parse_log(&String::from_utf8_lossy(&b)).map_err(|e| e.to_string())
+                })
+            else {
+                continue;
+            };
+            self.logs[i].log = log;
+            changed.push(path);
+        }
+        if !changed.is_empty() {
+            let key = self.selection_key();
+            self.rebuild_entries();
+            self.select_by_key(key);
+        }
+        changed
     }
 
     fn selected_index_pub(&self) -> Option<usize> {
@@ -876,8 +935,45 @@ impl SarifView {
             path: path.to_path_buf(),
             log,
         });
+        let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        self.added_stamps.insert(path.to_path_buf(), stamp);
         self.rebuild_entries();
         true
+    }
+
+    /// The results that are not problems: `pass`, `notApplicable` and
+    /// `informational` (§3.27.9). `K` hides or shows them together.
+    pub const NON_PROBLEM_KINDS: [Kind; 3] = [Kind::Pass, Kind::NotApplicable, Kind::Informational];
+
+    /// Hide the non-problem kinds, or show them again when they are hidden
+    /// (#577). Returns whether they are hidden now.
+    pub fn toggle_non_problem_kinds(&mut self) -> bool {
+        let keep = self.selected_index();
+        let hidden = Self::NON_PROBLEM_KINDS
+            .iter()
+            .all(|k| self.filters.hidden_kinds.contains(k));
+        for k in Self::NON_PROBLEM_KINDS {
+            if hidden {
+                self.filters.hidden_kinds.remove(&k);
+            } else {
+                self.filters.hidden_kinds.insert(k);
+            }
+        }
+        self.reselect(keep);
+        !hidden
+    }
+
+    /// Close every log but the first, the one the viewer was opened on
+    /// (#577, VS Code's "close all"). Returns how many were closed.
+    pub fn close_added_logs(&mut self) -> usize {
+        let closed = self.logs.len().saturating_sub(1);
+        if closed == 0 {
+            return 0;
+        }
+        self.logs.truncate(1);
+        self.baseline = self.baseline.filter(|&b| b == 0);
+        self.rebuild_entries();
+        closed
     }
 
     /// Close log `index`. The last log stays: closing it is closing the tab.
@@ -1516,6 +1612,95 @@ mod tests {
     }
 
     // ── export ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn k_hides_and_shows_the_non_problem_kinds_together() {
+        let mut v = sample();
+        v.entries[1].kind = Kind::Pass;
+        v.entries[3].kind = Kind::Informational;
+        v.entries[4].kind = Kind::Review;
+        assert_eq!(v.visible().len(), 5);
+        assert!(v.toggle_non_problem_kinds());
+        let shown: Vec<usize> = v.visible().iter().map(|&i| v.entries[i].result).collect();
+        assert!(!shown.contains(&1) && !shown.contains(&3), "{shown:?}");
+        assert!(shown.contains(&4), "review is a problem kind");
+        assert!(!v.toggle_non_problem_kinds());
+        assert_eq!(v.visible().len(), 5);
+    }
+
+    #[test]
+    fn an_added_log_changed_on_disk_is_read_again_keeping_the_selection() {
+        let log_text = |rules: &[&str]| {
+            let results: Vec<String> = rules
+                .iter()
+                .map(|r| format!(r#"{{"ruleId":"{r}","message":{{"text":"{r} msg"}}}}"#))
+                .collect();
+            format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{}]}}]}}"#,
+                results.join(",")
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let added = tmp.path().join("added.sarif");
+        std::fs::write(&added, log_text(&["B1", "B2"])).unwrap();
+        let own = super::super::load::parse_log(&log_text(&["A"])).unwrap();
+        let mut v = SarifView::open(&tmp.path().join("own.sarif"), own);
+        let read =
+            super::super::load::parse_log(&std::fs::read_to_string(&added).unwrap()).unwrap();
+        assert!(v.add_log(&added, read));
+        assert!(v.refresh_added_logs().is_empty(), "unchanged");
+        let rows = v.rows();
+        v.selected = rows
+            .iter()
+            .position(|r| matches!(r, Row::Item { entry } if v.entries[*entry].rule_id == "B2"))
+            .unwrap();
+
+        // A later scan rewrites it: a new result first, shifting the rest.
+        std::fs::write(&added, log_text(&["B0", "B1", "B2"])).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&added)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(v.refresh_added_logs(), std::slice::from_ref(&added));
+        assert_eq!(v.entries.len(), 4);
+        assert_eq!(v.selected_entry().map(|e| e.rule_id.as_str()), Some("B2"));
+        assert!(v.refresh_added_logs().is_empty(), "read once per change");
+
+        // A rewrite that does not parse keeps the log as it was.
+        std::fs::write(&added, "{ broken").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&added)
+            .unwrap()
+            .set_modified(later + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(v.refresh_added_logs().is_empty());
+        assert_eq!(v.entries.len(), 4);
+    }
+
+    #[test]
+    fn closing_the_added_logs_keeps_the_viewers_own() {
+        let log = |rule: &str| {
+            super::super::load::parse_log(&format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{{"ruleId":"{rule}","message":{{"text":"m"}}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        let mut v = SarifView::open(std::path::Path::new("/own.sarif"), log("A"));
+        assert_eq!(v.close_added_logs(), 0);
+        assert!(v.add_log(std::path::Path::new("/b.sarif"), log("B")));
+        assert!(v.add_log(std::path::Path::new("/c.sarif"), log("C")));
+        v.baseline = Some(2);
+        assert_eq!(v.entries.len(), 3);
+        assert_eq!(v.close_added_logs(), 2);
+        assert_eq!(v.logs.len(), 1);
+        assert_eq!(v.logs[0].path, std::path::Path::new("/own.sarif"));
+        assert_eq!(v.entries.len(), 1);
+        assert_eq!(v.baseline, None, "the baseline went with its log");
+    }
 
     #[test]
     fn export_csv_lists_the_visible_results_with_quoting() {
