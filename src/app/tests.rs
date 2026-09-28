@@ -57392,6 +57392,114 @@ fn a_real_alert_runs_alerts_and_raw_results_are_viewed_as_csv() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_qlref_opens_the_query_it_references() {
+    // #578: "open a referenced file" from a .qlref test file.
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let query = tmp.path().join("src/Alert.ql");
+        std::fs::create_dir_all(query.parent().unwrap()).unwrap();
+        std::fs::write(&query, "select 1").unwrap();
+        let qlref = tmp.path().join("test/A.qlref");
+        std::fs::create_dir_all(qlref.parent().unwrap()).unwrap();
+        std::fs::write(&qlref, "Alert.ql\n").unwrap();
+        let program = bin.path().join("codeql");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\necho '{{ \"resolvedPath\" : \"{q}\", \"resolvedPostprocessingPaths\" : [ ] }}'\n",
+                log = bin.path().join("calls.log").display(),
+                q = query.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = program;
+        app.run_command(Command::CodeqlOpenReferencedFile);
+        assert_eq!(app.status, "Open a .qlref file first");
+        app.editor.open(&qlref).unwrap();
+        app.run_command(Command::CodeqlOpenReferencedFile);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_doc() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.status, "The query A.qlref references");
+        assert_eq!(app.editor.path.as_deref(), Some(query.as_path()));
+        let calls = std::fs::read_to_string(bin.path().join("calls.log")).unwrap();
+        assert_eq!(calls.trim(), format!("resolve qlref {}", qlref.display()));
+    });
+}
+
+/// #578's "open a referenced file" against the real CLI: a test pack's
+/// `.qlref` names a query in the query pack it depends on.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn a_real_qlref_opens_the_query_in_the_pack_it_depends_on() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::write(
+            ws.join("codeql-workspace.yml"),
+            "provide:\n  - \"*/qlpack.yml\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("test")).unwrap();
+        std::fs::write(
+            ws.join("src/qlpack.yml"),
+            "name: me/src\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n",
+        )
+        .unwrap();
+        let query = ws.join("src/Alert.ql");
+        std::fs::write(&query, "import python\nselect 1\n").unwrap();
+        std::fs::write(
+            ws.join("test/qlpack.yml"),
+            "name: me/test\nversion: 0.0.1\ndependencies:\n  me/src: \"*\"\nextractor: python\ntests: .\n",
+        )
+        .unwrap();
+        let qlref = ws.join("test/A.qlref");
+        std::fs::write(&qlref, "Alert.ql\n").unwrap();
+        for dir in ["src", "test"] {
+            let out = std::process::Command::new(&codeql)
+                .args(["pack", "install"])
+                .current_dir(ws.join(dir))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let mut app = App::new(ws.to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&qlref).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenReferencedFile);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while !app.drain_codeql_doc() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status, "The query A.qlref references");
+        assert_eq!(
+            app.editor.path.as_ref().map(|p| p.canonicalize().unwrap()),
+            Some(query.canonicalize().unwrap())
+        );
+    });
+}
+
 /// #578's AST Viewer against the real CLI: build a Python database, read
 /// the AST of its source file, and find the function in it. Needs a
 /// `codeql` with the codeql/python-all pack downloaded; set

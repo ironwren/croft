@@ -26627,6 +26627,45 @@ impl App {
         true
     }
 
+    /// CodeQL: Open Referenced File (#578): the query the open `.qlref`
+    /// test file names, as `codeql resolve qlref` finds it through the
+    /// test pack's dependencies.
+    fn open_codeql_referenced_file(&mut self) {
+        let Some(qlref) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "qlref"))
+        else {
+            self.status = String::from("Open a .qlref file first");
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let name = qlref
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let found = Self::codeql_stdout(&program, &crate::codeql_query::qlref_args(&qlref))
+                .and_then(|json| {
+                    crate::codeql_query::parse_qlref(&json)
+                        .ok_or_else(|| String::from("the CLI named no query"))
+                });
+            let _ = tx.send(found);
+        });
+        self.status = format!("Resolving {name}\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("The query {name} references"),
+            format!("Could not resolve {name}"),
+        ));
+    }
+
     /// The Query History run selected in the side bar, else the newest;
     /// says so when nothing has run.
     fn codeql_chosen_run(&mut self) -> Option<crate::codeql_query::HistoryEntry> {
@@ -46727,6 +46766,7 @@ impl App {
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
             Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
             Cmd::CodeqlViewAlertsSarif => self.view_codeql_alerts(false),
             Cmd::CodeqlViewResultsCsv => self.view_codeql_raw_results(),
