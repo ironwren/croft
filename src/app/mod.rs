@@ -3172,6 +3172,12 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// The AST being read for the AST Viewer (#578): the tree or why not,
+    /// and the view it fills in.
+    codeql_ast_job: Option<(
+        std::sync::mpsc::Receiver<Result<crate::codeql_ast::AstTree, String>>,
+        crate::codeql_ast::AstView,
+    )>,
     /// `codeql_cli_path` from settings (#578), kept to notice a reload
     /// changing it.
     codeql_cli_setting: Option<String>,
@@ -5517,6 +5523,7 @@ impl App {
             codeql_log_viewer: None,
             codeql_perf_compare: None,
             codeql_pack_job: None,
+            codeql_ast_job: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -23572,8 +23579,28 @@ impl App {
             Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
-            Hit::Action(Action::ViewAst) => {
-                self.status = String::from("The AST viewer is not available yet (#578)");
+            Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::ClearAst) => {
+                self.codeql.ast = None;
+                self.status = String::from("Cleared the AST");
+            }
+            Hit::Action(Action::AstNode(i)) => {
+                let Some(view) = self.codeql.ast.as_mut() else {
+                    return;
+                };
+                view.toggle(i);
+                match view.target(i) {
+                    Some((path, line, column)) if path.is_file() => {
+                        let (line, column) = (line.max(1) - 1, column.max(1) - 1);
+                        if let Err(e) = self.open_at(&path, line as usize, column as usize) {
+                            self.status = format!("{}: {e}", path.display());
+                        }
+                    }
+                    Some((path, ..)) => {
+                        self.status = format!("{} is not on this machine", path.display());
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -26351,6 +26378,151 @@ impl App {
             0 => String::from("Cancelling the running CodeQL query\u{2026}"),
             n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
         };
+    }
+
+    /// Run `codeql` with `args` and return what it printed on stdout; a
+    /// failure is read as [`Self::codeql_command`] reads it.
+    fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
+    }
+
+    /// CodeQL: View AST (#578): the AST of the open file, read from the
+    /// current database with its language's print-AST query, off the UI
+    /// thread; [`Self::drain_codeql_ast`] shows it in the AST Viewer.
+    fn view_codeql_ast(&mut self) {
+        use crate::codeql_ast as ast;
+        if self.codeql_ast_job.is_some() {
+            self.status = String::from("An AST is already being read");
+            return;
+        }
+        let Some(file) = self.editor.path.clone() else {
+            self.status = String::from("Open a source file from the CodeQL database first");
+            return;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Select a CodeQL database first");
+            return;
+        };
+        let Some(lang) = db.language.clone() else {
+            self.status = format!("CodeQL database {} does not say its language", db.name);
+            return;
+        };
+        // The places this database's source can be open from: its `src`
+        // folder and its extracted `src.zip`s, which both mirror the
+        // absolute paths it was built from.
+        let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+        let mut roots: Vec<PathBuf> = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|e| e.path())
+            .collect();
+        roots.push(db.path.join("src"));
+        let archive = ast::archive_path(&file, &roots);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("ast")
+            .join(stamp.to_string());
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (db_path, csv) = (db.path.clone(), ast::selected_file_csv(&archive));
+        let shown = archive.clone();
+        std::thread::spawn(move || {
+            let read = || -> Result<ast::AstTree, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let suite = dir.join("print-ast.qls");
+                std::fs::write(&suite, ast::print_ast_suite(&lang)).map_err(io)?;
+                let listed = Self::codeql_stdout(&program, &ast::resolve_args(&suite))?;
+                let query = ast::first_query(&listed).ok_or_else(|| {
+                    format!(
+                        "no print-AST query for {lang}; download the codeql/{lang}-all pack \
+                         with CodeQL: Download Packs"
+                    )
+                })?;
+                // A library pack downloaded on its own may lack what it
+                // depends on; installing is quick when nothing is missing.
+                if let Some(pack) = ast::pack_dir(&query) {
+                    Self::codeql_command(&program, &crate::codeql_query::pack_install_args(&pack))?;
+                }
+                let selected = dir.join("selected-file.csv");
+                std::fs::write(&selected, csv).map_err(io)?;
+                let bqrs = dir.join("ast.bqrs");
+                Self::codeql_command(&program, &ast::run_args(&query, &db_path, &selected, &bqrs))?;
+                let json = dir.join("ast.json");
+                Self::codeql_command(&program, &ast::decode_args(&bqrs, &json))?;
+                let tree = ast::parse_graph(&std::fs::read_to_string(&json).map_err(io)?)?;
+                if tree.roots.is_empty() {
+                    return Err(format!("the database has no AST for {shown}"));
+                }
+                Ok(tree)
+            };
+            let _ = tx.send(read());
+        });
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = format!("Reading the AST of {name} from {}\u{2026}", db.name);
+        self.codeql_ast_job = Some((
+            rx,
+            ast::AstView {
+                file,
+                archive,
+                database: db.name,
+                ..ast::AstView::default()
+            },
+        ));
+    }
+
+    /// Show a finished AST read in the AST Viewer (#578), or say why there
+    /// is none.
+    pub fn drain_codeql_ast(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_ast_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the AST read stopped unexpectedly"))
+            }
+        };
+        let Some((_, mut view)) = self.codeql_ast_job.take() else {
+            return false;
+        };
+        match outcome {
+            Ok(tree) => {
+                let name = view
+                    .file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.status = format!("AST of {name}: {} nodes", tree.nodes.len());
+                view.tree = tree;
+                self.codeql.ast = Some(view);
+                self.codeql
+                    .collapsed
+                    .remove(&crate::widgets::codeql::Section::AstViewer);
+            }
+            Err(why) => self.status = format!("Could not read the AST: {why}"),
+        }
+        true
     }
 
     /// Run `codeql` with `args` and wait. A failure is the reason and the
@@ -46219,6 +46391,7 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlViewAst => self.view_codeql_ast(),
             Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
             Cmd::CodeqlRunSelectedQueries => self.run_selected_codeql_queries(),
             Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
@@ -65280,6 +65453,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let codeql_changed = app.drain_codeql_run()
+            | app.drain_codeql_ast()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()
