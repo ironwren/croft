@@ -24549,6 +24549,73 @@ impl App {
         true
     }
 
+    /// VS Code's "Compare Results" for history entry `index` (#578): its
+    /// table against the latest earlier run of the same query, written
+    /// beside its results as a CSV of the rows only one run has, and opened.
+    fn compare_codeql_results(&mut self, index: usize) {
+        use crate::codeql_query::RunStatus;
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        if entry.status != RunStatus::Succeeded {
+            self.status = format!(
+                "{} did not finish, so it has no results",
+                entry.display_name()
+            );
+            return;
+        }
+        if entry.output.extension().is_none_or(|e| e != "csv") {
+            self.status =
+                String::from("Only table results can be compared; alerts open in the SARIF viewer");
+            return;
+        }
+        let Some(partner) = history.compare_partner(index).map(|i| &history.entries[i]) else {
+            self.status = format!(
+                "There is no earlier successful run of {} to compare with",
+                entry.query_name()
+            );
+            return;
+        };
+        let read =
+            |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+        let compared = read(&partner.output).and_then(|old| {
+            let new = read(&entry.output)?;
+            crate::codeql_query::compare_tables(
+                &old,
+                &new,
+                &format!("earlier ({})", partner.database),
+                &format!("later ({})", entry.database),
+            )
+        });
+        let text = match compared {
+            Ok(text) => text,
+            Err(why) => {
+                self.status = format!("Could not compare the results: {why}");
+                return;
+            }
+        };
+        let out = entry
+            .output
+            .with_file_name(format!("compare-{}.csv", partner.started));
+        if let Err(e) = std::fs::write(&out, &text) {
+            self.status = format!("{}: {e}", out.display());
+            return;
+        }
+        let differing = text.lines().count().saturating_sub(1);
+        match self.editor.open(&out) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = match differing {
+                    0 => String::from("Both runs have the same results"),
+                    1 => String::from("1 row differs between the runs"),
+                    n => format!("{n} rows differ between the runs"),
+                };
+            }
+            Err(e) => self.status = format!("{}: {e}", out.display()),
+        }
+    }
+
     /// VS Code's "Open Results Directory" for history entry `index`. The
     /// folder lives in croft's cache, outside the workspace, so the
     /// Explorer can show it only when the user has it open; otherwise its
@@ -44465,6 +44532,11 @@ impl App {
             },
             Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
             Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
+            Cmd::CodeqlCompareResults => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.compare_codeql_results(i);
+                }
+            }
             Cmd::CodeqlShowEvaluatorLog => {
                 if let Some(i) = self.current_codeql_history() {
                     self.show_codeql_evaluator_log(i);

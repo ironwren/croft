@@ -227,6 +227,76 @@ pub fn quick_query(module: &str) -> (String, String) {
     (pack, query)
 }
 
+/// VS Code's "Compare Results" for two result tables: the rows of `old`
+/// that `new` lacks and those `new` has that `old` did not, as one CSV
+/// whose first column names the run each row is from. Rows are compared
+/// whole and counted, so a duplicated row that lost a copy still shows.
+/// Tables with different columns cannot be compared.
+pub fn compare_tables(
+    old: &str,
+    new: &str,
+    old_label: &str,
+    new_label: &str,
+) -> Result<String, String> {
+    fn read(text: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+        let mut r = csv::ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(text.as_bytes());
+        let header = r
+            .headers()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(str::to_string)
+            .collect();
+        let rows = r
+            .records()
+            .map(|rec| rec.map(|rec| rec.iter().map(str::to_string).collect()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok((header, rows))
+    }
+    let (old_header, old_rows) = read(old)?;
+    let (new_header, new_rows) = read(new)?;
+    if old_header != new_header {
+        return Err(String::from("the two runs' result columns differ"));
+    }
+    // Everything in `a` beyond what `b` has, row for row.
+    fn missing<'a>(a: &'a [Vec<String>], b: &[Vec<String>]) -> Vec<&'a Vec<String>> {
+        let mut left: std::collections::HashMap<&Vec<String>, usize> =
+            std::collections::HashMap::new();
+        for row in b {
+            *left.entry(row).or_default() += 1;
+        }
+        a.iter()
+            .filter(|row| match left.get_mut(row) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect()
+    }
+    let mut w = csv::Writer::from_writer(Vec::new());
+    let io = |e: csv::Error| e.to_string();
+    w.write_record(std::iter::once("run").chain(old_header.iter().map(String::as_str)))
+        .map_err(io)?;
+    for (label, row) in missing(&old_rows, &new_rows)
+        .into_iter()
+        .map(|r| (old_label, r))
+        .chain(
+            missing(&new_rows, &old_rows)
+                .into_iter()
+                .map(|r| (new_label, r)),
+        )
+    {
+        w.write_record(std::iter::once(label).chain(row.iter().map(String::as_str)))
+            .map_err(io)?;
+    }
+    let bytes = w.into_inner().map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -730,6 +800,25 @@ impl History {
         self.entries.iter().position(|e| e.output == output)
     }
 
+    /// The run "Compare Results" sets entry `index` against: the latest
+    /// earlier successful run of the same query with the same kind of
+    /// results, on any database.
+    pub fn compare_partner(&self, index: usize) -> Option<usize> {
+        let this = self.entries.get(index)?;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| {
+                i != index
+                    && e.query == this.query
+                    && e.status == RunStatus::Succeeded
+                    && e.output.extension() == this.output.extension()
+                    && e.started <= this.started
+            })
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+
     /// The index of the most recent run, whatever the order.
     pub fn newest(&self) -> Option<usize> {
         self.entries
@@ -804,6 +893,53 @@ mod tests {
         assert!(pack.contains("  codeql/python-all: \"*\"\n"));
         assert!(query.contains("\nimport python\n"));
         assert_eq!(output_for(&query), Output::Table);
+    }
+
+    #[test]
+    fn comparing_tables_lists_the_rows_each_run_has_alone() {
+        let old = "name,line\na,1\nb,2\nb,2\n";
+        let new = "name,line\nb,2\nc,3\n";
+        assert_eq!(
+            compare_tables(old, new, "old", "new").unwrap(),
+            "run,name,line\nold,a,1\nold,b,2\nnew,c,3\n"
+        );
+        assert_eq!(
+            compare_tables(old, old, "old", "new").unwrap(),
+            "run,name,line\n"
+        );
+        assert!(compare_tables(old, "other\nx\n", "old", "new").is_err());
+    }
+
+    #[test]
+    fn a_runs_compare_partner_is_the_latest_earlier_success_of_the_same_query() {
+        let entry = |query: &str, started: u64, status: RunStatus, out: &str| HistoryEntry {
+            query: PathBuf::from(query),
+            database: String::from("db"),
+            database_path: None,
+            started,
+            seconds: 1,
+            status,
+            output: PathBuf::from(out),
+            name: None,
+        };
+        let history = History {
+            entries: vec![
+                entry("q.ql", 4, RunStatus::Succeeded, "/r/4/results.csv"),
+                entry(
+                    "q.ql",
+                    3,
+                    RunStatus::Failed(String::from("x")),
+                    "/r/3/results.csv",
+                ),
+                entry("other.ql", 3, RunStatus::Succeeded, "/r/3o/results.csv"),
+                entry("q.ql", 2, RunStatus::Succeeded, "/r/2/results.sarif"),
+                entry("q.ql", 1, RunStatus::Succeeded, "/r/1/results.csv"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(history.compare_partner(0), Some(4));
+        assert_eq!(history.compare_partner(4), None);
+        assert_eq!(history.compare_partner(2), None);
     }
 
     #[test]

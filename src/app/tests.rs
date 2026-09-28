@@ -55785,6 +55785,46 @@ fn a_codeql_quick_query_opens_for_the_databases_language() {
 }
 
 #[test]
+fn comparing_codeql_results_opens_the_rows_one_run_has_alone() {
+    // #578: VS Code's "Compare Results". The newest run's table is set
+    // against the previous run of the same query; the rows only one of
+    // them has open as a CSV beside the newer results.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = |n: &str| App::codeql_results_dir().join(n).join("results.csv");
+        seed_codeql_history(tmp.path(), &[("q.ql", 1, RunStatus::Succeeded, out("1-q"))]);
+        app.run_command(Command::CodeqlCompareResults);
+        assert_eq!(
+            app.status,
+            "There is no earlier successful run of q.ql to compare with"
+        );
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("q.ql", 1, RunStatus::Succeeded, out("1-q")),
+                ("q.ql", 2, RunStatus::Succeeded, out("2-q")),
+            ],
+        );
+        for (dir, body) in [("1-q", "f\na\nb\n"), ("2-q", "f\nb\nc\n")] {
+            std::fs::create_dir_all(out(dir).parent().unwrap()).unwrap();
+            std::fs::write(out(dir), body).unwrap();
+        }
+        app.run_command(Command::CodeqlCompareResults);
+        assert_eq!(app.status, "2 rows differ between the runs");
+        let compared = out("2-q").with_file_name("compare-1.csv");
+        assert_eq!(app.editor.path.as_deref(), Some(compared.as_path()));
+        let text = std::fs::read_to_string(&compared).unwrap();
+        assert!(text.starts_with("run,f\n"), "{text}");
+        assert!(text.contains(",a\n") && text.contains(",c\n"), "{text}");
+    });
+}
+
+#[test]
 fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     use crate::codeql_query::RunStatus;
