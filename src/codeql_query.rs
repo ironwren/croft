@@ -70,6 +70,24 @@ pub fn log_summary_args(log: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// The structured, one-predicate-per-line summary of the run whose results
+/// are `output`, made from its evaluator log for the log viewer.
+pub fn evaluator_log_predicates(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.predicates.jsonl")
+}
+
+/// `codeql` arguments summarising the evaluator log `log` as predicate
+/// records at `out` (VS Code's "Show Evaluator Log (Viewer)").
+pub fn log_predicates_args(log: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("log-summary"),
+        String::from("--format=predicates"),
+        path(log),
+        path(out),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -819,6 +837,24 @@ impl History {
             .map(|(i, _)| i)
     }
 
+    /// The run "Compare Performance" sets entry `index` against: the latest
+    /// earlier successful run of the same query, whatever kind of results
+    /// either wrote, on any database.
+    pub fn perf_partner(&self, index: usize) -> Option<usize> {
+        let this = self.entries.get(index)?;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| {
+                i != index
+                    && e.query == this.query
+                    && e.status == RunStatus::Succeeded
+                    && e.started <= this.started
+            })
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+
     /// The index of the most recent run, whatever the order.
     pub fn newest(&self) -> Option<usize> {
         self.entries
@@ -940,6 +976,12 @@ mod tests {
         assert_eq!(history.compare_partner(0), Some(4));
         assert_eq!(history.compare_partner(4), None);
         assert_eq!(history.compare_partner(2), None);
+        // Performance compares any kind of results: the SARIF run counts.
+        assert_eq!(history.perf_partner(0), Some(3));
+        assert_eq!(history.perf_partner(3), Some(4));
+        assert_eq!(history.perf_partner(4), None);
+        assert_eq!(history.perf_partner(2), None);
+        assert_eq!(history.perf_partner(9), None);
     }
 
     #[test]
@@ -1019,6 +1061,19 @@ mod tests {
                 "--format=text",
                 "/out/evaluator-log.jsonl",
                 "/out/evaluator-log.summary.txt"
+            ]
+        );
+        assert_eq!(
+            log_predicates_args(
+                &evaluator_log(Path::new("/out/results.csv")),
+                &evaluator_log_predicates(Path::new("/out/results.csv"))
+            ),
+            vec![
+                "generate",
+                "log-summary",
+                "--format=predicates",
+                "/out/evaluator-log.jsonl",
+                "/out/evaluator-log.predicates.jsonl"
             ]
         );
         assert_eq!(
