@@ -3158,6 +3158,12 @@ pub struct App {
     /// The evaluator log summary being generated (#578): where the outcome
     /// arrives, and the summary file to open once it lands.
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
+    /// The evaluator log viewer being prepared (#578): where the rendered
+    /// tree (or why there is none) arrives, and the tab label to show it in.
+    codeql_log_viewer: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    /// The performance comparison being prepared (#578): where the rendered
+    /// table (or why there is none) arrives, and the tab label to show it in.
+    codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
@@ -5459,6 +5465,8 @@ impl App {
             codeql_upgrade: None,
             codeql_version: None,
             codeql_log_summary: None,
+            codeql_log_viewer: None,
+            codeql_perf_compare: None,
             codeql_pack_job: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
@@ -24920,6 +24928,160 @@ impl App {
                 self.status = String::from("Opened the evaluator log summary");
             }
             Err(why) => self.status = format!("Could not summarise the evaluator log: {why}"),
+        }
+        true
+    }
+
+    /// The predicates the evaluator log `log` records, for a worker thread:
+    /// `codeql generate log-summary --format=predicates` the first time
+    /// (kept beside the log), then that summary parsed.
+    fn codeql_log_predicates(
+        program: &Path,
+        log: &Path,
+    ) -> Result<Vec<crate::codeql_evallog::Predicate>, String> {
+        let predicates = crate::codeql_query::evaluator_log_predicates(log);
+        if !predicates.is_file() {
+            let args = crate::codeql_query::log_predicates_args(log, &predicates);
+            Self::codeql_command(program, &args)?;
+        }
+        let text = std::fs::read_to_string(&predicates)
+            .map_err(|e| format!("{}: {e}", predicates.display()))?;
+        Ok(crate::codeql_evallog::parse(&text))
+    }
+
+    /// VS Code's "Show Evaluator Log (Viewer)" for history entry `index`:
+    /// on a worker thread, `codeql generate log-summary --format=predicates`
+    /// the first time (kept beside the log), then that summary parsed and
+    /// rendered as a tree of predicates, slowest first.
+    fn show_codeql_evaluator_log_viewer(&mut self, index: usize) {
+        let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        if self.codeql_log_viewer.is_some() {
+            self.status = String::from("The evaluator log viewer is already being prepared");
+            return;
+        }
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let query = history
+            .entries
+            .get(index)
+            .map(|e| e.query_name())
+            .unwrap_or_default();
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = query.clone();
+        std::thread::spawn(move || {
+            let tree = Self::codeql_log_predicates(&program, &log)
+                .map(|parsed| crate::codeql_evallog::render(&name, &parsed));
+            let _ = tx.send(tree);
+        });
+        self.status = String::from("Reading the evaluator log\u{2026}");
+        self.codeql_log_viewer = Some((rx, format!("Evaluator Log ({query})")));
+    }
+
+    /// Show a prepared evaluator log tree (#578) in a tab with every
+    /// predicate folded, or say why it could not be made.
+    pub fn drain_codeql_log_viewer(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_log_viewer.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the viewer stopped unexpectedly"))
+            }
+        };
+        let Some((_, label)) = self.codeql_log_viewer.take() else {
+            return false;
+        };
+        match outcome.and_then(|text| {
+            self.editor
+                .open_text_buffer(Path::new(&label), &text)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {
+                self.editor.fold_all();
+                self.focus_pane(Pane::Editor);
+                self.status = String::from("Opened the evaluator log viewer");
+            }
+            Err(why) => self.status = format!("Could not read the evaluator log: {why}"),
+        }
+        true
+    }
+
+    /// VS Code's "Compare Performance" for history entry `index` (#578):
+    /// the predicate timings of its evaluator log against those of the
+    /// latest earlier successful run of the same query, biggest change
+    /// first. Predicate summaries either run lacks are made on a worker
+    /// thread, as the evaluator log viewer makes them.
+    fn compare_codeql_performance(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        let Some(new_log) = self.codeql_history_log(index) else {
+            return;
+        };
+        let Some(partner) = history.perf_partner(index) else {
+            self.status = format!(
+                "There is no earlier successful run of {} to compare with",
+                entry.query_name()
+            );
+            return;
+        };
+        let Some(old_log) = self.codeql_history_log(partner) else {
+            return;
+        };
+        if self.codeql_perf_compare.is_some() {
+            self.status = String::from("A performance comparison is already being prepared");
+            return;
+        }
+        let query = entry.query_name();
+        let old_label = format!("earlier ({})", history.entries[partner].database);
+        let new_label = format!("later ({})", entry.database);
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let table = Self::codeql_log_predicates(&program, &old_log).and_then(|old| {
+                let new = Self::codeql_log_predicates(&program, &new_log)?;
+                let rows = crate::codeql_evallog::compare(&old, &new);
+                Ok(crate::codeql_evallog::render_comparison(
+                    &old_label, &new_label, &rows,
+                ))
+            });
+            let _ = tx.send(table);
+        });
+        self.status = String::from("Comparing the evaluator logs\u{2026}");
+        self.codeql_perf_compare = Some((rx, format!("Performance ({query})")));
+    }
+
+    /// Show a prepared performance comparison (#578) in a tab, or say why
+    /// it could not be made.
+    pub fn drain_codeql_perf_compare(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_perf_compare.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the comparison stopped unexpectedly"))
+            }
+        };
+        let Some((_, label)) = self.codeql_perf_compare.take() else {
+            return false;
+        };
+        match outcome.and_then(|text| {
+            self.editor
+                .open_text_buffer(Path::new(&label), &text)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {
+                self.focus_pane(Pane::Editor);
+                self.status = String::from("Opened the performance comparison");
+            }
+            Err(why) => self.status = format!("Could not compare performance: {why}"),
         }
         true
     }
@@ -45598,6 +45760,16 @@ impl App {
                     self.show_codeql_evaluator_log_summary(i);
                 }
             }
+            Cmd::CodeqlShowEvaluatorLogViewer => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_evaluator_log_viewer(i);
+                }
+            }
+            Cmd::CodeqlComparePerformance => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.compare_codeql_performance(i);
+                }
+            }
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -64234,6 +64406,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()
+            | app.drain_codeql_log_viewer()
+            | app.drain_codeql_perf_compare()
             | app.drain_codeql_pack_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
