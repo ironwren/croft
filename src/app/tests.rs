@@ -55101,6 +55101,66 @@ fn sarif_enter_opens_the_location_and_keeps_the_viewer_tab() {
 }
 
 #[test]
+fn a_sarif_result_whose_file_is_only_in_the_log_opens_the_logs_copy() {
+    // #577: `artifacts[].contents` is the file when it is not on this
+    // machine: text opens read-only at the result, binary in the hex viewer.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("embedded.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T"}},
+              "artifacts":[
+                {"location":{"uri":"file:///build/gen/query.c"},"contents":{"text":"line one\nline two\nint bad;\n"}},
+                {"location":{"uri":"file:///build/blob.bin"},"contents":{"binary":"AAEC/w=="}}],
+              "results":[
+                {"ruleId":"R1","message":{"text":"text"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///build/gen/query.c","index":0},"region":{"startLine":3,"startColumn":5}}}]},
+                {"ruleId":"R2","message":{"text":"bin"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///build/blob.bin","index":1}}}]}]}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        let select = |app: &mut App, rule: &str| {
+            let view = app.editor.sarif.as_mut().unwrap();
+            let rows = view.rows();
+            view.selected = rows
+                .iter()
+                .position(|r| matches!(r, crate::sarif::view::Row::Item { entry } if view.entries[*entry].rule_id == rule))
+                .unwrap();
+        };
+        select(&mut app, "R1");
+        app.open_selected_sarif_result();
+        let opened = app.editor.path.clone().expect("a copy opened");
+        assert!(
+            opened.starts_with(croft_cache_dir()),
+            "{opened:?}: {}",
+            app.status
+        );
+        assert_eq!(opened.file_name().unwrap(), "query.c");
+        assert_eq!(app.editor.lines[2], "int bad;");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+        assert!(app.status.contains("read-only"), "{}", app.status);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&opened).unwrap().permissions().mode() & 0o222,
+            0
+        );
+
+        app.editor.open_preview(&log).unwrap();
+        select(&mut app, "R2");
+        app.open_selected_sarif_result();
+        let opened = app.editor.path.clone().expect("a copy opened");
+        assert_eq!(std::fs::read(&opened).unwrap(), [0, 1, 2, 255]);
+        assert!(
+            app.editor.has_non_text_view(),
+            "binary opens in the hex viewer"
+        );
+    });
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
