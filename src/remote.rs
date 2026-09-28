@@ -467,20 +467,28 @@ fn outcome_or_bail(status: ExitStatus) -> Result<RemoteOutcome> {
     }
 }
 
-/// True when the remote host has `dtach`, which croft launches its session
-/// under for persistence across an SSH transport drop. Best-effort over the
-/// existing control master; any error (host unreachable, no dtach) reports
-/// `false` so croft simply runs without persistence.
+/// True when the remote host has a supervisor croft launches its session
+/// under for persistence across an SSH transport drop: croft's own
+/// `session-host`, or `dtach` (#831). Best-effort over the existing control
+/// master; any error (host unreachable, neither supervisor) reports `false`
+/// so croft simply runs without persistence.
 fn remote_has_session_supervisor(ssh: &SshControl) -> bool {
     ssh.command()
         .arg(&ssh.host)
-        .arg("command -v dtach >/dev/null 2>&1")
+        .arg(session_supervisor_check_command())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The remote check behind [`remote_has_session_supervisor`]: the same
+/// supervisors, probed the same way, as [`remote_croft_command`] launches
+/// the session under, so the two never disagree about persistence.
+fn session_supervisor_check_command() -> &'static str {
+    "export PATH=\"$HOME/.cargo/bin:$PATH\"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1"
 }
 
 /// Re-establish the SSH control master after a transport drop (laptop sleep,
@@ -3950,6 +3958,47 @@ fn ssh_control_socket_path_for_test(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_host_or_dtach_on_the_remote_makes_the_session_persistent() {
+        // #831: the check accepted only dtach, so a host whose session
+        // survived under `croft session-host` was never reconnected to.
+        use std::os::unix::fs::PermissionsExt;
+        let exe = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let check = |home: &Path, extra_path: &Path| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(session_supervisor_check_command())
+                .env("HOME", home)
+                .env("PATH", format!("{}:/usr/bin:/bin", extra_path.display()))
+                .status()
+                .unwrap()
+                .success()
+        };
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        assert!(!check(home.path(), bin.path()), "neither supervisor");
+
+        let croft = home.path().join(".cargo/bin/croft");
+        exe(&croft, "[ \"$1 $2\" = 'session-host --probe' ]");
+        assert!(check(home.path(), bin.path()), "croft's session host");
+
+        // A croft too old for session-host, with dtach beside it.
+        exe(&croft, "exit 2");
+        assert!(!check(home.path(), bin.path()));
+        exe(&bin.path().join("dtach"), "exit 0");
+        assert!(check(home.path(), bin.path()), "dtach");
+
+        // The check probes exactly as the launched session does.
+        let launch = remote_croft_command_for_terminal(None, None, None, false, &[], false);
+        assert!(launch.contains("croft session-host --probe >/dev/null 2>&1"));
+        assert!(launch.contains("command -v dtach >/dev/null 2>&1"));
+    }
 
     fn report(path: &str, host: Option<&str>) -> CwdReport {
         (std::path::PathBuf::from(path), host.map(str::to_string))
