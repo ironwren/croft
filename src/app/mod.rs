@@ -3145,6 +3145,11 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
+    /// Raised to stop the query run in flight: its `codeql` is killed and
+    /// the run recorded as cancelled (#578).
+    codeql_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The file name of the query in flight, for its status-bar chip.
+    codeql_run_name: String,
     /// Queries "Run Queries in Pack" has yet to start, in order (#578).
     codeql_run_queue: std::collections::VecDeque<PathBuf>,
     /// How many queries the pack run holds and how many have failed so
@@ -4140,6 +4145,8 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    /// The running CodeQL query's status-bar chip; a click cancels it (#578).
+    status_codeql_rect: Rect,
     status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
@@ -5500,6 +5507,8 @@ impl App {
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
             codeql_run: None,
+            codeql_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            codeql_run_name: String::new(),
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
             codeql_upgrade: None,
@@ -5711,6 +5720,7 @@ impl App {
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_codeql_rect: Rect::default(),
             status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
@@ -18814,6 +18824,28 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // A running CodeQL query (#578): what runs and for how long, and a
+        // click on it cancels the run.
+        let mut codeql_chip: Option<(u16, u16)> = None;
+        if let Some((_, since)) = &self.codeql_run {
+            let secs = since.elapsed().as_secs();
+            let text = format!(
+                " \u{27f3} CodeQL {} {}:{:02} \u{2715} ",
+                self.codeql_run_name,
+                secs / 60,
+                secs % 60
+            );
+            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            codeql_chip = Some((x, text.chars().count() as u16));
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         if let Some((_, _, started)) = &self.recording {
             // A terminal recording (#356) is the other state a user can
             // leave on; it is not the macro recorder, so it has its own
@@ -18996,6 +19028,15 @@ impl App {
         let status_rect = outer[2];
         // The F1 cheat-sheet is gone; F1 / the palette still open Shortcuts.
         self.shortcuts_hit_rect = None;
+        self.status_codeql_rect = match codeql_chip {
+            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
+                x: status_rect.x + x,
+                y: status_rect.y,
+                width: w.min(status_rect.width - x),
+                height: 1,
+            },
+            _ => Rect::default(),
+        };
         // Diagnostics hit rect (left group), for click-to-PROBLEMS.
         self.status_diag_rect = if status_h > 0 {
             Rect {
@@ -19139,6 +19180,11 @@ impl App {
             // the frame edge, it went on answering for cells that now read
             // "Ln 1, Col 1" — opening PROBLEMS from a click on the position
             // readout, with the counts it claimed not even on screen.
+            if self.status_codeql_rect.x >= rx {
+                self.status_codeql_rect = Rect::default();
+            } else if self.status_codeql_rect.right() > rx {
+                self.status_codeql_rect.width = rx - self.status_codeql_rect.x;
+            }
             if self.status_diag_rect.x >= rx {
                 // Entirely behind the cluster: not on screen, so not a target.
                 self.status_diag_rect = Rect::default();
@@ -22817,6 +22863,53 @@ impl App {
         self.status = String::from("Running CodeQL tests");
     }
 
+    /// CodeQL: Accept Test Output (#578): make a failing CodeQL test's
+    /// actual results its expected ones, through `codeql test accept`. The
+    /// test is the one the open file belongs to (its `.ql`, `.qlref`,
+    /// `.expected` or `.actual`), else every CodeQL test the last run
+    /// failed. Only tests a run left `.actual` output for are accepted.
+    fn accept_codeql_test_output(&mut self) {
+        use crate::testing::codeqltest as ct;
+        let tests: Vec<PathBuf> = match self.editor.path.as_deref().and_then(ct::test_for_file) {
+            Some(test) => vec![test],
+            None => self
+                .testing
+                .failed_names()
+                .into_iter()
+                .map(|id| self.active_test_root.join(ct::id_path(&id)))
+                .filter(|t| t.is_file())
+                .collect(),
+        };
+        if tests.is_empty() {
+            self.status = String::from(
+                "No CodeQL test to accept: open one of its files, or run the tests first",
+            );
+            return;
+        }
+        let ready: Vec<PathBuf> = tests
+            .into_iter()
+            .filter(|t| ct::actual_output(t).is_file())
+            .collect();
+        if ready.is_empty() {
+            self.status = String::from(
+                "No actual output to accept: run the test first, and accept it once it fails",
+            );
+            return;
+        }
+        let what = match ready.as_slice() {
+            [one] => one
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            many => format!("{} tests", many.len()),
+        };
+        self.start_codeql_pack_job(
+            ct::accept_args(&ready),
+            format!("Accepting the output of {what}\u{2026}"),
+            format!("Accepted the output of {what} as expected"),
+            format!("Could not accept the output of {what}"),
+        );
+    }
+
     /// Point every CodeQL run at `program`: the side bar's queries and,
     /// through the test worker, the Testing view's CodeQL tests (#578).
     /// The one place the configured `codeql` changes, so the two never
@@ -23231,12 +23324,14 @@ impl App {
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
-    /// query in the pack; Esc then first cancels the ones still queued.
+    /// query in the pack; Esc then first cancels the ones still queued, and
+    /// once none are, the running query.
     /// In the Variant Analysis Repositories section `a` adds a repository
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
     /// opens the selected repository or owner on GitHub; on a submitted run,
-    /// Enter opens its report, `v` its results and `x` exports them; Enter selects what a run
+    /// Enter opens its report, `v` its results, `x` exports them, `c` copies
+    /// its repository list and `l` opens its logs on GitHub Actions; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23248,6 +23343,7 @@ impl App {
         let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
+            KeyCode::Esc if self.codeql_run.is_some() => self.cancel_codeql_run(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
@@ -23278,6 +23374,12 @@ impl App {
                 } else if let Some(Item::List(i)) = va_item {
                     self.prompt_rename_codeql_variant_list(i);
                 }
+            }
+            KeyCode::Char('c') if self.codeql.selected_variant_run().is_some() => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run());
+            }
+            KeyCode::Char('l') if self.codeql.selected_variant_run().is_some() => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run());
             }
             KeyCode::Char('a') if in_va => self.prompt_add_codeql_variant_repo(),
             KeyCode::Char('l') if in_va => self.prompt_add_codeql_variant_list(),
@@ -23422,6 +23524,9 @@ impl App {
                     }
                     crate::codeql_query::RunStatus::Running => {
                         self.status = String::from("That query is still running");
+                    }
+                    crate::codeql_query::RunStatus::Cancelled => {
+                        self.status = String::from("That run was cancelled");
                     }
                 }
             }
@@ -25479,6 +25584,59 @@ impl App {
         false
     }
 
+    /// The submitted variant analysis run `index`, else the newest; says
+    /// so when none has been submitted.
+    fn codeql_variant_run(
+        &mut self,
+        index: Option<usize>,
+    ) -> Option<crate::codeql_submit::Submitted> {
+        let runs = crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path());
+        let run = index.map_or(runs.last(), |i| runs.get(i)).cloned();
+        if run.is_none() {
+            self.status = String::from("No variant analysis has been submitted yet");
+        }
+        run
+    }
+
+    /// Copy the repositories variant analysis run `index` (else the newest)
+    /// covers, one per line (#578).
+    fn copy_codeql_variant_repo_list(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        self.status = match crate::codeql_submit::repository_list(&run) {
+            Some(list) => {
+                copy_to_clipboard(&list);
+                format!(
+                    "Copied the {} repositories of variant analysis {}",
+                    list.lines().count(),
+                    run.id
+                )
+            }
+            None => format!(
+                "Variant analysis {} has not reported its repositories yet",
+                run.id
+            ),
+        };
+    }
+
+    /// Open the GitHub Actions run of variant analysis run `index` (else
+    /// the newest), where its logs are (#578).
+    fn view_codeql_variant_logs(&mut self, index: Option<usize>) {
+        let Some(run) = self.codeql_variant_run(index) else {
+            return;
+        };
+        match crate::codeql_submit::workflow_run_url(&run) {
+            Some(url) => self.open_url_for_user(&url),
+            None => {
+                self.status = format!(
+                    "Variant analysis {} has no Actions run yet; GitHub starts one shortly",
+                    run.id
+                )
+            }
+        }
+    }
+
     /// Fetch the results of remembered variant analysis `index` (the newest
     /// when `None`) and open them (#578): each repository that succeeded
     /// with results has its artifact downloaded (once; later opens use the
@@ -26104,8 +26262,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        // A fresh flag per run, so a late cancel never stops the next one.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.codeql_cancel = cancel.clone();
         std::thread::spawn(move || {
-            let run = |args: Vec<String>| Self::codeql_command(&program, &args);
+            let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
                 .and_then(|()| match kind {
@@ -26118,11 +26279,78 @@ impl App {
                 });
             let _ = tx.send(match outcome {
                 Ok(()) => RunStatus::Succeeded,
+                Err(_) if cancel.load(std::sync::atomic::Ordering::SeqCst) => RunStatus::Cancelled,
                 Err(e) => RunStatus::Failed(e),
             });
         });
         self.codeql_run = Some((rx, std::time::Instant::now()));
+        self.codeql_run_name = name.clone();
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
+    /// raised (#578). Its output is drained on threads of its own, so a
+    /// chatty CLI never blocks on a full pipe while this polls.
+    fn codeql_command_until(
+        program: &Path,
+        args: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(String::from("cancelled"));
+        }
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let mut stderr = child.stderr.take();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(s) = stderr.as_mut() {
+                let _ = s.read_to_string(&mut text);
+            }
+            text
+        });
+        let status = loop {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(String::from("cancelled"));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(e) => return Err(format!("could not wait for codeql: {e}")),
+            }
+        };
+        let err = reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(())
+        } else {
+            Err(crate::codeql_query::failure_reason(&err))
+        }
+    }
+
+    /// CodeQL: Cancel Running Query (#578): stop the query in flight, and
+    /// the queries a pack or multi-database run has queued after it.
+    fn cancel_codeql_run(&mut self) {
+        if self.codeql_run.is_none() {
+            self.status = String::from("No CodeQL query is running");
+            return;
+        }
+        self.codeql_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let queued = self.codeql_run_queue.len();
+        self.codeql_run_queue.clear();
+        self.status = match queued {
+            0 => String::from("Cancelling the running CodeQL query\u{2026}"),
+            n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
+        };
     }
 
     /// Run `codeql` with `args` and wait. A failure is the reason and the
@@ -26196,6 +26424,7 @@ impl App {
         self.refresh_codeql_history();
         match status {
             RunStatus::Failed(why) => self.status = format!("{name} failed: {why}"),
+            RunStatus::Cancelled => self.status = format!("{name} cancelled"),
             _ => match self.editor.open(&output) {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
@@ -45941,10 +46170,18 @@ impl App {
             Cmd::CodeqlExportVariantResults => {
                 self.prompt_export_codeql_variant_results(self.codeql.selected_variant_run())
             }
+            Cmd::CodeqlCopyVariantRepoList => {
+                self.copy_codeql_variant_repo_list(self.codeql.selected_variant_run())
+            }
+            Cmd::CodeqlViewVariantLogs => {
+                self.view_codeql_variant_logs(self.codeql.selected_variant_run())
+            }
             Cmd::CodeqlOpenVariantResults => {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
+            Cmd::CodeqlAcceptTestOutput => self.accept_codeql_test_output(),
             Cmd::CodeqlFocusSideBar => {
                 // Show it and take the keys, as VS Code's "Focus" does.
                 self.open_codeql_view();
@@ -48644,6 +48881,10 @@ impl App {
             }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
+                return;
+            }
+            if rect_contains(self.status_codeql_rect, m.column, m.row) {
+                self.cancel_codeql_run();
                 return;
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
