@@ -60086,3 +60086,18 @@ fn a_real_cargo_llvm_cov_run_marks_the_covered_file() {
         lens.percent
     );
 }
+
+/// #262: a `config.synced.json` that arrives by config sync is applied on
+/// arrival: it is in the settings chain, so the config watch's reload of it
+/// re-runs the merge.
+#[test]
+fn the_synced_settings_layer_is_in_the_reload_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let synced = crate::config_layers::synced_config_path();
+    assert!(
+        app.settings_chain.contains(&synced),
+        "{synced:?} in {:?}",
+        app.settings_chain
+    );
+}
