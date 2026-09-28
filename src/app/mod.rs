@@ -26448,18 +26448,57 @@ impl App {
         let Some(queries) = self.codeql.queries.get(pack).map(|p| p.queries.clone()) else {
             return;
         };
+        self.run_codeql_batch(queries, "That pack has no queries");
+    }
+
+    /// Run `queries` one after another on the current database, through
+    /// the queue a pack run uses; `none` is what to say when there are none.
+    fn run_codeql_batch(&mut self, queries: Vec<PathBuf>, none: &str) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         if store.current.and_then(|i| store.databases.get(i)).is_none() {
             self.status = String::from("Add a CodeQL database and select it first");
             return;
         }
         if queries.is_empty() {
-            self.status = String::from("That pack has no queries");
+            self.status = none.to_string();
             return;
         }
         self.codeql_batch = (queries.len(), 0);
         self.codeql_run_queue = queries.into();
         self.start_next_queued_codeql();
+    }
+
+    /// CodeQL: Run All Queries in Workspace (#578): every query the side
+    /// bar's Queries section lists, pack after pack.
+    fn run_all_codeql_queries(&mut self) {
+        self.refresh_codeql_queries();
+        let queries: Vec<PathBuf> = self
+            .codeql
+            .queries
+            .iter()
+            .flat_map(|p| p.queries.iter().cloned())
+            .collect();
+        self.run_codeql_batch(queries, "No CodeQL queries in the workspace");
+    }
+
+    /// CodeQL: Run Queries in Selected Files (#578): the `.ql` files
+    /// selected in the Explorer, and every query under a selected folder.
+    fn run_selected_codeql_queries(&mut self) {
+        let mut paths: Vec<PathBuf> = self.tree.marked.iter().cloned().collect();
+        if paths.is_empty()
+            && let Some(p) = self.tree.selected_path()
+        {
+            paths.push(p.to_path_buf());
+        }
+        let queries = crate::codeql_query::queries_in(&paths);
+        self.run_codeql_batch(
+            queries,
+            "Select .ql files, or folders holding them, in the Explorer first",
+        );
     }
 
     /// Start the pack run's next query, read from disk as the side-bar rows
@@ -46180,6 +46219,8 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
+            Cmd::CodeqlRunSelectedQueries => self.run_selected_codeql_queries(),
             Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
             Cmd::CodeqlAcceptTestOutput => self.accept_codeql_test_output(),
             Cmd::CodeqlFocusSideBar => {
