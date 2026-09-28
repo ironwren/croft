@@ -55717,6 +55717,58 @@ fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
 }
 
 #[test]
+fn codeql_focus_side_bar_and_open_results_directory_are_palette_commands() {
+    // #578: VS Code's "CodeQL: Focus Side Bar", and the results directory
+    // of the selected run (else the newest) without the side bar's `o`.
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.config_dir = tmp.path().join("config");
+        assert_eq!(
+            Command::from_id("codeql_focus_side_bar"),
+            Some(Command::CodeqlFocusSideBar)
+        );
+        assert_eq!(
+            Command::CodeqlFocusSideBar.title(),
+            "CodeQL: Focus Side Bar"
+        );
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.status, "No CodeQL query has run yet");
+
+        let newer = App::codeql_results_dir().join("200-a/results.csv");
+        let older = App::codeql_results_dir().join("100-b/results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("b.ql", 100, RunStatus::Succeeded, older.clone()),
+                ("a.ql", 200, RunStatus::Succeeded, newer.clone()),
+            ],
+        );
+        app.focus = Pane::Editor;
+        app.run_command(Command::CodeqlFocusSideBar);
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(app.focus == Pane::Tree, "the side bar takes the keys");
+
+        // Nothing selected in Query History: the newest run.
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.editor.path.as_deref(), Some(newer.as_path()));
+        // A selected run: that one.
+        app.codeql.select_history(1);
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(older.as_path()),
+            "{}",
+            app.status
+        );
+    });
+}
+
+#[test]
 fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
     // Opening the CodeQL view reads croft's cache, whose test override is
     // process-global: without the lock and a cache of its own, this test
