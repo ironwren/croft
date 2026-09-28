@@ -26388,6 +26388,58 @@ impl App {
         );
     }
 
+    /// CodeQL: Debug Query (#578): evaluate the open query up to its first
+    /// breakpoint, the way VS Code's CodeQL debugger stops at one: the
+    /// predicate the breakpoint's line defines or calls is quick-evaluated.
+    /// With no breakpoints the whole query runs.
+    fn debug_codeql_query(&mut self) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to debug it");
+            return;
+        };
+        let lines: Vec<usize> = self
+            .editor
+            .breakpoints
+            .get(&query)
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            self.run_codeql_query();
+            return;
+        }
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let target = lines.iter().find_map(|&line| {
+            let text = self.editor.lines.get(line.checked_sub(1)?)?;
+            crate::codeql_qs::breakpoint_target(text, line as u32)
+        });
+        let Some((span, name)) = target else {
+            self.status = format!(
+                "No predicate at the breakpoint on line {}: put it on a line that defines or calls one",
+                lines[0]
+            );
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        let label = format!("{name} (breakpoint on line {})", span.line);
+        self.run_codeql_file_with(
+            query,
+            &source,
+            Some(crate::codeql_qs::QuickEval {
+                span,
+                count: false,
+                label,
+            }),
+        );
+    }
+
     /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
     /// raised (#578). Its output is drained on threads of its own, so a
     /// chatty CLI never blocks on a full pipe while this polls.
@@ -46942,6 +46994,8 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlDebugQuery => self.debug_codeql_query(),
+            Cmd::CodeqlDebugSelection => self.quick_eval_codeql(false),
             Cmd::CodeqlResultsUp => self.walk_codeql_results(-1, 0),
             Cmd::CodeqlResultsDown => self.walk_codeql_results(1, 0),
             Cmd::CodeqlResultsLeft => self.walk_codeql_results(0, -1),

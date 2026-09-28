@@ -292,9 +292,95 @@ pub fn span_at(
     ))
 }
 
+/// QL words that open a formula or an aggregate: followed by `(` but
+/// not predicates, so never what a breakpoint means.
+const NOT_PREDICATES: [&str; 20] = [
+    "exists",
+    "forall",
+    "forex",
+    "not",
+    "count",
+    "strictcount",
+    "sum",
+    "strictsum",
+    "min",
+    "max",
+    "avg",
+    "concat",
+    "strictconcat",
+    "rank",
+    "any",
+    "none",
+    "unique",
+    "if",
+    "and",
+    "or",
+];
+
+/// What a breakpoint on 1-based `line` (whose text is `text`) evaluates,
+/// the way VS Code's CodeQL debugger stops at one (#578): the predicate
+/// the line defines or calls, which is the first name followed by `(`
+/// that is not a formula word. The query server takes that name as a
+/// quick-evaluation target; a whole line it refuses.
+pub fn breakpoint_target(text: &str, line: u32) -> Option<(Span, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = 0;
+    while i < chars.len() {
+        if !(chars[i].is_alphabetic() || chars[i] == '_') || (i > 0 && word(chars[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && word(chars[i]) {
+            i += 1;
+        }
+        let name: String = chars[start..i].iter().collect();
+        let mut j = i;
+        while j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'(') && !NOT_PREDICATES.contains(&name.as_str()) {
+            return Some((
+                Span {
+                    line,
+                    column: start as u32 + 1,
+                    end_line: line,
+                    end_column: i as u32,
+                },
+                name,
+            ));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_breakpoint_evaluates_the_predicate_its_line_defines_or_calls() {
+        // Both spans were checked against the real query server (2.27.1):
+        // the name is a valid target, the whole line and the call are not.
+        let (span, name) = breakpoint_target("predicate isCall(Call c) { exists(c) }", 3).unwrap();
+        assert_eq!(name, "isCall");
+        assert_eq!((span.line, span.column, span.end_column), (3, 11, 16));
+        let (span, name) = breakpoint_target("where isCall(c)", 6).unwrap();
+        assert_eq!(
+            (name.as_str(), span.column, span.end_column),
+            ("isCall", 7, 12)
+        );
+        assert_eq!(
+            breakpoint_target("  exists(Call c | isCall (c))", 1)
+                .map(|t| t.1)
+                .as_deref(),
+            Some("isCall"),
+            "formula words are skipped"
+        );
+        assert_eq!(breakpoint_target("select c", 7), None);
+        assert_eq!(breakpoint_target("from Call c", 5), None);
+    }
 
     #[test]
     fn messages_are_framed_and_read_back() {

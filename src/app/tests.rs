@@ -57779,6 +57779,72 @@ fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() 
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn debugging_a_codeql_query_stops_at_its_first_breakpoint() {
+    // #578: Debug Query quick-evaluates the predicate at the first
+    // breakpoint; with none it runs the whole query.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
+        );
+        app.codeql_program = fake_query_server(
+            bin.path(),
+            r#"{"resultType": 0, "message": "", "evaluationTime": 1}"#,
+            "\"c\"\n",
+        );
+        let query = tmp.path().join("q.ql");
+        // A breakpoint on a line with no predicate is refused with why.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(7);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert!(
+            app.status
+                .starts_with("No predicate at the breakpoint on line 7"),
+            "{}",
+            app.status
+        );
+        // On the `where` line: the called predicate.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(6);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(
+            app.status,
+            "Running Quick evaluation of isCall (breakpoint on line 6) on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        let requests = std::fs::read_to_string(bin.path().join("requests.jsonl")).unwrap();
+        let run: serde_json::Value =
+            serde_json::from_str(requests.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["line"],
+            6
+        );
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["column"],
+            7
+        );
+        // Without breakpoints the whole query runs, as Run Query does.
+        app.editor.open(&query).unwrap();
+        app.editor.breakpoints.clear();
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(app.status, "Running q.ql on app\u{2026}");
+        wait_for_codeql(&mut app);
+    });
+}
+
 /// #578's quick evaluation against the real CLI's query server: a
 /// predicate's tuples, and their count.
 #[cfg(unix)]
