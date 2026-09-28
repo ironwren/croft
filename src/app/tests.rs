@@ -42765,19 +42765,6 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
     );
 }
 
-/// A geometry change reaches the cast BEFORE the frame drawn at it (#397).
-///
-/// `record_active_screen` emits the resize first so a player has the new
-/// geometry before the frame that was wrapped for it; the other order renders
-/// one frame at the old width. Nothing pinned that order. In every other
-/// fixture `recorded_size` already equals the pane's size at record time, so
-/// the branch never runs at all, and the one other test that produces an `r`
-/// event calls `record_resize` directly, which bypasses the ordering logic
-/// rather than exercising it.
-///
-/// `last_inner` alone moves here, without a `resize`: it is what the branch
-/// reads, and the claim under test is the ORDER of two events, not the
-/// content of the frame between them.
 /// #356's playback criterion with `agg`, the GIF converter: a recording
 /// with colour, a resize and a wrapped line converts without complaint.
 /// Set `CROFT_TEST_AGG` to an agg binary (`cargo install --git
@@ -42830,6 +42817,19 @@ fn a_recorded_cast_converts_to_a_gif_with_agg() {
     assert!(bytes.starts_with(b"GIF89a"), "a GIF was written");
 }
 
+/// A geometry change reaches the cast BEFORE the frame drawn at it (#397).
+///
+/// `record_active_screen` emits the resize first so a player has the new
+/// geometry before the frame that was wrapped for it; the other order renders
+/// one frame at the old width. Nothing pinned that order. In every other
+/// fixture `recorded_size` already equals the pane's size at record time, so
+/// the branch never runs at all, and the one other test that produces an `r`
+/// event calls `record_resize` directly, which bypasses the ordering logic
+/// rather than exercising it.
+///
+/// `last_inner` alone moves here, without a `resize`: it is what the branch
+/// reads, and the claim under test is the ORDER of two events, not the
+/// content of the frame between them.
 #[test]
 fn a_recorded_resize_precedes_the_frame_it_was_drawn_for() {
     let tmp = tempfile::tempdir().unwrap();
