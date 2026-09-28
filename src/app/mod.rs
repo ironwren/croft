@@ -3172,6 +3172,15 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// The control flow graph being read for View CFG (#578): the
+    /// document it writes, or why not.
+    codeql_cfg_job: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// The AST being read for the AST Viewer (#578): the tree or why not,
+    /// and the view it fills in.
+    codeql_ast_job: Option<(
+        std::sync::mpsc::Receiver<Result<crate::codeql_ast::AstTree, String>>,
+        crate::codeql_ast::AstView,
+    )>,
     /// `codeql_cli_path` from settings (#578), kept to notice a reload
     /// changing it.
     codeql_cli_setting: Option<String>,
@@ -5517,6 +5526,8 @@ impl App {
             codeql_log_viewer: None,
             codeql_perf_compare: None,
             codeql_pack_job: None,
+            codeql_ast_job: None,
+            codeql_cfg_job: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -23579,8 +23590,28 @@ impl App {
             Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
-            Hit::Action(Action::ViewAst) => {
-                self.status = String::from("The AST viewer is not available yet (#578)");
+            Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::ClearAst) => {
+                self.codeql.ast = None;
+                self.status = String::from("Cleared the AST");
+            }
+            Hit::Action(Action::AstNode(i)) => {
+                let Some(view) = self.codeql.ast.as_mut() else {
+                    return;
+                };
+                view.toggle(i);
+                match view.target(i) {
+                    Some((path, line, column)) if path.is_file() => {
+                        let (line, column) = (line.max(1) - 1, column.max(1) - 1);
+                        if let Err(e) = self.open_at(&path, line as usize, column as usize) {
+                            self.status = format!("{}: {e}", path.display());
+                        }
+                    }
+                    Some((path, ..)) => {
+                        self.status = format!("{} is not on this machine", path.display());
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -26360,6 +26391,260 @@ impl App {
         };
     }
 
+    /// Run `codeql` with `args` and return what it printed on stdout; a
+    /// failure is read as [`Self::codeql_command`] reads it.
+    fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
+    }
+
+    /// What a contextual query (AST, CFG) runs on (#578): the open file,
+    /// the current database, its language, and the file's name in that
+    /// database's source archive. Says what is missing when something is.
+    fn codeql_contextual_target(
+        &mut self,
+    ) -> Option<(PathBuf, crate::codeql_db::DbEntry, String, String)> {
+        let Some(file) = self.editor.path.clone() else {
+            self.status = String::from("Open a source file from the CodeQL database first");
+            return None;
+        };
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Select a CodeQL database first");
+            return None;
+        };
+        let Some(lang) = db.language.clone() else {
+            self.status = format!("CodeQL database {} does not say its language", db.name);
+            return None;
+        };
+        // The places this database's source can be open from: its `src`
+        // folder and its extracted `src.zip`s, which both mirror the
+        // absolute paths it was built from.
+        let prefix = crate::codeql_db::source_cache_prefix(&db.path);
+        let mut roots: Vec<PathBuf> = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|e| e.path())
+            .collect();
+        roots.push(db.path.join("src"));
+        let archive = crate::codeql_ast::archive_path(&file, &roots);
+        Some((file, db, lang, archive))
+    }
+
+    /// A fresh folder for one contextual query run of `kind`.
+    fn codeql_contextual_dir(kind: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        croft_cache_dir()
+            .join("codeql")
+            .join(kind)
+            .join(stamp.to_string())
+    }
+
+    /// Resolve `lang`'s contextual query tagged `tag`, and make sure its
+    /// pack's dependencies are there (#578).
+    fn codeql_contextual_query(
+        program: &Path,
+        dir: &Path,
+        lang: &str,
+        tag: &str,
+    ) -> Result<PathBuf, String> {
+        use crate::codeql_ast as ast;
+        let suite = dir.join(format!("{tag}.qls"));
+        std::fs::write(&suite, ast::contextual_suite(lang, tag))
+            .map_err(|e| format!("{}: {e}", suite.display()))?;
+        let listed = Self::codeql_stdout(program, &ast::resolve_args(&suite))?;
+        let query = ast::first_query(&listed).ok_or_else(|| {
+            format!(
+                "no {tag} query for {lang}; download the codeql/{lang}-all pack \
+                 with CodeQL: Download Packs"
+            )
+        })?;
+        // A library pack downloaded on its own may lack what it depends
+        // on; installing is quick when nothing is missing.
+        if let Some(pack) = ast::pack_dir(&query) {
+            Self::codeql_command(program, &crate::codeql_query::pack_install_args(&pack))?;
+        }
+        Ok(query)
+    }
+
+    /// CodeQL: View CFG (#578): the control flow graph of the function at
+    /// the cursor, from the current database, opened as a document.
+    fn view_codeql_cfg(&mut self) {
+        use crate::codeql_ast as ast;
+        if self.codeql_cfg_job.is_some() {
+            self.status = String::from("A control flow graph is already being read");
+            return;
+        }
+        let Some((file, db, lang, archive)) = self.codeql_contextual_target() else {
+            return;
+        };
+        let (line, column) = (self.editor.cursor_row + 1, self.editor.cursor_col + 1);
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let title = format!("{name}:{line}:{column} in {}", db.name);
+        let dir = Self::codeql_contextual_dir("cfg");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = || -> Result<PathBuf, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let query = Self::codeql_contextual_query(&program, &dir, &lang, "print-cfg")?;
+                let (f, l, c) = (
+                    dir.join("file.csv"),
+                    dir.join("line.csv"),
+                    dir.join("column.csv"),
+                );
+                std::fs::write(&f, ast::selected_file_csv(&archive)).map_err(io)?;
+                std::fs::write(&l, format!("{line}\n")).map_err(io)?;
+                std::fs::write(&c, format!("{column}\n")).map_err(io)?;
+                let bqrs = dir.join("cfg.bqrs");
+                Self::codeql_command(
+                    &program,
+                    &crate::codeql_cfg::run_args(&query, &db.path, &f, &l, &c, &bqrs),
+                )?;
+                let json = dir.join("cfg.json");
+                Self::codeql_command(&program, &ast::decode_args(&bqrs, &json))?;
+                let cfg =
+                    crate::codeql_cfg::parse_cfg(&std::fs::read_to_string(&json).map_err(io)?)?;
+                let doc = dir.join("cfg.md");
+                std::fs::write(&doc, crate::codeql_cfg::render_document(&cfg, &title))
+                    .map_err(io)?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o444));
+                Ok(doc)
+            };
+            let _ = tx.send(read());
+        });
+        self.status = format!("Reading the control flow graph at {name}:{line}\u{2026}");
+        self.codeql_cfg_job = Some(rx);
+    }
+
+    /// Open a finished View CFG document (#578), or say why there is none.
+    pub fn drain_codeql_cfg(&mut self) -> bool {
+        let Some(rx) = self.codeql_cfg_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the CFG read stopped unexpectedly"))
+            }
+        };
+        self.codeql_cfg_job = None;
+        self.status = match outcome {
+            Ok(doc) => match self.editor.open(&doc) {
+                Ok(()) => String::from("Control flow graph"),
+                Err(e) => format!("{}: {e}", doc.display()),
+            },
+            Err(why) => format!("Could not read the control flow graph: {why}"),
+        };
+        true
+    }
+
+    /// CodeQL: View AST (#578): the AST of the open file, read from the
+    /// current database with its language's print-AST query, off the UI
+    /// thread; [`Self::drain_codeql_ast`] shows it in the AST Viewer.
+    fn view_codeql_ast(&mut self) {
+        use crate::codeql_ast as ast;
+        if self.codeql_ast_job.is_some() {
+            self.status = String::from("An AST is already being read");
+            return;
+        }
+        let Some((file, db, lang, archive)) = self.codeql_contextual_target() else {
+            return;
+        };
+        let dir = Self::codeql_contextual_dir("ast");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (db_path, csv) = (db.path.clone(), ast::selected_file_csv(&archive));
+        let shown = archive.clone();
+        std::thread::spawn(move || {
+            let read = || -> Result<ast::AstTree, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let query = Self::codeql_contextual_query(&program, &dir, &lang, "print-ast")?;
+                let selected = dir.join("selected-file.csv");
+                std::fs::write(&selected, csv).map_err(io)?;
+                let bqrs = dir.join("ast.bqrs");
+                Self::codeql_command(&program, &ast::run_args(&query, &db_path, &selected, &bqrs))?;
+                let json = dir.join("ast.json");
+                Self::codeql_command(&program, &ast::decode_args(&bqrs, &json))?;
+                let tree = ast::parse_graph(&std::fs::read_to_string(&json).map_err(io)?)?;
+                if tree.roots.is_empty() {
+                    return Err(format!("the database has no AST for {shown}"));
+                }
+                Ok(tree)
+            };
+            let _ = tx.send(read());
+        });
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = format!("Reading the AST of {name} from {}\u{2026}", db.name);
+        self.codeql_ast_job = Some((
+            rx,
+            ast::AstView {
+                file,
+                archive,
+                database: db.name,
+                ..ast::AstView::default()
+            },
+        ));
+    }
+
+    /// Show a finished AST read in the AST Viewer (#578), or say why there
+    /// is none.
+    pub fn drain_codeql_ast(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_ast_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the AST read stopped unexpectedly"))
+            }
+        };
+        let Some((_, mut view)) = self.codeql_ast_job.take() else {
+            return false;
+        };
+        match outcome {
+            Ok(tree) => {
+                let name = view
+                    .file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.status = format!("AST of {name}: {} nodes", tree.nodes.len());
+                view.tree = tree;
+                self.codeql.ast = Some(view);
+                self.codeql
+                    .collapsed
+                    .remove(&crate::widgets::codeql::Section::AstViewer);
+            }
+            Err(why) => self.status = format!("Could not read the AST: {why}"),
+        }
+        true
+    }
+
     /// Run `codeql` with `args` and wait. A failure is the reason and the
     /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
@@ -26455,18 +26740,57 @@ impl App {
         let Some(queries) = self.codeql.queries.get(pack).map(|p| p.queries.clone()) else {
             return;
         };
+        self.run_codeql_batch(queries, "That pack has no queries");
+    }
+
+    /// Run `queries` one after another on the current database, through
+    /// the queue a pack run uses; `none` is what to say when there are none.
+    fn run_codeql_batch(&mut self, queries: Vec<PathBuf>, none: &str) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         if store.current.and_then(|i| store.databases.get(i)).is_none() {
             self.status = String::from("Add a CodeQL database and select it first");
             return;
         }
         if queries.is_empty() {
-            self.status = String::from("That pack has no queries");
+            self.status = none.to_string();
             return;
         }
         self.codeql_batch = (queries.len(), 0);
         self.codeql_run_queue = queries.into();
         self.start_next_queued_codeql();
+    }
+
+    /// CodeQL: Run All Queries in Workspace (#578): every query the side
+    /// bar's Queries section lists, pack after pack.
+    fn run_all_codeql_queries(&mut self) {
+        self.refresh_codeql_queries();
+        let queries: Vec<PathBuf> = self
+            .codeql
+            .queries
+            .iter()
+            .flat_map(|p| p.queries.iter().cloned())
+            .collect();
+        self.run_codeql_batch(queries, "No CodeQL queries in the workspace");
+    }
+
+    /// CodeQL: Run Queries in Selected Files (#578): the `.ql` files
+    /// selected in the Explorer, and every query under a selected folder.
+    fn run_selected_codeql_queries(&mut self) {
+        let mut paths: Vec<PathBuf> = self.tree.marked.iter().cloned().collect();
+        if paths.is_empty()
+            && let Some(p) = self.tree.selected_path()
+        {
+            paths.push(p.to_path_buf());
+        }
+        let queries = crate::codeql_query::queries_in(&paths);
+        self.run_codeql_batch(
+            queries,
+            "Select .ql files, or folders holding them, in the Explorer first",
+        );
     }
 
     /// Start the pack run's next query, read from disk as the side-bar rows
@@ -46187,6 +46511,10 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlViewCfg => self.view_codeql_cfg(),
+            Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
+            Cmd::CodeqlRunSelectedQueries => self.run_selected_codeql_queries(),
             Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
             Cmd::CodeqlAcceptTestOutput => self.accept_codeql_test_output(),
             Cmd::CodeqlFocusSideBar => {
@@ -65246,6 +65574,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
         let codeql_changed = app.drain_codeql_run()
+            | app.drain_codeql_ast()
+            | app.drain_codeql_cfg()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()
