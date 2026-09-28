@@ -190,6 +190,30 @@ impl DbJob {
     }
 }
 
+/// `codeql` arguments installing the dependencies of the pack in `dir` (VS
+/// Code's "CodeQL: Install Pack Dependencies").
+pub fn pack_install_args(dir: &Path) -> Vec<String> {
+    vec![String::from("pack"), String::from("install"), path(dir)]
+}
+
+/// `codeql` arguments downloading `packs` from the registry (VS Code's
+/// "CodeQL: Download Packs").
+pub fn pack_download_args(packs: &[String]) -> Vec<String> {
+    let mut args = vec![String::from("pack"), String::from("download")];
+    args.extend(packs.iter().cloned());
+    args
+}
+
+/// The pack references in what the user typed: separated by spaces or
+/// commas, each `scope/name`, optionally with `@version`.
+pub fn parse_pack_list(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -735,6 +759,29 @@ mod tests {
             DbJob::TrimCache.finished("app", Err(String::from("locked"))),
             "Could not clean up the cache of CodeQL database app: locked"
         );
+    }
+
+    #[test]
+    fn pack_commands_install_the_packs_dependencies_or_download_the_named_packs() {
+        assert_eq!(
+            pack_install_args(Path::new("/w/pack")),
+            vec!["pack", "install", "/w/pack"]
+        );
+        let packs = parse_pack_list(" codeql/java-queries, codeql/python-all@1.0.0 ,,");
+        assert_eq!(
+            packs,
+            vec!["codeql/java-queries", "codeql/python-all@1.0.0"]
+        );
+        assert_eq!(
+            pack_download_args(&packs),
+            vec![
+                "pack",
+                "download",
+                "codeql/java-queries",
+                "codeql/python-all@1.0.0"
+            ]
+        );
+        assert!(parse_pack_list("  , ").is_empty());
     }
 
     #[test]

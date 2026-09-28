@@ -55633,6 +55633,100 @@ fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn codeql_pack_commands_install_dependencies_and_download_packs() {
+    // #578: "Install Pack Dependencies" runs `codeql pack install` on the
+    // selected pack's folder; "Download Packs" asks which packs and runs
+    // `codeql pack download` on them. Both off the UI thread.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("pack")).unwrap();
+        std::fs::write(tmp.path().join("pack/qlpack.yml"), "name: acme/rust\n").unwrap();
+        std::fs::write(tmp.path().join("pack/a.ql"), "select 1").unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "Select a query pack or one of its queries in the CodeQL side bar first"
+        );
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| {
+                matches!(
+                    l,
+                    crate::widgets::codeql::Line::Action(
+                        crate::widgets::codeql::Action::RunQuery(0, 0),
+                        _
+                    )
+                )
+            })
+            .expect("a.ql is listed");
+        app.codeql.selected = row;
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "Installing the dependencies of acme/rust\u{2026}"
+        );
+        app.run_command(Command::CodeqlInstallPackDependencies);
+        assert_eq!(
+            app.status,
+            "A CodeQL pack install or download is already running"
+        );
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_pack_job() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pack job never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait(&mut app);
+        assert_eq!(app.status, "Installed the dependencies of acme/rust");
+
+        app.run_command(Command::CodeqlDownloadPacks);
+        for c in "codeql/java-queries codeql/python-all@1.0.0".chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "Downloaded codeql/java-queries, codeql/python-all@1.0.0"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            vec![
+                format!("pack install {}", tmp.path().join("pack").display()),
+                String::from("pack download codeql/java-queries codeql/python-all@1.0.0"),
+            ]
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: no such pack");
+        app.run_command(Command::CodeqlDownloadPacks);
+        for c in "acme/missing".chars() {
+            app.input_prompt.as_mut().unwrap().push_char(c);
+        }
+        app.submit_input_prompt();
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not download acme/missing: ERROR: no such pack"
+        );
+    });
+}
+
 #[test]
 fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());

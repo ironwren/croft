@@ -3158,6 +3158,9 @@ pub struct App {
     /// The evaluator log summary being generated (#578): where the outcome
     /// arrives, and the summary file to open once it lands.
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
+    /// The pack install or download in flight (#578): where its outcome
+    /// arrives, and the status lines for success and failure.
+    codeql_pack_job: Option<CodeqlPackJob>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5425,6 +5428,7 @@ impl App {
             codeql_upgrade: None,
             codeql_version: None,
             codeql_log_summary: None,
+            codeql_pack_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23456,6 +23460,99 @@ impl App {
         ));
     }
 
+    /// VS Code's "CodeQL: Install Pack Dependencies" for pack `pack` of the
+    /// Queries section (#578): `codeql pack install` on its folder.
+    fn install_codeql_pack_dependencies(&mut self, pack: usize) {
+        let Some(p) = self.codeql.queries.get(pack) else {
+            return;
+        };
+        if p.name == crate::codeql_query::NO_PACK {
+            self.status =
+                String::from("These queries are in no pack, so they have no dependencies");
+            return;
+        }
+        let (name, args) = (
+            p.name.clone(),
+            crate::codeql_query::pack_install_args(&p.dir),
+        );
+        self.start_codeql_pack_job(
+            args,
+            format!("Installing the dependencies of {name}\u{2026}"),
+            format!("Installed the dependencies of {name}"),
+            format!("Could not install the dependencies of {name}"),
+        );
+    }
+
+    /// Ask which packs "CodeQL: Download Packs" fetches (#578).
+    fn prompt_download_codeql_packs(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlDownloadPacks,
+            String::from("Download Packs"),
+            "packs to download, e.g. codeql/java-queries codeql/python-all@1.0.0",
+        ));
+    }
+
+    fn submit_download_codeql_packs(&mut self, value: &str) {
+        let packs = crate::codeql_query::parse_pack_list(value);
+        if packs.is_empty() {
+            self.status = String::from("Name at least one pack to download");
+            return;
+        }
+        let what = packs.join(", ");
+        self.start_codeql_pack_job(
+            crate::codeql_query::pack_download_args(&packs),
+            format!("Downloading {what}\u{2026}"),
+            format!("Downloaded {what}"),
+            format!("Could not download {what}"),
+        );
+    }
+
+    /// Run a `codeql pack` command on a worker thread (#578); one at a
+    /// time, since installs and downloads write the same package cache.
+    fn start_codeql_pack_job(
+        &mut self,
+        args: Vec<String>,
+        running: String,
+        done: String,
+        failed: String,
+    ) {
+        if self.codeql_pack_job.is_some() {
+            self.status = String::from("A CodeQL pack install or download is already running");
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = running;
+        self.codeql_pack_job = Some((rx, done, failed));
+    }
+
+    /// Collect a finished pack install or download (#578) onto the status
+    /// line.
+    pub fn drain_codeql_pack_job(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_pack_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the pack command stopped unexpectedly"))
+            }
+        };
+        let Some((_, done, failed)) = self.codeql_pack_job.take() else {
+            return false;
+        };
+        self.status = match outcome {
+            Ok(()) => done,
+            Err(why) => format!("{failed}: {why}"),
+        };
+        true
+    }
+
     fn submit_add_codeql_variant_owner(&mut self, value: &str) {
         let saved = self.edit_codeql_variant(|c| {
             c.add_owner(value)
@@ -28914,6 +29011,10 @@ impl App {
             InputPurpose::CodeqlAddVariantOwner => {
                 self.close_input_prompt();
                 self.submit_add_codeql_variant_owner(&value);
+            }
+            InputPurpose::CodeqlDownloadPacks => {
+                self.close_input_prompt();
+                self.submit_download_codeql_packs(&value);
             }
             InputPurpose::CodeqlRenameVariantList { name } => {
                 self.close_input_prompt();
@@ -44298,6 +44399,15 @@ impl App {
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
             Cmd::CodeqlCopyVersion => self.copy_codeql_version(),
+            Cmd::CodeqlInstallPackDependencies => match self.codeql.selected_pack() {
+                Some(p) => self.install_codeql_pack_dependencies(p),
+                None => {
+                    self.status = String::from(
+                        "Select a query pack or one of its queries in the CodeQL side bar first",
+                    );
+                }
+            },
+            Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
             Cmd::CodeqlShowEvaluatorLog => {
                 if let Some(i) = self.current_codeql_history() {
                     self.show_codeql_evaluator_log(i);
@@ -61420,6 +61530,14 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
+/// A `codeql pack` install or download in flight (#578): where its outcome
+/// arrives, and the status lines for success and for failure.
+type CodeqlPackJob = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    String,
+);
+
 /// A CodeQL database upgrade or cache cleanup in flight (#578): where its
 /// outcome arrives, which job it is, and the database's name and folder.
 type CodeqlUpgrade = (
@@ -62872,7 +62990,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let codeql_changed = app.drain_codeql_run()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
-            | app.drain_codeql_log_summary();
+            | app.drain_codeql_log_summary()
+            | app.drain_codeql_pack_job();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
