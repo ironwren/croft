@@ -25412,6 +25412,15 @@ impl App {
             return;
         }
         let dest = self.typed_path(value);
+        // Open the results first: a missing or unreadable run then fails
+        // before anything is created at the destination.
+        let mut src = match std::fs::File::open(output) {
+            Ok(src) => src,
+            Err(e) => {
+                self.status = format!("Could not read the results at {}: {e}", output.display());
+                return;
+            }
+        };
         // `create_new` refuses an existing file (or a dangling symlink) in
         // the same step that creates it, so nothing can slip in between a
         // check and the copy.
@@ -25433,15 +25442,14 @@ impl App {
                 return;
             }
         };
-        let copied =
-            std::fs::File::open(output).and_then(|mut src| std::io::copy(&mut src, &mut file));
-        self.status = match copied {
+        // A copy failing midway leaves the partial file in place: removing
+        // it by name could delete a file another process put there since.
+        self.status = match std::io::copy(&mut src, &mut file) {
             Ok(_) => format!("Exported results to {}", dest.display()),
-            Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(&dest);
-                format!("Could not export the results to {}: {e}", dest.display())
-            }
+            Err(e) => format!(
+                "Could not finish exporting to {} ({e}); the file there is incomplete",
+                dest.display()
+            ),
         };
     }
 

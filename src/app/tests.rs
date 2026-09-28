@@ -56669,6 +56669,19 @@ fn codeql_results_are_exported_to_a_new_file_only() {
             assert!(app.status.contains("already exists"), "{}", app.status);
             assert!(!target.exists(), "the link's target was not created");
         }
+        // Results gone while the prompt was open: nothing is created at
+        // the destination.
+        let fresh = app.workspace_root().join("fresh.csv");
+        app.run_command(Command::CodeqlExportResults);
+        app.input_prompt.as_mut().unwrap().value = fresh.display().to_string();
+        std::fs::remove_file(App::codeql_results_dir().join("2-q/results.csv")).unwrap();
+        app.submit_input_prompt();
+        assert!(
+            app.status.starts_with("Could not read the results at "),
+            "{}",
+            app.status
+        );
+        assert!(!fresh.exists(), "no file was created for a failed export");
         assert_eq!(
             Command::from_id("codeql_export_results"),
             Some(Command::CodeqlExportResults)
