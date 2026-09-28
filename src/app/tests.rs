@@ -61104,6 +61104,7 @@ echo "gh $*" >> '{log}'
 case "$2" in
   */repos/a/b) echo '{{"analysis_status": "succeeded", "artifact_url": "http://127.0.0.1:{port}/ab.zip", "database_commit_sha": "abc"}}' ;;
   */repos/c/d) echo '{{"analysis_status": "succeeded", "artifact_url": "http://127.0.0.1:{port}/cd.zip"}}' ;;
+  create) echo "- Creating gist"; echo "https://gist.github.com/me/0123" ;;
   *) echo 'HTTP 404: Not Found' >&2; exit 1 ;;
 esac
 "#,
@@ -61224,6 +61225,85 @@ out="${{4#--output=}}"; printf '"name","count"\n"x","1"\n' > "$out"
             gh_calls + 1,
             "only the failed repository is asked again"
         );
+
+        // Export: Markdown into a folder, offered in the workspace.
+        app.run_command(Command::CodeqlExportVariantResults);
+        let offered = tmp.path().join("codeql-variant-analysis-9");
+        assert_eq!(
+            app.input_prompt.as_ref().map(|p| p.value.clone()),
+            Some(offered.display().to_string())
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let export = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !app.drain_codeql_variant_export() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the export never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        export(&mut app);
+        assert!(
+            app.status
+                .starts_with(&format!("Exported 2 repositories to {}", offered.display())),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(offered.join("_summary.md").as_path())
+        );
+        let summary = std::fs::read_to_string(offered.join("_summary.md")).unwrap();
+        assert!(summary.contains("| [a/b](a-b.md) | 1 |"), "{summary}");
+        assert!(summary.contains("| [c/d](c-d.md) | 1 |"), "{summary}");
+        let ab = std::fs::read_to_string(offered.join("a-b.md")).unwrap();
+        assert!(
+            ab.contains("- found it ([src/x.py:4](https://github.com/a/b/blob/abc/src/x.py#L4))"),
+            "{ab}"
+        );
+        assert!(
+            std::fs::read_to_string(offered.join("c-d.md"))
+                .unwrap()
+                .contains("| x | 1 |")
+        );
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "export reuses the downloads"
+        );
+
+        // Or a secret gist, `_summary.md` first.
+        app.run_command(Command::CodeqlExportVariantResults);
+        if let Some(p) = app.input_prompt.as_mut() {
+            p.value = String::from("gist");
+        }
+        let _ = std::fs::write(&log, "");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        export(&mut app);
+        assert!(
+            app.status
+                .starts_with("Exported 2 repositories to https://gist.github.com/me/0123"),
+            "{}",
+            app.status
+        );
+        let asked = std::fs::read_to_string(&log).unwrap();
+        let gist = asked
+            .lines()
+            .find(|l| l.starts_with("gh gist create"))
+            .unwrap_or_default();
+        assert!(
+            gist.contains("--desc Find.ql (variant analysis 9 of 2 repositories)"),
+            "{gist}"
+        );
+        let first_file = gist
+            .split_whitespace()
+            .find(|w| w.ends_with(".md"))
+            .unwrap_or_default();
+        assert!(first_file.ends_with("/_summary.md"), "{gist}");
     });
 }
 
