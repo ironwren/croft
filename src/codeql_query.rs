@@ -89,6 +89,81 @@ pub fn upgrade_args(db: &Path) -> Vec<String> {
     vec![String::from("database"), String::from("upgrade"), path(db)]
 }
 
+/// A job that rewrites a database in place (#578): VS Code's "CodeQL:
+/// Upgrade Database" and its three cache commands, which all run `codeql
+/// database cleanup` with a different `--cache-cleanup` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbJob {
+    Upgrade,
+    ClearCache,
+    TrimCache,
+    TrimCacheToOverlay,
+}
+
+impl DbJob {
+    /// The `codeql` arguments running this job on `db`.
+    pub fn args(self, db: &Path) -> Vec<String> {
+        let mode = match self {
+            DbJob::Upgrade => return upgrade_args(db),
+            DbJob::ClearCache => "clear",
+            DbJob::TrimCache => "trim",
+            DbJob::TrimCacheToOverlay => "overlay",
+        };
+        vec![
+            String::from("database"),
+            String::from("cleanup"),
+            format!("--cache-cleanup={mode}"),
+            path(db),
+        ]
+    }
+
+    /// What the job is, for "already running" and "wait for" messages.
+    pub fn noun(self) -> &'static str {
+        match self {
+            DbJob::Upgrade => "upgrade",
+            _ => "cache cleanup",
+        }
+    }
+
+    /// What the job does, after "before" in the message refusing it while a
+    /// query runs.
+    pub fn gerund(self) -> &'static str {
+        match self {
+            DbJob::Upgrade => "upgrading",
+            _ => "cleaning up the cache",
+        }
+    }
+
+    /// The status line while the job runs on database `name`.
+    pub fn running(self, name: &str) -> String {
+        match self {
+            DbJob::Upgrade => format!("Upgrading CodeQL database {name}\u{2026}"),
+            DbJob::ClearCache => format!("Clearing the cache of CodeQL database {name}\u{2026}"),
+            DbJob::TrimCache | DbJob::TrimCacheToOverlay => {
+                format!("Trimming the cache of CodeQL database {name}\u{2026}")
+            }
+        }
+    }
+
+    /// The status line once the job has finished: `Ok` or the CLI's error.
+    pub fn finished(self, name: &str, outcome: Result<(), String>) -> String {
+        match (self, outcome) {
+            (DbJob::Upgrade, Ok(())) => format!("Upgraded CodeQL database {name}"),
+            (DbJob::ClearCache, Ok(())) => format!("Cleared the cache of CodeQL database {name}"),
+            (DbJob::TrimCache, Ok(())) => format!("Trimmed the cache of CodeQL database {name}"),
+            (DbJob::TrimCacheToOverlay, Ok(())) => {
+                format!("Trimmed the cache of CodeQL database {name} to its overlay base")
+            }
+            (DbJob::Upgrade, Err(why)) => {
+                format!("Could not upgrade CodeQL database {name}: {why}")
+            }
+            (_, Err(why)) => {
+                format!("Could not clean up the cache of CodeQL database {name}: {why}")
+            }
+        }
+    }
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -605,6 +680,36 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_jobs_run_database_cleanup_in_their_mode() {
+        let db = Path::new("/dbs/app");
+        assert_eq!(DbJob::Upgrade.args(db), upgrade_args(db));
+        for (job, mode) in [
+            (DbJob::ClearCache, "clear"),
+            (DbJob::TrimCache, "trim"),
+            (DbJob::TrimCacheToOverlay, "overlay"),
+        ] {
+            assert_eq!(
+                job.args(db),
+                vec![
+                    String::from("database"),
+                    String::from("cleanup"),
+                    format!("--cache-cleanup={mode}"),
+                    String::from("/dbs/app"),
+                ]
+            );
+            assert_eq!(job.noun(), "cache cleanup");
+        }
+        assert_eq!(
+            DbJob::TrimCacheToOverlay.finished("app", Ok(())),
+            "Trimmed the cache of CodeQL database app to its overlay base"
+        );
+        assert_eq!(
+            DbJob::TrimCache.finished("app", Err(String::from("locked"))),
+            "Could not clean up the cache of CodeQL database app: locked"
+        );
+    }
 
     #[test]
     fn version_information_names_croft_the_cli_and_the_platform() {

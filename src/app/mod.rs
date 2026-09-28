@@ -3150,7 +3150,7 @@ pub struct App {
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
-    /// The database upgrade in flight (#578).
+    /// The database upgrade or cache cleanup in flight (#578).
     codeql_upgrade: Option<CodeqlUpgrade>,
     /// The `codeql version` call behind "CodeQL: Copy Version Information"
     /// (#578): its bare version number, or why it could not be read.
@@ -23849,12 +23849,23 @@ impl App {
     /// [`Self::drain_codeql_upgrade`] collects it. Refused while a query or
     /// another upgrade runs: either would read a database being rewritten.
     fn upgrade_codeql_database(&mut self, index: usize) {
-        if self.codeql_upgrade.is_some() {
-            self.status = String::from("A CodeQL database upgrade is already running");
+        self.start_codeql_db_job(index, crate::codeql_query::DbJob::Upgrade);
+    }
+
+    /// Run `job` on database `index` on a worker thread (#578): an upgrade,
+    /// or VS Code's "CodeQL: Clear Cache", "Trim Cache" and "Trim Cache to
+    /// Overlay Base". One at a time, never beside a query run, since each
+    /// rewrites the database a query would read.
+    fn start_codeql_db_job(&mut self, index: usize, job: crate::codeql_query::DbJob) {
+        if let Some((_, running, _, _)) = self.codeql_upgrade.as_ref() {
+            self.status = format!("A CodeQL database {} is already running", running.noun());
             return;
         }
         if self.codeql_run.is_some() {
-            self.status = String::from("Wait for the CodeQL query run to finish before upgrading");
+            self.status = format!(
+                "Wait for the CodeQL query run to finish before {}",
+                job.gerund()
+            );
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
@@ -23865,32 +23876,29 @@ impl App {
         let path = db.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let args = crate::codeql_query::upgrade_args(&path);
-            let _ = tx.send(Self::codeql_command(&program, &args));
+            let _ = tx.send(Self::codeql_command(&program, &job.args(&path)));
         });
-        self.status = format!("Upgrading CodeQL database {}\u{2026}", db.name);
-        self.codeql_upgrade = Some((rx, db.name, db.path));
+        self.status = job.running(&db.name);
+        self.codeql_upgrade = Some((rx, job, db.name, db.path));
     }
 
-    /// Collect a finished database upgrade (#578) onto the status line.
+    /// Collect a finished database upgrade or cache cleanup (#578) onto the
+    /// status line.
     pub fn drain_codeql_upgrade(&mut self) -> bool {
-        let Some((rx, _, _)) = self.codeql_upgrade.as_ref() else {
+        let Some((rx, _, _, _)) = self.codeql_upgrade.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
             Ok(outcome) => outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(String::from("the upgrade stopped unexpectedly"))
+                Err(String::from("the job stopped unexpectedly"))
             }
         };
-        let Some((_, name, _)) = self.codeql_upgrade.take() else {
+        let Some((_, job, name, _)) = self.codeql_upgrade.take() else {
             return false;
         };
-        self.status = match outcome {
-            Ok(()) => format!("Upgraded CodeQL database {name}"),
-            Err(why) => format!("Could not upgrade CodeQL database {name}: {why}"),
-        };
+        self.status = job.finished(&name, outcome);
         true
     }
 
@@ -24021,7 +24029,7 @@ impl App {
     fn unused_codeql_databases(&self) -> Vec<PathBuf> {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
-        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, p)| p);
+        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, _, p)| p);
         store
             .databases
             .iter()
@@ -24410,8 +24418,8 @@ impl App {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
-        if self.codeql_upgrade.is_some() {
-            self.status = String::from("Wait for the CodeQL database upgrade to finish");
+        if let Some((_, job, _, _)) = self.codeql_upgrade.as_ref() {
+            self.status = format!("Wait for the CodeQL database {} to finish", job.noun());
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
@@ -44155,6 +44163,17 @@ impl App {
                     self.upgrade_codeql_database(i);
                 }
             }
+            Cmd::CodeqlClearCache | Cmd::CodeqlTrimCache | Cmd::CodeqlTrimCacheToOverlay => {
+                use crate::codeql_query::DbJob;
+                let job = match cmd {
+                    Cmd::CodeqlClearCache => DbJob::ClearCache,
+                    Cmd::CodeqlTrimCache => DbJob::TrimCache,
+                    _ => DbJob::TrimCacheToOverlay,
+                };
+                if let Some(i) = self.current_codeql_database() {
+                    self.start_codeql_db_job(i, job);
+                }
+            }
             Cmd::CodeqlAddDatabaseSource => {
                 if let Some(i) = self.current_codeql_database() {
                     self.add_codeql_database_source(i);
@@ -61300,10 +61319,11 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
-/// A CodeQL database upgrade in flight (#578): where its outcome arrives,
-/// and the database's name and folder.
+/// A CodeQL database upgrade or cache cleanup in flight (#578): where its
+/// outcome arrives, which job it is, and the database's name and folder.
 type CodeqlUpgrade = (
     std::sync::mpsc::Receiver<Result<(), String>>,
+    crate::codeql_query::DbJob,
     String,
     PathBuf,
 );

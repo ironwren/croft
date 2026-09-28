@@ -56293,6 +56293,80 @@ fn upgrading_a_codeql_database_runs_the_cli_off_the_ui_thread() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn the_codeql_cache_commands_clean_up_the_selected_database() {
+    // #578: VS Code's "CodeQL: Clear Cache", "Trim Cache" and "Trim Cache
+    // to Overlay Base" run `codeql database cleanup` on the selected
+    // database, one job at a time and never beside a query run.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.open_codeql_view();
+        app.codeql.select_database(0);
+        let db = tmp.path().join("dbs/app");
+        app.run_command(Command::CodeqlClearCache);
+        assert_eq!(
+            app.status,
+            "Clearing the cache of CodeQL database app\u{2026}"
+        );
+        app.run_command(Command::CodeqlUpgradeDatabase);
+        assert_eq!(
+            app.status,
+            "A CodeQL database cache cleanup is already running"
+        );
+        app.run_command(Command::CodeqlRunQuery);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL database cache cleanup to finish"
+        );
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Cleared the cache of CodeQL database app");
+        app.run_command(Command::CodeqlTrimCache);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(app.status, "Trimmed the cache of CodeQL database app");
+        app.run_command(Command::CodeqlTrimCacheToOverlay);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Trimmed the cache of CodeQL database app to its overlay base"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let expected: Vec<String> = ["clear", "trim", "overlay"]
+            .iter()
+            .map(|m| format!("database cleanup --cache-cleanup={m} {}", db.display()))
+            .collect();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
+
+        app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: the cache is locked");
+        app.run_command(Command::CodeqlTrimCache);
+        wait_for_codeql_upgrade(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not clean up the cache of CodeQL database app: ERROR: the cache is locked"
+        );
+
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        app.run_command(Command::CodeqlClearCache);
+        assert_eq!(
+            app.status,
+            "Wait for the CodeQL query run to finish before cleaning up the cache"
+        );
+        assert!(app.codeql_upgrade.is_none());
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_trim_cache_to_overlay_base"),
+            Some(Command::CodeqlTrimCacheToOverlay)
+        );
+    });
+}
+
 #[test]
 fn a_codeql_databases_source_is_added_to_the_workspace() {
     // #578: VS Code's "CodeQL: Add Database Source to Workspace". A `src`
