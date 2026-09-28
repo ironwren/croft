@@ -2078,6 +2078,9 @@ struct ServerRestarts {
     /// pass restarts them as a set again: a non-empty list is never re-probed,
     /// and a lone missing server cannot be added to documents the others hold.
     incomplete: std::collections::HashSet<ClientKey>,
+    /// Set by [`WorkerState::restart_dead_servers`] for the respawn it has
+    /// already counted, so `ensure_clients` does not count it again.
+    prepaid: bool,
     /// Raised after a restart; the app polls it to re-open its tabs.
     restarted: Arc<AtomicBool>,
 }
@@ -2687,6 +2690,7 @@ impl WorkerState {
             // Respawn as a re-probe, not a first attempt, so a set that comes
             // back short is marked incomplete and tried again.
             self.clients.insert(key.clone(), Vec::new());
+            self.restarts.prepaid = true;
             self.ensure_clients(key.0, &key.1).await;
             self.restarts.restarted.store(true, Ordering::Relaxed);
         }
@@ -2701,12 +2705,30 @@ impl WorkerState {
         let first_attempt = !self.clients.contains_key(&key);
         // A key whose servers crash-looped stays down (#694): the empty-list
         // re-probe below would otherwise respawn them on every open.
-        let should_try = !self.restarts.gave_up.contains(&key)
-            && (first_attempt
-                || self
-                    .clients
-                    .get(&key)
-                    .is_some_and(|clients| clients.is_empty()));
+        let empty = !first_attempt
+            && self
+                .clients
+                .get(&key)
+                .is_some_and(|clients| clients.is_empty());
+        let prepaid = std::mem::take(&mut self.restarts.prepaid);
+        let mut should_try = !self.restarts.gave_up.contains(&key) && (first_attempt || empty);
+        // An empty list left by a restart whose respawn failed is re-probed
+        // by every request. Each re-probe is another restart and spends the
+        // same budget, so a server that never comes back stops being launched.
+        if should_try
+            && empty
+            && !prepaid
+            && self.restarts.attempts.contains_key(&key)
+            && !self.restarts.try_restart(&key, std::time::Instant::now())
+        {
+            let msg = format!(
+                "language servers for {} did not come back after {MAX_RESTARTS} restarts in 10 minutes; leaving them off until croft restarts or the workspace reopens",
+                key.1.display()
+            );
+            log_file::log(&format!("lsp restart: {msg}"));
+            crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+            should_try = false;
+        }
         if should_try {
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             // Spawn every server for this root concurrently rather than awaiting
@@ -9394,6 +9416,7 @@ while True:
                 provision: None,
             },
         );
+        state.restarts.attempts.clear();
         state.clients.insert(key.clone(), Vec::new());
         handle.block_on(state.ensure_clients(key.0, &key.1));
         assert_eq!(started(4).len(), 4);
@@ -9407,6 +9430,22 @@ while True:
             state.restarts.incomplete.contains(&key),
             "a restart that comes back short again must stay marked"
         );
+
+        // A restart that brought nothing back leaves an empty list, which
+        // every request re-probes. Those re-probes spend the restart budget,
+        // so the servers stop being launched once it is gone.
+        state.restarts.incomplete.remove(&key);
+        let before = started(0).len();
+        for _ in 0..MAX_RESTARTS + 2 {
+            state.clients.insert(key.clone(), Vec::new());
+            handle.block_on(state.ensure_clients(key.0, &key.1));
+        }
+        let launched = started(0).len() - before;
+        assert!(
+            launched < MAX_RESTARTS + 2,
+            "re-probes past the budget must not launch servers ({launched})"
+        );
+        assert!(state.restarts.gave_up.contains(&key));
         handle.block_on(state.shutdown_all());
     }
 
