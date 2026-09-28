@@ -6,6 +6,11 @@ key by key:
 1. **Built-in defaults** — what a fresh install behaves like.
 2. **User** — `~/.config/croft/config.json` (or `$XDG_CONFIG_HOME/croft/`).
    The file every toggle and the theme picker write to.
+   - **Synced** — `~/.config/croft/config.synced.json`. Written by config
+     sync when you `croft remote` here from another machine (see below): that
+     machine's theme and editor toggles, limited to the same allowlist as a
+     workspace layer. It wins over this machine's `config.json`, so your
+     theme follows you, and loses to `config.local.json`.
 3. **User, machine-local** — `~/.config/croft/config.local.json`. Overrides
    for this machine only; keep `config.json` in your dotfiles repo and put
    the per-box exceptions here.
@@ -125,8 +130,17 @@ croft-native workspace file always wins over the VS Code one.
 `croft remote <host>` pushes your `keybindings.json`, `snippets.json`,
 `triggers.json`, `matchers.json` and `macros.json` to the remote's
 `~/.config/croft/` on connect, only when their content differs (#262).
-`config.json` never travels: it carries MCP consent and tool fingerprints,
-which must be granted per machine. Two user-layer settings opt out:
+
+Your theme and editor toggles travel too, but `config.json` itself never
+does: it carries MCP consent and tool fingerprints, which must be granted
+per machine. croft sends its projection instead: the keys a workspace layer
+may set (see the allowlist above), read from your `config.json`'s top level,
+landing as the remote's `config.synced.json`. That is a layer of its own, so
+it never touches the remote's `config.json` and whatever was granted there,
+and the remote refuses any other key in it. It applies on arrival and is
+re-sent when you change `config.json` during the session. To keep a
+different theme on one box, set it in that box's `config.local.json`, or
+exclude `config.synced.json` for everyone. Two user-layer settings opt out:
 
 ```jsonc
 {
