@@ -3823,7 +3823,23 @@ command -v croft >/dev/null 2>&1 && echo yes"#,
 }
 
 fn local_source_stamp() -> Result<String> {
-    source_stamp_for(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    build_stamp_for(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The stamp of a croft built from `root` at `version`: the hash of its
+/// source, or `release-v<version>` when `root` does not exist here. A
+/// release binary bakes the CI checkout it was built in; hashing a missing
+/// tree gives one constant for every version, so after the first install a
+/// remote would never update again, its watcher never fire and F9 never
+/// offer the relaunch (#261). A release's version names its binary exactly.
+fn build_stamp_for(root: &PathBuf, version: &str) -> Result<String> {
+    if !root.exists() {
+        return Ok(format!("release-v{version}"));
+    }
+    source_stamp_for(root)
 }
 
 /// A croft installed with `cargo install` from a registry or git snapshot
@@ -4532,6 +4548,25 @@ mod tests {
             cross_tool_command("cargo").get_current_dir(),
             None,
             "a presence probe must not trigger a toolchain auto-install"
+        );
+    }
+
+    #[test]
+    fn a_release_binary_is_stamped_by_its_version_not_a_missing_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("home/runner/work/croft/croft");
+        assert_eq!(build_stamp_for(&gone, "0.1.9").unwrap(), "release-v0.1.9");
+        assert_ne!(
+            build_stamp_for(&gone, "0.1.9").unwrap(),
+            build_stamp_for(&gone, "0.1.10").unwrap(),
+            "a new release is a new stamp, so the remote updates"
+        );
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        let root = tmp.path().to_path_buf();
+        assert_eq!(
+            build_stamp_for(&root, "0.1.9").unwrap(),
+            source_stamp_for(&root).unwrap(),
+            "a source tree is still hashed"
         );
     }
 
