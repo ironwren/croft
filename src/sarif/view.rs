@@ -96,6 +96,8 @@ pub struct Entry {
     /// and the rule's `relationships` targets, as `CWE-89` when the
     /// taxonomy is CWE, else the taxon id as written.
     pub taxa: Vec<String>,
+    /// `rank` (§3.27.27, 0.0–100.0) as shown, empty when the result has none.
+    pub rank: String,
     /// The user applied a fix for it or marked it fixed (#577).
     pub fixed: bool,
 }
@@ -177,16 +179,18 @@ pub enum ExtraColumn {
     Baseline,
     Suppression,
     Tool,
+    Rank,
 }
 
 impl ExtraColumn {
-    pub const ALL: [ExtraColumn; 6] = [
+    pub const ALL: [ExtraColumn; 7] = [
         ExtraColumn::Rule,
         ExtraColumn::Level,
         ExtraColumn::Kind,
         ExtraColumn::Baseline,
         ExtraColumn::Suppression,
         ExtraColumn::Tool,
+        ExtraColumn::Rank,
     ];
 
     pub fn name(self) -> &'static str {
@@ -197,6 +201,7 @@ impl ExtraColumn {
             ExtraColumn::Baseline => "baseline",
             ExtraColumn::Suppression => "suppression",
             ExtraColumn::Tool => "tool",
+            ExtraColumn::Rank => "rank",
         }
     }
 
@@ -209,6 +214,7 @@ impl ExtraColumn {
             ExtraColumn::Baseline => 11,
             ExtraColumn::Suppression => 14,
             ExtraColumn::Tool => 12,
+            ExtraColumn::Rank => 5,
         }
     }
 
@@ -221,6 +227,7 @@ impl ExtraColumn {
             ExtraColumn::Baseline => baseline_label(e.baseline).to_string(),
             ExtraColumn::Suppression => suppression_label(e.suppression).to_string(),
             ExtraColumn::Tool => e.tool.clone(),
+            ExtraColumn::Rank => e.rank.clone(),
         }
     }
 }
@@ -1547,6 +1554,11 @@ fn entry_for(
         column: region.and_then(|r| r.start_column).unwrap_or(0),
         tags,
         taxa,
+        rank: result
+            .rank
+            .filter(|r| r.is_finite())
+            .map(|r| format!("{r:.1}"))
+            .unwrap_or_default(),
         fixed: false,
     }
 }
@@ -1603,6 +1615,7 @@ mod tests {
             column: 1,
             tags: vec![],
             taxa: vec![],
+            rank: String::new(),
             fixed: false,
         }
     }
@@ -1837,6 +1850,26 @@ mod tests {
             hits("CWE-79"),
             vec![v.entries[1].result],
             "taxa are searched too"
+        );
+    }
+
+    #[test]
+    fn rank_is_a_column_shown_to_one_decimal() {
+        let log = crate::sarif::load::parse_log(
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T"}},"results":[
+                {"ruleId":"R1","message":{"text":"m"},"rank":87.25},
+                {"ruleId":"R2","message":{"text":"m"}}]}]}"#,
+        )
+        .unwrap();
+        let run = &log.runs[0];
+        let results = run.results.as_ref().unwrap();
+        let ranked = entry_for(run, &results[0], (0, 0, 0), &[]);
+        let plain = entry_for(run, &results[1], (0, 0, 1), &[]);
+        assert_eq!(ExtraColumn::Rank.cell(&ranked), "87.2");
+        assert_eq!(ExtraColumn::Rank.cell(&plain), "");
+        assert_eq!(
+            parse_columns("rank, rule"),
+            Ok(vec![ExtraColumn::Rank, ExtraColumn::Rule])
         );
     }
 
