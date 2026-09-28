@@ -55223,6 +55223,82 @@ fn a_sarif_log_rewritten_on_disk_keeps_the_readers_place() {
 }
 
 #[test]
+fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
+    // #577: optional columns between a row's position and its message.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let (tmp, log) = sarif_fixture();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&log).unwrap();
+        assert!(
+            app.editor.sarif.as_ref().unwrap().columns.is_empty(),
+            "none by default"
+        );
+        let draw = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            screen_text(&term)
+        };
+        let row = |screen: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains("Query built from user input."))
+                .and_then(|l| {
+                    // The list part only: the detail pane shares the line.
+                    let end = l.find("input.")? + "input.".len();
+                    Some(l[..end].to_string())
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            !row(&draw(&mut app)).contains("R1 "),
+            "{}",
+            row(&draw(&mut app))
+        );
+
+        // An unknown name is refused and names the choices.
+        app.handle_sarif_key(key(KeyCode::Char('C'), KeyModifiers::NONE));
+        app.input_prompt.as_mut().unwrap().value = String::from("rule, colour");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.status.contains("No column \"colour\""),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("rule, level, kind"), "{}", app.status);
+
+        app.handle_sarif_key(key(KeyCode::Char('C'), KeyModifiers::NONE));
+        app.input_prompt.as_mut().unwrap().value = String::from("rule, baseline");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.status, "SARIF columns: rule, baseline");
+        let shown = row(&draw(&mut app));
+        let (rule, base, msg) = (
+            shown.find("R1").expect(&shown),
+            shown.find("no baseline").expect(&shown),
+            shown.find("Query built").unwrap(),
+        );
+        assert!(rule < base && base < msg, "in the chosen order: {shown}");
+
+        // Remembered: the next viewer opens with them, and C offers them.
+        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        again.editor.open(&log).unwrap();
+        assert_eq!(
+            again.editor.sarif.as_ref().unwrap().columns,
+            [
+                crate::sarif::view::ExtraColumn::Rule,
+                crate::sarif::view::ExtraColumn::Baseline
+            ]
+        );
+        again.handle_sarif_key(key(KeyCode::Char('C'), KeyModifiers::NONE));
+        assert_eq!(again.input_prompt.as_ref().unwrap().value, "rule,baseline");
+    });
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

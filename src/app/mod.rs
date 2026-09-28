@@ -3783,6 +3783,8 @@ pub struct App {
     /// The open SARIF logs (path, disk stamp) the published diagnostics were
     /// built from (#577); a different set means publish again.
     sarif_diag_signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// When the SARIF viewers' added logs were last checked for changes.
+    sarif_added_polled: Option<std::time::Instant>,
     /// Every (file, source key) SARIF diagnostics were published under, so a
     /// closed log's results can be withdrawn exactly.
     sarif_published: Vec<(PathBuf, String)>,
@@ -5664,6 +5666,7 @@ impl App {
             search_editor_job: None,
             code_lens_requested: std::collections::HashMap::new(),
             sarif_diag_signature: Vec::new(),
+            sarif_added_polled: None,
             sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -8175,6 +8178,28 @@ impl App {
     /// open logs, or one of them on disk, changes; returns whether anything
     /// did.
     pub fn sync_sarif_diagnostics(&mut self) -> bool {
+        // Logs added to a viewer with `o` are read again when they change
+        // on disk (#577), at most once a second.
+        if self
+            .sarif_added_polled
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.sarif_added_polled = Some(std::time::Instant::now());
+            let mut refreshed = 0;
+            for tab in self.editor.editors.iter_mut() {
+                if let Some(view) = tab.sarif.as_mut() {
+                    refreshed += view.refresh_added_logs().len();
+                }
+            }
+            if refreshed > 0 {
+                // Their results are published again below.
+                self.sarif_diag_signature.clear();
+                self.status = format!(
+                    "Reloaded {refreshed} changed SARIF log{}",
+                    if refreshed == 1 { "" } else { "s" }
+                );
+            }
+        }
         let inactive: Vec<&crate::widgets::editor::Editor> = self
             .editor_layout
             .inactive_groups()
@@ -30684,6 +30709,10 @@ impl App {
             InputPurpose::SarifAddLog => {
                 self.close_input_prompt();
                 self.submit_sarif_add_log(&value);
+            }
+            InputPurpose::SarifColumns => {
+                self.close_input_prompt();
+                self.submit_sarif_columns(&value);
             }
             InputPurpose::SarifBaseline => {
                 self.close_input_prompt();
@@ -57612,6 +57641,33 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('K') => {
+                self.status = if view.toggle_non_problem_kinds() {
+                    String::from("Hiding pass, not-applicable and informational results")
+                } else {
+                    String::from("Showing results of every kind")
+                };
+            }
+            KeyCode::Char('W') => {
+                self.status = match view.close_added_logs() {
+                    0 => String::from("Only the viewer's own log is open"),
+                    n => format!("Closed {n} added log{}", if n == 1 { "" } else { "s" }),
+                };
+            }
+            KeyCode::Char('C') => {
+                use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                let current = crate::sarif::view::columns_text(&view.columns);
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::SarifColumns,
+                        String::from("SARIF Columns"),
+                        String::from(
+                            "rule, level, kind, baseline, suppression, tool (empty for none)",
+                        ),
+                    )
+                    .with_value(current),
+                );
+            }
             KeyCode::Char('f') => self.apply_sarif_fix(0),
             KeyCode::Char('o') => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
@@ -58665,6 +58721,32 @@ impl App {
         }
         self.status = format!("Opened the log's own copy of {uri} (read-only)");
         Ok(())
+    }
+
+    /// Set the SARIF results list's optional columns from what the user
+    /// typed, remember them for every viewer, and apply them to each open
+    /// one (#577).
+    fn submit_sarif_columns(&mut self, value: &str) {
+        let cols = match crate::sarif::view::parse_columns(value) {
+            Ok(c) => c,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        for tab in self.editor.editors.iter_mut() {
+            if let Some(view) = tab.sarif.as_mut() {
+                view.columns = cols.clone();
+            }
+        }
+        self.status = match crate::sarif::view::save_columns(&cols) {
+            Ok(()) if cols.is_empty() => String::from("SARIF columns: position and message only"),
+            Ok(()) => format!(
+                "SARIF columns: {}",
+                crate::sarif::view::columns_text(&cols).replace(',', ", ")
+            ),
+            Err(e) => format!("Columns set, but not saved: {e}"),
+        };
     }
 
     /// The paths of the files open in editor tabs, for SARIF resolution.

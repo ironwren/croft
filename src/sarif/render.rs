@@ -260,7 +260,13 @@ pub fn render(
                     Style::default().fg(level_color(e.level)).bg(bg)
                 };
                 buf.set_stringn(inner.x + 2, y, level_glyph(e.level), 1, glyph_style);
-                let rest = format!(" {pos:<8} {}", e.message);
+                let mut cells = String::new();
+                for col in &view.columns {
+                    let w = col.width();
+                    let cell: String = col.cell(e).chars().take(w).collect();
+                    cells.push_str(&format!("{cell:<w$} "));
+                }
+                let rest = format!(" {pos:<8} {cells}{}", e.message);
                 let rest_w = (list_w as usize).saturating_sub(3);
                 let padded = format!("{rest:<rest_w$}");
                 buf.set_stringn(inner.x + 3, y, &padded, rest_w, base);
@@ -290,7 +296,7 @@ pub fn render(
     let hint = if view.editing_query {
         " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: cwe: · Enter done · Esc clear "
     } else {
-        " ↑↓ move · Enter open · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · 1-4 levels · u suppressed · a absent · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
+        " ↑↓ move · Enter open · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · C columns · 1-4 levels · u suppressed · a absent · K non-problems · W close added logs · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
     };
     buf.set_stringn(
         inner.x,
