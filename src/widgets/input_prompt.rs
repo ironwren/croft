@@ -100,6 +100,11 @@ pub enum InputPurpose {
     CodeqlVariantCodeSearch {
         list: String,
     },
+    /// Where to export the results of remembered variant analysis `index`
+    /// (#578): a folder, or `gist`.
+    CodeqlExportVariantResults {
+        index: usize,
+    },
     /// A new name for the variant analysis list called `name` (#578).
     CodeqlRenameVariantList {
         name: String,
