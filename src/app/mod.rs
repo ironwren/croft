@@ -46827,6 +46827,7 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::SheetSortByColumn => self.sort_sheet_by_column(),
             Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
             Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
@@ -57412,6 +57413,43 @@ impl App {
             KeyCode::Right => diff.scroll_right_by(4),
             _ => {}
         }
+    }
+
+    /// Sheet: Sort by Column (#578): sort the open CSV/TSV sheet's rows by
+    /// the cursor's column, reversing when it is already sorted that way.
+    /// A reorder is an edit, as in a spreadsheet: it marks the sheet
+    /// unsaved. xlsx is left out, since its edits are written back by
+    /// row, and so are the read-only kinds.
+    fn sort_sheet_by_column(&mut self) {
+        let Some(sheet) = self.editor.sheet.as_mut() else {
+            self.status = String::from("Open a CSV or TSV file to sort it");
+            return;
+        };
+        if !matches!(
+            sheet.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        ) {
+            self.status = String::from("Sorting is for CSV and TSV sheets");
+            return;
+        }
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        let col = data.cur_col;
+        let name = data
+            .headers
+            .get(col)
+            .filter(|h| !h.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        let ascending = data.sort_by_column(col);
+        sheet.dirty = true;
+        self.editor.dirty = true;
+        self.status = format!(
+            "Sorted by {name}, {}",
+            if ascending { "ascending" } else { "descending" }
+        );
     }
 
     fn handle_sheet_key(&mut self, key: KeyEvent) {
