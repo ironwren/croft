@@ -55159,6 +55159,68 @@ fn a_sarif_result_whose_file_is_only_in_the_log_opens_the_logs_copy() {
 }
 
 #[test]
+fn a_sarif_log_rewritten_on_disk_keeps_the_readers_place() {
+    // #577: a rebuild that rewrites the log (a scan re-run) used to reopen
+    // the viewer from scratch, losing the selection, filter, folds and any
+    // log added with `o`.
+    let tmp = tempfile::tempdir().unwrap();
+    let result = |rule: &str, line: u32| {
+        format!(
+            r#"{{"ruleId":"{rule}","level":"warning","message":{{"text":"{rule} here"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"src/{rule}.rs"}},"region":{{"startLine":{line}}}}}}}]}}"#
+        )
+    };
+    let log_of = |results: &[String]| {
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"lint"}}}},"results":[{}]}}]}}"#,
+            results.join(",")
+        )
+    };
+    let main = tmp.path().join("main.sarif");
+    let extra = tmp.path().join("extra.sarif");
+    std::fs::write(&main, log_of(&[result("Aa", 1), result("Bb", 2)])).unwrap();
+    std::fs::write(&extra, log_of(&[result("Cc", 3)])).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&main).unwrap();
+    {
+        let view = app.editor.sarif.as_mut().unwrap();
+        let log = crate::sarif::load::parse_log(&std::fs::read_to_string(&extra).unwrap()).unwrap();
+        assert!(view.add_log(&extra, log));
+        view.query_text = String::from("-Cc");
+        view.filters
+            .hidden_levels
+            .insert(crate::sarif::semantics::Level::Note);
+        view.collapsed.insert(String::from("some-group"));
+        let rows = view.rows();
+        view.selected = rows
+            .iter()
+            .position(|r| matches!(r, crate::sarif::view::Row::Item { entry } if view.entries[*entry].rule_id == "Bb"))
+            .unwrap();
+    }
+    // The scan runs again: a new result lands first, shifting the others.
+    std::fs::write(
+        &main,
+        log_of(&[result("Zz", 9), result("Aa", 1), result("Bb", 2)]),
+    )
+    .unwrap();
+    app.editor.revert_to_disk().unwrap();
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 2, "the added log is still there");
+    assert_eq!(view.query_text, "-Cc");
+    assert!(
+        view.filters
+            .hidden_levels
+            .contains(&crate::sarif::semantics::Level::Note)
+    );
+    assert!(view.collapsed.contains("some-group"));
+    assert_eq!(view.entries.len(), 4, "the rewritten log was read");
+    assert_eq!(
+        view.selected_entry().map(|e| e.rule_id.as_str()),
+        Some("Bb"),
+        "the same result stays selected though it moved"
+    );
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
