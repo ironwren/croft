@@ -315,6 +315,54 @@ pub fn compare_tables(
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
+/// Why a `codeql` call failed, read from its stderr (#578): the reason
+/// and the fix the CLI suggests, rather than its first line, which is
+/// usually progress ("Compiling query plan for …"). Lines are kept in the
+/// CLI's own words: the fatal-error line leads, then each distinct `ERROR:`
+/// line, then every line suggesting
+/// what to do ("Consider running …", "Try …", "Run …", "Use --…", a hint).
+/// With none of those, the last non-empty line, where a tool usually
+/// ends on its reason.
+pub fn failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if !s.is_empty() && !parts.iter().any(|p| p == s || p.contains(s)) {
+            parts.push(s.to_string());
+        }
+    };
+    for l in &lines {
+        if l.starts_with("A fatal error occurred:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        if l.starts_with("ERROR:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        let lower = l.to_ascii_lowercase();
+        let suggests = ["consider ", "try ", "run ", "use --", "hint:", "please run"]
+            .iter()
+            .any(|w| lower.starts_with(w) || lower.contains(&format!("({w}")));
+        if suggests {
+            push(l);
+        }
+    }
+    if parts.is_empty() {
+        return lines
+            .last()
+            .map_or_else(|| String::from("codeql failed"), |l| l.to_string());
+    }
+    parts.join(" · ")
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -868,6 +916,34 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_reads_the_reason_and_the_suggested_fix_not_the_progress() {
+        let stderr = "Compiling query plan for /w/q.ql.\n\
+            ERROR: could not resolve module cpp (/w/q.ql:1,8-11)\n\
+            Failed [1/1] /w/q.ql.\n\
+            A fatal error occurred: Could not compile the query.\n\
+            Consider running `codeql pack install` in /w to fetch its dependencies.\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "A fatal error occurred: Could not compile the query. · \
+             ERROR: could not resolve module cpp (/w/q.ql:1,8-11) · \
+             Consider running `codeql pack install` in /w to fetch its dependencies."
+        );
+        // A fix given inside the fatal line is not repeated.
+        assert_eq!(
+            failure_reason(
+                "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`.\n"
+            ),
+            "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`."
+        );
+        // Nothing recognisable: the last line, where a tool ends on its reason.
+        assert_eq!(
+            failure_reason("starting\nno such file: x\n"),
+            "no such file: x"
+        );
+        assert_eq!(failure_reason("\n"), "codeql failed");
+    }
 
     #[test]
     fn cache_jobs_run_database_cleanup_in_their_mode() {
