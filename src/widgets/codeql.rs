@@ -61,6 +61,10 @@ pub enum Action {
     CreateQuery,
     SetUpControllerRepository,
     ViewAst,
+    /// Node `.0` of the AST shown: go to its code and fold or unfold it.
+    AstNode(usize),
+    /// Forget the AST shown.
+    ClearAst,
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
@@ -170,6 +174,8 @@ pub struct CodeqlPanel {
     pub folded_lists: std::collections::HashSet<String>,
     /// A line per submitted variant analysis, oldest first (#578).
     pub variant_runs: Vec<String>,
+    /// The AST the AST Viewer section shows, once one has been read.
+    pub ast: Option<crate::codeql_ast::AstView>,
 }
 
 impl CodeqlPanel {
@@ -540,11 +546,41 @@ impl CodeqlPanel {
                     out.push(Line::Text("moment. Select a database to run a CodeQL"));
                     out.push(Line::Text("query and get your first results."));
                 }
-                Section::AstViewer => {
-                    out.push(Line::Text("Run 'CodeQL: View AST' on an open source"));
-                    out.push(Line::Text("file from a CodeQL database."));
-                    out.push(Line::Action(Action::ViewAst, "View AST".to_string()));
-                }
+                Section::AstViewer => match &self.ast {
+                    Some(view) => {
+                        let name = view
+                            .file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        out.push(Line::Action(
+                            Action::ClearAst,
+                            format!("Clear \u{b7} {name} in {}", view.database),
+                        ));
+                        for (depth, i) in view.visible() {
+                            let node = &view.tree.nodes[i];
+                            let mark = match (node.children.is_empty(), view.open.contains(&i)) {
+                                (true, _) => ' ',
+                                (false, true) => '\u{25be}',
+                                (false, false) => '\u{25b8}',
+                            };
+                            let at = node
+                                .location
+                                .as_ref()
+                                .map(|l| format!("  {}:{}", l.line, l.column))
+                                .unwrap_or_default();
+                            out.push(Line::Action(
+                                Action::AstNode(i),
+                                format!("{}{mark} {}{at}", "  ".repeat(depth), node.label),
+                            ));
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Run 'CodeQL: View AST' on an open source"));
+                        out.push(Line::Text("file from a CodeQL database."));
+                        out.push(Line::Action(Action::ViewAst, "View AST".to_string()));
+                    }
+                },
                 Section::MethodModeling => {
                     out.push(Line::Text("Select a method in the model editor to"));
                     out.push(Line::Text("see and edit its model here."));
