@@ -57285,6 +57285,19 @@ impl App {
                 }
             }
             KeyCode::Char('x') => view.clear_filters(),
+            KeyCode::Char('K') => {
+                self.status = if view.toggle_non_problem_kinds() {
+                    String::from("Hiding pass, not-applicable and informational results")
+                } else {
+                    String::from("Showing results of every kind")
+                };
+            }
+            KeyCode::Char('W') => {
+                self.status = match view.close_added_logs() {
+                    0 => String::from("Only the viewer's own log is open"),
+                    n => format!("Closed {n} added log{}", if n == 1 { "" } else { "s" }),
+                };
+            }
             KeyCode::Char('C') => {
                 use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
                 let current = crate::sarif::view::columns_text(&view.columns);
