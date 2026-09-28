@@ -3145,6 +3145,11 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
+    /// Raised to stop the query run in flight: its `codeql` is killed and
+    /// the run recorded as cancelled (#578).
+    codeql_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The file name of the query in flight, for its status-bar chip.
+    codeql_run_name: String,
     /// Queries "Run Queries in Pack" has yet to start, in order (#578).
     codeql_run_queue: std::collections::VecDeque<PathBuf>,
     /// How many queries the pack run holds and how many have failed so
@@ -4140,6 +4145,8 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    /// The running CodeQL query's status-bar chip; a click cancels it (#578).
+    status_codeql_rect: Rect,
     status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
@@ -5500,6 +5507,8 @@ impl App {
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
             codeql_run: None,
+            codeql_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            codeql_run_name: String::new(),
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
             codeql_upgrade: None,
@@ -5711,6 +5720,7 @@ impl App {
             shortcuts_modal: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_codeql_rect: Rect::default(),
             status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
@@ -18814,6 +18824,28 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // A running CodeQL query (#578): what runs and for how long, and a
+        // click on it cancels the run.
+        let mut codeql_chip: Option<(u16, u16)> = None;
+        if let Some((_, since)) = &self.codeql_run {
+            let secs = since.elapsed().as_secs();
+            let text = format!(
+                " \u{27f3} CodeQL {} {}:{:02} \u{2715} ",
+                self.codeql_run_name,
+                secs / 60,
+                secs % 60
+            );
+            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            codeql_chip = Some((x, text.chars().count() as u16));
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
         if let Some((_, _, started)) = &self.recording {
             // A terminal recording (#356) is the other state a user can
             // leave on; it is not the macro recorder, so it has its own
@@ -18996,6 +19028,15 @@ impl App {
         let status_rect = outer[2];
         // The F1 cheat-sheet is gone; F1 / the palette still open Shortcuts.
         self.shortcuts_hit_rect = None;
+        self.status_codeql_rect = match codeql_chip {
+            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
+                x: status_rect.x + x,
+                y: status_rect.y,
+                width: w.min(status_rect.width - x),
+                height: 1,
+            },
+            _ => Rect::default(),
+        };
         // Diagnostics hit rect (left group), for click-to-PROBLEMS.
         self.status_diag_rect = if status_h > 0 {
             Rect {
@@ -19139,6 +19180,11 @@ impl App {
             // the frame edge, it went on answering for cells that now read
             // "Ln 1, Col 1" — opening PROBLEMS from a click on the position
             // readout, with the counts it claimed not even on screen.
+            if self.status_codeql_rect.x >= rx {
+                self.status_codeql_rect = Rect::default();
+            } else if self.status_codeql_rect.right() > rx {
+                self.status_codeql_rect.width = rx - self.status_codeql_rect.x;
+            }
             if self.status_diag_rect.x >= rx {
                 // Entirely behind the cluster: not on screen, so not a target.
                 self.status_diag_rect = Rect::default();
@@ -23278,7 +23324,8 @@ impl App {
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
-    /// query in the pack; Esc then first cancels the ones still queued.
+    /// query in the pack; Esc then first cancels the ones still queued, and
+    /// once none are, the running query.
     /// In the Variant Analysis Repositories section `a` adds a repository
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
@@ -23296,6 +23343,7 @@ impl App {
         let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
+            KeyCode::Esc if self.codeql_run.is_some() => self.cancel_codeql_run(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
@@ -23476,6 +23524,9 @@ impl App {
                     }
                     crate::codeql_query::RunStatus::Running => {
                         self.status = String::from("That query is still running");
+                    }
+                    crate::codeql_query::RunStatus::Cancelled => {
+                        self.status = String::from("That run was cancelled");
                     }
                 }
             }
@@ -26211,8 +26262,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        // A fresh flag per run, so a late cancel never stops the next one.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.codeql_cancel = cancel.clone();
         std::thread::spawn(move || {
-            let run = |args: Vec<String>| Self::codeql_command(&program, &args);
+            let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
                 .and_then(|()| match kind {
@@ -26225,11 +26279,78 @@ impl App {
                 });
             let _ = tx.send(match outcome {
                 Ok(()) => RunStatus::Succeeded,
+                Err(_) if cancel.load(std::sync::atomic::Ordering::SeqCst) => RunStatus::Cancelled,
                 Err(e) => RunStatus::Failed(e),
             });
         });
         self.codeql_run = Some((rx, std::time::Instant::now()));
+        self.codeql_run_name = name.clone();
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
+    /// raised (#578). Its output is drained on threads of its own, so a
+    /// chatty CLI never blocks on a full pipe while this polls.
+    fn codeql_command_until(
+        program: &Path,
+        args: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(String::from("cancelled"));
+        }
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let mut stderr = child.stderr.take();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(s) = stderr.as_mut() {
+                let _ = s.read_to_string(&mut text);
+            }
+            text
+        });
+        let status = loop {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(String::from("cancelled"));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(e) => return Err(format!("could not wait for codeql: {e}")),
+            }
+        };
+        let err = reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(())
+        } else {
+            Err(crate::codeql_query::failure_reason(&err))
+        }
+    }
+
+    /// CodeQL: Cancel Running Query (#578): stop the query in flight, and
+    /// the queries a pack or multi-database run has queued after it.
+    fn cancel_codeql_run(&mut self) {
+        if self.codeql_run.is_none() {
+            self.status = String::from("No CodeQL query is running");
+            return;
+        }
+        self.codeql_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let queued = self.codeql_run_queue.len();
+        self.codeql_run_queue.clear();
+        self.status = match queued {
+            0 => String::from("Cancelling the running CodeQL query\u{2026}"),
+            n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
+        };
     }
 
     /// Run `codeql` with `args` and wait. A failure is the reason and the
@@ -26303,6 +26424,7 @@ impl App {
         self.refresh_codeql_history();
         match status {
             RunStatus::Failed(why) => self.status = format!("{name} failed: {why}"),
+            RunStatus::Cancelled => self.status = format!("{name} cancelled"),
             _ => match self.editor.open(&output) {
                 Ok(()) => {
                     self.sync_open_file_poll_mtime();
@@ -46058,6 +46180,7 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlCancelRunningQuery => self.cancel_codeql_run(),
             Cmd::CodeqlAcceptTestOutput => self.accept_codeql_test_output(),
             Cmd::CodeqlFocusSideBar => {
                 // Show it and take the keys, as VS Code's "Focus" does.
@@ -48758,6 +48881,10 @@ impl App {
             }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
+                return;
+            }
+            if rect_contains(self.status_codeql_rect, m.column, m.row) {
+                self.cancel_codeql_run();
                 return;
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
