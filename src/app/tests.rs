@@ -55768,6 +55768,242 @@ fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
+    // #578: "Show Evaluator Log (Viewer)" runs `codeql generate log-summary
+    // --format=predicates` once, keeps the file beside the log, and shows
+    // its predicates slowest first as a tree folded to one line each.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = App::codeql_results_dir().join("1-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 1, RunStatus::Succeeded, out.clone())],
+        );
+        app.run_command(Command::CodeqlShowEvaluatorLogViewer);
+        assert_eq!(app.status, "q.ql has no evaluator log");
+        assert!(app.codeql_log_viewer.is_none());
+
+        let log = crate::codeql_query::evaluator_log(&out);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "{\"type\":\"LOG_HEADER\"}\n").unwrap();
+        let sample = concat!(
+            r#"{"summaryLogVersion":"0.4.0"}"#,
+            "\n",
+            r#"{"predicateName":"Foo::fast#a","evaluationStrategy":"COMPUTE_SIMPLE","millis":7,"resultSize":2,"dependencies":{"files":"h"},"ra":{"pipeline":["{1} r1 = SCAN files","return r1"]},"pipelineRuns":[{"raReference":"pipeline"}]}"#,
+            "\n",
+            r#"{"predicateName":"Foo::slow#b","evaluationStrategy":"COMPUTE_RECURSIVE","millis":1500,"resultSize":1234,"predicateIterationMillis":[500,1000],"ra":{"base":["return r1"],"standard":["return r2"]}}"#,
+            "\n",
+        );
+        let reply = tmp.path().join("reply.jsonl");
+        std::fs::write(&reply, sample).unwrap();
+        // The fake CLI copies its reply to the path after the log.
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace(
+                "exit 0",
+                &format!(
+                    "[ \"$1\" = generate ] && cp '{}' \"$5\"\nexit 0",
+                    reply.display()
+                ),
+            ),
+        )
+        .unwrap();
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_log_viewer() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the viewer never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        app.run_command(Command::CodeqlShowEvaluatorLogViewer);
+        assert_eq!(app.status, "Reading the evaluator log\u{2026}");
+        wait(&mut app);
+        assert_eq!(app.status, "Opened the evaluator log viewer");
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(std::path::Path::new("Evaluator Log (q.ql)"))
+        );
+        assert_eq!(
+            app.editor.lines[2],
+            "\u{25b8} 1,500 ms  1,234 rows  Foo::slow#b (COMPUTE_RECURSIVE), 2 iterations"
+        );
+        assert!(
+            app.editor
+                .lines
+                .iter()
+                .any(|l| l.starts_with("\u{25b8} 7 ms  2 rows  Foo::fast#a")),
+            "{:?}",
+            app.editor.lines
+        );
+        assert!(app.editor.lines.iter().any(|l| l == "        files"));
+        assert!(app.editor.is_line_hidden(3), "predicates start folded");
+        let predicates = crate::codeql_query::evaluator_log_predicates(&out);
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate log-summary --format=predicates {} {}",
+                log.display(),
+                predicates.display()
+            )
+        );
+
+        // Made once: the second request reads the kept file without the CLI.
+        app.run_command(Command::CodeqlShowEvaluatorLogViewer);
+        wait(&mut app);
+        assert_eq!(app.status, "Opened the evaluator log viewer");
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls.trim().lines().count(), 1, "{calls}");
+        assert_eq!(
+            Command::from_id("codeql_show_evaluator_log_viewer"),
+            Some(Command::CodeqlShowEvaluatorLogViewer)
+        );
+
+        // A CLI failure says why.
+        std::fs::remove_file(&predicates).unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "no such log");
+        app.run_command(Command::CodeqlShowEvaluatorLogViewer);
+        wait(&mut app);
+        assert_eq!(app.status, "Could not read the evaluator log: no such log");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
+    // #578: VS Code's "Compare Performance". The newest run's evaluator
+    // log is set against the previous successful run of the same query,
+    // whatever its kind of results; a predicate summary either run lacks
+    // is made once by the CLI, as the log viewer makes it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let old_out = App::codeql_results_dir().join("1-q").join("results.sarif");
+        let new_out = App::codeql_results_dir().join("2-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 2, RunStatus::Succeeded, new_out.clone())],
+        );
+        app.run_command(Command::CodeqlComparePerformance);
+        assert_eq!(app.status, "q.ql has no evaluator log");
+        let new_log = crate::codeql_query::evaluator_log(&new_out);
+        std::fs::write(&new_log, "{}\n").unwrap();
+        app.run_command(Command::CodeqlComparePerformance);
+        assert_eq!(
+            app.status,
+            "There is no earlier successful run of q.ql to compare with"
+        );
+
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("q.ql", 1, RunStatus::Succeeded, old_out.clone()),
+                ("q.ql", 2, RunStatus::Succeeded, new_out.clone()),
+            ],
+        );
+        app.run_command(Command::CodeqlComparePerformance);
+        assert_eq!(app.status, "q.ql has no evaluator log", "the earlier run's");
+        assert!(app.codeql_perf_compare.is_none());
+
+        // The earlier run's summary is already kept; the later one's is not.
+        std::fs::write(crate::codeql_query::evaluator_log(&old_out), "{}\n").unwrap();
+        std::fs::write(
+            crate::codeql_query::evaluator_log_predicates(&old_out),
+            concat!(
+                r#"{"predicateName":"Foo::bar#abc","evaluationStrategy":"COMPUTE_SIMPLE","millis":3400,"resultSize":12}"#,
+                "\n",
+                r#"{"predicateName":"Gone::p#1","evaluationStrategy":"COMPUTE_SIMPLE","millis":500,"resultSize":4}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let reply = tmp.path().join("reply.jsonl");
+        std::fs::write(
+            &reply,
+            concat!(
+                r#"{"predicateName":"Foo::bar#def","evaluationStrategy":"COMPUTE_SIMPLE","millis":4600,"resultSize":15}"#,
+                "\n",
+                r#"{"predicateName":"Added::r#2","evaluationStrategy":"COMPUTE_SIMPLE","millis":90,"resultSize":7}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace(
+                "exit 0",
+                &format!(
+                    "[ \"$1\" = generate ] && cp '{}' \"$5\"\nexit 0",
+                    reply.display()
+                ),
+            ),
+        )
+        .unwrap();
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_perf_compare() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the comparison never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        app.run_command(Command::CodeqlComparePerformance);
+        assert_eq!(app.status, "Comparing the evaluator logs\u{2026}");
+        wait(&mut app);
+        assert_eq!(app.status, "Opened the performance comparison");
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(std::path::Path::new("Performance (q.ql)"))
+        );
+        assert_eq!(
+            app.editor.lines[..6],
+            [
+                "Performance: earlier (app) \u{2192} later (app)",
+                "3,900 \u{2192} 4,690 ms in all (+790 ms), 3 predicates: 1 in both, 1 only before, 1 only after",
+                "",
+                "+1,200 ms  3,400 \u{2192} 4,600 ms  12 \u{2192} 15 rows  Foo::bar#def",
+                "  -500 ms  500 \u{2192} \u{2013} ms  4 \u{2192} \u{2013} rows  Gone::p#1",
+                "   +90 ms  \u{2013} \u{2192} 90 ms  \u{2013} \u{2192} 7 rows  Added::r#2",
+            ]
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate log-summary --format=predicates {} {}",
+                new_log.display(),
+                crate::codeql_query::evaluator_log_predicates(&new_out).display()
+            )
+        );
+        assert_eq!(
+            Command::from_id("codeql_compare_performance"),
+            Some(Command::CodeqlComparePerformance)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn codeql_pack_commands_install_dependencies_and_download_packs() {
     // #578: "Install Pack Dependencies" runs `codeql pack install` on the
     // selected pack's folder; "Download Packs" asks which packs and runs
