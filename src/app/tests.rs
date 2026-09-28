@@ -56838,6 +56838,191 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     app
 }
 
+/// Wait for the AST Viewer's read to land, or fail after `secs`.
+fn wait_for_codeql_ast(app: &mut App, secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !app.drain_codeql_ast() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the AST read never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_ast_viewer_shows_the_open_files_tree_and_goes_to_its_code() {
+    // #578: the AST of a source file from the selected database, with
+    // go-to-code and clear, through a stand-in for the CLI.
+    use crate::widgets::codeql::{Action, Line};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let src = tmp.path().join("app.py");
+        std::fs::write(&src, "import os\n\ndef run(cmd):\n    os.system(cmd)\n").unwrap();
+        let pack = bin.path().join("rust-all");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: codeql/rust-all\n").unwrap();
+        let query = pack.join("printAst.ql");
+        std::fs::write(&query, "select 1").unwrap();
+        let file = src.display().to_string();
+        let graph = format!(
+            r#"{{"nodes": {{"tuples": [
+              [{{"id": 0, "label": "[Import] import os", "url": {{"uri": "file://{file}", "startLine": 1, "startColumn": 1}}}}, "semmle.order", "1"],
+              [{{"id": 1, "label": "[FunctionDef] run", "url": {{"uri": "file://{file}", "startLine": 3, "startColumn": 1}}}}, "semmle.order", "2"],
+              [{{"id": 2, "label": "[Call] os.system(cmd)", "url": {{"uri": "file://{file}", "startLine": 4, "startColumn": 5}}}}, "semmle.label", "[Call] os.system(cmd)"]]}},
+             "edges": {{"tuples": [
+              [{{"id": 1}}, {{"id": 2}}, "semmle.label", "body"]]}}}}"#
+        );
+        std::fs::write(bin.path().join("graph.json"), graph).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1 $2\" in 'resolve queries') echo '[\"{query}\"]'; exit 0 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{graph}' \"${{a#--output=}}\" ;; --external=selectedSourceFile=*) cp \"${{a#--external=selectedSourceFile=}}\" '{sel}' ;; esac; done\nexit 0\n",
+            log = bin.path().join("calls.log").display(),
+            query = query.display(),
+            graph = bin.path().join("graph.json").display(),
+            sel = bin.path().join("selected.csv").display(),
+        );
+        let program = bin.path().join("codeql");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.codeql_program = program;
+
+        app.editor.open(&src).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlViewAst);
+        assert_eq!(app.status, "Reading the AST of app.py from app\u{2026}");
+        wait_for_codeql_ast(&mut app, 10);
+        assert_eq!(app.status, "AST of app.py: 3 nodes");
+        let calls = std::fs::read_to_string(bin.path().join("calls.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert!(
+            calls[0].starts_with("resolve queries --format=json "),
+            "{calls:?}"
+        );
+        assert_eq!(calls[1], format!("pack install {}", pack.display()));
+        assert!(calls[2].starts_with("query run --database="), "{calls:?}");
+        assert!(
+            calls[3].starts_with("bqrs decode --format=json"),
+            "{calls:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.path().join("selected.csv")).unwrap(),
+            format!("\"{file}\"\n"),
+            "the file is named as the source archive names it"
+        );
+
+        app.open_codeql_view();
+        let rows: Vec<String> = app
+            .codeql
+            .lines()
+            .iter()
+            .filter_map(|l| match l {
+                Line::Action(Action::AstNode(_) | Action::ClearAst, text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "Clear \u{b7} app.py in app",
+                "  [Import] import os  1:1",
+                "\u{25b8} [FunctionDef] run  3:1"
+            ]
+        );
+        // Enter on the function unfolds it and goes to its code.
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::AstNode(1), _)))
+            .unwrap();
+        app.codeql.selected = row;
+        app.focus = Pane::Tree;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.editor.path.as_deref(), Some(src.as_path()));
+        assert_eq!(app.editor.cursor_row, 2);
+        assert!(app.codeql.lines().iter().any(|l| matches!(
+            l,
+            Line::Action(Action::AstNode(2), t) if t == "    body: [Call] os.system(cmd)  4:5"
+        )));
+        // Clear forgets it.
+        app.activate_codeql(crate::widgets::codeql::Hit::Action(Action::ClearAst));
+        assert!(app.codeql.ast.is_none());
+    });
+}
+
+/// #578's AST Viewer against the real CLI: build a Python database, read
+/// the AST of its source file, and find the function in it. Needs a
+/// `codeql` with the codeql/python-all pack downloaded; set
+/// `CROFT_TEST_CODEQL` to it.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn the_ast_viewer_reads_a_real_databases_ast() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("app.py");
+        std::fs::write(&file, "import os\n\ndef run(cmd):\n    os.system(cmd)\n").unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&file).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlViewAst);
+        wait_for_codeql_ast(&mut app, 600);
+        let view = app
+            .codeql
+            .ast
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}", app.status));
+        let def = view
+            .tree
+            .roots
+            .iter()
+            .copied()
+            .find(|&i| view.tree.nodes[i].label.starts_with("[FunctionDef] run"))
+            .expect("the function is a top-level node");
+        assert_eq!(
+            view.target(def).map(|t| (t.0, t.1)),
+            Some((file.clone(), 3))
+        );
+        assert!(!view.tree.nodes[def].children.is_empty());
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn a_problem_query_runs_on_the_current_database_and_opens_as_sarif() {
