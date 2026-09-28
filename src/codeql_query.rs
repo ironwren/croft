@@ -457,6 +457,54 @@ pub fn compare_tables(
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
+/// Why a `codeql` call failed, read from its stderr (#578): the reason
+/// and the fix the CLI suggests, rather than its first line, which is
+/// usually progress ("Compiling query plan for …"). Lines are kept in the
+/// CLI's own words: the fatal-error line leads, then each distinct `ERROR:`
+/// line, then every line suggesting
+/// what to do ("Consider running …", "Try …", "Run …", "Use --…", a hint).
+/// With none of those, the last non-empty line, where a tool usually
+/// ends on its reason.
+pub fn failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if !s.is_empty() && !parts.iter().any(|p| p == s || p.contains(s)) {
+            parts.push(s.to_string());
+        }
+    };
+    for l in &lines {
+        if l.starts_with("A fatal error occurred:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        if l.starts_with("ERROR:") {
+            push(l);
+        }
+    }
+    for l in &lines {
+        let lower = l.to_ascii_lowercase();
+        let suggests = ["consider ", "try ", "run ", "use --", "hint:", "please run"]
+            .iter()
+            .any(|w| lower.starts_with(w) || lower.contains(&format!("({w}")));
+        if suggests {
+            push(l);
+        }
+    }
+    if parts.is_empty() {
+        return lines
+            .last()
+            .map_or_else(|| String::from("codeql failed"), |l| l.to_string());
+    }
+    parts.join(" · ")
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -760,6 +808,43 @@ pub struct HistoryEntry {
     /// History saved before renaming existed reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// How many results a successful run produced: table rows, or SARIF
+    /// results (#578). `None` while running, after a failure, and for
+    /// history saved before counts were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<u64>,
+}
+
+/// How many results `output` holds: the rows of a CSV table (its header
+/// aside), or the results of every run of a SARIF log. `None` when it
+/// cannot be read.
+pub fn count_results(output: &Path) -> Option<u64> {
+    let is_csv = output
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    if is_csv {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_path(output)
+            .ok()?;
+        let mut n = 0u64;
+        for record in reader.records() {
+            record.ok()?;
+            n += 1;
+        }
+        return Some(n);
+    }
+    let log: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(output).ok()?).ok()?;
+    Some(
+        log.get("runs")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| r.get("results").and_then(|v| v.as_array()))
+            .map(|r| r.len() as u64)
+            .sum(),
+    )
 }
 
 impl HistoryEntry {
@@ -804,10 +889,17 @@ impl HistoryEntry {
         }
         let name = self.query_name();
         match &self.status {
-            RunStatus::Succeeded => format!(
-                "\u{2713} {name} \u{b7} {} \u{b7} {}s",
-                self.database, self.seconds
-            ),
+            RunStatus::Succeeded => {
+                let count = match self.results {
+                    Some(1) => String::from(" \u{b7} 1 result"),
+                    Some(n) => format!(" \u{b7} {n} results"),
+                    None => String::new(),
+                };
+                format!(
+                    "\u{2713} {name} \u{b7} {} \u{b7} {}s{count}",
+                    self.database, self.seconds
+                )
+            }
             RunStatus::Failed(why) => format!(
                 "\u{2717} {name} \u{b7} {} \u{b7} failed: {why}",
                 self.database
@@ -819,9 +911,8 @@ impl HistoryEntry {
     }
 }
 
-/// The orders the Query History section sorts by. VS Code also sorts by
-/// result count; croft's history does not record counts, so the third
-/// order groups runs by how they ended instead.
+/// The orders the Query History section sorts by, VS Code's three plus
+/// grouping runs by how they ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HistSort {
     /// Newest first.
@@ -830,6 +921,9 @@ pub enum HistSort {
     Name,
     /// Succeeded, then failed, then running; newest first within each.
     Status,
+    /// Most results first; runs without a count last, newest first among
+    /// equals.
+    Count,
 }
 
 impl HistSort {
@@ -838,7 +932,8 @@ impl HistSort {
         match self {
             HistSort::Date => HistSort::Name,
             HistSort::Name => HistSort::Status,
-            HistSort::Status => HistSort::Date,
+            HistSort::Status => HistSort::Count,
+            HistSort::Count => HistSort::Date,
         }
     }
 
@@ -847,6 +942,7 @@ impl HistSort {
             HistSort::Date => "date",
             HistSort::Name => "name",
             HistSort::Status => "status",
+            HistSort::Count => "result count",
         }
     }
 }
@@ -951,6 +1047,9 @@ impl History {
                 };
                 (rank, Reverse(e.started))
             }),
+            HistSort::Count => self
+                .entries
+                .sort_by_key(|e| (e.results.is_none(), Reverse(e.results), Reverse(e.started))),
         }
         self.sort_by = by;
     }
@@ -1034,6 +1133,34 @@ pub fn export_file_name(query: &Path, output: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_reads_the_reason_and_the_suggested_fix_not_the_progress() {
+        let stderr = "Compiling query plan for /w/q.ql.\n\
+            ERROR: could not resolve module cpp (/w/q.ql:1,8-11)\n\
+            Failed [1/1] /w/q.ql.\n\
+            A fatal error occurred: Could not compile the query.\n\
+            Consider running `codeql pack install` in /w to fetch its dependencies.\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "A fatal error occurred: Could not compile the query. · \
+             ERROR: could not resolve module cpp (/w/q.ql:1,8-11) · \
+             Consider running `codeql pack install` in /w to fetch its dependencies."
+        );
+        // A fix given inside the fatal line is not repeated.
+        assert_eq!(
+            failure_reason(
+                "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`.\n"
+            ),
+            "A fatal error occurred: The database is too old. Run `codeql database upgrade /db`."
+        );
+        // Nothing recognisable: the last line, where a tool ends on its reason.
+        assert_eq!(
+            failure_reason("starting\nno such file: x\n"),
+            "no such file: x"
+        );
+        assert_eq!(failure_reason("\n"), "codeql failed");
+    }
 
     #[test]
     fn cache_jobs_run_database_cleanup_in_their_mode() {
@@ -1197,6 +1324,7 @@ mod tests {
             status,
             output: PathBuf::from(out),
             name: None,
+            results: None,
         };
         let history = History {
             entries: vec![
@@ -1534,6 +1662,7 @@ mod tests {
             status,
             output: PathBuf::from("/out/r.sarif"),
             name: None,
+            results: None,
         }
     }
 
@@ -1658,7 +1787,48 @@ mod tests {
         assert_eq!(History::load(&path).sort_by, HistSort::Status, "saved");
         h.sort(HistSort::Date);
         assert_eq!(started(&h), [5, 4, 3, 2, 1]);
-        assert_eq!(HistSort::Status.next(), HistSort::Date);
+        assert_eq!(HistSort::Status.next(), HistSort::Count);
+        assert_eq!(HistSort::Count.next(), HistSort::Date);
+    }
+
+    #[test]
+    fn history_sorts_by_result_count_and_labels_show_it() {
+        let mut h = History::default();
+        let counted = |q: &str, t: u64, n: Option<u64>| HistoryEntry {
+            results: n,
+            ..run(q, t, RunStatus::Succeeded)
+        };
+        h.push(counted("a.ql", 1, Some(3)));
+        h.push(counted("b.ql", 2, None));
+        h.push(counted("c.ql", 3, Some(40)));
+        h.push(counted("d.ql", 4, Some(3)));
+        h.sort(HistSort::Count);
+        assert_eq!(started(&h), [3, 4, 1, 2], "most first, uncounted last");
+        assert!(h.entries[0].label().ends_with("12s \u{b7} 40 results"));
+        assert!(h.entries[3].label().ends_with("12s"), "no count, no suffix");
+        assert!(
+            counted("e.ql", 5, Some(1))
+                .label()
+                .ends_with("\u{b7} 1 result")
+        );
+    }
+
+    #[test]
+    fn results_are_counted_from_a_table_or_a_sarif_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("results.csv");
+        std::fs::write(&csv, "col0,col1\n1,\"two\nlines\"\n3,x\n").unwrap();
+        assert_eq!(count_results(&csv), Some(2), "a quoted newline is one row");
+        std::fs::write(&csv, "col0\n").unwrap();
+        assert_eq!(count_results(&csv), Some(0));
+        let sarif = dir.path().join("results.sarif");
+        std::fs::write(
+            &sarif,
+            r#"{"version":"2.1.0","runs":[{"results":[{},{}]},{"results":[{}]},{}]}"#,
+        )
+        .unwrap();
+        assert_eq!(count_results(&sarif), Some(3));
+        assert_eq!(count_results(&dir.path().join("missing.sarif")), None);
     }
 
     #[test]

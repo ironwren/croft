@@ -55719,6 +55719,58 @@ fn codeql_is_a_built_in_extensions_row_and_a_palette_command() {
 }
 
 #[test]
+fn codeql_focus_side_bar_and_open_results_directory_are_palette_commands() {
+    // #578: VS Code's "CodeQL: Focus Side Bar", and the results directory
+    // of the selected run (else the newest) without the side bar's `o`.
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.config_dir = tmp.path().join("config");
+        assert_eq!(
+            Command::from_id("codeql_focus_side_bar"),
+            Some(Command::CodeqlFocusSideBar)
+        );
+        assert_eq!(
+            Command::CodeqlFocusSideBar.title(),
+            "CodeQL: Focus Side Bar"
+        );
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.status, "No CodeQL query has run yet");
+
+        let newer = App::codeql_results_dir().join("200-a/results.csv");
+        let older = App::codeql_results_dir().join("100-b/results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("b.ql", 100, RunStatus::Succeeded, older.clone()),
+                ("a.ql", 200, RunStatus::Succeeded, newer.clone()),
+            ],
+        );
+        app.focus = Pane::Editor;
+        app.run_command(Command::CodeqlFocusSideBar);
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(app.focus == Pane::Tree, "the side bar takes the keys");
+
+        // Nothing selected in Query History: the newest run.
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(app.editor.path.as_deref(), Some(newer.as_path()));
+        // A selected run: that one.
+        app.codeql.select_history(1);
+        app.run_command(Command::CodeqlOpenResultsDirectory);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(older.as_path()),
+            "{}",
+            app.status
+        );
+    });
+}
+
+#[test]
 fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
     // Opening the CodeQL view reads croft's cache, whose test override is
     // process-global: without the lock and a cache of its own, this test
@@ -56038,6 +56090,7 @@ fn seed_codeql_history(
             status: status.clone(),
             output: output.clone(),
             name: None,
+            results: None,
         });
     }
     history.save(&App::codeql_history_path()).unwrap();
@@ -57288,6 +57341,30 @@ fn a_failed_query_run_is_recorded_with_codeqls_own_words() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_successful_query_run_records_its_result_count() {
+    // #578: Query History shows how many results a run produced, and can
+    // sort by it.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n2\n", 0, "");
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(history.entries[0].results, Some(2), "{}", app.status);
+        assert!(
+            app.codeql.history[0].ends_with("\u{b7} 2 results"),
+            "{}",
+            app.codeql.history[0]
+        );
+    });
+}
+
 #[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -58244,6 +58321,7 @@ fn deleting_unused_codeql_databases_keeps_used_current_and_outside_ones() {
                 status: crate::codeql_query::RunStatus::Succeeded,
                 output: db.join("unused-output.csv"),
                 name: None,
+                results: None,
             });
         }
         history.save(&App::codeql_history_path()).unwrap();
@@ -58320,6 +58398,7 @@ fn renaming_one_of_two_same_named_databases_keeps_both_protected() {
             status: crate::codeql_query::RunStatus::Succeeded,
             output: tmp.path().join("r.csv"),
             name: None,
+            results: None,
         });
         history.save(&App::codeql_history_path()).unwrap();
 

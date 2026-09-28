@@ -25437,6 +25437,19 @@ impl App {
         }
     }
 
+    /// "CodeQL: Open Query Results Directory" (#578): the folder of the
+    /// Query History run selected in the side bar, else of the newest run.
+    fn open_codeql_results_directory(&mut self) {
+        let index = self
+            .codeql
+            .selected_history()
+            .or_else(|| crate::codeql_query::History::load(&Self::codeql_history_path()).newest());
+        match index {
+            Some(i) => self.open_codeql_history_results_dir(i),
+            None => self.status = String::from("No CodeQL query has run yet"),
+        }
+    }
+
     /// VS Code's "Open Results Directory" for history entry `index`. The
     /// folder lives in croft's cache, outside the workspace, so the
     /// Explorer can show it only when the user has it open; otherwise its
@@ -26294,6 +26307,7 @@ impl App {
             status: RunStatus::Running,
             output: output.clone(),
             name: None,
+            results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
@@ -26336,13 +26350,9 @@ impl App {
             .output()
             .map_err(|e| format!("could not run codeql: {e}"))?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(err
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("codeql could not resolve the suite")
-                .to_string());
+            return Err(crate::codeql_query::failure_reason(
+                &String::from_utf8_lossy(&out.stderr),
+            ));
         }
         let tables = crate::codeql_query::table_queries_in_suite(
             &String::from_utf8_lossy(&out.stdout),
@@ -26357,8 +26367,8 @@ impl App {
         ))
     }
 
-    /// Run `codeql` with `args` and wait. A failure is the first line it
-    /// printed on stderr, where the CLI puts the reason.
+    /// Run `codeql` with `args` and wait. A failure is the reason and the
+    /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
         let out = std::process::Command::new(program)
             .args(args)
@@ -26367,13 +26377,9 @@ impl App {
         if out.status.success() {
             return Ok(());
         }
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("codeql failed")
-            .to_string())
+        Err(crate::codeql_query::failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+        ))
     }
 
     /// Collect a finished query run (#578): record how it went in the
@@ -26419,6 +26425,9 @@ impl App {
         };
         entry.status = status.clone();
         entry.seconds = seconds;
+        entry.results = (status == RunStatus::Succeeded)
+            .then(|| crate::codeql_query::count_results(&entry.output))
+            .flatten();
         let output = entry.output.clone();
         let name = entry
             .query
@@ -46289,6 +46298,14 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlFocusSideBar => {
+                // Show it and take the keys, as VS Code's "Focus" does.
+                self.open_codeql_view();
+                if self.sidebar_view == SidebarView::CodeQL {
+                    self.focus = Pane::Tree;
+                }
+            }
+            Cmd::CodeqlOpenResultsDirectory => self.open_codeql_results_directory(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
