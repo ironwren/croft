@@ -58531,6 +58531,187 @@ fn a_real_results_table_is_walked_into_the_code() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn the_model_editor_lists_a_databases_endpoints_by_group() {
+    // #578: Method Modeling. The language pack's model-editor endpoints
+    // query runs on the current database, and its endpoints are listed by
+    // module or class with whether CodeQL models them; Enter goes to one.
+    use crate::widgets::codeql::{Action, Hit, Line};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let src = tmp.path().join("core.py");
+        std::fs::write(
+            &src,
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n",
+        )
+        .unwrap();
+        let query = bin.path().join("FrameworkModeEndpoints.ql");
+        std::fs::write(&query, "select 1").unwrap();
+        let rows = format!(
+            r#"{{"columns":[],"tuples":[
+              [{{"label":"Function run","url":{{"uri":"file://{f}","startLine":3,"startColumn":1}}}},"mylib","core","run","(cmd,shell)",false,"core.py","",{{"label":"Function"}}],
+              [{{"label":"Function go","url":{{"uri":"file://{f}","startLine":3,"startColumn":1}}}},"mylib","core.Runner","go","(self,what)",true,"core.py","",{{"label":"InstanceMethod"}}]]}}"#,
+            f = src.display()
+        );
+        std::fs::write(bin.path().join("rows.json"), rows).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1 $2\" in 'resolve queries') echo '[\"{query}\"]'; exit 0 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{rows}' \"${{a#--output=}}\" ;; esac; done\nexit 0\n",
+            log = bin.path().join("calls.log").display(),
+            query = query.display(),
+            rows = bin.path().join("rows.json").display(),
+        );
+        let program = bin.path().join("codeql");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.codeql_program = program;
+
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        assert_eq!(app.status, "Reading the endpoints of app\u{2026}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.status, "2 endpoints of app, 1 modeled by CodeQL");
+        let calls = std::fs::read_to_string(bin.path().join("calls.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert!(
+            calls[0].starts_with("resolve queries --format=json "),
+            "{calls:?}"
+        );
+        assert!(calls[1].starts_with("query run --database="), "{calls:?}");
+        assert!(calls[2].contains("--result-set=#select"), "{calls:?}");
+
+        let rows: Vec<(Action, String)> = app
+            .codeql
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Action(
+                    a
+                    @ (Action::OpenModelEditor | Action::ModelGroup(_) | Action::ModelEndpoint(_)),
+                    t,
+                ) => Some((a, t)),
+                _ => None,
+            })
+            .collect();
+        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Refresh \u{b7} app (rust)",
+                "\u{25be} mylib.core  0/1 modeled",
+                "  \u{25cb} run(cmd,shell)",
+                "\u{25be} mylib.core.Runner  1/1 modeled",
+                "  \u{2713} go(self,what)",
+            ]
+        );
+        // Enter on an endpoint goes to its code.
+        app.activate_codeql(Hit::Action(rows[2].0));
+        assert_eq!(app.editor.path.as_deref(), Some(src.as_path()));
+        assert_eq!(app.editor.cursor_row, 2);
+        assert_eq!(app.status, "run(cmd,shell) (Function): not modeled");
+        // A group folds.
+        app.activate_codeql(Hit::Action(rows[3].0));
+        assert!(
+            !app.codeql
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(_, t) if t.contains("go(self")))
+        );
+    });
+}
+
+/// #578's Model Editor against the real CLI: a Python library's
+/// framework-mode endpoints, read from a database built in the test.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-queries; set CROFT_TEST_CODEQL"]
+fn the_model_editor_reads_a_real_librarys_endpoints() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("mylib")).unwrap();
+        std::fs::write(
+            src.join("mylib/__init__.py"),
+            "from .core import run, Runner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("mylib/core.py"),
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n\nclass Runner:\n    def go(self, what):\n        return run(what)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("pyproject.toml"),
+            "[project]\nname = \"mylib\"\nversion = \"0.1\"\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("lib"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let view = app
+            .codeql
+            .model
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}", app.status));
+        let labels: Vec<String> = view.endpoints.iter().map(|e| e.label()).collect();
+        assert!(
+            labels.contains(&String::from("run(cmd,shell)")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&String::from("go(self,what)")),
+            "{labels:?}"
+        );
+        let run = view.endpoints.iter().find(|e| e.function == "run").unwrap();
+        assert_eq!(
+            (run.namespace.as_str(), run.class.as_str()),
+            ("mylib", "core")
+        );
+        assert_eq!(run.location.as_ref().map(|l| l.line), Some(3));
+    });
+}
+
 /// #578's AST Viewer against the real CLI: build a Python database, read
 /// the AST of its source file, and find the function in it. Needs a
 /// `codeql` with the codeql/python-all pack downloaded; set
