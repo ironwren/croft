@@ -3150,8 +3150,17 @@ pub struct App {
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
-    /// The database upgrade in flight (#578).
+    /// The database upgrade or cache cleanup in flight (#578).
     codeql_upgrade: Option<CodeqlUpgrade>,
+    /// The `codeql version` call behind "CodeQL: Copy Version Information"
+    /// (#578): its bare version number, or why it could not be read.
+    codeql_version: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The evaluator log summary being generated (#578): where the outcome
+    /// arrives, and the summary file to open once it lands.
+    codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
+    /// The pack install or download in flight (#578): where its outcome
+    /// arrives, and the status lines for success and failure.
+    codeql_pack_job: Option<CodeqlPackJob>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5417,6 +5426,9 @@ impl App {
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
             codeql_upgrade: None,
+            codeql_version: None,
+            codeql_log_summary: None,
+            codeql_pack_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23448,6 +23460,155 @@ impl App {
         ));
     }
 
+    /// VS Code's "CodeQL: Install Pack Dependencies" for pack `pack` of the
+    /// Queries section (#578): `codeql pack install` on its folder.
+    fn install_codeql_pack_dependencies(&mut self, pack: usize) {
+        let Some(p) = self.codeql.queries.get(pack) else {
+            return;
+        };
+        if p.name == crate::codeql_query::NO_PACK {
+            self.status =
+                String::from("These queries are in no pack, so they have no dependencies");
+            return;
+        }
+        let (name, args) = (
+            p.name.clone(),
+            crate::codeql_query::pack_install_args(&p.dir),
+        );
+        self.start_codeql_pack_job(
+            args,
+            format!("Installing the dependencies of {name}\u{2026}"),
+            format!("Installed the dependencies of {name}"),
+            format!("Could not install the dependencies of {name}"),
+        );
+    }
+
+    /// VS Code's "CodeQL: Quick Query" (#578): open a scratch query for the
+    /// selected database's language, kept in croft's cache so it outlives
+    /// the session. The first time, its pack is written; until `codeql pack
+    /// install` has left a lock file, its library dependency is installed.
+    fn open_codeql_quick_query(&mut self) {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)) else {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        };
+        let Some(module) = db
+            .language
+            .as_deref()
+            .and_then(crate::codeql_query::language_module)
+        else {
+            self.status = format!("CodeQL database {} has no language croft knows", db.name);
+            return;
+        };
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("quick-query")
+            .join(module);
+        let query = dir.join("quick-query.ql");
+        let fresh = !query.is_file();
+        if fresh {
+            let (pack, source) = crate::codeql_query::quick_query(module);
+            let written = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(dir.join("qlpack.yml"), pack))
+                .and_then(|()| std::fs::write(&query, source));
+            if let Err(e) = written {
+                self.status = format!("Could not create the quick query: {e}");
+                return;
+            }
+        }
+        match self.editor.open(&query) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", query.display());
+                return;
+            }
+        }
+        if !dir.join("codeql-pack.lock.yml").is_file() {
+            self.start_codeql_pack_job(
+                crate::codeql_query::pack_install_args(&dir),
+                format!("Installing codeql/{module}-all for the quick query\u{2026}"),
+                format!("Quick query ready: codeql/{module}-all is installed"),
+                format!("Could not install codeql/{module}-all for the quick query"),
+            );
+        } else {
+            self.status = format!("Opened the {module} quick query");
+        }
+    }
+
+    /// Ask which packs "CodeQL: Download Packs" fetches (#578).
+    fn prompt_download_codeql_packs(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlDownloadPacks,
+            String::from("Download Packs"),
+            "packs to download, e.g. codeql/java-queries codeql/python-all@1.0.0",
+        ));
+    }
+
+    fn submit_download_codeql_packs(&mut self, value: &str) {
+        let packs = crate::codeql_query::parse_pack_list(value);
+        if packs.is_empty() {
+            self.status = String::from("Name at least one pack to download");
+            return;
+        }
+        let what = packs.join(", ");
+        self.start_codeql_pack_job(
+            crate::codeql_query::pack_download_args(&packs),
+            format!("Downloading {what}\u{2026}"),
+            format!("Downloaded {what}"),
+            format!("Could not download {what}"),
+        );
+    }
+
+    /// Run a `codeql pack` command on a worker thread (#578); one at a
+    /// time, since installs and downloads write the same package cache.
+    fn start_codeql_pack_job(
+        &mut self,
+        args: Vec<String>,
+        running: String,
+        done: String,
+        failed: String,
+    ) {
+        if self.codeql_pack_job.is_some() {
+            self.status = String::from("A CodeQL pack install or download is already running");
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = running;
+        self.codeql_pack_job = Some((rx, done, failed));
+    }
+
+    /// Collect a finished pack install or download (#578) onto the status
+    /// line.
+    pub fn drain_codeql_pack_job(&mut self) -> bool {
+        let Some((rx, _, _)) = self.codeql_pack_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the pack command stopped unexpectedly"))
+            }
+        };
+        let Some((_, done, failed)) = self.codeql_pack_job.take() else {
+            return false;
+        };
+        self.status = match outcome {
+            Ok(()) => done,
+            Err(why) => format!("{failed}: {why}"),
+        };
+        true
+    }
+
     fn submit_add_codeql_variant_owner(&mut self, value: &str) {
         let saved = self.edit_codeql_variant(|c| {
             c.add_owner(value)
@@ -23845,12 +24006,23 @@ impl App {
     /// [`Self::drain_codeql_upgrade`] collects it. Refused while a query or
     /// another upgrade runs: either would read a database being rewritten.
     fn upgrade_codeql_database(&mut self, index: usize) {
-        if self.codeql_upgrade.is_some() {
-            self.status = String::from("A CodeQL database upgrade is already running");
+        self.start_codeql_db_job(index, crate::codeql_query::DbJob::Upgrade);
+    }
+
+    /// Run `job` on database `index` on a worker thread (#578): an upgrade,
+    /// or VS Code's "CodeQL: Clear Cache", "Trim Cache" and "Trim Cache to
+    /// Overlay Base". One at a time, never beside a query run, since each
+    /// rewrites the database a query would read.
+    fn start_codeql_db_job(&mut self, index: usize, job: crate::codeql_query::DbJob) {
+        if let Some((_, running, _, _)) = self.codeql_upgrade.as_ref() {
+            self.status = format!("A CodeQL database {} is already running", running.noun());
             return;
         }
         if self.codeql_run.is_some() {
-            self.status = String::from("Wait for the CodeQL query run to finish before upgrading");
+            self.status = format!(
+                "Wait for the CodeQL query run to finish before {}",
+                job.gerund()
+            );
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
@@ -23861,31 +24033,82 @@ impl App {
         let path = db.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let args = crate::codeql_query::upgrade_args(&path);
-            let _ = tx.send(Self::codeql_command(&program, &args));
+            let _ = tx.send(Self::codeql_command(&program, &job.args(&path)));
         });
-        self.status = format!("Upgrading CodeQL database {}\u{2026}", db.name);
-        self.codeql_upgrade = Some((rx, db.name, db.path));
+        self.status = job.running(&db.name);
+        self.codeql_upgrade = Some((rx, job, db.name, db.path));
     }
 
-    /// Collect a finished database upgrade (#578) onto the status line.
+    /// Collect a finished database upgrade or cache cleanup (#578) onto the
+    /// status line.
     pub fn drain_codeql_upgrade(&mut self) -> bool {
-        let Some((rx, _, _)) = self.codeql_upgrade.as_ref() else {
+        let Some((rx, _, _, _)) = self.codeql_upgrade.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
             Ok(outcome) => outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(String::from("the upgrade stopped unexpectedly"))
+                Err(String::from("the job stopped unexpectedly"))
             }
         };
-        let Some((_, name, _)) = self.codeql_upgrade.take() else {
+        let Some((_, job, name, _)) = self.codeql_upgrade.take() else {
             return false;
         };
-        self.status = match outcome {
-            Ok(()) => format!("Upgraded CodeQL database {name}"),
-            Err(why) => format!("Could not upgrade CodeQL database {name}: {why}"),
+        self.status = job.finished(&name, outcome);
+        true
+    }
+
+    /// Ask the CodeQL CLI for its version on a worker thread (#578, VS
+    /// Code's "CodeQL: Copy Version Information");
+    /// [`Self::drain_codeql_version`] copies the report.
+    fn copy_codeql_version(&mut self) {
+        if self.codeql_version.is_some() {
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&program)
+                .args(crate::codeql_query::version_args())
+                .output();
+            let _ = tx.send(match out {
+                Ok(o) if o.status.success() => {
+                    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                }
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("codeql failed")
+                    .to_string()),
+                Err(e) => Err(format!("could not run codeql: {e}")),
+            });
+        });
+        self.status = String::from("Reading the CodeQL CLI version\u{2026}");
+        self.codeql_version = Some(rx);
+    }
+
+    /// Copy the version report once the CLI has answered (#578). A missing
+    /// CLI still copies croft's version and the platform, saying why the
+    /// CLI's could not be read.
+    pub fn drain_codeql_version(&mut self) -> bool {
+        let Some(rx) = self.codeql_version.as_ref() else {
+            return false;
+        };
+        let cli = match rx.try_recv() {
+            Ok(cli) => cli,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the version check stopped unexpectedly"))
+            }
+        };
+        self.codeql_version = None;
+        let text = crate::codeql_query::version_information(env!("CARGO_PKG_VERSION"), &cli);
+        copy_to_clipboard(&text);
+        self.status = match cli {
+            Ok(_) => String::from("Copied CodeQL version information"),
+            Err(why) => format!("Copied version information; the CodeQL CLI is unavailable: {why}"),
         };
         true
     }
@@ -23963,7 +24186,7 @@ impl App {
     fn unused_codeql_databases(&self) -> Vec<PathBuf> {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
-        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, p)| p);
+        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, _, p)| p);
         store
             .databases
             .iter()
@@ -24239,6 +24462,160 @@ impl App {
         }
     }
 
+    /// The evaluator log of history entry `index`, or why there is none: a
+    /// run croft made before it kept logs, or one still going.
+    fn codeql_history_log(&mut self, index: usize) -> Option<PathBuf> {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = history.entries.get(index)?;
+        if entry.status == crate::codeql_query::RunStatus::Running {
+            self.status = format!("{} is still running", entry.query_name());
+            return None;
+        }
+        let log = crate::codeql_query::evaluator_log(&entry.output);
+        if log.is_file() {
+            return Some(log);
+        }
+        self.status = format!("{} has no evaluator log", entry.query_name());
+        None
+    }
+
+    /// VS Code's "Show Evaluator Log (Raw JSON)" for history entry `index`.
+    fn show_codeql_evaluator_log(&mut self, index: usize) {
+        let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        match self.editor.open(&log) {
+            Ok(()) => self.sync_open_file_poll_mtime(),
+            Err(e) => self.status = format!("{}: {e}", log.display()),
+        }
+    }
+
+    /// VS Code's "Show Evaluator Log (Summary Text)" for history entry
+    /// `index`: `codeql generate log-summary` on a worker thread the first
+    /// time, then the summary it wrote beside the log.
+    fn show_codeql_evaluator_log_summary(&mut self, index: usize) {
+        let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        let summary = crate::codeql_query::evaluator_log_summary(&log);
+        if summary.is_file() {
+            match self.editor.open(&summary) {
+                Ok(()) => self.sync_open_file_poll_mtime(),
+                Err(e) => self.status = format!("{}: {e}", summary.display()),
+            }
+            return;
+        }
+        if self.codeql_log_summary.is_some() {
+            self.status = String::from("An evaluator log summary is already being made");
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let args = crate::codeql_query::log_summary_args(&log, &summary);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = String::from("Summarising the evaluator log\u{2026}");
+        self.codeql_log_summary = Some((rx, summary));
+    }
+
+    /// Open a finished evaluator log summary (#578), or say why the CLI
+    /// could not make it.
+    pub fn drain_codeql_log_summary(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_log_summary.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the summary stopped unexpectedly"))
+            }
+        };
+        let Some((_, summary)) = self.codeql_log_summary.take() else {
+            return false;
+        };
+        match outcome.and_then(|()| {
+            self.editor
+                .open(&summary)
+                .map_err(|e| format!("{}: {e}", summary.display()))
+        }) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = String::from("Opened the evaluator log summary");
+            }
+            Err(why) => self.status = format!("Could not summarise the evaluator log: {why}"),
+        }
+        true
+    }
+
+    /// VS Code's "Compare Results" for history entry `index` (#578): its
+    /// table against the latest earlier run of the same query, written
+    /// beside its results as a CSV of the rows only one run has, and opened.
+    fn compare_codeql_results(&mut self, index: usize) {
+        use crate::codeql_query::RunStatus;
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        if entry.status != RunStatus::Succeeded {
+            self.status = format!(
+                "{} did not finish, so it has no results",
+                entry.display_name()
+            );
+            return;
+        }
+        if entry.output.extension().is_none_or(|e| e != "csv") {
+            self.status =
+                String::from("Only table results can be compared; alerts open in the SARIF viewer");
+            return;
+        }
+        let Some(partner) = history.compare_partner(index).map(|i| &history.entries[i]) else {
+            self.status = format!(
+                "There is no earlier successful run of {} to compare with",
+                entry.query_name()
+            );
+            return;
+        };
+        let read =
+            |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+        let compared = read(&partner.output).and_then(|old| {
+            let new = read(&entry.output)?;
+            crate::codeql_query::compare_tables(
+                &old,
+                &new,
+                &format!("earlier ({})", partner.database),
+                &format!("later ({})", entry.database),
+            )
+        });
+        let text = match compared {
+            Ok(text) => text,
+            Err(why) => {
+                self.status = format!("Could not compare the results: {why}");
+                return;
+            }
+        };
+        let out = entry
+            .output
+            .with_file_name(format!("compare-{}.csv", partner.started));
+        if let Err(e) = std::fs::write(&out, &text) {
+            self.status = format!("{}: {e}", out.display());
+            return;
+        }
+        let differing = text.lines().count().saturating_sub(1);
+        match self.editor.open(&out) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = match differing {
+                    0 => String::from("Both runs have the same results"),
+                    1 => String::from("1 row differs between the runs"),
+                    n => format!("{n} rows differ between the runs"),
+                };
+            }
+            Err(e) => self.status = format!("{}: {e}", out.display()),
+        }
+    }
+
     /// VS Code's "Open Results Directory" for history entry `index`. The
     /// folder lives in croft's cache, outside the workspace, so the
     /// Explorer can show it only when the user has it open; otherwise its
@@ -24352,8 +24729,8 @@ impl App {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
-        if self.codeql_upgrade.is_some() {
-            self.status = String::from("Wait for the CodeQL database upgrade to finish");
+        if let Some((_, job, _, _)) = self.codeql_upgrade.as_ref() {
+            self.status = format!("Wait for the CodeQL database {} to finish", job.noun());
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
@@ -28757,6 +29134,10 @@ impl App {
             InputPurpose::CodeqlAddVariantOwner => {
                 self.close_input_prompt();
                 self.submit_add_codeql_variant_owner(&value);
+            }
+            InputPurpose::CodeqlDownloadPacks => {
+                self.close_input_prompt();
+                self.submit_download_codeql_packs(&value);
             }
             InputPurpose::CodeqlRenameVariantList { name } => {
                 self.close_input_prompt();
@@ -44097,6 +44478,17 @@ impl App {
                     self.upgrade_codeql_database(i);
                 }
             }
+            Cmd::CodeqlClearCache | Cmd::CodeqlTrimCache | Cmd::CodeqlTrimCacheToOverlay => {
+                use crate::codeql_query::DbJob;
+                let job = match cmd {
+                    Cmd::CodeqlClearCache => DbJob::ClearCache,
+                    Cmd::CodeqlTrimCache => DbJob::TrimCache,
+                    _ => DbJob::TrimCacheToOverlay,
+                };
+                if let Some(i) = self.current_codeql_database() {
+                    self.start_codeql_db_job(i, job);
+                }
+            }
             Cmd::CodeqlAddDatabaseSource => {
                 if let Some(i) = self.current_codeql_database() {
                     self.add_codeql_database_source(i);
@@ -44129,6 +44521,32 @@ impl App {
                 }
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
+            Cmd::CodeqlCopyVersion => self.copy_codeql_version(),
+            Cmd::CodeqlInstallPackDependencies => match self.codeql.selected_pack() {
+                Some(p) => self.install_codeql_pack_dependencies(p),
+                None => {
+                    self.status = String::from(
+                        "Select a query pack or one of its queries in the CodeQL side bar first",
+                    );
+                }
+            },
+            Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
+            Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
+            Cmd::CodeqlCompareResults => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.compare_codeql_results(i);
+                }
+            }
+            Cmd::CodeqlShowEvaluatorLog => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_evaluator_log(i);
+                }
+            }
+            Cmd::CodeqlShowEvaluatorLogSummary => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_evaluator_log_summary(i);
+                }
+            }
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -61241,10 +61659,19 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
-/// A CodeQL database upgrade in flight (#578): where its outcome arrives,
-/// and the database's name and folder.
+/// A `codeql pack` install or download in flight (#578): where its outcome
+/// arrives, and the status lines for success and for failure.
+type CodeqlPackJob = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    String,
+);
+
+/// A CodeQL database upgrade or cache cleanup in flight (#578): where its
+/// outcome arrives, which job it is, and the database's name and folder.
 type CodeqlUpgrade = (
     std::sync::mpsc::Receiver<Result<(), String>>,
+    crate::codeql_query::DbJob,
     String,
     PathBuf,
 );
@@ -62689,7 +63116,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run() | app.drain_codeql_upgrade();
+        let codeql_changed = app.drain_codeql_run()
+            | app.drain_codeql_upgrade()
+            | app.drain_codeql_version()
+            | app.drain_codeql_log_summary()
+            | app.drain_codeql_pack_job();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
