@@ -3161,6 +3161,21 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// `codeql_cli_path` from settings (#578), kept to notice a reload
+    /// changing it.
+    codeql_cli_setting: Option<String>,
+    /// Where [`Self::codeql_program`] came from (#578).
+    codeql_cli_source: crate::codeql_cli::Source,
+    /// The newest CLI release "CodeQL: Check for CLI Updates" found, which
+    /// "CodeQL: Download CLI" then installs (#578).
+    codeql_cli_latest: Option<String>,
+    /// The CLI download in flight (#578).
+    codeql_cli_download: Option<std::sync::mpsc::Receiver<crate::codeql_cli::JobUpdate>>,
+    /// The CLI update check in flight (#578): the latest release and the
+    /// version in use, if it could be read.
+    codeql_cli_check: Option<std::sync::mpsc::Receiver<CodeqlCliCheck>>,
+    /// The network calls behind those two, replaced in tests.
+    codeql_cli_net: crate::codeql_cli::Net,
     /// The GitHub Code Search in flight: the list its repositories go
     /// into, and its outcome (#578).
     codeql_code_search: Option<CodeqlCodeSearch>,
@@ -5435,6 +5450,12 @@ impl App {
             codeql_version: None,
             codeql_log_summary: None,
             codeql_pack_job: None,
+            codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
+            codeql_cli_source: crate::codeql_cli::Source::Fallback,
+            codeql_cli_latest: None,
+            codeql_cli_download: None,
+            codeql_cli_check: None,
+            codeql_cli_net: crate::codeql_cli::Net::default(),
             codeql_code_search: None,
             codeql_variant_submit: None,
             ext_index_manual_refresh: false,
@@ -5915,9 +5936,14 @@ impl App {
         app.problems.scope =
             crate::widgets::problems::ProblemScope::from_config(&loaded_prefs.problems_scope);
         // #578: the Testing view runs CodeQL tests with the same `codeql`
-        // as the side bar, from the first tree click on.
-        app.test_worker
-            .set_codeql_program(app.codeql_program.clone());
+        // as the side bar, from the first tree click on. Tests keep plain
+        // `codeql` rather than whatever the machine has installed.
+        if cfg!(test) {
+            app.test_worker
+                .set_codeql_program(app.codeql_program.clone());
+        } else {
+            app.resolve_codeql_cli();
+        }
         app.sync_focus_flags();
         // Seed the highlighter with the persisted theme's code palette so a
         // file opened before the first theme switch already highlights in the
@@ -22677,12 +22703,24 @@ impl App {
     /// Point every CodeQL run at `program`: the side bar's queries and,
     /// through the test worker, the Testing view's CodeQL tests (#578).
     /// The one place the configured `codeql` changes, so the two never
-    /// disagree. There is no user setting for it yet, so only tests change
-    /// it; the worker is told the startup value in [`App::new`].
-    #[cfg(test)]
+    /// disagree.
     fn set_codeql_program(&mut self, program: PathBuf) {
         self.test_worker.set_codeql_program(program.clone());
         self.codeql_program = program;
+    }
+
+    /// Pick the `codeql` to run from settings, `PATH` and croft's managed
+    /// copies (#578), at startup and when the setting changes.
+    fn resolve_codeql_cli(&mut self) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let resolved = crate::codeql_cli::resolve(
+            self.codeql_cli_setting.as_deref(),
+            home.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+            &croft_cache_dir(),
+        );
+        self.codeql_cli_source = resolved.source;
+        self.set_codeql_program(resolved.program);
     }
 
     /// Kick off a full test run on the worker (no-op if a run/discovery is
@@ -24218,21 +24256,7 @@ impl App {
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let out = std::process::Command::new(&program)
-                .args(crate::codeql_query::version_args())
-                .output();
-            let _ = tx.send(match out {
-                Ok(o) if o.status.success() => {
-                    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                }
-                Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("codeql failed")
-                    .to_string()),
-                Err(e) => Err(format!("could not run codeql: {e}")),
-            });
+            let _ = tx.send(Self::read_codeql_version(&program));
         });
         self.status = String::from("Reading the CodeQL CLI version\u{2026}");
         self.codeql_version = Some(rx);
@@ -24258,6 +24282,151 @@ impl App {
         self.status = match cli {
             Ok(_) => String::from("Copied CodeQL version information"),
             Err(why) => format!("Copied version information; the CodeQL CLI is unavailable: {why}"),
+        };
+        true
+    }
+
+    /// `program`'s bare version number, or why it could not be read.
+    fn read_codeql_version(program: &std::path::Path) -> Result<String, String> {
+        let out = std::process::Command::new(program)
+            .args(crate::codeql_query::version_args())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("codeql failed")
+                .to_string()),
+            Err(e) => Err(format!("could not run codeql: {e}")),
+        }
+    }
+
+    /// Download the newest known CodeQL CLI release into croft's cache on a
+    /// worker thread (#578, the VS Code extension's managed CLI);
+    /// [`Self::drain_codeql_cli_download`] switches to it.
+    fn download_codeql_cli(&mut self) {
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        let Some(asset) = crate::codeql_cli::asset_name(os, arch) else {
+            self.status = format!(
+                "GitHub publishes no CodeQL CLI for {os} on {arch}; install one and set codeql_cli_path"
+            );
+            return;
+        };
+        self.start_codeql_cli_download(asset);
+    }
+
+    fn start_codeql_cli_download(&mut self, asset: &'static str) {
+        use crate::codeql_cli::JobUpdate;
+        if self.codeql_cli_download.is_some() {
+            self.status = String::from("The CodeQL CLI is already downloading");
+            return;
+        }
+        let version =
+            crate::codeql_cli::install_version(self.codeql_cli_latest.as_deref()).to_string();
+        let root = crate::codeql_cli::cli_root(&croft_cache_dir());
+        let net = self.codeql_cli_net.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.status = format!("Downloading CodeQL CLI v{version}\u{2026}");
+        std::thread::spawn(move || {
+            let send = |update| {
+                let _ = tx.send(update);
+            };
+            let out = crate::codeql_cli::download_and_install(&net, &root, &version, asset, &send);
+            send(JobUpdate::Done(out.map(|program| (version, program))));
+        });
+        self.codeql_cli_download = Some(rx);
+    }
+
+    /// Show the CLI download's progress, and switch to the CLI once it is
+    /// installed (#578), unless settings name another: that one always wins.
+    pub fn drain_codeql_cli_download(&mut self) -> bool {
+        use crate::codeql_cli::JobUpdate;
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.codeql_cli_download.take() else {
+            return false;
+        };
+        let mut changed = false;
+        let outcome = loop {
+            match rx.try_recv() {
+                Ok(JobUpdate::Progress(line)) => {
+                    self.status = line;
+                    changed = true;
+                }
+                Ok(JobUpdate::Done(outcome)) => break outcome,
+                Err(TryRecvError::Empty) => {
+                    self.codeql_cli_download = Some(rx);
+                    return changed;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    break Err(String::from("the download stopped unexpectedly"));
+                }
+            }
+        };
+        self.status = match outcome {
+            Ok((version, _)) if self.codeql_cli_source == crate::codeql_cli::Source::Settings => {
+                format!(
+                    "Installed CodeQL CLI v{version}; codeql_cli_path in settings still takes precedence"
+                )
+            }
+            Ok((version, program)) => {
+                self.set_codeql_program(program);
+                let status = format!("Installed CodeQL CLI v{version} and switched to it");
+                self.codeql_cli_source = crate::codeql_cli::Source::Managed(version);
+                status
+            }
+            Err(why) => format!("Could not install the CodeQL CLI: {why}"),
+        };
+        true
+    }
+
+    /// Look up the newest CodeQL CLI release and the version in use on a
+    /// worker thread (#578, VS Code's "CodeQL: Check for CLI Updates");
+    /// [`Self::drain_codeql_cli_check`] compares them.
+    fn check_codeql_cli_updates(&mut self) {
+        if self.codeql_cli_check.is_some() {
+            return;
+        }
+        // A managed copy's folder names its version; any other CLI is asked.
+        let known = match &self.codeql_cli_source {
+            crate::codeql_cli::Source::Managed(v) => Some(v.clone()),
+            _ => None,
+        };
+        let program = self.codeql_program.clone();
+        let latest = self.codeql_cli_net.latest.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let current = known.or_else(|| Self::read_codeql_version(&program).ok());
+            let _ = tx.send((latest(), current));
+        });
+        self.status = String::from("Checking for CodeQL CLI updates\u{2026}");
+        self.codeql_cli_check = Some(rx);
+    }
+
+    /// Report the update check (#578), remembering the latest release for
+    /// "CodeQL: Download CLI".
+    pub fn drain_codeql_cli_check(&mut self) -> bool {
+        let Some(rx) = self.codeql_cli_check.as_ref() else {
+            return false;
+        };
+        let (latest, current) = match rx.try_recv() {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                (Err(String::from("the check stopped unexpectedly")), None)
+            }
+        };
+        self.codeql_cli_check = None;
+        self.status = match latest {
+            Ok(latest) => {
+                let status = crate::codeql_cli::update_status(&latest, current.as_deref());
+                self.codeql_cli_latest = Some(latest);
+                status
+            }
+            Err(why) => format!("Could not check for CodeQL CLI updates: {why}"),
         };
         true
     }
@@ -44835,6 +45004,8 @@ impl App {
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
             Cmd::CodeqlCopyVersion => self.copy_codeql_version(),
+            Cmd::CodeqlDownloadCli => self.download_codeql_cli(),
+            Cmd::CodeqlCheckCliUpdates => self.check_codeql_cli_updates(),
             Cmd::CodeqlInstallPackDependencies => match self.codeql.selected_pack() {
                 Some(p) => self.install_codeql_pack_dependencies(p),
                 None => {
@@ -52447,6 +52618,10 @@ impl App {
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
         self.lane_agent = p.lane_agent.clone();
+        if p.codeql_cli_path != self.codeql_cli_setting {
+            self.codeql_cli_setting = p.codeql_cli_path.clone();
+            self.resolve_codeql_cli();
+        }
         // Live like every other pref here (#363): editing a group in
         // config.json takes effect on the next fleet run without a restart.
         self.fleet_groups = p.fleet_groups.clone();
@@ -61970,6 +62145,10 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
+/// What "CodeQL: Check for CLI Updates" learns (#578): the latest release,
+/// or why it could not be read, and the version in use when it runs.
+type CodeqlCliCheck = (Result<String, String>, Option<String>);
+
 /// A `codeql pack` install or download in flight (#578): where its outcome
 /// arrives, and the status lines for success and for failure.
 type CodeqlPackJob = (
@@ -63440,6 +63619,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()
             | app.drain_codeql_pack_job()
+            | app.drain_codeql_cli_download()
+            | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()
             | app.drain_codeql_variant_submit();
         let search_changed = app.drain_search_results();
