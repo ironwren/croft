@@ -56381,6 +56381,46 @@ fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
         );
         assert!(app.editor.lines.iter().any(|l| l == "        files"));
         assert!(app.editor.is_line_hidden(3), "predicates start folded");
+        // The side bar's Evaluator Log Viewer section holds the same tree.
+        {
+            use crate::widgets::codeql::{Action, Hit, Line};
+            let rows = |app: &App| -> Vec<(Action, String)> {
+                app.codeql
+                    .lines()
+                    .into_iter()
+                    .filter_map(|l| match l {
+                        Line::Action(
+                            a @ (Action::EvalPredicate(_)
+                            | Action::EvalDependency(_)
+                            | Action::ClearEvalLog),
+                            t,
+                        ) => Some((a, t)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let folded = rows(&app);
+            assert_eq!(folded.len(), 3, "{folded:?}");
+            assert_eq!(folded[0].1, "Clear \u{b7} q.ql");
+            assert!(folded[1].1.contains("Foo::slow#b"), "slowest first");
+            assert!(folded[2].1.contains("Foo::fast#a"));
+            app.activate_codeql(Hit::Action(Action::EvalPredicate(1)));
+            let open = rows(&app);
+            assert!(open[2].1.starts_with("\u{25be}"), "{open:?}");
+            assert!(
+                open.iter().any(|(_, t)| t == "  Pipeline pipeline"),
+                "{open:?}"
+            );
+            let dep = open
+                .iter()
+                .find(|(a, _)| matches!(a, Action::EvalDependency(_)))
+                .expect("the dependency row");
+            assert_eq!(dep.1, "  \u{2192} files");
+            app.activate_codeql(Hit::Action(dep.0));
+            assert!(app.status.contains("not in this log"), "{}", app.status);
+            app.activate_codeql(Hit::Action(Action::ClearEvalLog));
+            assert!(app.codeql.evallog.is_none());
+        }
         let predicates = crate::codeql_query::evaluator_log_predicates(&out);
         let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
         assert_eq!(
@@ -57779,6 +57819,72 @@ fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() 
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn debugging_a_codeql_query_stops_at_its_first_breakpoint() {
+    // #578: Debug Query quick-evaluates the predicate at the first
+    // breakpoint; with none it runs the whole query.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
+        );
+        app.codeql_program = fake_query_server(
+            bin.path(),
+            r#"{"resultType": 0, "message": "", "evaluationTime": 1}"#,
+            "\"c\"\n",
+        );
+        let query = tmp.path().join("q.ql");
+        // A breakpoint on a line with no predicate is refused with why.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(7);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert!(
+            app.status
+                .starts_with("No predicate at the breakpoint on line 7"),
+            "{}",
+            app.status
+        );
+        // On the `where` line: the called predicate.
+        app.editor
+            .breakpoints
+            .entry(query.clone())
+            .or_default()
+            .insert(6);
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(
+            app.status,
+            "Running Quick evaluation of isCall (breakpoint on line 6) on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        let requests = std::fs::read_to_string(bin.path().join("requests.jsonl")).unwrap();
+        let run: serde_json::Value =
+            serde_json::from_str(requests.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["line"],
+            6
+        );
+        assert_eq!(
+            run["params"]["body"]["target"]["quickEval"]["quickEvalPos"]["column"],
+            7
+        );
+        // Without breakpoints the whole query runs, as Run Query does.
+        app.editor.open(&query).unwrap();
+        app.editor.breakpoints.clear();
+        app.run_command(Command::CodeqlDebugQuery);
+        assert_eq!(app.status, "Running q.ql on app\u{2026}");
+        wait_for_codeql(&mut app);
+    });
+}
+
 /// #578's quick evaluation against the real CLI's query server: a
 /// predicate's tuples, and their count.
 #[cfg(unix)]
@@ -57972,6 +58078,187 @@ fn a_real_results_table_is_walked_into_the_code() {
         assert_eq!(app.editor.cursor_row, 5, "def go is on line 6");
         app.run_command(crate::widgets::command_palette::Command::CodeqlResultsDown);
         assert_eq!(app.editor.cursor_row, 2, "def run is on line 3");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn the_model_editor_lists_a_databases_endpoints_by_group() {
+    // #578: Method Modeling. The language pack's model-editor endpoints
+    // query runs on the current database, and its endpoints are listed by
+    // module or class with whether CodeQL models them; Enter goes to one.
+    use crate::widgets::codeql::{Action, Hit, Line};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let src = tmp.path().join("core.py");
+        std::fs::write(
+            &src,
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n",
+        )
+        .unwrap();
+        let query = bin.path().join("FrameworkModeEndpoints.ql");
+        std::fs::write(&query, "select 1").unwrap();
+        let rows = format!(
+            r#"{{"columns":[],"tuples":[
+              [{{"label":"Function run","url":{{"uri":"file://{f}","startLine":3,"startColumn":1}}}},"mylib","core","run","(cmd,shell)",false,"core.py","",{{"label":"Function"}}],
+              [{{"label":"Function go","url":{{"uri":"file://{f}","startLine":3,"startColumn":1}}}},"mylib","core.Runner","go","(self,what)",true,"core.py","",{{"label":"InstanceMethod"}}]]}}"#,
+            f = src.display()
+        );
+        std::fs::write(bin.path().join("rows.json"), rows).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$1 $2\" in 'resolve queries') echo '[\"{query}\"]'; exit 0 ;; esac\nfor a in \"$@\"; do case \"$a\" in --output=*) cp '{rows}' \"${{a#--output=}}\" ;; esac; done\nexit 0\n",
+            log = bin.path().join("calls.log").display(),
+            query = query.display(),
+            rows = bin.path().join("rows.json").display(),
+        );
+        let program = bin.path().join("codeql");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.codeql_program = program;
+
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        assert_eq!(app.status, "Reading the endpoints of app\u{2026}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(app.status, "2 endpoints of app, 1 modeled by CodeQL");
+        let calls = std::fs::read_to_string(bin.path().join("calls.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert!(
+            calls[0].starts_with("resolve queries --format=json "),
+            "{calls:?}"
+        );
+        assert!(calls[1].starts_with("query run --database="), "{calls:?}");
+        assert!(calls[2].contains("--result-set=#select"), "{calls:?}");
+
+        let rows: Vec<(Action, String)> = app
+            .codeql
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Action(
+                    a
+                    @ (Action::OpenModelEditor | Action::ModelGroup(_) | Action::ModelEndpoint(_)),
+                    t,
+                ) => Some((a, t)),
+                _ => None,
+            })
+            .collect();
+        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Refresh \u{b7} app (rust)",
+                "\u{25be} mylib.core  0/1 modeled",
+                "  \u{25cb} run(cmd,shell)",
+                "\u{25be} mylib.core.Runner  1/1 modeled",
+                "  \u{2713} go(self,what)",
+            ]
+        );
+        // Enter on an endpoint goes to its code.
+        app.activate_codeql(Hit::Action(rows[2].0));
+        assert_eq!(app.editor.path.as_deref(), Some(src.as_path()));
+        assert_eq!(app.editor.cursor_row, 2);
+        assert_eq!(app.status, "run(cmd,shell) (Function): not modeled");
+        // A group folds.
+        app.activate_codeql(Hit::Action(rows[3].0));
+        assert!(
+            !app.codeql
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Action(_, t) if t.contains("go(self")))
+        );
+    });
+}
+
+/// #578's Model Editor against the real CLI: a Python library's
+/// framework-mode endpoints, read from a database built in the test.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-queries; set CROFT_TEST_CODEQL"]
+fn the_model_editor_reads_a_real_librarys_endpoints() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("mylib")).unwrap();
+        std::fs::write(
+            src.join("mylib/__init__.py"),
+            "from .core import run, Runner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("mylib/core.py"),
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n\nclass Runner:\n    def go(self, what):\n        return run(what)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("pyproject.toml"),
+            "[project]\nname = \"mylib\"\nversion = \"0.1\"\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("lib"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let view = app
+            .codeql
+            .model
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}", app.status));
+        let labels: Vec<String> = view.endpoints.iter().map(|e| e.label()).collect();
+        assert!(
+            labels.contains(&String::from("run(cmd,shell)")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&String::from("go(self,what)")),
+            "{labels:?}"
+        );
+        let run = view.endpoints.iter().find(|e| e.function == "run").unwrap();
+        assert_eq!(
+            (run.namespace.as_str(), run.class.as_str()),
+            ("mylib", "core")
+        );
+        assert_eq!(run.location.as_ref().map(|l| l.line), Some(3));
     });
 }
 
