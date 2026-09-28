@@ -49,6 +49,44 @@ pub fn location_parts(run: &Run, loc: &ArtifactLocation) -> Option<(String, Opti
     Some((uri, base))
 }
 
+/// A file's contents carried in the log itself (§3.24.8, `artifacts[].contents`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Embedded {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// The contents the log embeds for `loc`'s artifact (#577): the artifact
+/// `loc.index` names, else the one whose location has the same `uri` and
+/// `uriBaseId`. Text is preferred to binary; binary is base64 (§3.3.2).
+pub fn embedded_contents(run: &Run, loc: &ArtifactLocation) -> Option<Embedded> {
+    use base64::Engine;
+    let by_index = loc
+        .index
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| run.artifacts.get(i));
+    let by_uri = || {
+        let uri = loc.uri.as_deref()?;
+        run.artifacts.iter().find(|a| {
+            a.location
+                .as_ref()
+                .is_some_and(|l| l.uri.as_deref() == Some(uri) && l.uri_base_id == loc.uri_base_id)
+        })
+    };
+    let contents = by_index
+        .filter(|a| a.contents.is_some())
+        .or_else(by_uri)?
+        .contents
+        .as_ref()?;
+    if let Some(text) = &contents.text {
+        return Some(Embedded::Text(text.clone()));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(contents.binary.as_deref()?.trim())
+        .ok()?;
+    Some(Embedded::Binary(bytes))
+}
+
 /// Whether `uri` carries a scheme (RFC 3986 §3.1), making it absolute. A
 /// single letter before the colon is a Windows drive, not a scheme.
 fn has_scheme(uri: &str) -> bool {
@@ -133,7 +171,7 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(percent_decode(uri)))
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -547,6 +585,37 @@ mod tests {
             )
         };
         assert_eq!(at("file:///build/ery.rs"), None);
+    }
+
+    #[test]
+    fn embedded_contents_are_found_by_index_or_uri() {
+        let run = run(r#"{"artifacts":[
+                {"location":{"uri":"gen/a.c"},"contents":{"text":"int a;"}},
+                {"location":{"uri":"b.bin","uriBaseId":"SRC"},"contents":{"binary":"AAEC/w=="}},
+                {"location":{"uri":"none.c"}}]}"#);
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"index":0}"#)),
+            Some(Embedded::Text(String::from("int a;")))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"gen/a.c"}"#)),
+            Some(Embedded::Text(String::from("int a;")))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"b.bin","uriBaseId":"SRC"}"#)),
+            Some(Embedded::Binary(vec![0, 1, 2, 255]))
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"uri":"b.bin"}"#)),
+            None,
+            "another base"
+        );
+        assert_eq!(
+            embedded_contents(&run, &loc(r#"{"index":2}"#)),
+            None,
+            "no contents"
+        );
+        assert_eq!(embedded_contents(&run, &loc(r#"{"uri":"x.c"}"#)), None);
     }
 
     #[test]

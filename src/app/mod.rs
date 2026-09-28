@@ -57434,7 +57434,7 @@ impl App {
     fn open_selected_sarif_result(&mut self) {
         use crate::sarif::region::{ColumnKind, column_kind};
         let root = self.workspace_root().to_path_buf();
-        let Some((path, line, column, kind, uri, place)) =
+        let Some((path, line, column, kind, uri, place, embedded)) =
             self.editor.sarif.as_ref().and_then(|v| {
                 let e = v.selected_entry()?;
                 let loaded = v.logs.get(e.log)?;
@@ -57459,11 +57459,37 @@ impl App {
                 let place = region
                     .cloned()
                     .map(|r| (r, crate::sarif::region::newline_sequences(run)));
-                Some((found, line, column, column_kind(run), e.uri.clone(), place))
+                let embedded = found
+                    .is_none()
+                    .then(|| crate::sarif::resolve::embedded_contents(run, artifact))
+                    .flatten();
+                Some((
+                    found,
+                    line,
+                    column,
+                    column_kind(run),
+                    e.uri.clone(),
+                    place,
+                    embedded,
+                ))
             })
         else {
             self.status = String::from("This result has no location to open");
             return;
+        };
+        // Not on this machine, but the log carries the file (#577): open a
+        // read-only copy, text as text and binary in the hex viewer.
+        let path = match (path, embedded) {
+            (Some(p), _) => Some(p),
+            (None, Some(contents)) => {
+                if let Err(e) =
+                    self.open_sarif_embedded(&uri, &contents, line as usize, column as usize)
+                {
+                    self.status = format!("Could not open the log's copy of {uri}: {e}");
+                }
+                return;
+            }
+            (None, None) => None,
         };
         let Some(path) = path else {
             // VS Code's Locate…: ask where the file is.
@@ -58258,6 +58284,56 @@ impl App {
             .and_then(|m| m.text.clone())
             .unwrap_or_else(|| String::from("the fix"));
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
+    }
+
+    /// Open the copy of `uri` a SARIF log embeds (#577), written read-only
+    /// under croft's cache (named by a hash of the URI and contents, so an
+    /// unchanged copy is reused): text at `line`/`column`, binary in the hex
+    /// viewer. Saving it is refused by the file's permissions, since the
+    /// log, not this copy, is the source.
+    fn open_sarif_embedded(
+        &mut self,
+        uri: &str,
+        contents: &crate::sarif::resolve::Embedded,
+        line: usize,
+        column: usize,
+    ) -> anyhow::Result<()> {
+        use crate::sarif::resolve::Embedded;
+        use std::hash::{Hash, Hasher};
+        let bytes: &[u8] = match contents {
+            Embedded::Text(t) => t.as_bytes(),
+            Embedded::Binary(b) => b,
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        uri.hash(&mut h);
+        bytes.hash(&mut h);
+        let name = uri
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .map(crate::sarif::resolve::percent_decode)
+            .filter(|n| n != "." && n != ".." && !n.contains(['/', '\\']))
+            .unwrap_or_else(|| String::from("artifact"));
+        let dir = croft_cache_dir()
+            .join("sarif-embedded")
+            .join(format!("{:016x}", h.finish()));
+        let path = dir.join(&name);
+        if !path.is_file() {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&path, bytes)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+        }
+        self.editor.pin_active();
+        match contents {
+            Embedded::Text(_) => self.open_at(&path, line, column)?,
+            Embedded::Binary(_) => {
+                self.editor.open_hex(&path)?;
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+        }
+        self.status = format!("Opened the log's own copy of {uri} (read-only)");
+        Ok(())
     }
 
     /// The paths of the files open in editor tabs, for SARIF resolution.
