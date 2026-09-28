@@ -29,8 +29,12 @@ impl Sink for FirstLine {
 /// `widgets::testing::tests::foo`), or `None` if no `fn` is found. `line` is
 /// 0-based, ready for [`crate::app`]'s go-to-definition. pytest node IDs
 /// (`tests/test_x.py::test_y`) carry their file, so those skip the walk and
-/// grep just that file for the `def`.
+/// grep just that file for the `def`. A CodeQL test id names its `.ql` or
+/// `.qlref` file outright, so the jump lands on the file's first line.
 pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    if let Some(hit) = codeql_source(root, full_name) {
+        return Some(hit);
+    }
     if full_name.contains(".py::") {
         return pytest_source(root, full_name);
     }
@@ -90,6 +94,18 @@ pub fn find_test_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> 
         }
     }
     best.map(|(p, l, _)| (p, l))
+}
+
+/// Resolve a CodeQL test id (`dir::Foo.qlref`, or a bare `Foo.ql` at the
+/// root) to its file, when that file exists. Anything else — a title that
+/// merely ends in `.ql` — is left to the other resolvers.
+fn codeql_source(root: &Path, full_name: &str) -> Option<(PathBuf, u32)> {
+    let leaf = full_name.rsplit("::").next()?;
+    if !(leaf.ends_with(".ql") || leaf.ends_with(".qlref")) {
+        return None;
+    }
+    let path = root.join(super::codeqltest::id_path(full_name));
+    path.is_file().then_some((path, 0))
 }
 
 /// Resolve a pytest node ID: the segment before `.py::` is the file (relative
@@ -492,6 +508,24 @@ mod tests {
         .unwrap();
         let (_, line) = find_test_source(root, "a.test.js::odd little title").unwrap();
         assert_eq!(line, 0);
+    }
+
+    #[test]
+    fn codeql_test_ids_jump_to_their_query_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("test/Find")).unwrap();
+        std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+        std::fs::write(root.join("Top.ql"), "select 1\n").unwrap();
+        assert_eq!(
+            find_test_source(root, "test/Find::Find.qlref"),
+            Some((root.join("test/Find/Find.qlref"), 0))
+        );
+        assert_eq!(
+            find_test_source(root, "Top.ql"),
+            Some((root.join("Top.ql"), 0))
+        );
+        assert_eq!(find_test_source(root, "test/Find::Gone.ql"), None);
     }
 
     #[test]

@@ -56059,6 +56059,133 @@ fn running_a_codeql_pack_is_refused_while_a_query_runs_or_without_a_database() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn codeql_run_tests_runs_the_test_pack_through_the_testing_view() {
+    // #578: "CodeQL: Run Tests" runs every CodeQL test with the app's
+    // `codeql`, and the results land in the Testing view; outside a
+    // CodeQL test workspace it says why nothing ran.
+    use crate::testing::model::TestStatus;
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        Command::from_id("codeql_run_tests"),
+        Some(Command::CodeqlRunTests)
+    );
+    assert_eq!(Command::CodeqlRunTests.title(), "CodeQL: Run Tests");
+
+    let plain = tempfile::tempdir().unwrap();
+    let mut app = App::new(plain.path().to_path_buf()).unwrap();
+    app.run_command(Command::CodeqlRunTests);
+    assert!(
+        app.status.starts_with("No CodeQL tests here"),
+        "{}",
+        app.status
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Bad")).unwrap();
+    std::fs::write(
+        root.join("test/qlpack.yml"),
+        "name: acme/tests\nextractor: rust\ntests: .\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("test/Bad/Bad.ql"), "select 1").unwrap();
+    std::fs::write(root.join("test/Bad/Bad.expected"), "").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("calls.log");
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+             echo '[1/1 comp 1s eval 9ms] FAILED(RESULT) {root}/test/Bad/Bad.ql'\n\
+             echo '--- expected'\necho '+++ actual'\necho '+| 1 |'\n\
+             echo '0 tests passed; 1 tests failed:'\nexit 1\n",
+            log = log.display(),
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program.clone());
+    app.run_command(Command::CodeqlRunTests);
+    assert_eq!(app.status, "Running CodeQL tests");
+    assert!(app.sidebar_view == SidebarView::Testing);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if !app.testing.is_busy()
+            && app
+                .testing
+                .cases_for_test()
+                .contains(&(String::from("test/Bad::Bad.ql"), TestStatus::Failed))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CodeQL run never reported; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.testing.failed_count(), 1);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "test run test\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_test_clicked_in_the_tree_runs_with_the_configured_codeql() {
+    // #578: the test worker learns the app's `codeql` when it starts and
+    // whenever it changes, so a tree click runs the configured program
+    // (never PATH's) without "CodeQL: Run Tests" having run first.
+    use crate::testing::model::TestStatus;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("test/Find")).unwrap();
+    std::fs::write(root.join("test/qlpack.yml"), "name: acme/tests\ntests: .\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+    std::fs::write(root.join("test/Find/Find.expected"), "").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("calls.log");
+    let program = bin.path().join("codeql");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+             echo '[1/1 comp 1s eval 9ms] PASSED {root}/test/Find/Find.qlref'\nexit 0\n",
+            log = log.display(),
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.set_codeql_program(program);
+    app.run_test(String::from("test/Find::Find.qlref"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = app.test_worker.drain(&mut app.testing);
+        if app.testing.status_of("test/Find::Find.qlref") == Some(TestStatus::Passed) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clicked test never ran with the configured codeql; cases: {:?}",
+            app.testing.cases_for_test()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "test run test/Find/Find.qlref\n"
+    );
+}
+
 /// Drain the database upgrade until it lands, or fail after a few seconds.
 fn wait_for_codeql_upgrade(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
