@@ -282,6 +282,36 @@ impl Resolver {
     }
 }
 
+/// Where `uri`, a location in `run`, sits on GitHub, when the run names a
+/// GitHub repository and commit in its `versionControlProvenance`: the
+/// case of a variant analysis, whose results are in other repositories.
+/// `line` (1-based, 0 for none) becomes the URL's fragment.
+pub fn github_blob_url(run: &Run, uri: &str, line: i64) -> Option<String> {
+    let vcs = run.version_control_provenance.first()?;
+    let repo = vcs
+        .repository_uri
+        .as_deref()?
+        .strip_prefix("https://github.com/")?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let rev = vcs.revision_id.as_deref().unwrap_or("HEAD");
+    let path = uri
+        .strip_prefix("file:///")
+        .unwrap_or(uri)
+        .trim_start_matches('/');
+    if repo.is_empty() || path.is_empty() || path.contains("://") {
+        return None;
+    }
+    let fragment = if line > 0 {
+        format!("#L{line}")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "https://github.com/{repo}/blob/{rev}/{path}{fragment}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +531,27 @@ mod tests {
             r.resolve(&run("{}"), &loc(r#"{"uri":"nope.rs"}"#), &disk(&[])),
             None
         );
+    }
+    #[test]
+    fn a_location_in_a_github_repository_links_to_its_commit() {
+        use super::super::model::VersionControlDetails;
+        let mut run = Run::default();
+        assert_eq!(github_blob_url(&run, "src/a.py", 3), None, "no provenance");
+        run.version_control_provenance = vec![VersionControlDetails {
+            repository_uri: Some("https://github.com/a/b".into()),
+            revision_id: Some("abc".into()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            github_blob_url(&run, "src/a.py", 3).as_deref(),
+            Some("https://github.com/a/b/blob/abc/src/a.py#L3")
+        );
+        assert_eq!(
+            github_blob_url(&run, "/src/a.py", 0).as_deref(),
+            Some("https://github.com/a/b/blob/abc/src/a.py")
+        );
+        assert_eq!(github_blob_url(&run, "https://x/y", 1), None);
+        run.version_control_provenance[0].repository_uri = Some("https://gitlab.com/a/b".into());
+        assert_eq!(github_blob_url(&run, "src/a.py", 3), None);
     }
 }
