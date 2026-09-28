@@ -15,6 +15,7 @@ mod code_lens;
 mod codeql_cli;
 mod codeql_db;
 mod codeql_query;
+mod codeql_submit;
 mod codeql_variant;
 mod collab;
 mod collab_agent;

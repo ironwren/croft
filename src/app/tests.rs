@@ -60475,9 +60475,9 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
         assert!(saved().lists.is_empty(), "{}", app.status);
         assert!(app.codeql.selected_hit().is_some(), "still on a row");
 
-        // Submission is still to come.
+        // A run needs a query open.
         app.run_command(Command::CodeqlRunVariantAnalysis);
-        assert!(app.status.contains("not available yet"), "{}", app.status);
+        assert!(app.status.contains("Open a .ql query"), "{}", app.status);
 
         // The config file opens in a tab.
         app.run_command(Command::CodeqlOpenVariantConfig);
@@ -60501,6 +60501,163 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
             Command::from_id("codeql_set_up_controller_repository"),
             Some(Command::CodeqlSetUpController)
         );
+    });
+}
+
+#[test]
+fn codeql_run_variant_analysis_bundles_the_query_and_posts_it_to_the_controller() {
+    // #578: VS Code's "CodeQL: Run Variant Analysis". The open query is
+    // bundled with its pack (default suite pointed at it) and posted with
+    // gh to the controller, against what the side bar selects.
+    use crate::codeql_submit::load_submitted;
+    use crate::codeql_variant::{Item, VariantConfig};
+    use crate::widgets::command_palette::Command;
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let pack = ws.join("mypack");
+        std::fs::create_dir_all(pack.join("src")).unwrap();
+        std::fs::write(
+            pack.join("qlpack.yml"),
+            "name: me/q\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\ndefaultSuite:\n  - queries: .\n",
+        )
+        .unwrap();
+        std::fs::write(pack.join("src/Lib.qll"), "predicate p() { any() }").unwrap();
+        let query = pack.join("src/Find.ql");
+        std::fs::write(&query, "import python\nselect 1").unwrap();
+
+        // `codeql pack bundle` writes the pack file and its file list as the
+        // "archive", so the test can read what was bundled.
+        let log = tmp.path().join("log");
+        let stub = |name: &str, body: String| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let codeql = stub(
+            "codeql",
+            format!(
+                r#"#!/bin/sh
+echo "codeql $*" >> '{log}'
+case "$1 $2" in
+  "pack install") exit 0 ;;
+  "pack bundle") out="${{3#--output=}}"; dir="$5"
+     {{ cat "$dir/qlpack.yml"; (cd "$dir" && find . -type f | sort); }} > "$out" ;;
+esac
+"#,
+                log = log.display()
+            ),
+        );
+        let body = tmp.path().join("body.json");
+        let gh = stub(
+            "gh",
+            format!(
+                r#"#!/bin/sh
+echo "gh $*" >> '{log}'
+while [ $# -gt 0 ]; do [ "$1" = --input ] && cp "$2" '{body}'; shift; done
+echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no_codeql_db_repos": {{"repository_count": 1}}}}}}'
+"#,
+                log = log.display(),
+                body = body.display()
+            ),
+        );
+
+        let mut app = App::new(ws.clone()).unwrap();
+        app.gh_program = gh;
+        app.set_codeql_program(codeql);
+        let finish = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !app.drain_codeql_variant_submit() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the submission never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        app.editor.open(&query).unwrap();
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(
+            app.status.contains("controller repository"),
+            "{}",
+            app.status
+        );
+
+        let mut config = VariantConfig::default();
+        config.set_controller("me/ctl").unwrap();
+        config.add_list("top").unwrap();
+        config.add_repo(Some(0), "a/b").unwrap();
+        config.add_repo(Some(0), "c/d").unwrap();
+        config.save(&App::codeql_variant_path()).unwrap();
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(
+            app.status.contains("Select a repository list"),
+            "{}",
+            app.status
+        );
+
+        config.select(Item::List(0)).unwrap();
+        config.save(&App::codeql_variant_path()).unwrap();
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(
+            app.status
+                .contains("Submitting Find.ql as a variant analysis against 2 repositories"),
+            "{}",
+            app.status
+        );
+        finish(&mut app);
+        assert_eq!(
+            app.status,
+            "Variant analysis 4242 of Find.ql submitted, 1 repository skipped: https://github.com/me/ctl/actions/runs/99"
+        );
+
+        let asked = std::fs::read_to_string(&log).unwrap();
+        assert!(asked.contains("codeql pack install"), "{asked}");
+        assert!(
+            asked.contains(
+                "gh api --method POST repos/me/ctl/code-scanning/codeql/variant-analyses --input"
+            ),
+            "{asked}"
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&body).unwrap()).unwrap();
+        assert_eq!(sent["language"], "python", "from the pack's dependency");
+        assert_eq!(sent["repositories"], serde_json::json!(["a/b", "c/d"]));
+        let bundled = base64::engine::general_purpose::STANDARD
+            .decode(sent["query_pack"].as_str().unwrap())
+            .unwrap();
+        let bundled = String::from_utf8(bundled).unwrap();
+        assert!(
+            bundled.contains("defaultSuite:\n  - query: \"src/Find.ql\"\n"),
+            "{bundled}"
+        );
+        assert!(
+            !bundled.contains("queries: ."),
+            "the pack's own suite is replaced: {bundled}"
+        );
+        assert!(bundled.contains("./src/Lib.qll"), "{bundled}");
+
+        let runs = load_submitted(&App::codeql_variant_runs_path());
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].id, runs[0].controller.as_str()), (4242, "me/ctl"));
+        assert!(
+            !croft_cache_dir()
+                .join("codeql/variant")
+                .read_dir()
+                .is_ok_and(|mut d| d.next().is_some()),
+            "the work folder is cleaned up"
+        );
+
+        // An unsaved query is not sent as its last saved version.
+        app.editor.dirty = true;
+        app.run_command(Command::CodeqlRunVariantAnalysis);
+        assert!(app.status.contains("Save the query"), "{}", app.status);
     });
 }
 

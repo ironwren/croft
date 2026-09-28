@@ -3179,6 +3179,9 @@ pub struct App {
     /// The GitHub Code Search in flight: the list its repositories go
     /// into, and its outcome (#578).
     codeql_code_search: Option<CodeqlCodeSearch>,
+    /// The variant analysis being bundled and submitted (#578).
+    codeql_variant_submit:
+        Option<std::sync::mpsc::Receiver<Result<crate::codeql_submit::Submitted, String>>>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5454,6 +5457,7 @@ impl App {
             codeql_cli_check: None,
             codeql_cli_net: crate::codeql_cli::Net::default(),
             codeql_code_search: None,
+            codeql_variant_submit: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -25017,6 +25021,166 @@ impl App {
             }
             Err(e) => self.status = format!("{}: {e}", path.display()),
         }
+    }
+
+    /// Where submitted variant analyses are remembered (#578).
+    fn codeql_variant_runs_path() -> PathBuf {
+        croft_cache_dir().join("codeql-variant-analyses.json")
+    }
+
+    /// Submit the open query as a variant analysis (#578, VS Code's "CodeQL:
+    /// Run Variant Analysis"): bundle it into a query pack and post it to
+    /// the controller repository, which runs it on GitHub Actions against
+    /// the selected list, repository or owner. The bundling and the post
+    /// happen on a worker thread; [`Self::drain_codeql_variant_submit`]
+    /// reports the run.
+    fn run_codeql_variant_analysis(&mut self) {
+        use crate::codeql_submit as cs;
+        if self.codeql_variant_submit.is_some() {
+            self.status = String::from("A variant analysis is already being submitted");
+            return;
+        }
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
+            _ => {
+                self.status = String::from("Open a .ql query to run a variant analysis");
+                return;
+            }
+        };
+        // The bundle is built from the file on disk.
+        if self.editor.dirty {
+            self.status = String::from("Save the query before running a variant analysis");
+            return;
+        }
+        let config = match crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path())
+        {
+            Ok(c) => c,
+            Err(why) => {
+                self.status = format!("Could not read the variant analysis config: {why}");
+                return;
+            }
+        };
+        let Some(controller) = config.controller_repo.clone() else {
+            self.status = String::from(
+                "Set up a controller repository under Variant Analysis Repositories first",
+            );
+            return;
+        };
+        let targets = match cs::targets(&config) {
+            Ok(t) => t,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let pack_language = cs::enclosing_pack(&query)
+            .and_then(|(_, file)| std::fs::read_to_string(file).ok())
+            .and_then(|text| crate::codeql_query::pack_language(&text));
+        let Some(language) =
+            pack_language.or_else(|| self.codeql_search_language().map(str::to_string))
+        else {
+            self.status = String::from(
+                "The query's pack names no language: pick one in the CodeQL side bar's Language section",
+            );
+            return;
+        };
+        let submitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = query
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let work = croft_cache_dir()
+            .join("codeql")
+            .join("variant")
+            .join(format!("{submitted_at}-{stem}"));
+        let program = self.codeql_program.clone();
+        let gh = self.gh_program.to_string_lossy().into_owned();
+        let root = self.active_workspace_root().to_path_buf();
+        let describe = targets.describe();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query_for_run = query.clone();
+        std::thread::spawn(move || {
+            let query = query_for_run;
+            let outcome = (|| {
+                let _ = std::fs::remove_dir_all(&work);
+                let pack = cs::prepare_pack(&query, &language, &work)?;
+                let run = |args: Vec<String>| Self::codeql_command(&program, &args);
+                run(crate::codeql_query::pack_install_args(&pack))
+                    .map_err(|e| format!("installing the pack's dependencies failed: {e}"))?;
+                let bundle = work.join("pack.tgz");
+                run(cs::pack_bundle_args(&pack, &bundle))
+                    .map_err(|e| format!("bundling the query failed: {e}"))?;
+                let bytes =
+                    std::fs::read(&bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+                let body = work.join("body.json");
+                std::fs::write(
+                    &body,
+                    cs::submission_body(&language, &bytes, &targets).to_string(),
+                )
+                .map_err(|e| format!("{}: {e}", body.display()))?;
+                let answer = crate::pr_review::run_gh(
+                    &gh,
+                    &cs::submit_args(&controller, &body),
+                    &root,
+                    crate::pr_review::GH_TIMEOUT,
+                )?;
+                cs::parse_submission(&answer, &controller, &query, &language, submitted_at)
+            })();
+            let _ = std::fs::remove_dir_all(&work);
+            let _ = tx.send(outcome);
+        });
+        self.codeql_variant_submit = Some(rx);
+        self.status = format!(
+            "Submitting {} as a variant analysis against {describe}\u{2026}",
+            query.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    /// Report a finished variant analysis submission, and remember the run.
+    /// Returns true when one finished.
+    pub fn drain_codeql_variant_submit(&mut self) -> bool {
+        let Some(rx) = self.codeql_variant_submit.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the submission stopped without answering"))
+            }
+        };
+        self.codeql_variant_submit = None;
+        self.status = match outcome {
+            Ok(run) => {
+                let name = run
+                    .query
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let skipped = match run.skipped {
+                    0 => String::new(),
+                    n => format!(
+                        ", {n} repositor{} skipped",
+                        if n == 1 { "y" } else { "ies" }
+                    ),
+                };
+                let url = run.url();
+                let id = run.id;
+                match crate::codeql_submit::record_submitted(&Self::codeql_variant_runs_path(), run)
+                {
+                    Ok(()) => format!("Variant analysis {id} of {name} submitted{skipped}: {url}"),
+                    Err(e) => format!(
+                        "Variant analysis {id} of {name} submitted{skipped}: {url} (not remembered: {e})"
+                    ),
+                }
+            }
+            Err(why) => format!("Could not submit the variant analysis: {why}"),
+        };
+        true
     }
 
     /// Run the open `.ql` file on the current database (#578), from the
@@ -44874,10 +45038,7 @@ impl App {
             Cmd::CodeqlVariantCodeSearch => self.prompt_codeql_variant_code_search(),
             Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
             Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
-            Cmd::CodeqlRunVariantAnalysis => {
-                self.status =
-                    String::from("Running a variant analysis is not available yet (#578)");
-            }
+            Cmd::CodeqlRunVariantAnalysis => self.run_codeql_variant_analysis(),
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
@@ -63460,7 +63621,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_pack_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
-            | app.drain_codeql_code_search();
+            | app.drain_codeql_code_search()
+            | app.drain_codeql_variant_submit();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
