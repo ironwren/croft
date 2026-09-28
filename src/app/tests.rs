@@ -57323,6 +57323,58 @@ fn drain_one_codeql_run(app: &mut App) {
 
 #[cfg(unix)]
 #[test]
+fn codeql_runs_every_workspace_query_or_the_ones_selected_in_the_explorer() {
+    // #578: "run one or all" queries, and run on selected files.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_pack_fixture(tmp.path(), bin.path());
+        let pack = tmp.path().join("pack");
+        let listed: usize = app.codeql.queries.iter().map(|p| p.queries.len()).sum();
+        assert!(listed >= 3);
+
+        app.run_command(Command::CodeqlRunAllQueries);
+        assert!(
+            app.status
+                .starts_with(&format!("Running CodeQL queries 1/{listed}: ")),
+            "{}",
+            app.status
+        );
+        while app.codeql_run.is_some() {
+            drain_one_codeql_run(&mut app);
+        }
+        assert_eq!(app.status, format!("Ran {listed} CodeQL queries, 1 failed"));
+
+        // Nothing selected in the Explorer that holds a query.
+        app.tree.marked.clear();
+        app.tree.marked.insert(tmp.path().join("pack/qlpack.yml"));
+        app.run_command(Command::CodeqlRunSelectedQueries);
+        assert!(app.status.starts_with("Select .ql files"), "{}", app.status);
+
+        // Two files, listed out of order.
+        app.tree.marked.clear();
+        app.tree.marked.insert(pack.join("c.ql"));
+        app.tree.marked.insert(pack.join("a.ql"));
+        app.run_command(Command::CodeqlRunSelectedQueries);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/2: a.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/2: c.ql on app\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert_eq!(app.status, "Ran 2 CodeQL queries");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
     // #578: `r` on a pack line queues every query in it; each run lands in
     // the query history in order and a failing one doesn't stop the rest.

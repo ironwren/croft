@@ -378,6 +378,44 @@ pub fn query_text_path(output: &Path, query: &Path) -> PathBuf {
         .join(name)
 }
 
+/// The `.ql` queries `paths` name (#578, "run queries in selected files"):
+/// each `.ql` file itself, and every `.ql` under a folder, skipping hidden
+/// folders. Sorted and without repeats; a path that is neither is ignored.
+pub fn queries_in(paths: &[PathBuf]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let hidden = p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            if hidden {
+                continue;
+            }
+            if p.is_dir() {
+                if depth < 16 {
+                    walk(&p, depth + 1, out);
+                }
+            } else if p.extension().is_some_and(|e| e == "ql") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            walk(p, 0, &mut out);
+        } else if p.is_file() && p.extension().is_some_and(|e| e == "ql") {
+            out.push(p.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -989,6 +1027,38 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queries_in_takes_ql_files_and_walks_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for f in [
+            "a/One.ql",
+            "a/b/Two.ql",
+            "a/lib.qll",
+            "a/.hidden/Three.ql",
+            "Top.ql",
+            "x.txt",
+        ] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "select 1").unwrap();
+        }
+        let got = queries_in(&[
+            root.join("a"),
+            root.join("Top.ql"),
+            root.join("a/One.ql"),
+            root.join("x.txt"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                root.join("Top.ql"),
+                root.join("a/One.ql"),
+                root.join("a/b/Two.ql")
+            ]
+        );
+    }
 
     #[test]
     fn a_failure_reads_the_reason_and_the_suggested_fix_not_the_progress() {
