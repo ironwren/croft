@@ -23226,7 +23226,8 @@ impl App {
     /// On a database row, Delete removes it, F2 renames it, `e` shows its
     /// folder in the Explorer, `u` upgrades it and `w` adds its source to
     /// the workspace. On a query history row, Delete removes it, F2
-    /// renames it, `v` opens its query and `o` its results directory. `s`
+    /// renames it, `v` opens its query, `t` the query's text as it ran and
+    /// `o` its results directory. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
@@ -23312,6 +23313,11 @@ impl App {
             KeyCode::Char('o') => {
                 if let Some(i) = run {
                     self.open_codeql_history_results_dir(i);
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(i) = run {
+                    self.view_codeql_history_query_text(i);
                 }
             }
             KeyCode::Char('s')
@@ -24912,6 +24918,30 @@ impl App {
         }
     }
 
+    /// "View Query Text" (#578): the query of history entry `index` as it
+    /// was when it ran, which the file itself may no longer be.
+    fn view_codeql_history_query_text(&mut self, index: usize) {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let Some(entry) = history.entries.get(index) else {
+            return;
+        };
+        let text = crate::codeql_query::query_text_path(&entry.output, &entry.query);
+        if !text.is_file() {
+            self.status = format!(
+                "{} ran before croft kept query text; v opens the query file",
+                entry.query_name()
+            );
+            return;
+        }
+        match self.editor.open(&text) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = format!("{} as it was when it ran", entry.query_name());
+            }
+            Err(e) => self.status = format!("{}: {e}", text.display()),
+        }
+    }
+
     /// The evaluator log of history entry `index`, or why there is none: a
     /// run croft made before it kept logs, or one still going.
     fn codeql_history_log(&mut self, index: usize) -> Option<PathBuf> {
@@ -26043,6 +26073,17 @@ impl App {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
         });
+        // The query as it is run, for "View Query Text": the file may change
+        // or go before anyone looks back at this run. Read-only, since
+        // editing it would change nothing.
+        let text = cq::query_text_path(&output, &query);
+        if let Some(parent) = text.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+            && std::fs::write(&text, source).is_ok()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&text, std::fs::Permissions::from_mode(0o444));
+        }
         let mut history = History::load(&Self::codeql_history_path());
         history.push(HistoryEntry {
             query: query.clone(),
@@ -26053,6 +26094,7 @@ impl App {
             status: RunStatus::Running,
             output: output.clone(),
             name: None,
+            results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
@@ -26141,6 +26183,9 @@ impl App {
         };
         entry.status = status.clone();
         entry.seconds = seconds;
+        entry.results = (status == RunStatus::Succeeded)
+            .then(|| crate::codeql_query::count_results(&entry.output))
+            .flatten();
         let output = entry.output.clone();
         let name = entry
             .query
