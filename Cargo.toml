@@ -72,6 +72,9 @@ tree-sitter-lua = "0.5"
 # CodeQL `.ql` / `.qll` highlighting and outline (#578). MIT, same
 # `LanguageFn` shape as the other 0.23+ grammars.
 tree-sitter-ql = "0.23"
+# CodeQL `.dbscheme` highlighting (#578). MIT; ships no highlights query,
+# so croft carries its own.
+tree-sitter-ql-dbscheme = "0.23"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.
