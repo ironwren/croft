@@ -93,6 +93,13 @@ pub enum InputPurpose {
     CodeqlAddVariantList,
     /// A GitHub user or organisation to add for variant analysis (#578).
     CodeqlAddVariantOwner,
+    /// The CodeQL packs to download from the registry (#578).
+    CodeqlDownloadPacks,
+    /// A GitHub Code Search query whose repositories go into the variant
+    /// analysis list called `list` (#578).
+    CodeqlVariantCodeSearch {
+        list: String,
+    },
     /// A new name for the variant analysis list called `name` (#578).
     CodeqlRenameVariantList {
         name: String,

@@ -251,6 +251,70 @@ pub fn parse_owner(value: &str) -> Result<String, String> {
     Ok(owner.to_string())
 }
 
+/// The most repositories one GitHub Code Search adds: the API serves no
+/// result past its first 1000, as in VS Code's CodeQL extension.
+pub const CODE_SEARCH_LIMIT: usize = 1000;
+
+/// The Code Search query for `query`, scoped to CodeQL language `language`
+/// (the side bar's) unless the query already names a language. GitHub
+/// Actions workflows are YAML, which a language filter cannot tell from any
+/// other YAML, so that language adds no filter.
+pub fn code_search_query(query: &str, language: Option<&str>) -> String {
+    let query = query.trim();
+    let named = query
+        .split_whitespace()
+        .any(|w| w.to_ascii_lowercase().starts_with("language:"));
+    match language {
+        Some(lang) if !named && lang != "actions" => format!("{query} language:{lang}"),
+        _ => query.to_string(),
+    }
+}
+
+/// Results on one page of a Code Search: the API's most.
+pub const CODE_SEARCH_PAGE: usize = 100;
+
+/// `gh` arguments for page `page` (from 1) of a GitHub Code Search for
+/// `query`, printing each result's repository as `owner/repo` on a line of
+/// its own. Pages are asked for one at a time rather than with
+/// `--paginate`, which would follow GitHub's link past the 1000th result
+/// into a 422 and lose every page before it.
+pub fn code_search_args(query: &str, page: usize) -> Vec<String> {
+    [
+        "api",
+        "--method",
+        "GET",
+        "search/code",
+        "--raw-field",
+        &format!("q={query}"),
+        "--raw-field",
+        &format!("per_page={CODE_SEARCH_PAGE}"),
+        "--raw-field",
+        &format!("page={page}"),
+        "--jq",
+        ".items[].repository.full_name",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// The distinct repositories in `gh`'s output of [`code_search_args`]
+/// (its pages joined), in
+/// the order found and at most [`CODE_SEARCH_LIMIT`]. Many results share a
+/// repository, and names differing only in letter case are one repository.
+pub fn parse_code_search(out: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for nwo in out.lines().filter_map(|l| parse_nwo(l).ok()) {
+        if found.len() == CODE_SEARCH_LIMIT {
+            break;
+        }
+        if !found.iter().any(|r| r.eq_ignore_ascii_case(&nwo)) {
+            found.push(nwo);
+        }
+    }
+    found
+}
+
 impl VariantConfig {
     /// The config at `path`. A missing file is an empty config; one that
     /// cannot be read or parsed is an error, so it is never overwritten
@@ -321,6 +385,24 @@ impl VariantConfig {
         }
         repos.push(nwo.clone());
         Ok(nwo)
+    }
+
+    /// Add each of `nwos` to list `list`, skipping those already in it.
+    /// Returns how many were added and how many were already there.
+    pub fn add_repos(&mut self, list: usize, nwos: &[String]) -> Result<(usize, usize), String> {
+        let repos = &mut self
+            .lists
+            .get_mut(list)
+            .ok_or_else(|| String::from("No such list"))?
+            .repos;
+        let before = repos.len();
+        for nwo in nwos {
+            if !repos.iter().any(|r| r.eq_ignore_ascii_case(nwo)) {
+                repos.push(nwo.clone());
+            }
+        }
+        let added = repos.len() - before;
+        Ok((added, nwos.len() - added))
     }
 
     /// Add an owner, all of whose repositories a run targets.
@@ -605,5 +687,51 @@ mod tests {
         assert!(c.remove(Item::Owner(0)).is_err());
         assert!(c.select(Item::List(3)).is_err());
         assert_eq!(c.name_of(Item::List(0)), Some("two"));
+    }
+
+    #[test]
+    fn a_code_search_is_scoped_to_the_side_bars_language() {
+        assert_eq!(
+            code_search_query(" import torch ", Some("python")),
+            "import torch language:python"
+        );
+        assert_eq!(code_search_query("x", None), "x");
+        // A query naming its own language keeps it.
+        assert_eq!(
+            code_search_query("x Language:Go", Some("python")),
+            "x Language:Go"
+        );
+        // A language filter cannot single out workflow YAML.
+        assert_eq!(code_search_query("on: push", Some("actions")), "on: push");
+        let args = code_search_args("a b language:go", 3);
+        assert!(
+            args.contains(&String::from("q=a b language:go")),
+            "{args:?}"
+        );
+        assert!(args.contains(&String::from("page=3")), "{args:?}");
+        assert!(!args.contains(&String::from("--paginate")), "{args:?}");
+    }
+
+    #[test]
+    fn code_search_results_become_distinct_repositories_up_to_the_cap() {
+        let out = "github/codeql\nGitHub/CodeQL\n\nnot a repo\na/b\ngithub/codeql\n";
+        assert_eq!(parse_code_search(out), ["github/codeql", "a/b"]);
+        let many: String = (0..CODE_SEARCH_LIMIT + 5)
+            .map(|i| format!("o/r{i}\n"))
+            .collect();
+        let found = parse_code_search(&many);
+        assert_eq!(found.len(), CODE_SEARCH_LIMIT);
+        assert_eq!(found.last().map(String::as_str), Some("o/r999"));
+    }
+
+    #[test]
+    fn adding_search_results_skips_repositories_already_listed() {
+        let mut c = VariantConfig::default();
+        c.add_list("top").unwrap();
+        c.add_repo(Some(0), "a/b").unwrap();
+        let found = vec![String::from("A/B"), String::from("c/d")];
+        assert_eq!(c.add_repos(0, &found), Ok((1, 1)));
+        assert_eq!(c.lists[0].repos, ["a/b", "c/d"]);
+        assert!(c.add_repos(1, &found).is_err());
     }
 }
