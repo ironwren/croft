@@ -59087,6 +59087,110 @@ fn codeql_runs_every_workspace_query_or_the_ones_selected_in_the_explorer() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_query_runs_on_each_database_checked_in_the_list() {
+    // #578: "Run Query on Multiple Databases": check databases in a list,
+    // and the open query, as edited, runs on each in the list's order.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        for name in ["lib", "gone"] {
+            let path = tmp.path().join("dbs").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            store.databases.push(crate::codeql_db::DbEntry {
+                name: name.to_string(),
+                path,
+                language: None,
+                added: 0,
+                former_names: Vec::new(),
+            });
+        }
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.editor.lines[0] = String::from("select 2");
+
+        app.run_command(Command::CodeqlRunQueryOnDatabases);
+        let labels = |app: &App| -> Vec<String> {
+            let picker = app.list_picker.as_ref().expect("the databases");
+            picker.rows.iter().map(|r| r.label.clone()).collect()
+        };
+        assert_eq!(
+            app.list_picker.as_ref().unwrap().title,
+            "Run q.ql on databases"
+        );
+        assert_eq!(
+            labels(&app),
+            [
+                "\u{25b6} Run on the checked database",
+                "[x] app (rust)",
+                "[ ] lib",
+                "[ ] gone",
+            ]
+        );
+        // Check lib and gone, the cursor staying on the row picked.
+        for row in [2, 3] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+            assert_eq!(app.list_picker.as_ref().unwrap().selected, row);
+        }
+        assert_eq!(labels(&app)[0], "\u{25b6} Run on the 3 checked databases");
+        assert_eq!(labels(&app)[3], "[x] gone");
+        // Unchecking all of them refuses to run.
+        for row in [1, 2, 3] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+        }
+        app.list_picker.as_mut().unwrap().selected = 0;
+        app.confirm_list_picker();
+        assert_eq!(app.status, "Check at least one database to run on");
+        for row in [3, 2, 1] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+        }
+
+        app.list_picker.as_mut().unwrap().selected = 0;
+        app.confirm_list_picker();
+        assert!(app.list_picker.is_none());
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/3: q.ql on app\u{2026}"
+        );
+        // gone disappears before its turn: skipped, the rest still run.
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.databases.retain(|db| db.name != "gone");
+        store.save(&App::codeql_db_store_path()).unwrap();
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/3: q.ql on lib\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert!(app.codeql_run.is_none());
+        assert_eq!(app.status, "Ran 3 CodeQL queries, 1 failed");
+
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let ran: Vec<&str> = history
+            .entries
+            .iter()
+            .map(|e| e.database.as_str())
+            .collect();
+        assert_eq!(ran.len(), 2);
+        assert!(ran.contains(&"app") && ran.contains(&"lib"), "{ran:?}");
+        for e in &history.entries {
+            let text =
+                std::fs::read_to_string(crate::codeql_query::query_text_path(&e.output, &e.query))
+                    .unwrap();
+            assert_eq!(text, "select 2", "the buffer, not the file");
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn running_a_codeql_pack_runs_each_query_in_turn_past_a_failure() {
     // #578: `r` on a pack line queues every query in it; each run lands in
     // the query history in order and a failing one doesn't stop the rest.
