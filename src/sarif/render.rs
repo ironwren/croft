@@ -315,7 +315,7 @@ pub fn render(
     let hint = if view.editing_query {
         " type to filter · terms AND · a|b OR · -x exclude · rule: file: level: tag: tool: msg: cwe: · Enter done · Esc clear "
     } else {
-        " ↑↓ move · Enter open · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · C columns · 1-4 levels · u suppressed · a absent · K non-problems · W close added logs · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
+        " ↑↓ move · Enter open · Space preview · / filter · Tab view · f fix · o add log · b baseline · E export · X dismiss alert · s sort · C columns · 1-4 levels · u suppressed · a absent · K non-problems · W close added logs · x clear · ←→ fold · d/D details tab · [ ] scroll details · n/N next/prev step · L follow link "
     };
     buf.set_stringn(
         inner.x,
@@ -342,6 +342,10 @@ fn render_details(
     theme: crate::theme::Theme,
 ) {
     if w < 10 || h < 2 {
+        return;
+    }
+    if let Some(p) = view.current_preview().cloned() {
+        render_preview(&p, x, top, w, h, buf, text, dim, theme);
         return;
     }
     let tab = view.detail_tab;
@@ -431,8 +435,13 @@ fn render_details(
                     super::semantics::Segment::UriLink { text, uri } => format!("{text} <{uri}>"),
                 })
                 .collect();
-            for l in wrap(&message, w) {
-                lines.push((l, text));
+            match &d.message_markdown {
+                Some(md) => push_markdown(&mut lines, md, w, text, dim),
+                None => {
+                    for l in wrap(&message, w) {
+                        lines.push((l, text));
+                    }
+                }
             }
             lines.push((String::new(), text));
             for l in &d.locations {
@@ -449,15 +458,23 @@ fn render_details(
             }
             if !d.description.is_empty() {
                 lines.push((String::new(), text));
-                for l in wrap(&d.description, w) {
-                    lines.push((l, dim));
+                if d.description_markdown {
+                    push_markdown(&mut lines, &d.description, w, dim, dim);
+                } else {
+                    for l in wrap(&d.description, w) {
+                        lines.push((l, dim));
+                    }
                 }
             }
             if !d.help.is_empty() {
                 lines.push((String::new(), text));
                 lines.push(("help".to_string(), text.add_modifier(Modifier::BOLD)));
-                for l in wrap(&d.help, w) {
-                    lines.push((l, text));
+                if d.help_markdown {
+                    push_markdown(&mut lines, &d.help, w, text, dim);
+                } else {
+                    for l in wrap(&d.help, w) {
+                        lines.push((l, text));
+                    }
                 }
             }
             if let Some(u) = &d.help_uri {
@@ -594,8 +611,60 @@ fn render_details(
     }
 }
 
+/// Markdown laid out for the details pane: headings bold, code dim.
+fn push_markdown(lines: &mut Vec<(String, Style)>, md: &str, w: usize, text: Style, dim: Style) {
+    use super::md::LineKind;
+    for (l, kind) in super::md::lines(md, w) {
+        let style = match kind {
+            LineKind::Text => text,
+            LineKind::Heading => text.add_modifier(Modifier::BOLD),
+            LineKind::Code => dim,
+        };
+        lines.push((l, style));
+    }
+}
+
+/// Space's source preview (#577): the file, then its numbered lines with
+/// the result's line marked.
+#[allow(clippy::too_many_arguments)]
+fn render_preview(
+    p: &super::view::SourcePreview,
+    x: u16,
+    top: u16,
+    w: usize,
+    h: u16,
+    buf: &mut Buffer,
+    text: Style,
+    dim: Style,
+    theme: crate::theme::Theme,
+) {
+    buf.set_stringn(
+        x,
+        top,
+        format!("Preview · {} · Space closes", p.title),
+        w,
+        text.add_modifier(Modifier::BOLD),
+    );
+    let digits = (p.first + p.lines.len()).to_string().len();
+    let mark = Style::default()
+        .fg(theme.accent_contrast_fg())
+        .bg(theme.accent());
+    for (i, line) in p.lines.iter().take((h - 1) as usize).enumerate() {
+        let n = p.first + i;
+        let row = top + 1 + i as u16;
+        let style = if n == p.target { mark } else { text };
+        let gutter = format!("{n:>digits$} ");
+        buf.set_stringn(x, row, &gutter, w, if n == p.target { mark } else { dim });
+        let gw = gutter.chars().count();
+        if w > gw {
+            let body = format!("{:<width$}", line.replace('\t', "    "), width = w - gw);
+            buf.set_stringn(x + gw as u16, row, &body, w - gw, style);
+        }
+    }
+}
+
 /// Greedy word wrap to `width` columns; a word longer than a line is split.
-fn wrap(s: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(s: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for para in s.lines() {
         let mut line = String::new();
