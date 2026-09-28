@@ -56480,6 +56480,173 @@ fn copy_codeql_version_copies_croft_the_cli_and_the_platform() {
     assert_eq!(calls.trim(), "version --format=terse");
 }
 
+/// Offline stand-ins for the CodeQL CLI's network calls (#578): the
+/// latest release is `latest`, and a download copies `zip` (or fails with
+/// `offline` when there is none), noting each URL asked for in `urls`.
+fn offline_codeql_net(
+    latest: &str,
+    zip: Option<std::path::PathBuf>,
+    urls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> crate::codeql_cli::Net {
+    let latest = latest.to_string();
+    crate::codeql_cli::Net {
+        latest: std::sync::Arc::new(move || Ok(latest.clone())),
+        download: std::sync::Arc::new(move |url, dest, progress| {
+            urls.lock().unwrap().push(url.to_string());
+            let zip = zip.as_ref().ok_or_else(|| String::from("offline"))?;
+            let n = std::fs::copy(zip, dest).map_err(|e| e.to_string())?;
+            progress(n);
+            Ok(())
+        }),
+    }
+}
+
+/// Drain the CLI download until it lands, or fail after a few seconds.
+fn wait_for_codeql_cli_download(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.codeql_cli_download.is_some() {
+        app.drain_codeql_cli_download();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CLI download never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Drain the CLI update check until it lands, or fail after a few seconds.
+fn wait_for_codeql_cli_check(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_codeql_cli_check() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CLI update check never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codeql_cli_update_check_then_download_switches_to_the_managed_cli() {
+    // #578: "Check for CLI Updates" compares the latest release with the
+    // CLI in use; "Download CLI" then installs that release into the cache
+    // and runs it from then on, for the Testing view's CodeQL tests too.
+    let _guard = relay_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let zip = bin.path().join("release.zip");
+    crate::codeql_cli::write_test_archive(&zip, "#!/bin/sh\necho 2.30.0\n");
+    let urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    with_relay_home(home.path(), || {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_cli_net = offline_codeql_net("2.30.0", Some(zip.clone()), urls.clone());
+        let on_path = fake_codeql(bin.path(), "", 0, "");
+        let script = std::fs::read_to_string(&on_path).unwrap();
+        std::fs::write(&on_path, script.replace("exit 0", "echo 2.19.3\nexit 0")).unwrap();
+        app.set_codeql_program(on_path);
+        app.codeql_cli_source = crate::codeql_cli::Source::Path;
+
+        app.run_command(crate::widgets::command_palette::Command::CodeqlCheckCliUpdates);
+        wait_for_codeql_cli_check(&mut app);
+        assert_eq!(
+            app.status,
+            "CodeQL CLI v2.30.0 is available \u{2014} run CodeQL: Download CLI to install it"
+        );
+
+        app.start_codeql_cli_download("codeql-linux64.zip");
+        wait_for_codeql_cli_download(&mut app);
+        assert_eq!(
+            app.status,
+            "Installed CodeQL CLI v2.30.0 and switched to it"
+        );
+        let root = crate::codeql_cli::cli_root(&home.path().join(".cache").join("croft"));
+        assert_eq!(
+            urls.lock().unwrap().as_slice(),
+            [crate::codeql_cli::download_url(
+                "2.30.0",
+                "codeql-linux64.zip"
+            )]
+        );
+        assert_eq!(
+            app.codeql_program,
+            crate::codeql_cli::managed_program(&root, "2.30.0")
+        );
+        assert!(!root.join("2.30.0.download.zip").exists());
+
+        // The managed copy's folder names its version, so the next check
+        // does not need to run it.
+        app.run_command(crate::widgets::command_palette::Command::CodeqlCheckCliUpdates);
+        wait_for_codeql_cli_check(&mut app);
+        assert_eq!(app.status, "The CodeQL CLI is up to date (v2.30.0)");
+
+        // Downloading an installed release reuses it.
+        app.start_codeql_cli_download("codeql-linux64.zip");
+        wait_for_codeql_cli_download(&mut app);
+        assert_eq!(
+            app.status,
+            "Installed CodeQL CLI v2.30.0 and switched to it"
+        );
+        assert_eq!(urls.lock().unwrap().len(), 1);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn codeql_cli_download_keeps_the_settings_cli_and_reports_failures() {
+    // #578: a CLI named in settings always wins over the downloaded one,
+    // and a failed download says why on the status line.
+    let _guard = relay_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    with_relay_home(home.path(), || {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_cli_net = offline_codeql_net("2.30.0", None, urls.clone());
+        app.start_codeql_cli_download("codeql-linux64.zip");
+        wait_for_codeql_cli_download(&mut app);
+        assert_eq!(
+            app.status,
+            "Could not install the CodeQL CLI: download failed: offline"
+        );
+        assert_eq!(app.codeql_program, std::path::PathBuf::from("codeql"));
+
+        let zip = bin.path().join("release.zip");
+        crate::codeql_cli::write_test_archive(&zip, "#!/bin/sh\necho 2.30.0\n");
+        app.codeql_cli_net = offline_codeql_net("2.30.0", Some(zip), urls.clone());
+        let mine = fake_codeql(bin.path(), "", 0, "");
+        app.codeql_cli_setting = Some(mine.display().to_string());
+        app.resolve_codeql_cli();
+        assert_eq!(app.codeql_cli_source, crate::codeql_cli::Source::Settings);
+        // No check has run, so the pinned release is the one installed.
+        app.start_codeql_cli_download("codeql-linux64.zip");
+        wait_for_codeql_cli_download(&mut app);
+        assert_eq!(
+            app.status,
+            format!(
+                "Installed CodeQL CLI v{}; codeql_cli_path in settings still takes precedence",
+                crate::codeql_cli::PINNED_VERSION
+            )
+        );
+        assert_eq!(app.codeql_program, mine);
+
+        // Cleared from settings, the managed copy is found at the next
+        // resolution (PATH aside).
+        app.codeql_cli_setting = None;
+        let resolved = crate::codeql_cli::resolve(None, None, None, &crate::app::croft_cache_dir());
+        assert_eq!(
+            resolved.source,
+            crate::codeql_cli::Source::Managed(crate::codeql_cli::PINNED_VERSION.into())
+        );
+    });
+}
+
 /// Drain the database upgrade until it lands, or fail after a few seconds.
 fn wait_for_codeql_upgrade(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

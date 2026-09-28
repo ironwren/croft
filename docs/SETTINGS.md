@@ -92,7 +92,7 @@ allowlist — appearance and editor/terminal behavior:
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
-`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `locale`, and any future key not explicitly
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 
@@ -187,6 +187,20 @@ branch's history, so a branch whose latest commits are not scanned yet still
 gets results. **SARIF: Load Code Scanning Results for This Branch** loads them
 whatever the setting. **SARIF: Open GitHub Code Scanning Analysis** picks any
 one analysis by hand.
+
+## The CodeQL CLI
+
+`codeql_cli_path` names the CodeQL CLI croft runs, such as
+`"~/tools/codeql/codeql"`. When it is unset or not a file, croft uses
+`codeql` on `PATH`, then the newest CLI it downloaded itself into
+`~/.cache/croft/codeql/cli/<version>/`, else plain `codeql`.
+
+**CodeQL: Download CLI** downloads GitHub's release for this platform
+(Linux x64, macOS or Windows x64) and switches to it, unless
+`codeql_cli_path` is set: that one always wins. **CodeQL: Check for CLI
+Updates** compares the latest release with the CLI in use; a newer one is
+what the next download installs. User config only: it names a program to
+run.
 
 ## Notification sinks
 
