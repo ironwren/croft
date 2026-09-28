@@ -202,6 +202,10 @@ pub struct Resolver {
     pub learned: Vec<(String, PathBuf)>,
     /// File name → every workspace path with that name.
     pub names: HashMap<String, Vec<PathBuf>>,
+    /// Files open in the editor (#577). An artifact that resolves nowhere
+    /// else is the one open document whose path ends with the artifact's
+    /// path, compared by whole components, when exactly one does.
+    pub open: Vec<PathBuf>,
 }
 
 impl Resolver {
@@ -250,7 +254,49 @@ impl Resolver {
             }
         }
 
-        // 5. A unique file name.
+        // 5. An open document ending with the artifact's path: the longest
+        //    match wins, and a tie between two is no answer.
+        let parts: Vec<String> = expanded
+            .uri
+            .split('/')
+            .filter(|s| !s.is_empty() && !s.contains(':'))
+            .map(percent_decode)
+            .collect();
+        let trailing = |p: &Path| {
+            let comps: Vec<String> = p
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            comps
+                .iter()
+                .rev()
+                .zip(parts.iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        let mut best: Option<(usize, &PathBuf)> = None;
+        let mut tied = false;
+        for p in &self.open {
+            let n = trailing(p);
+            if n == 0 {
+                continue;
+            }
+            match best {
+                Some((m, _)) if n < m => {}
+                Some((m, _)) if n == m => tied = true,
+                _ => {
+                    best = Some((n, p));
+                    tied = false;
+                }
+            }
+        }
+        if let (Some((_, p)), false) = (best, tied)
+            && let Some(p) = found(p.clone())
+        {
+            return Some(p);
+        }
+
+        // 6. A unique file name.
         let name = expanded.uri.rsplit('/').next().map(percent_decode)?;
         match self.names.get(&name).map(Vec::as_slice) {
             Some([only]) => found(only.clone()),
@@ -456,6 +502,51 @@ mod tests {
             &disk(&["/ws/a.rs"]),
         );
         assert_eq!(got, Some(PathBuf::from("/ws/a.rs")));
+    }
+
+    #[test]
+    fn an_open_document_ending_with_the_path_resolves_it() {
+        // The build ran elsewhere (/build/...); the file is open from a
+        // checkout the roots do not cover (#577).
+        let mut r = resolver(&["/ws"]);
+        r.open = vec![
+            PathBuf::from("/elsewhere/proj/src/db/query.rs"),
+            PathBuf::from("/elsewhere/proj/src/api/query.rs"),
+            PathBuf::from("/elsewhere/proj/README.md"),
+        ];
+        let files = [
+            "/elsewhere/proj/src/db/query.rs",
+            "/elsewhere/proj/src/api/query.rs",
+            "/elsewhere/proj/README.md",
+        ];
+        let at = |uri: &str| {
+            r.resolve(
+                &run("{}"),
+                &loc(&format!(r#"{{"uri":"{uri}"}}"#)),
+                &disk(&files),
+            )
+        };
+        assert_eq!(
+            at("file:///build/proj/src/db/query.rs"),
+            Some(PathBuf::from("/elsewhere/proj/src/db/query.rs")),
+            "the longest trailing match"
+        );
+        assert_eq!(
+            at("file:///build/other/query.rs"),
+            None,
+            "two tie on the name alone"
+        );
+        assert_eq!(at("file:///build/xyz.rs"), None, "nothing open matches");
+        // Whole components: `ery.rs` is not a match for `query.rs`.
+        r.open = vec![PathBuf::from("/elsewhere/proj/src/db/query.rs")];
+        let at = |uri: &str| {
+            r.resolve(
+                &run("{}"),
+                &loc(&format!(r#"{{"uri":"{uri}"}}"#)),
+                &disk(&files),
+            )
+        };
+        assert_eq!(at("file:///build/ery.rs"), None);
     }
 
     #[test]
