@@ -370,6 +370,10 @@ pub struct Prefs {
     /// argument (`spd-say`, `say`). User layers only: it names a command.
     #[serde(default)]
     pub screen_reader_command: Option<String>,
+    /// The CodeQL CLI to run (#578), used before one on `PATH` or the copy
+    /// croft downloads. User layers only: it names a program to run.
+    #[serde(default)]
+    pub codeql_cli_path: Option<String>,
     /// UI language (#621), such as `de` or `es`. Unset, croft follows
     /// `LC_ALL` / `LC_MESSAGES` / `LANG`.
     #[serde(default)]
