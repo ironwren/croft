@@ -57779,12 +57779,335 @@ esac
             app.editor.diff.is_some()
         });
         let args = std::fs::read_to_string(&log).unwrap();
-        let lines: Vec<&str> = args.lines().collect();
+        // The viewed-state read (`gh api graphql`) runs beside these.
+        let lines: Vec<&str> = args.lines().filter(|l| l.starts_with("pr ")).collect();
         assert!(
             lines[0].starts_with("pr view https://github.com/x/y/pull/42 --json"),
             "the URL, not a bare 42 this repository would resolve: {args}"
         );
         assert_eq!(lines[1], "pr diff https://github.com/x/y/pull/42");
+    });
+}
+
+/// A stub `gh` for the viewed-sync tests (#365): it logs its argv to
+/// `gh-args`, answers `pr view` with PR x/y#42 (a.rs, b.rs, c.rs), and
+/// runs `graphql` for everything else.
+fn viewed_sync_gh(
+    dir: &std::path::Path,
+    graphql: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("gh-args");
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> '{}'
+case "$*" in
+  "pr view"*) echo '{{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {{"login": "a"}}, "files": [{{"path": "a.rs", "additions": 1, "deletions": 0, "changeType": "ADDED"}}, {{"path": "b.rs", "additions": 1, "deletions": 0, "changeType": "ADDED"}}, {{"path": "c.rs", "additions": 1, "deletions": 0, "changeType": "ADDED"}}], "statusCheckRollup": []}}' ;;
+{graphql}
+esac
+"#,
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (gh, log)
+}
+
+/// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
+fn open_synced_pr(app: &mut App) {
+    app.submit_pr_number("42");
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+        app.poll_pr_gh();
+        app.editor.pr_review.is_some() && app.pr_viewed_fetch.is_none()
+    });
+}
+
+/// Wait until every queued viewed mutation has run.
+fn settle_viewed_writes(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the viewed mutations",
+        || {
+            app.poll_pr_gh();
+            app.pr_viewed_queue.is_empty() && app.pr_viewed_write.is_none()
+        },
+    );
+}
+
+/// #365: GitHub's viewed state (paged) is the truth when it loads: VIEWED
+/// ticks, DISMISSED (changed since viewed) and UNVIEWED untick even a
+/// local mark, and the local store follows. Toggling sends the matching
+/// mutation; a failed one keeps the local mark and says so once.
+#[test]
+fn pr_viewed_state_syncs_with_github() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let page = |nodes: &str, next: &str| {
+            format!(
+                r#"echo '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kw42","files":{{"nodes":[{nodes}],"pageInfo":{next}}}}}}}}}}}'"#
+            )
+        };
+        let graphql = format!(
+            "  *unmarkFileAsViewed*) echo '{{}}' ;;\n  *markFileAsViewed*) echo 'Resource not accessible' >&2; exit 1 ;;\n  *after=CUR1*) {} ;;\n  *graphql*) {} ;;",
+            page(
+                r#"{"path":"c.rs","viewerViewedState":"UNVIEWED"}"#,
+                r#"{"hasNextPage":false,"endCursor":"CUR2"}"#
+            ),
+            page(
+                r#"{"path":"a.rs","viewerViewedState":"VIEWED"},{"path":"b.rs","viewerViewedState":"DISMISSED"}"#,
+                r#"{"hasNextPage":true,"endCursor":"CUR1"}"#
+            ),
+        );
+        let (gh, log) = viewed_sync_gh(tmp.path(), &graphql);
+        // Marked locally before; GitHub says otherwise for both.
+        let store_path = App::pr_viewed_path();
+        let mut store = crate::pr_review::ViewedStore::default();
+        store.set("x/y#42", "b.rs", true);
+        store.set("x/y#42", "c.rs", true);
+        store.save(&store_path).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        open_synced_pr(&mut app);
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert_eq!(view.github_id.as_deref(), Some("PR_kw42"));
+        assert_eq!(
+            view.viewed.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a.rs"],
+            "both pages applied, GitHub wins"
+        );
+        assert!(pr_screen(&mut app).contains("1 of 3 viewed"));
+        let stored = crate::pr_review::ViewedStore::load(&store_path).viewed("x/y#42");
+        assert_eq!(
+            stored.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a.rs"],
+            "the local store follows GitHub"
+        );
+
+        // a.rs is selected and viewed: Space unticks it at once and sends
+        // unmarkFileAsViewed, which succeeds.
+        app.status.clear();
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            !app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("a.rs")
+        );
+        settle_viewed_writes(&mut app);
+        assert!(app.status.is_empty(), "{}", app.status);
+        let args = std::fs::read_to_string(&log).unwrap();
+        let unmark = args.lines().last().unwrap();
+        assert!(
+            unmark.starts_with("api graphql -f query=mutation(")
+                && unmark.contains("unmarkFileAsViewed(input: {pullRequestId: $id, path: $path})")
+                && unmark.ends_with("-f id=PR_kw42 -f path=a.rs"),
+            "{unmark}"
+        );
+
+        // b.rs: marking fails on GitHub; the mark stays, locally too, and
+        // the reason shows once.
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("b.rs")
+        );
+        settle_viewed_writes(&mut app);
+        assert_eq!(
+            app.status,
+            "Viewed state saved locally; GitHub could not be updated: Resource not accessible"
+        );
+        assert!(
+            crate::pr_review::ViewedStore::load(&store_path)
+                .viewed("x/y#42")
+                .contains("b.rs")
+        );
+        // c.rs fails too, quietly this time.
+        app.status.clear();
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        settle_viewed_writes(&mut app);
+        assert!(app.status.is_empty(), "said once: {}", app.status);
+        assert!(
+            app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("c.rs")
+        );
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.lines()
+                .last()
+                .unwrap()
+                .ends_with("-f id=PR_kw42 -f path=c.rs"),
+            "{args}"
+        );
+    });
+}
+
+/// #365: when gh cannot read the viewed state (signed out, not GitHub),
+/// review behaves as before: local marks, no error, no mutations.
+#[test]
+fn pr_viewed_state_stays_local_without_github() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, log) = viewed_sync_gh(
+            tmp.path(),
+            "  *graphql*) echo 'gh auth login required' >&2; exit 4 ;;",
+        );
+        let store_path = App::pr_viewed_path();
+        let mut store = crate::pr_review::ViewedStore::default();
+        store.set("x/y#42", "b.rs", true);
+        store.save(&store_path).unwrap();
+
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        open_synced_pr(&mut app);
+        assert_eq!(app.status, "Reviewing PR #42", "no error spam");
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert_eq!(view.github_id, None);
+        assert!(view.viewed.contains("b.rs"), "local marks as before");
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        settle_viewed_writes(&mut app);
+        assert!(
+            app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("a.rs")
+        );
+        assert!(
+            crate::pr_review::ViewedStore::load(&store_path)
+                .viewed("x/y#42")
+                .contains("a.rs")
+        );
+        assert_eq!(app.status, "Reviewing PR #42");
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(!args.contains("FileAsViewed"), "no mutation: {args}");
+    });
+}
+
+/// #365: a file toggled while GitHub's viewed state is still loading keeps
+/// the person's mark, and it is sent once the PR's id is known.
+#[test]
+fn a_toggle_before_github_answers_wins_and_is_sent() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, log) = viewed_sync_gh(tmp.path(), "  *FileAsViewed*) echo '{}' ;;");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        app.open_pr_review(
+            crate::pr_review::parse_pr(
+                r#"{"number": 42, "url": "https://github.com/x/y/pull/42", "files": [{"path": "a.rs"}]}"#,
+            )
+            .unwrap(),
+            String::from("x/y#42"),
+        );
+        // A read in flight that has not answered yet.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(
+            String::from("a.rs"),
+            crate::pr_review::ViewedState::Unviewed,
+        );
+        tx.send(Ok((String::from("PR_kw42"), states))).unwrap();
+        settle_viewed_writes(&mut app);
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert!(view.viewed.contains("a.rs"), "the click is newer");
+        assert!(view.unsynced.is_empty());
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.contains(" markFileAsViewed(") && args.ends_with("-f id=PR_kw42 -f path=a.rs\n"),
+            "{args}"
+        );
+    });
+}
+
+/// #365: a viewed-state read that began while a write was in flight may
+/// have seen GitHub before the write landed. Its answer must not undo the
+/// mark, even after the write finished and a refresh replaced the view.
+#[test]
+fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, _log) = viewed_sync_gh(tmp.path(), "  *FileAsViewed*) echo '{}' ;;");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.review_gh = gh.display().to_string();
+        let pr = || {
+            crate::pr_review::parse_pr(
+                r#"{"number": 42, "url": "https://github.com/x/y/pull/42", "files": [{"path": "a.rs"}]}"#,
+            )
+            .unwrap()
+        };
+        app.open_pr_review(pr(), String::from("x/y#42"));
+        app.editor.pr_review.as_mut().unwrap().github_id = Some(String::from("PR_kw42"));
+        // Tick a.rs: its mutation is queued, then sent.
+        app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.poll_pr_viewed();
+        assert!(app.pr_viewed_write.is_some(), "in flight");
+        // A refresh replaces the view and starts a read while it is.
+        app.open_pr_review(pr(), String::from("x/y#42"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        // The write lands and settles before the read answers ...
+        settle_viewed_writes(&mut app);
+        assert!(app.pr_viewed_queue.is_empty() && app.pr_viewed_write.is_none());
+        // ... with what GitHub said before it: unviewed.
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(
+            String::from("a.rs"),
+            crate::pr_review::ViewedState::Unviewed,
+        );
+        tx.send(Ok((String::from("PR_kw42"), states))).unwrap();
+        app.poll_pr_viewed();
+        let view = app.editor.pr_review.as_ref().unwrap();
+        assert!(view.viewed.contains("a.rs"), "the stale answer is ignored");
+        assert!(
+            crate::pr_review::ViewedStore::load(&App::pr_viewed_path())
+                .viewed("x/y#42")
+                .contains("a.rs"),
+            "and does not reach the local store"
+        );
+        // A read that begins after the write settled is trusted again.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(
+            String::from("a.rs"),
+            crate::pr_review::ViewedState::Unviewed,
+        );
+        tx.send(Ok((String::from("PR_kw42"), states))).unwrap();
+        app.poll_pr_viewed();
+        assert!(
+            !app.editor
+                .pr_review
+                .as_ref()
+                .unwrap()
+                .viewed
+                .contains("a.rs")
+        );
     });
 }
 
@@ -60058,8 +60381,13 @@ fn a_real_cargo_llvm_cov_run_marks_the_covered_file() {
     .unwrap();
     std::fs::write(
         root.join("src/lib.rs"),
-        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn unused() -> i32 {\n    0\n}\n\n\
-         #[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
+        // Two literals, not one continued across a line: a continuation
+        // line opening with `#[` reads as an attribute to the doc gate's
+        // line classifier, which then never sees the closing quote.
+        concat!(
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn unused() -> i32 {\n    0\n}\n\n",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
+        ),
     )
     .unwrap();
     let mut app = App::new(root.clone()).unwrap();
@@ -60084,5 +60412,20 @@ fn a_real_cargo_llvm_cov_run_marks_the_covered_file() {
         lens.percent.is_some_and(|p| p > 0.0 && p < 100.0),
         "{:?}",
         lens.percent
+    );
+}
+
+/// #262: a `config.synced.json` that arrives by config sync is applied on
+/// arrival: it is in the settings chain, so the config watch's reload of it
+/// re-runs the merge.
+#[test]
+fn the_synced_settings_layer_is_in_the_reload_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let synced = crate::config_layers::synced_config_path();
+    assert!(
+        app.settings_chain.contains(&synced),
+        "{synced:?} in {:?}",
+        app.settings_chain
     );
 }
