@@ -25,7 +25,7 @@ use crate::session_state::dirs_cache_croft;
 /// Directory holding one `<hash>.sock` dtach control socket per persistent
 /// workspace, each with a `<hash>.json` sidecar recording which workspace it
 /// belongs to. Same `$HOME/.cache/croft/sessions` path the remote wrapper uses.
-fn sessions_dir() -> PathBuf {
+pub(crate) fn sessions_dir() -> PathBuf {
     dirs_cache_croft().join("sessions")
 }
 

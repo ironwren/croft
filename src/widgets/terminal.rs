@@ -4139,6 +4139,11 @@ pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, us
 /// wraps)`: see [`PtyTerminal::grid_lines_ansi_wrapped`], which reads from
 /// the top of the scrollback, and [`PtyTerminal::screen_ansi_wrapped`],
 /// which reads the visible screen only.
+/// [`ansi_rows`] for another module's model of a pane (#694's pane host).
+pub(crate) fn ansi_rows_from(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
+    ansi_rows(term, top)
+}
+
 fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
     let bottom = term.screen_lines() as i32 - 1;
     let ncols = term.columns();
