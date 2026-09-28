@@ -23,8 +23,12 @@ use std::path::PathBuf;
 /// A file that may travel to a remote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Syncable {
-    /// Name under `~/.config/croft/`, and the name it lands under remotely.
+    /// The name it lands under in the remote's `~/.config/croft/`.
     pub name: &'static str,
+    /// The local file under `~/.config/croft/` it comes from. The same as
+    /// `name` for a file that travels whole; `config.json` for the synced
+    /// settings layer, which travels as a projection (see [`local_source`]).
+    pub source: &'static str,
     /// Whether a running croft applies this file when it changes on disk:
     /// `reload_config_for_path` has an arm for it, reached both by croft's
     /// own save and by [`ConfigWatch`], which notices a file that ARRIVES by
@@ -34,33 +38,45 @@ pub struct Syncable {
 
 /// Files that travel, in the order the OUTPUT channel lists them.
 ///
-/// `config.json` is deliberately ABSENT. It carries MCP consent
+/// `config.json` itself never travels. It carries MCP consent
 /// (`mcp_consented`), trust-on-first-use tool fingerprints
 /// (`mcp_tool_fingerprints`), and `disabled_extensions` in the same
-/// document as the appearance settings a user would want synced, so it
-/// cannot travel as a file: consent granted on the laptop would silently
-/// become consent on every box they connect to, and the push would clobber
-/// consent granted on the remote. Resolving that is tracked on #262 and
-/// needs either a filtered projection or the trust fields moved out.
+/// document as the appearance settings a user would want synced: sent as a
+/// file, consent granted on the laptop would silently become consent on
+/// every box they connect to, and the push would clobber consent granted on
+/// the remote. What travels instead is its projection onto the keys a
+/// workspace layer may set ([`crate::config_layers::synced_projection`]),
+/// landing as the remote's `config.synced.json`, a layer of its own that
+/// the remote's loader filters by the same allowlist on the way in.
 pub const SYNCABLE: &[Syncable] = &[
     Syncable {
+        name: crate::config_layers::SYNCED_CONFIG_NAME,
+        source: "config.json",
+        hot_reloads: true,
+    },
+    Syncable {
         name: "keybindings.json",
+        source: "keybindings.json",
         hot_reloads: true,
     },
     Syncable {
         name: "snippets.json",
+        source: "snippets.json",
         hot_reloads: true,
     },
     Syncable {
         name: "triggers.json",
+        source: "triggers.json",
         hot_reloads: true,
     },
     Syncable {
         name: "matchers.json",
+        source: "matchers.json",
         hot_reloads: true,
     },
     Syncable {
         name: "macros.json",
+        source: "macros.json",
         hot_reloads: true,
     },
 ];
@@ -167,13 +183,37 @@ impl ConfigWatch {
 /// blank whatever the remote had.
 pub fn local_files() -> Vec<(Syncable, PathBuf)> {
     let dir = crate::prefs::config_dir();
+    let out = projection_dir();
     SYNCABLE
         .iter()
-        .filter_map(|s| {
-            let p = dir.join(s.name);
-            p.is_file().then_some((*s, p))
-        })
+        .filter_map(|s| Some((*s, local_source(s, &dir, &out)?)))
         .collect()
+}
+
+/// Where the synced settings projection is written before it is pushed.
+fn projection_dir() -> PathBuf {
+    crate::app::croft_cache_dir().join("config-sync")
+}
+
+/// The local file to push for `s`, if there is one. A whole-file syncable
+/// is its own source. The synced settings layer is built from `config.json`
+/// in `dir`: its appearance and editor keys, and nothing else, written under
+/// `out` as `s.name`. No `config.json`, an unreadable one, or one with none
+/// of those keys means nothing to push, never an empty file that would
+/// blank the remote's copy.
+pub fn local_source(s: &Syncable, dir: &std::path::Path, out: &std::path::Path) -> Option<PathBuf> {
+    let src = dir.join(s.source);
+    if s.source == s.name {
+        return src.is_file().then_some(src);
+    }
+    let text = std::fs::read_to_string(&src).ok()?;
+    let doc: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+    let projected = crate::config_layers::synced_projection(&doc)?;
+    let json = serde_json::to_string_pretty(&projected).ok()? + "\n";
+    std::fs::create_dir_all(out).ok()?;
+    let path = out.join(s.name);
+    std::fs::write(&path, json).ok()?;
+    Some(path)
 }
 
 /// Whether `host` is one config sync never pushes to (#262): the user's
@@ -206,20 +246,29 @@ pub fn apply_exclusions(
 /// watches, so a file created mid-session is sent too.
 pub fn watched_local_paths() -> Vec<PathBuf> {
     let dir = crate::prefs::config_dir();
-    SYNCABLE.iter().map(|s| dir.join(s.name)).collect()
+    SYNCABLE.iter().map(|s| dir.join(s.source)).collect()
 }
 
 /// The syncable files among `changed` that exist now, as pushes to make.
 /// A deleted file is not pushed: the remote keeps its copy, the same rule
 /// the push at connect time follows for a file the laptop does not have.
 pub fn repush_targets(changed: &[PathBuf], dir: &std::path::Path) -> Vec<(Syncable, PathBuf)> {
+    repush_targets_into(changed, dir, &projection_dir())
+}
+
+/// [`repush_targets`] with the projection written under `out`.
+fn repush_targets_into(
+    changed: &[PathBuf],
+    dir: &std::path::Path,
+    out: &std::path::Path,
+) -> Vec<(Syncable, PathBuf)> {
     changed
         .iter()
         .filter(|p| p.parent() == Some(dir) && p.is_file())
         .filter_map(|p| {
             let name = p.file_name()?.to_str()?;
-            let s = SYNCABLE.iter().find(|s| s.name == name)?;
-            Some((*s, p.clone()))
+            let s = SYNCABLE.iter().find(|s| s.source == name)?;
+            Some((*s, local_source(s, dir, out)?))
         })
         .collect()
 }
@@ -571,6 +620,56 @@ mod tests {
             keep.len(),
             SYNCABLE.len() - 1,
             "only the excluded one stays"
+        );
+    }
+
+    /// #262: the theme travels, the trust does not. A changed `config.json`
+    /// re-pushes as `config.synced.json` holding only its appearance and
+    /// editor keys; `config.json` itself is never the file sent.
+    #[test]
+    fn config_json_travels_as_a_projection_without_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{ "theme": "light", "mcp_consented": ["srv"], "mcp_tool_fingerprints": {"srv": "f"} }"#,
+        )
+        .unwrap();
+        let got = repush_targets_into(std::slice::from_ref(&config), dir.path(), out.path());
+        assert_eq!(got.len(), 1);
+        let (s, path) = &got[0];
+        assert_eq!(s.name, crate::config_layers::SYNCED_CONFIG_NAME);
+        assert_ne!(path, &config, "config.json itself never travels");
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(sent, serde_json::json!({ "theme": "light" }));
+
+        std::fs::write(&config, r#"{ "mcp_consented": ["srv"] }"#).unwrap();
+        assert!(
+            repush_targets_into(std::slice::from_ref(&config), dir.path(), out.path()).is_empty(),
+            "nothing shareable, nothing pushed"
+        );
+        std::fs::write(&config, "not json").unwrap();
+        assert!(
+            repush_targets_into(std::slice::from_ref(&config), dir.path(), out.path()).is_empty(),
+            "an unreadable config pushes nothing rather than an empty layer"
+        );
+    }
+
+    /// A live re-push watches `config.json`, the synced layer's source.
+    #[test]
+    fn the_watch_covers_the_projections_source() {
+        let watched = watched_local_paths();
+        assert!(
+            watched.iter().any(|p| p.ends_with("config.json")),
+            "{watched:?}"
+        );
+        assert!(
+            !watched
+                .iter()
+                .any(|p| p.ends_with(crate::config_layers::SYNCED_CONFIG_NAME)),
+            "the synced layer is written by other machines, not watched for pushing"
         );
     }
 }
