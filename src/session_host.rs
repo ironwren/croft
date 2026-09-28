@@ -117,6 +117,13 @@ pub enum Control {
     /// as session end. Pre-swap clients skip the unknown variant and keep
     /// the old behavior (EOF = detach), same tolerance as [`Control::Claim`].
     HostSwap,
+    /// Pane host to its client, after [`Control::ServerHello`] (#694): the
+    /// pid of the shell it holds, for the cwd, foreground-process and port
+    /// lookups a pane makes on its shell. Session hosts never send it.
+    PaneInfo { pid: u32 },
+    /// Client to pane host: end the shell (the pane is being closed, or
+    /// croft is quitting). Disconnecting instead leaves it running.
+    Kill,
 }
 
 /// One attached client as reported in [`Control::Presence`].
