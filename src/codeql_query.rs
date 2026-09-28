@@ -525,6 +525,23 @@ pub fn pack_download_args(packs: &[String]) -> Vec<String> {
     args
 }
 
+/// The pack a "Run Queries in Published Pack" reference names (#578):
+/// `scope/name`, optionally `@version`, without a `:path` into the pack,
+/// which `pack download` does not take. `None` when it names no pack.
+pub fn published_pack(reference: &str) -> Option<&str> {
+    let pack = reference.split(':').next()?.trim();
+    let name = pack.split('@').next()?;
+    let (scope, rest) = name.split_once('/')?;
+    // Pack scopes and names are lowercase letters, digits and hyphens.
+    let ok = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    (ok(scope) && ok(rest)).then_some(pack)
+}
+
 /// The pack references in what the user typed: separated by spaces or
 /// commas, each `scope/name`, optionally with `@version`.
 pub fn parse_pack_list(input: &str) -> Vec<String> {
@@ -533,69 +550,6 @@ pub fn parse_pack_list(input: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-/// The databases "Run Query on Multiple Databases" runs on, from what the
-/// user typed: `*` for all of `names`, else a comma-separated list where
-/// each item is `#N` (the Nth database, 1-based: the one key that is never
-/// ambiguous) or a name matched exactly. Indices into `names`, in the order
-/// typed, once each. A name several databases share is refused, and so is
-/// input that reads both as one name holding commas and as a list of other
-/// names, rather than silently picking one reading.
-pub fn parse_database_selection(input: &str, names: &[String]) -> Result<Vec<usize>, String> {
-    let input = input.trim();
-    if input == "*" {
-        return Ok((0..names.len()).collect());
-    }
-    let one = |item: &str| -> Result<Option<usize>, String> {
-        if let Some(n) = item.strip_prefix('#') {
-            return match n.trim().parse::<usize>() {
-                Ok(n) if (1..=names.len()).contains(&n) => Ok(Some(n - 1)),
-                _ => Err(format!("There is no CodeQL database {item}")),
-            };
-        }
-        let mut hits = names.iter().enumerate().filter(|(_, n)| n.as_str() == item);
-        match (hits.next(), hits.next()) {
-            (Some((i, _)), None) => Ok(Some(i)),
-            (Some(_), Some(_)) => Err(format!(
-                "Several CodeQL databases are called {item}; pick one by its #number"
-            )),
-            _ => Ok(None),
-        }
-    };
-    // The whole input as one name holding commas (never a `#N` key).
-    let whole = if input.contains(',') && !input.starts_with('#') {
-        one(input)?
-    } else {
-        None
-    };
-    let mut picked = Vec::new();
-    let mut missing = None;
-    for item in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        match one(item) {
-            Ok(Some(i)) => {
-                if !picked.contains(&i) {
-                    picked.push(i);
-                }
-            }
-            Ok(None) => {
-                missing.get_or_insert_with(|| item.to_string());
-            }
-            Err(e) if whole.is_none() => return Err(e),
-            Err(_) => missing = Some(String::new()),
-        }
-    }
-    match (whole, missing) {
-        (Some(_), None) => Err(format!(
-            "\"{input}\" is both one database's name and a list of others; pick by #number"
-        )),
-        (Some(i), Some(_)) => Ok(vec![i]),
-        (None, Some(item)) => Err(format!("There is no CodeQL database called {item}")),
-        (None, None) if picked.is_empty() => {
-            Err(String::from("Name at least one database, or * for all"))
-        }
-        (None, None) => Ok(picked),
-    }
 }
 
 /// The pack file and query of VS Code's "CodeQL: Quick Query" for the
@@ -1064,6 +1018,16 @@ pub enum RunStatus {
     Failed(String),
     /// Stopped by the user before it finished (#578).
     Cancelled,
+}
+
+/// A query waiting in a batch run (#578): run from its file on the
+/// current database, or with `source` and `database` set, from that text
+/// on that database ("Run Query on Multiple Databases").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRun {
+    pub query: PathBuf,
+    pub source: Option<String>,
+    pub database: Option<PathBuf>,
 }
 
 /// One query history entry.
@@ -1647,54 +1611,28 @@ mod tests {
     }
 
     #[test]
-    fn databases_are_picked_by_name_or_all_with_a_star() {
-        let names = vec![
-            String::from("app"),
-            String::from("lib one"),
-            String::from("cli"),
-        ];
-        assert_eq!(parse_database_selection(" * ", &names), Ok(vec![0, 1, 2]));
+    fn a_published_pack_reference_names_the_pack_to_download() {
         assert_eq!(
-            parse_database_selection("cli, lib one,,cli", &names),
-            Ok(vec![2, 1])
+            published_pack("codeql/python-queries"),
+            Some("codeql/python-queries")
         );
+        assert_eq!(published_pack(" acme/q@1.2.0 "), Some("acme/q@1.2.0"));
         assert_eq!(
-            parse_database_selection("app, web", &names),
-            Err(String::from("There is no CodeQL database called web"))
+            published_pack("codeql/python-queries:Security/CWE-078"),
+            Some("codeql/python-queries")
         );
-        assert_eq!(
-            parse_database_selection(" , ", &names),
-            Err(String::from("Name at least one database, or * for all"))
-        );
-        // A name with a comma is picked whole; a shared name is refused and
-        // `#N` picks any one database unambiguously.
-        let names = vec![
-            String::from("a, b"),
-            String::from("twin"),
-            String::from("twin"),
-        ];
-        assert_eq!(parse_database_selection("a, b", &names), Ok(vec![0]));
-        assert_eq!(
-            parse_database_selection("twin", &names),
-            Err(String::from(
-                "Several CodeQL databases are called twin; pick one by its #number"
-            ))
-        );
-        assert_eq!(parse_database_selection("#3, #1", &names), Ok(vec![2, 0]));
-        assert_eq!(
-            parse_database_selection("#4", &names),
-            Err(String::from("There is no CodeQL database #4"))
-        );
-        // Both readings possible: refused, never silently one of them.
-        let names = vec![String::from("a"), String::from("b"), String::from("a, b")];
-        assert_eq!(
-            parse_database_selection("a, b", &names),
-            Err(String::from(
-                "\"a, b\" is both one database's name and a list of others; pick by #number"
-            ))
-        );
-        assert_eq!(parse_database_selection("#1, #2", &names), Ok(vec![0, 1]));
-        assert_eq!(parse_database_selection("#3", &names), Ok(vec![2]));
+        assert_eq!(published_pack("acme/q@~1.0:x.ql"), Some("acme/q@~1.0"));
+        for bad in [
+            "",
+            "python-queries",
+            "/q",
+            "acme/",
+            "a b/c",
+            "../x",
+            "Acme/q",
+        ] {
+            assert_eq!(published_pack(bad), None, "{bad}");
+        }
     }
 
     #[test]

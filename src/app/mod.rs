@@ -3150,10 +3150,11 @@ pub struct App {
     codeql_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The file name of the query in flight, for its status-bar chip.
     codeql_run_name: String,
-    /// Queries "Run Queries in Pack" and "Run Query on Multiple Databases"
-    /// have yet to start, in order, each with the database it runs on: the
-    /// current one when `None` (#578).
-    codeql_run_queue: std::collections::VecDeque<CodeqlQueued>,
+    /// Queries "Run Queries in Pack" has yet to start, in order (#578).
+    codeql_run_queue: std::collections::VecDeque<crate::codeql_query::QueuedRun>,
+    /// "Run Query on Multiple Databases" being set up (#578): the query,
+    /// its text, and the databases checked so far.
+    codeql_multi_db: Option<(PathBuf, String, Vec<PathBuf>)>,
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
@@ -5532,6 +5533,7 @@ impl App {
             codeql_run_name: String::new(),
             codeql_run_queue: std::collections::VecDeque::new(),
             codeql_batch: (0, 0),
+            codeql_multi_db: None,
             codeql_upgrade: None,
             codeql_version: None,
             codeql_log_summary: None,
@@ -23573,7 +23575,7 @@ impl App {
                 // A side-bar row runs the file as saved, as VS Code's
                 // Queries view does.
                 match std::fs::read_to_string(&path) {
-                    Ok(source) => self.run_codeql_file(path, &source, None),
+                    Ok(source) => self.run_codeql_file(path, &source),
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
@@ -26532,7 +26534,7 @@ impl App {
             return;
         }
         let source = self.editor.lines.join("\n");
-        self.run_codeql_file(query, &source, None);
+        self.run_codeql_file(query, &source);
     }
 
     /// VS Code's "CodeQL: Run Query Suite" (#578): the open `.qls` suite on
@@ -26550,13 +26552,12 @@ impl App {
         self.run_codeql_query();
     }
 
-    /// Run `query`, whose text is `source`, on the database at `db`, else
-    /// the current one (#578): alerts, and every query of a `.qls` suite,
-    /// through `database analyze` into SARIF, anything else through `query
-    /// run` into a table decoded as CSV. The run happens on a worker
+    /// Run `query`, whose text is `source`, on the current database (#578):
+    /// alerts through `database analyze` into SARIF, anything else through
+    /// `query run` into a table decoded as CSV. The run happens on a worker
     /// thread; [`Self::drain_codeql_run`] collects it.
-    fn run_codeql_file(&mut self, query: PathBuf, source: &str, db: Option<&Path>) {
-        self.run_codeql_file_with(query, source, db, None);
+    fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+        self.run_codeql_file_with(query, source, None);
     }
 
     /// [`Self::run_codeql_file`], or with `quick` a quick evaluation of a
@@ -26566,8 +26567,44 @@ impl App {
         &mut self,
         query: PathBuf,
         source: &str,
-        db: Option<&Path>,
         quick: Option<crate::codeql_qs::QuickEval>,
+    ) {
+        let mode = match quick {
+            Some(q) => CodeqlRunMode::Quick(q),
+            None => CodeqlRunMode::Whole,
+        };
+        self.run_codeql_file_on(query, source, mode, None);
+    }
+
+    /// CodeQL: Run Queries in Published Pack (#578): ask which pack.
+    fn prompt_run_codeql_published_pack(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlRunPublishedPack,
+            String::from("Run Queries in Published Pack"),
+            "e.g. codeql/python-queries, scope/name@1.0.0, scope/name:path/in/pack",
+        ));
+    }
+
+    /// Download the pack `reference` names and run it, or the part of it
+    /// after `:`, on the current database into SARIF (#578).
+    fn run_codeql_published_pack(&mut self, reference: &str) {
+        let reference = reference.trim();
+        if crate::codeql_query::published_pack(reference).is_none() {
+            self.status = format!("{reference:?} is not a pack: write scope/name");
+            return;
+        }
+        self.run_codeql_file_on(PathBuf::from(reference), "", CodeqlRunMode::Pack, None);
+    }
+
+    /// [`Self::run_codeql_file_with`] on the database at `database`, or on
+    /// the current one when that is `None`.
+    fn run_codeql_file_on(
+        &mut self,
+        query: PathBuf,
+        source: &str,
+        mode: CodeqlRunMode,
+        database: Option<&Path>,
     ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
@@ -26579,21 +26616,16 @@ impl App {
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
-        let db = match db {
-            Some(path) => {
-                let Some(db) = store.databases.iter().find(|d| d.path == path).cloned() else {
-                    self.status = format!("{} is no longer a CodeQL database here", path.display());
-                    return;
-                };
-                db
-            }
-            None => {
-                let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
-                    self.status = String::from("Add a CodeQL database and select it first");
-                    return;
-                };
-                db
-            }
+        let db = match database {
+            Some(path) => store.databases.iter().find(|db| db.path == path).cloned(),
+            None => store.current.and_then(|i| store.databases.get(i)).cloned(),
+        };
+        let Some(db) = db else {
+            self.status = match database {
+                Some(path) => format!("The CodeQL database {} is gone", path.display()),
+                None => String::from("Add a CodeQL database and select it first"),
+            };
+            return;
         };
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -26612,9 +26644,10 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = match quick {
-            Some(_) => Output::Table,
-            None => cq::output_of(&query, source),
+        let kind = match mode {
+            CodeqlRunMode::Quick(_) => Output::Table,
+            CodeqlRunMode::Pack => Output::Sarif,
+            CodeqlRunMode::Whole => cq::output_of(&query, source),
         };
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
@@ -26624,7 +26657,8 @@ impl App {
         // or go before anyone looks back at this run. Read-only, since
         // editing it would change nothing.
         let text = cq::query_text_path(&output, &query);
-        if let Some(parent) = text.parent()
+        if !matches!(mode, CodeqlRunMode::Pack)
+            && let Some(parent) = text.parent()
             && std::fs::create_dir_all(parent).is_ok()
             && std::fs::write(&text, source).is_ok()
         {
@@ -26640,14 +26674,18 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
-            name: quick.as_ref().map(|q| q.title()),
+            name: match &mode {
+                CodeqlRunMode::Quick(q) => Some(q.title()),
+                _ => None,
+            },
             results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
-        let name = match &quick {
-            Some(q) => q.title(),
-            None => query
+        let name = match &mode {
+            CodeqlRunMode::Quick(q) => q.title(),
+            CodeqlRunMode::Pack => query.display().to_string(),
+            CodeqlRunMode::Whole => query
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -26665,15 +26703,24 @@ impl App {
             let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
-                .and_then(|()| match (quick, kind) {
-                    (Some(q), _) => {
+                .and_then(|()| match (mode, kind) {
+                    (CodeqlRunMode::Quick(q), _) => {
                         let bqrs = dir.join("results.bqrs");
                         crate::codeql_qs::run_quick_eval(
                             &program, &db.path, &query, &bqrs, &packs, q.span, q.count, &cancel,
                         )
                         .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
                     }
-                    (None, Output::Sarif) => {
+                    (CodeqlRunMode::Pack, _) => {
+                        let reference = query.to_string_lossy();
+                        let pack = cq::published_pack(&reference).unwrap_or_default();
+                        run(cq::pack_download_args(&[pack.to_string()])).and_then(|()| {
+                            let mut args = cq::analyze_args(&query, &db.path, &output);
+                            args.extend(models.iter().cloned());
+                            run(args)
+                        })
+                    }
+                    (CodeqlRunMode::Whole, Output::Sarif) => {
                         let mut args = cq::analyze_args(&query, &db.path, &output);
                         args.extend(models.iter().cloned());
                         if cq::is_suite(&query) {
@@ -26682,7 +26729,7 @@ impl App {
                             run(args)
                         }
                     }
-                    (None, Output::Table) => {
+                    (CodeqlRunMode::Whole, Output::Table) => {
                         let bqrs = dir.join("results.bqrs");
                         let mut args = cq::run_args(&query, &db.path, &bqrs);
                         args.extend(models.iter().cloned());
@@ -26757,7 +26804,6 @@ impl App {
         self.run_codeql_file_with(
             query,
             &source,
-            None,
             Some(crate::codeql_qs::QuickEval { span, count, label }),
         );
     }
@@ -26806,7 +26852,6 @@ impl App {
         self.run_codeql_file_with(
             query,
             &source,
-            None,
             Some(crate::codeql_qs::QuickEval {
                 span,
                 count: false,
@@ -27814,11 +27859,15 @@ impl App {
             .then(|| crate::codeql_query::count_results(&entry.output))
             .flatten();
         let output = entry.output.clone();
-        let name = entry
-            .query
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // A published pack's run names the pack by its reference.
+        let name = match entry.query.is_relative() {
+            true => entry.query.display().to_string(),
+            false => entry
+                .query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
         match status {
@@ -27873,94 +27922,131 @@ impl App {
             return;
         }
         self.codeql_batch = (queries.len(), 0);
-        self.codeql_run_queue = queries.into_iter().map(|q| (q, None, None)).collect();
+        self.codeql_run_queue = queries
+            .into_iter()
+            .map(|query| crate::codeql_query::QueuedRun {
+                query,
+                source: None,
+                database: None,
+            })
+            .collect();
         self.start_next_queued_codeql();
     }
 
-    /// VS Code's "CodeQL: Run Query on Multiple Databases" (#578): ask
-    /// which databases the open query or suite runs on.
-    fn prompt_run_codeql_on_databases(&mut self) {
-        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    /// CodeQL: Run Query on Multiple Databases (#578): check databases in
+    /// a list, then run the open query on each of them in turn.
+    fn run_codeql_query_on_databases(&mut self) {
         let query = match self.editor.path.clone() {
-            Some(p) if p.extension().is_some_and(|e| e == "ql" || e == "qls") => p,
+            Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
             _ => {
-                self.status = String::from("Open a .ql query or .qls suite to run it");
+                self.status = String::from("Open a .ql query to run it");
                 return;
             }
         };
-        if self.codeql_run.is_some() {
-            self.status = String::from("A CodeQL query is already running");
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let checked: Vec<PathBuf> = store
+            .current
+            .and_then(|i| store.databases.get(i))
+            .map(|db| db.path.clone())
+            .into_iter()
+            .collect();
+        self.codeql_multi_db = Some((query, self.editor.lines.join("\n"), checked));
+        self.open_codeql_multi_db_picker(0);
+    }
+
+    /// The checklist of databases for "Run Query on Multiple Databases",
+    /// with row `selected` under the cursor: Enter on a database checks or
+    /// unchecks it, Enter on the first row runs.
+    fn open_codeql_multi_db_picker(&mut self, selected: usize) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some((query, _, checked)) = self.codeql_multi_db.as_ref() else {
             return;
-        }
-        // As for a single run: CodeQL reads the saved file, so a batch
-        // would silently run the text before the unsaved edits.
-        if self.editor.dirty {
-            let name = query
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.status = format!("Save {name} before running it: CodeQL reads it from disk");
-            return;
-        }
+        };
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         if store.databases.is_empty() {
+            self.codeql_multi_db = None;
             self.status = String::from("Add a CodeQL database first");
             return;
         }
-        let names: Vec<&str> = store.databases.iter().map(|d| d.name.as_str()).collect();
         let name = query
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.open_input_prompt(InputPrompt::new(
-            InputPurpose::CodeqlRunOnDatabases { query },
-            format!("Run {name} on Databases"),
-            format!(
-                "names or #numbers separated by commas, or * for all: {}",
-                names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| format!("#{} {n}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        let mut rows = vec![ListRow {
+            id: String::from("run"),
+            label: match checked.len() {
+                1 => String::from("\u{25b6} Run on the checked database"),
+                n => format!("\u{25b6} Run on the {n} checked databases"),
+            },
+        }];
+        rows.extend(store.databases.iter().enumerate().map(|(i, db)| ListRow {
+            id: i.to_string(),
+            label: format!(
+                "{} {}{}",
+                if checked.contains(&db.path) { "[x]" } else { "[ ]" },
+                db.name,
+                db.language.as_deref().map(|l| format!(" ({l})")).unwrap_or_default()
             ),
-        ));
+        }));
+        let mut picker = ListPicker::new(
+            ListPurpose::CodeqlMultiDb,
+            format!("Run {name} on databases"),
+            rows,
+        );
+        picker.selected = selected.min(picker.rows.len() - 1);
+        self.open_list_picker(picker, "");
     }
 
-    /// Queue one run of `query` per database named in `value`, each with
-    /// its own history entry, through the pack run's queue.
-    fn submit_run_codeql_on_databases(&mut self, query: &Path, value: &str) {
+    /// A row picked in the databases checklist (#578): toggle a database,
+    /// or queue the query on every checked one.
+    fn choose_codeql_multi_db(&mut self, id: &str, selected: usize) {
+        let Some((_, _, checked)) = self.codeql_multi_db.as_mut() else {
+            return;
+        };
+        if id != "run" {
+            let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+            if let Some(db) = id
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| store.databases.get(i))
+            {
+                match checked.iter().position(|p| *p == db.path) {
+                    Some(at) => {
+                        checked.remove(at);
+                    }
+                    None => checked.push(db.path.clone()),
+                }
+            }
+            self.open_codeql_multi_db_picker(selected);
+            return;
+        }
+        if checked.is_empty() {
+            self.status = String::from("Check at least one database to run on");
+            self.open_codeql_multi_db_picker(selected);
+            return;
+        }
+        let Some((query, source, checked)) = self.codeql_multi_db.take() else {
+            return;
+        };
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
+        // In the list's order, not the order they were checked in.
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
-        let names: Vec<String> = store.databases.iter().map(|d| d.name.clone()).collect();
-        let picked = match crate::codeql_query::parse_database_selection(value, &names) {
-            Ok(picked) => picked,
-            Err(why) => {
-                self.status = why;
-                return;
-            }
-        };
-        // Every run of the batch must be the same query: its text now is
-        // what each later run checks the file against.
-        let source = match std::fs::read_to_string(query) {
-            Ok(source) => source,
-            Err(e) => {
-                self.status = format!("{}: {e}", query.display());
-                return;
-            }
-        };
-        self.codeql_batch = (picked.len(), 0);
-        self.codeql_run_queue = picked
+        let databases: Vec<PathBuf> = store
+            .databases
+            .iter()
+            .map(|db| db.path.clone())
+            .filter(|p| checked.contains(p))
+            .collect();
+        self.codeql_batch = (databases.len(), 0);
+        self.codeql_run_queue = databases
             .into_iter()
-            .map(|i| {
-                (
-                    query.to_path_buf(),
-                    Some(store.databases[i].path.clone()),
-                    Some(source.clone()),
-                )
+            .map(|database| crate::codeql_query::QueuedRun {
+                query: query.clone(),
+                source: Some(source.clone()),
+                database: Some(database),
             })
             .collect();
         self.start_next_queued_codeql();
@@ -28002,7 +28088,7 @@ impl App {
     fn start_next_queued_codeql(&mut self) {
         let (total, _) = self.codeql_batch;
         while self.codeql_run.is_none() {
-            let Some((path, db, pinned)) = self.codeql_run_queue.pop_front() else {
+            let Some(next) = self.codeql_run_queue.pop_front() else {
                 let failed = self.codeql_batch.1;
                 self.codeql_batch = (0, 0);
                 let queries = if total == 1 { "query" } else { "queries" };
@@ -28013,29 +28099,29 @@ impl App {
                 return;
             };
             let n = total - self.codeql_run_queue.len();
-            let source = match std::fs::read_to_string(&path) {
-                Ok(source) => source,
-                Err(e) => {
+            let path = next.query;
+            let source = match next.source {
+                Some(source) => source,
+                None => match std::fs::read_to_string(&path) {
+                    Ok(source) => source,
+                    Err(e) => {
+                        self.codeql_batch.1 += 1;
+                        self.status = format!("{}: {e}", path.display());
+                        continue;
+                    }
+                },
+            };
+            if let Some(database) = next.database {
+                self.run_codeql_file_on(path, &source, CodeqlRunMode::Whole, Some(&database));
+                if self.codeql_run.is_none() {
+                    // That database went away meanwhile: the others may
+                    // still be there.
                     self.codeql_batch.1 += 1;
-                    self.status = format!("{}: {e}", path.display());
                     continue;
                 }
-            };
-            if pinned.as_ref().is_some_and(|p| *p != source) {
-                // Saved mid-batch: the rest would run a different query
-                // under the same name, so the batch stops here.
-                let done = n - 1;
-                self.codeql_run_queue.clear();
-                self.codeql_batch = (0, 0);
-                self.status = format!(
-                    "{} changed during the batch; stopped after {done} of {total} runs",
-                    path.file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                );
-                return;
+            } else {
+                self.run_codeql_file(path, &source);
             }
-            self.run_codeql_file(path, &source, db.as_deref());
             if self.codeql_run.is_none() {
                 // Refused (the database went away meanwhile): the rest
                 // would be refused too.
@@ -32240,13 +32326,13 @@ impl App {
                 self.close_input_prompt();
                 self.submit_download_codeql_packs(&value);
             }
+            InputPurpose::CodeqlRunPublishedPack => {
+                self.close_input_prompt();
+                self.run_codeql_published_pack(&value);
+            }
             InputPurpose::CodeqlExportVariantResults { index } => {
                 self.close_input_prompt();
                 self.start_export_codeql_variant_results(index, &value);
-            }
-            InputPurpose::CodeqlRunOnDatabases { query } => {
-                self.close_input_prompt();
-                self.submit_run_codeql_on_databases(&query, &value);
             }
             InputPurpose::CodeqlExportResults { output } => {
                 self.close_input_prompt();
@@ -34518,6 +34604,7 @@ impl App {
             return;
         };
         let purpose = picker.purpose;
+        let selected = picker.selected;
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
@@ -34618,6 +34705,7 @@ impl App {
                 }
             }
             ListPurpose::CodeqlModel => self.choose_codeql_model(&row.id),
+            ListPurpose::CodeqlMultiDb => self.choose_codeql_multi_db(&row.id, selected),
             ListPurpose::CodeqlResultSet => {
                 let path = PathBuf::from(&row.id);
                 match self.editor.open(&path) {
@@ -47680,6 +47768,7 @@ impl App {
                 }
             }
             Cmd::CodeqlCreateQuery => self.prompt_create_codeql_query(),
+            Cmd::CodeqlRunQueryOnDatabases => self.run_codeql_query_on_databases(),
             Cmd::CodeqlRunPack => match self.codeql.selected_pack() {
                 Some(p) => self.run_codeql_pack(p),
                 None => {
@@ -47701,6 +47790,7 @@ impl App {
                 }
             },
             Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
+            Cmd::CodeqlRunPublishedPack => self.prompt_run_codeql_published_pack(),
             Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
             Cmd::CodeqlCompareResults => {
                 if let Some(i) = self.current_codeql_history() {
@@ -47735,7 +47825,6 @@ impl App {
             Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
             Cmd::CodeqlExportResults => self.prompt_export_codeql_results(),
             Cmd::CodeqlRunQuerySuite => self.run_codeql_query_suite(),
-            Cmd::CodeqlRunQueryOnMultipleDatabases => self.prompt_run_codeql_on_databases(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -65365,6 +65454,14 @@ fn agent_ledger_key(root: &Path) -> String {
         .to_string()
 }
 
+/// What a CodeQL run evaluates (#578): the whole query, a quick
+/// evaluation of part of it, or a published pack named by its reference.
+enum CodeqlRunMode {
+    Whole,
+    Quick(crate::codeql_qs::QuickEval),
+    Pack,
+}
+
 /// What "CodeQL: Check for CLI Updates" learns (#578): the latest release,
 /// or why it could not be read, and the version in use when it runs.
 type CodeqlCliCheck = (Result<String, String>, Option<String>);
@@ -65376,11 +65473,6 @@ type CodeqlQueryHelp = (
     PathBuf,
     String,
 );
-
-/// A query waiting in the batch queue (#578): its file, the database to
-/// run it on (`None`: the current one), and for a multi-database batch the
-/// text the file had when the batch began, which every run must still see.
-type CodeqlQueued = (PathBuf, Option<PathBuf>, Option<String>);
 
 /// A `codeql pack` install or download in flight (#578): where its outcome
 /// arrives, and the status lines for success and for failure.

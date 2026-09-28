@@ -94,6 +94,9 @@ pub enum ListPurpose {
     /// What to model a Model Editor endpoint as (#578): `id` is
     /// `<endpoint>:<choice>` or `<endpoint>:remove`.
     CodeqlModel,
+    /// The databases checklist of "Run Query on Multiple Databases"
+    /// (#578): `id` is a database's index, or `run`.
+    CodeqlMultiDb,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
