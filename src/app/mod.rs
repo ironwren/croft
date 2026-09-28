@@ -8249,6 +8249,7 @@ impl App {
                 let resolver = crate::sarif::resolve::Resolver {
                     roots,
                     learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                    open: self.open_file_paths(),
                     ..Default::default()
                 };
                 let log_index = view.logs.iter().position(|l| l.path == loaded.path);
@@ -57440,28 +57441,34 @@ impl App {
     fn open_selected_sarif_result(&mut self) {
         use crate::sarif::region::{ColumnKind, column_kind};
         let root = self.workspace_root().to_path_buf();
-        let Some((path, line, column, kind, uri)) = self.editor.sarif.as_ref().and_then(|v| {
-            let e = v.selected_entry()?;
-            let loaded = v.logs.get(e.log)?;
-            let run = loaded.log.runs.get(e.run)?;
-            let result = run.results.as_ref()?.get(e.result)?;
-            let physical = result.locations.first()?.physical_location.as_ref()?;
-            let artifact = physical.artifact_location.as_ref()?;
-            let mut roots = vec![root.clone()];
-            if let Some(dir) = loaded.path.parent() {
-                roots.push(dir.to_path_buf());
-            }
-            let resolver = crate::sarif::resolve::Resolver {
-                roots,
-                learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
-                ..Default::default()
-            };
-            let found = resolver.resolve(run, artifact, &|p| p.is_file());
-            let region = physical.region.as_ref();
-            let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
-            let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
-            Some((found, line, column, column_kind(run), e.uri.clone()))
-        }) else {
+        let Some((path, line, column, kind, uri, place)) =
+            self.editor.sarif.as_ref().and_then(|v| {
+                let e = v.selected_entry()?;
+                let loaded = v.logs.get(e.log)?;
+                let run = loaded.log.runs.get(e.run)?;
+                let result = run.results.as_ref()?.get(e.result)?;
+                let physical = result.locations.first()?.physical_location.as_ref()?;
+                let artifact = physical.artifact_location.as_ref()?;
+                let mut roots = vec![root.clone()];
+                if let Some(dir) = loaded.path.parent() {
+                    roots.push(dir.to_path_buf());
+                }
+                let resolver = crate::sarif::resolve::Resolver {
+                    roots,
+                    learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                    open: self.open_file_paths(),
+                    ..Default::default()
+                };
+                let found = resolver.resolve(run, artifact, &|p| p.is_file());
+                let region = physical.region.as_ref();
+                let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
+                let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
+                let place = region
+                    .cloned()
+                    .map(|r| (r, crate::sarif::region::newline_sequences(run)));
+                Some((found, line, column, column_kind(run), e.uri.clone(), place))
+            })
+        else {
             self.status = String::from("This result has no location to open");
             return;
         };
@@ -57477,12 +57484,42 @@ impl App {
             self.status = format!("Cannot find {uri} on this machine: where is it?");
             return;
         };
+        // The region read against the file as it is now: an offset-only
+        // region gets its line, and a snippet that moved is followed. The
+        // text is the open buffer's when the file is open (it may be
+        // edited), else the disk's.
+        let text = self
+            .editor
+            .iter_tabs()
+            .find(|t| t.path.as_deref() == Some(path.as_path()) && !t.has_non_text_view())
+            .map(|t| t.lines.join("\n"))
+            .or_else(|| std::fs::read_to_string(&path).ok());
+        let located = place.zip(text).and_then(|((region, newlines), text)| {
+            crate::sarif::region::locate(&region, &text, &newlines, kind)
+        });
         self.editor.pin_active();
-        let opened = match kind {
-            ColumnKind::Utf16CodeUnits => self.open_at_utf16(&path, line as u32, column as u32),
-            ColumnKind::UnicodeCodePoints => self.open_at(&path, line as usize, column as usize),
+        let (opened, line, moved) = match located {
+            // Columns are code points once located.
+            Some((pos, moved)) => (self.open_at(&path, pos.line, pos.col), pos.line, moved),
+            None => (
+                match kind {
+                    ColumnKind::Utf16CodeUnits => {
+                        self.open_at_utf16(&path, line as u32, column as u32)
+                    }
+                    ColumnKind::UnicodeCodePoints => {
+                        self.open_at(&path, line as usize, column as usize)
+                    }
+                },
+                line as usize,
+                false,
+            ),
         };
         self.status = match opened {
+            Ok(()) if moved => format!(
+                "Opened {}:{} (the code moved since the scan; found by its snippet)",
+                path.display(),
+                line + 1
+            ),
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
@@ -58174,6 +58211,7 @@ impl App {
         let resolver = crate::sarif::resolve::Resolver {
             roots,
             learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+            open: self.open_file_paths(),
             ..Default::default()
         };
         let open_text = |p: &std::path::Path| -> Option<String> {
@@ -58229,6 +58267,14 @@ impl App {
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 
+    /// The paths of the files open in editor tabs, for SARIF resolution.
+    fn open_file_paths(&self) -> Vec<PathBuf> {
+        self.editor
+            .iter_tabs()
+            .filter_map(|t| t.path.clone())
+            .collect()
+    }
+
     /// Open a location from the selected result's details (a step, a frame, a
     /// related location), resolving it the way the result's own location is
     /// resolved and keeping the viewer tab.
@@ -58252,6 +58298,7 @@ impl App {
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
                 learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                open: self.open_file_paths(),
                 ..Default::default()
             };
             let artifact = crate::sarif::model::ArtifactLocation {

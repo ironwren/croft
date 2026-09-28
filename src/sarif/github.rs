@@ -135,17 +135,23 @@ pub fn analyses_args(git_ref: Option<&str>) -> Vec<String> {
 }
 
 /// A JSON array from the API, or the message of the error object it sent.
+/// Several arrays one after another (`gh api --paginate`'s pages) are one
+/// list; an error object anywhere is the error.
 fn api_array(json: &str) -> Result<Vec<serde_json::Value>, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("unreadable reply: {e}"))?;
-    match v {
-        serde_json::Value::Array(a) => Ok(a),
-        other => Err(other
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unexpected reply")
-            .to_string()),
+    let mut out = Vec::new();
+    for v in serde_json::Deserializer::from_str(json).into_iter::<serde_json::Value>() {
+        match v.map_err(|e| format!("unreadable reply: {e}"))? {
+            serde_json::Value::Array(a) => out.extend(a),
+            other => {
+                return Err(other
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unexpected reply")
+                    .to_string());
+            }
+        }
     }
+    Ok(out)
 }
 
 fn text(v: &serde_json::Value, key: &str) -> String {
@@ -222,10 +228,15 @@ pub fn sarif_args(id: u64) -> Vec<String> {
     ]
 }
 
-/// `gh` arguments listing alerts, one page, for matching results.
+/// `gh` arguments listing every alert, for matching results. All pages:
+/// the alert a result is dismissed through can be anywhere in the list, and
+/// one page of 100 left a repository's older alerts unmatchable (#577).
+/// `gh --paginate` prints the pages as JSON arrays one after another, which
+/// [`parse_alerts`] reads as one list.
 pub fn alerts_args(git_ref: Option<&str>) -> Vec<String> {
     vec![
         String::from("api"),
+        String::from("--paginate"),
         with_ref(
             String::from("repos/{owner}/{repo}/code-scanning/alerts?per_page=100"),
             git_ref,
@@ -441,8 +452,18 @@ mod tests {
             alerts_args(Some("refs/heads/main")),
             vec![
                 "api",
+                "--paginate",
                 "repos/{owner}/{repo}/code-scanning/alerts?per_page=100&ref=refs%2Fheads%2Fmain"
             ]
+        );
+        // `--paginate` prints each page as its own array; they are one list.
+        let paged = format!("{ALERTS}\n{ALERTS}");
+        assert_eq!(parse_alerts(&paged).unwrap().len(), 4);
+        assert_eq!(parse_alerts("[]\n[]").unwrap().len(), 0);
+        assert_eq!(parse_alerts("").unwrap().len(), 0);
+        assert_eq!(
+            parse_alerts(r#"[] {"message": "Resource not accessible"}"#).unwrap_err(),
+            "Resource not accessible"
         );
         let alerts = parse_alerts(ALERTS).unwrap();
         assert_eq!(alerts.len(), 2);
