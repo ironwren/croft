@@ -3172,9 +3172,10 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
-    /// The control flow graph being read for View CFG (#578): the
-    /// document it writes, or why not.
-    codeql_cfg_job: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// A CodeQL document being made (#578: View CFG, the alert and result
+    /// views): the file it writes or why not, and the status lines for
+    /// each.
+    codeql_doc_job: Option<CodeqlDocJob>,
     /// The AST being read for the AST Viewer (#578): the tree or why not,
     /// and the view it fills in.
     codeql_ast_job: Option<(
@@ -5527,7 +5528,7 @@ impl App {
             codeql_perf_compare: None,
             codeql_pack_job: None,
             codeql_ast_job: None,
-            codeql_cfg_job: None,
+            codeql_doc_job: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -26546,8 +26547,8 @@ impl App {
     /// the cursor, from the current database, opened as a document.
     fn view_codeql_cfg(&mut self) {
         use crate::codeql_ast as ast;
-        if self.codeql_cfg_job.is_some() {
-            self.status = String::from("A control flow graph is already being read");
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
             return;
         }
         let Some((file, db, lang, archive)) = self.codeql_contextual_target() else {
@@ -26594,30 +26595,169 @@ impl App {
             let _ = tx.send(read());
         });
         self.status = format!("Reading the control flow graph at {name}:{line}\u{2026}");
-        self.codeql_cfg_job = Some(rx);
+        self.codeql_doc_job = Some((
+            rx,
+            String::from("Control flow graph"),
+            String::from("Could not read the control flow graph"),
+        ));
     }
 
-    /// Open a finished View CFG document (#578), or say why there is none.
-    pub fn drain_codeql_cfg(&mut self) -> bool {
-        let Some(rx) = self.codeql_cfg_job.as_ref() else {
+    /// Open a finished CodeQL document (#578), or say why there is none.
+    pub fn drain_codeql_doc(&mut self) -> bool {
+        let Some((rx, ..)) = self.codeql_doc_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
             Ok(outcome) => outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(String::from("the CFG read stopped unexpectedly"))
+                Err(String::from("it stopped unexpectedly"))
             }
         };
-        self.codeql_cfg_job = None;
+        let Some((_, done, failed)) = self.codeql_doc_job.take() else {
+            return false;
+        };
         self.status = match outcome {
             Ok(doc) => match self.editor.open(&doc) {
-                Ok(()) => String::from("Control flow graph"),
+                Ok(()) => done,
                 Err(e) => format!("{}: {e}", doc.display()),
             },
-            Err(why) => format!("Could not read the control flow graph: {why}"),
+            Err(why) => format!("{failed}: {why}"),
         };
         true
+    }
+
+    /// The Query History run selected in the side bar, else the newest;
+    /// says so when nothing has run.
+    fn codeql_chosen_run(&mut self) -> Option<crate::codeql_query::HistoryEntry> {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = self
+            .codeql
+            .selected_history()
+            .or_else(|| history.newest())
+            .and_then(|i| history.entries.get(i))
+            .cloned();
+        if entry.is_none() {
+            self.status = String::from("No CodeQL query has run yet");
+        }
+        entry
+    }
+
+    /// The folder of the database `entry` ran on, by its recorded path,
+    /// else by its name in the store.
+    fn codeql_run_database(entry: &crate::codeql_query::HistoryEntry) -> Option<PathBuf> {
+        entry.database_path.clone().or_else(|| {
+            crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path())
+                .databases
+                .into_iter()
+                .find(|d| d.name == entry.database)
+                .map(|d| d.path)
+        })
+    }
+
+    /// The alert views of a run (#578): "View Alerts (SARIF)" opens the
+    /// SARIF as JSON; "View Alerts (CSV)" has `codeql database
+    /// interpret-results` write the alerts as CSV from the results the
+    /// database keeps, without running the query again.
+    fn view_codeql_alerts(&mut self, csv: bool) {
+        let Some(entry) = self.codeql_chosen_run() else {
+            return;
+        };
+        let name = entry.query_name();
+        if entry.status != crate::codeql_query::RunStatus::Succeeded
+            || entry.output.extension().is_none_or(|e| e != "sarif")
+        {
+            self.status = format!("{name} did not produce alerts; its results are a table");
+            return;
+        }
+        if !csv {
+            // Opened, then reopened as text: the override holds only for
+            // the tab's own file, so it is set once the tab is on it.
+            let opened = self.editor.open(&entry.output).and_then(|()| {
+                self.editor.force_text = true;
+                self.editor.open(&entry.output)
+            });
+            self.status = match opened {
+                Ok(()) => format!("Alerts of {name} (SARIF)"),
+                Err(e) => format!("{}: {e}", entry.output.display()),
+            };
+            return;
+        }
+        let Some(db) = Self::codeql_run_database(&entry) else {
+            self.status = format!("The database {name} ran on is gone", name = entry.database);
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let out = entry.output.with_file_name("alerts.csv");
+        let program = self.codeql_program.clone();
+        let query = entry.query.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = Self::codeql_command(
+                &program,
+                &crate::codeql_query::interpret_csv_args(&db, &query, &out),
+            )
+            .map(|()| out);
+            let _ = tx.send(made);
+        });
+        self.status = format!("Writing the alerts of {name} as CSV\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("Alerts of {name} (CSV)"),
+            format!("Could not write the alerts of {name} as CSV"),
+        ));
+    }
+
+    /// "View Results (CSV)" (#578): a run's raw results as tables. A table
+    /// run's are its results already; an alert run's are decoded from the
+    /// BQRS the database keeps for the query.
+    fn view_codeql_raw_results(&mut self) {
+        let Some(entry) = self.codeql_chosen_run() else {
+            return;
+        };
+        let name = entry.query_name();
+        if entry.status != crate::codeql_query::RunStatus::Succeeded {
+            self.status = format!("{name} has no results");
+            return;
+        }
+        if entry.output.extension().is_some_and(|e| e == "csv") {
+            self.status = match self.editor.open(&entry.output) {
+                Ok(()) => format!("Results of {name} (CSV)"),
+                Err(e) => format!("{}: {e}", entry.output.display()),
+            };
+            return;
+        }
+        let Some(db) = Self::codeql_run_database(&entry) else {
+            self.status = format!("The database {name} ran on is gone", name = entry.database);
+            return;
+        };
+        let Some(bqrs) = crate::codeql_query::kept_bqrs(&db, &entry.query) else {
+            self.status = format!("The database no longer keeps the results of {name}");
+            return;
+        };
+        if self.codeql_doc_job.is_some() {
+            self.status = String::from("A CodeQL view is already being made");
+            return;
+        }
+        let out = entry.output.with_file_name("raw-results.csv");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let made = Self::codeql_decode_sets(&program, &bqrs, &out, &|args| {
+                Self::codeql_command(&program, &args)
+            })
+            .map(|()| out);
+            let _ = tx.send(made);
+        });
+        self.status = format!("Decoding the results of {name}\u{2026}");
+        self.codeql_doc_job = Some((
+            rx,
+            format!("Results of {name} (CSV)"),
+            format!("Could not decode the results of {name}"),
+        ));
     }
 
     /// CodeQL: View AST (#578): the AST of the open file, read from the
@@ -46587,6 +46727,9 @@ impl App {
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
+            Cmd::CodeqlViewAlertsSarif => self.view_codeql_alerts(false),
+            Cmd::CodeqlViewResultsCsv => self.view_codeql_raw_results(),
             Cmd::CodeqlShowResultSet => self.show_codeql_result_sets(),
             Cmd::CodeqlViewCfg => self.view_codeql_cfg(),
             Cmd::CodeqlRunAllQueries => self.run_all_codeql_queries(),
@@ -64152,6 +64295,14 @@ type CodeqlPackJob = (
     String,
 );
 
+/// A CodeQL document being made (#578): the file it writes, or why not,
+/// and the status lines for success and for failure.
+type CodeqlDocJob = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    String,
+    String,
+);
+
 /// A CodeQL database upgrade or cache cleanup in flight (#578): where its
 /// outcome arrives, which job it is, and the database's name and folder.
 type CodeqlUpgrade = (
@@ -65651,7 +65802,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let ext_index_changed = app.drain_ext_index_refresh();
         let codeql_changed = app.drain_codeql_run()
             | app.drain_codeql_ast()
-            | app.drain_codeql_cfg()
+            | app.drain_codeql_doc()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
             | app.drain_codeql_log_summary()

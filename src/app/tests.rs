@@ -56996,7 +56996,7 @@ fn view_cfg_opens_the_control_flow_at_the_cursor_as_a_document() {
             "Reading the control flow graph at app.py:3\u{2026}"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !app.drain_codeql_cfg() {
+        while !app.drain_codeql_doc() {
             assert!(std::time::Instant::now() < deadline, "never finished");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -57065,7 +57065,7 @@ fn view_cfg_reads_a_real_functions_control_flow() {
         app.editor.cursor_row = 2;
         app.run_command(crate::widgets::command_palette::Command::CodeqlViewCfg);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-        while !app.drain_codeql_cfg() {
+        while !app.drain_codeql_doc() {
             assert!(std::time::Instant::now() < deadline, "never finished");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -57198,6 +57198,197 @@ fn a_real_query_with_two_result_sets_decodes_each_to_its_own_csv() {
         let calls = std::fs::read_to_string(output.with_file_name("results-calls.csv")).unwrap();
         assert_eq!(calls.lines().next(), Some("\"c\",\"s\""), "{calls}");
         assert_eq!(calls.lines().count(), 4, "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn an_alert_runs_alerts_and_raw_results_open_as_csv_or_sarif_text() {
+    // #578: Query History's "View Alerts (CSV)", "View Alerts (SARIF)" and
+    // "View Results (CSV)".
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(
+            bin.path(),
+            "\"Calls\",,\"warning\",\"A call.\",\"/app.py\",\"4\",\"5\",\"4\",\"18\"\n",
+            0,
+            "",
+        );
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_doc() {
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let table = App::codeql_results_dir().join("1-t/results.csv");
+        let alerts = App::codeql_results_dir().join("2-a/results.sarif");
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                ("t.ql", 1, RunStatus::Succeeded, table.clone()),
+                ("Alert.ql", 2, RunStatus::Succeeded, alerts.clone()),
+            ],
+        );
+        std::fs::write(&alerts, r#"{"version":"2.1.0","runs":[]}"#).unwrap();
+
+        // The newest run is the alert one.
+        app.run_command(Command::CodeqlViewAlertsSarif);
+        assert_eq!(app.status, "Alerts of Alert.ql (SARIF)");
+        assert_eq!(app.editor.path.as_deref(), Some(alerts.as_path()));
+        assert!(app.editor.sarif.is_none(), "the JSON, not the viewer");
+        assert_eq!(app.editor.lines[0], r#"{"version":"2.1.0","runs":[]}"#);
+
+        app.run_command(Command::CodeqlViewAlertsCsv);
+        wait(&mut app);
+        assert_eq!(app.status, "Alerts of Alert.ql (CSV)");
+        let csv = alerts.with_file_name("alerts.csv");
+        assert_eq!(app.editor.path.as_deref(), Some(csv.as_path()));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.lines().last().unwrap(),
+            format!(
+                "database interpret-results --format=csv --output={} {} {}",
+                csv.display(),
+                tmp.path().join("dbs/app").display(),
+                tmp.path().join("Alert.ql").display()
+            )
+        );
+
+        // Raw results come from the BQRS the database keeps.
+        app.run_command(Command::CodeqlViewResultsCsv);
+        assert_eq!(
+            app.status,
+            "The database no longer keeps the results of Alert.ql"
+        );
+        let kept = tmp.path().join("dbs/app/results/me/q/Alert.bqrs");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "").unwrap();
+        app.run_command(Command::CodeqlViewResultsCsv);
+        wait(&mut app);
+        assert_eq!(app.status, "Results of Alert.ql (CSV)");
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(alerts.with_file_name("raw-results.csv").as_path())
+        );
+
+        // A table run has no alerts; its results are its table.
+        app.open_codeql_view();
+        app.codeql.select_history(1);
+        app.run_command(Command::CodeqlViewAlertsCsv);
+        assert_eq!(
+            app.status,
+            "t.ql did not produce alerts; its results are a table"
+        );
+        app.run_command(Command::CodeqlViewResultsCsv);
+        assert_eq!(app.editor.path.as_deref(), Some(table.as_path()));
+    });
+}
+
+/// #578's alert views against the real CLI: after an alert query runs,
+/// its alerts are written as CSV and its raw results decoded, both from
+/// what the database keeps.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn a_real_alert_runs_alerts_and_raw_results_are_viewed_as_csv() {
+    use crate::widgets::command_palette::Command;
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "def run(cmd):\n    print(cmd)\n\nrun(input())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let pack = tmp.path().join("q");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("qlpack.yml"),
+            "name: me/q\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n",
+        )
+        .unwrap();
+        let installed = std::process::Command::new(&codeql)
+            .args(["pack", "install"])
+            .arg(&pack)
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let query = pack.join("Alert.ql");
+        std::fs::write(
+            &query,
+            "/**\n * @name Calls\n * @kind problem\n * @id me/calls\n * @problem.severity warning\n */\nimport python\nfrom Call c\nselect c, \"A call.\"\n",
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.editor.open(&query).unwrap();
+        app.run_command(Command::CodeqlRunQuery);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while app.codeql_run.is_some() {
+            app.drain_codeql_run();
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(app.status.contains("finished"), "{}", app.status);
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while !app.drain_codeql_doc() {
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        app.run_command(Command::CodeqlViewAlertsCsv);
+        wait(&mut app);
+        assert_eq!(app.status, "Alerts of Alert.ql (CSV)");
+        // A CSV opens in the table view; its text is the file's.
+        let text = std::fs::read_to_string(app.editor.path.as_ref().unwrap()).unwrap();
+        assert_eq!(text.matches("\"A call.\"").count(), 3, "{text}");
+        app.run_command(Command::CodeqlViewResultsCsv);
+        wait(&mut app);
+        assert_eq!(app.status, "Results of Alert.ql (CSV)");
+        let text = std::fs::read_to_string(app.editor.path.as_ref().unwrap()).unwrap();
+        assert!(text.contains("A call."), "{text}");
+        assert_eq!(text.lines().count(), 4, "a header and three calls: {text}");
     });
 }
 

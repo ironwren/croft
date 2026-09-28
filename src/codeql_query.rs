@@ -127,6 +127,42 @@ pub fn decode_args(bqrs: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments writing the alerts `query` found in `db` as CSV at
+/// `out`, from the results the database keeps (#578, "View Alerts (CSV)").
+pub fn interpret_csv_args(db: &Path, query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("database"),
+        String::from("interpret-results"),
+        String::from("--format=csv"),
+        format!("--output={}", path(out)),
+        path(db),
+        path(query),
+    ]
+}
+
+/// The BQRS `db` keeps for `query` from its last analysis: the newest
+/// `<stem>.bqrs` under its `results` folder, which the CLI files by pack.
+pub fn kept_bqrs(db: &Path, query: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, want: &std::ffi::OsStr, depth: usize, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 12 {
+                    walk(&p, want, depth + 1, out);
+                }
+            } else if p.file_name() == Some(want) {
+                out.push(p);
+            }
+        }
+    }
+    let want = std::ffi::OsString::from(format!("{}.bqrs", query.file_stem()?.to_string_lossy()));
+    let mut found = Vec::new();
+    walk(&db.join("results"), &want, 0, &mut found);
+    found
+        .into_iter()
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+}
+
 /// `codeql` arguments listing a BQRS file's result sets as JSON.
 pub fn info_args(bqrs: &Path) -> Vec<String> {
     vec![
@@ -1119,6 +1155,30 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alert_runs_kept_results_are_found_and_interpreted_as_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        // Where the CLI keeps them: results/<pack scope>/<pack>/<query>.bqrs.
+        let kept = db.join("results/me/q/Alert.bqrs");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "").unwrap();
+        std::fs::write(db.join("results/me/q/Other.bqrs"), "").unwrap();
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Alert.ql")), Some(kept));
+        assert_eq!(kept_bqrs(&db, Path::new("/w/q/Gone.ql")), None);
+        assert_eq!(
+            interpret_csv_args(&db, Path::new("/w/q/Alert.ql"), Path::new("/r/alerts.csv")),
+            [
+                "database",
+                "interpret-results",
+                "--format=csv",
+                "--output=/r/alerts.csv",
+                &db.display().to_string(),
+                "/w/q/Alert.ql"
+            ]
+        );
+    }
 
     #[test]
     fn each_result_set_gets_its_own_csv() {
