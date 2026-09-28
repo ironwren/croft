@@ -805,7 +805,14 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let t = std::time::Instant::now();
         run_claude_code(&mut payload.as_bytes(), &mut out, &mut err, ANSWER_WINDOW).unwrap();
-        assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        // Fast means "did not wait out ANSWER_WINDOW" (two minutes). 100 ms
+        // was the first bound and failed under a loaded full-suite run; five
+        // seconds still sits far below the window it rules out.
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
         assert!(
             out.is_empty(),
             "no decision: Claude Code's own prompt stays in charge"
