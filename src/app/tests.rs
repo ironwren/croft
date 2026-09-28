@@ -56381,6 +56381,46 @@ fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
         );
         assert!(app.editor.lines.iter().any(|l| l == "        files"));
         assert!(app.editor.is_line_hidden(3), "predicates start folded");
+        // The side bar's Evaluator Log Viewer section holds the same tree.
+        {
+            use crate::widgets::codeql::{Action, Hit, Line};
+            let rows = |app: &App| -> Vec<(Action, String)> {
+                app.codeql
+                    .lines()
+                    .into_iter()
+                    .filter_map(|l| match l {
+                        Line::Action(
+                            a @ (Action::EvalPredicate(_)
+                            | Action::EvalDependency(_)
+                            | Action::ClearEvalLog),
+                            t,
+                        ) => Some((a, t)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let folded = rows(&app);
+            assert_eq!(folded.len(), 3, "{folded:?}");
+            assert_eq!(folded[0].1, "Clear \u{b7} q.ql");
+            assert!(folded[1].1.contains("Foo::slow#b"), "slowest first");
+            assert!(folded[2].1.contains("Foo::fast#a"));
+            app.activate_codeql(Hit::Action(Action::EvalPredicate(1)));
+            let open = rows(&app);
+            assert!(open[2].1.starts_with("\u{25be}"), "{open:?}");
+            assert!(
+                open.iter().any(|(_, t)| t == "  Pipeline pipeline"),
+                "{open:?}"
+            );
+            let dep = open
+                .iter()
+                .find(|(a, _)| matches!(a, Action::EvalDependency(_)))
+                .expect("the dependency row");
+            assert_eq!(dep.1, "  \u{2192} files");
+            app.activate_codeql(Hit::Action(dep.0));
+            assert!(app.status.contains("not in this log"), "{}", app.status);
+            app.activate_codeql(Hit::Action(Action::ClearEvalLog));
+            assert!(app.codeql.evallog.is_none());
+        }
         let predicates = crate::codeql_query::evaluator_log_predicates(&out);
         let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
         assert_eq!(
