@@ -11,6 +11,63 @@ use super::semantics::{self as sem, BaselineState, Kind, Level, SuppressionState
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+/// Where a result points (#577), worked out once for both opening it
+/// (Enter) and previewing it (Space).
+#[derive(Debug, Clone)]
+pub struct SelectedPlace {
+    /// Index into [`SarifView::entries`].
+    pub entry: usize,
+    /// The file on this machine, when it was found.
+    pub path: Option<PathBuf>,
+    /// 0-based line and column as the log gives them.
+    pub line: i64,
+    pub column: i64,
+    pub kind: super::region::ColumnKind,
+    pub uri: String,
+    /// The region, its context region and the run's newline sequences.
+    pub region: Option<(
+        super::model::Region,
+        Option<super::model::Region>,
+        Vec<String>,
+    )>,
+    /// The log's own copy of the file, when it is not on this machine.
+    pub embedded: Option<super::resolve::Embedded>,
+}
+
+/// Space's preview (#577): the lines around a result's location, drawn in
+/// the details pane while the list keeps the keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePreview {
+    /// Index into [`SarifView::entries`].
+    pub entry: usize,
+    /// The file shown, or why nothing is.
+    pub title: String,
+    /// 1-based number of `lines[0]`.
+    pub first: usize,
+    /// 1-based line the result is on; 0 when there is none to mark.
+    pub target: usize,
+    pub lines: Vec<String>,
+}
+
+/// Lines of context the preview shows on each side of the result.
+pub const PREVIEW_RADIUS: usize = 8;
+
+/// The lines of `text` within `radius` of 0-based `target`, with the
+/// 1-based number of the first. A target past the end shows the last lines.
+pub fn source_window(text: &str, target: usize, radius: usize) -> (usize, Vec<String>) {
+    let all: Vec<&str> = text.lines().collect();
+    if all.is_empty() {
+        return (1, Vec::new());
+    }
+    let target = target.min(all.len() - 1);
+    let start = target.saturating_sub(radius);
+    let end = (target + radius + 1).min(all.len());
+    (
+        start + 1,
+        all[start..end].iter().map(|l| l.to_string()).collect(),
+    )
+}
+
 /// Which results the user fixed, per log, kept in croft's cache so the
 /// strike-through survives closing and reopening a log (#577). Keyed by
 /// the log's path, then `run:result`.
@@ -536,6 +593,11 @@ pub struct SarifView {
     pub columns: Vec<ExtraColumn>,
     /// When each added log was last read, to notice it change on disk.
     added_stamps: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>,
+    /// Space's source preview is on: the details pane shows the code
+    /// around the selected result instead of its details (#577).
+    pub previewing: bool,
+    /// The preview last worked out, keyed by entry index.
+    pub preview: Option<SourcePreview>,
 }
 
 impl SarifView {
@@ -565,6 +627,8 @@ impl SarifView {
             baseline: None,
             columns: load_columns(),
             added_stamps: std::collections::HashMap::new(),
+            previewing: false,
+            preview: None,
         }
     }
 
@@ -1395,6 +1459,73 @@ impl SarifView {
         }
     }
 
+    /// Where the selected result points, found with `resolver` (the log's
+    /// own folder is tried after its roots). `None` when the selection is
+    /// on a group or the result has no physical location.
+    pub fn selected_place(
+        &self,
+        mut resolver: super::resolve::Resolver,
+        exists: &dyn Fn(&std::path::Path) -> bool,
+    ) -> Option<SelectedPlace> {
+        let entry = self.selected_index()?;
+        let e = self.entries.get(entry)?;
+        let loaded = self.logs.get(e.log)?;
+        let run = loaded.log.runs.get(e.run)?;
+        let result = run.results.as_ref()?.get(e.result)?;
+        let physical = result.locations.first()?.physical_location.as_ref()?;
+        let artifact = physical.artifact_location.as_ref()?;
+        if let Some(dir) = loaded.path.parent() {
+            resolver.roots.push(dir.to_path_buf());
+        }
+        let path = resolver.resolve(run, artifact, exists);
+        let region = physical.region.as_ref();
+        let embedded = path
+            .is_none()
+            .then(|| super::resolve::embedded_contents(run, artifact))
+            .flatten();
+        Some(SelectedPlace {
+            entry,
+            path,
+            line: region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1,
+            column: region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1,
+            kind: super::region::column_kind(run),
+            uri: e.uri.clone(),
+            region: region.cloned().map(|r| {
+                (
+                    r,
+                    physical.context_region.clone(),
+                    super::region::newline_sequences(run),
+                )
+            }),
+            embedded,
+        })
+    }
+
+    /// The entry whose preview is wanted but not yet worked out: the
+    /// selected result while Space's preview is on.
+    pub fn preview_due(&self) -> Option<usize> {
+        if !self.previewing {
+            return None;
+        }
+        let idx = self.selected_index()?;
+        (self.preview.as_ref().map(|p| p.entry) != Some(idx)).then_some(idx)
+    }
+
+    /// The preview to draw: on, and for the selected result.
+    pub fn current_preview(&self) -> Option<&SourcePreview> {
+        if !self.previewing {
+            return None;
+        }
+        let idx = self.selected_index()?;
+        self.preview.as_ref().filter(|p| p.entry == idx)
+    }
+
+    /// Space: show or hide the source preview.
+    pub fn toggle_preview(&mut self) {
+        self.previewing = !self.previewing;
+        self.preview = None;
+    }
+
     /// Re-point the selection at `entry` after the projection changed, or
     /// clamp it when that result is no longer listed.
     fn reselect(&mut self, entry: Option<usize>) {
@@ -1595,6 +1726,24 @@ pub(crate) fn display_file(uri: &str, roots: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_window_keeps_radius_lines_each_side_and_clamps_at_the_ends() {
+        let text = (1..=20)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (first, lines) = source_window(&text, 9, 2);
+        assert_eq!(
+            (first, lines.join(",")),
+            (8, "l8,l9,l10,l11,l12".to_string())
+        );
+        let (first, lines) = source_window(&text, 0, 2);
+        assert_eq!((first, lines.len()), (1, 3));
+        let (first, lines) = source_window(&text, 99, 2);
+        assert_eq!((first, lines.join(",")), (18, "l18,l19,l20".to_string()));
+        assert_eq!(source_window("", 3, 2), (1, Vec::new()));
+    }
 
     fn entry(file: &str, line: i64, rule: &str, level: Level, msg: &str) -> Entry {
         Entry {
