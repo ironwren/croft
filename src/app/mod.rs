@@ -24854,8 +24854,6 @@ impl App {
         }
     }
 
-    /// Run the open `.ql` file on the current database (#578), from the
-    /// buffer, not the disk: an unsaved edit is what the user means.
     /// Where submitted variant analyses are remembered (#578).
     fn codeql_variant_runs_path() -> PathBuf {
         croft_cache_dir().join("codeql-variant-analyses.json")
@@ -25016,6 +25014,8 @@ impl App {
         true
     }
 
+    /// Run the open `.ql` file on the current database (#578), from the
+    /// buffer, not the disk: an unsaved edit is what the user means.
     fn run_codeql_query(&mut self) {
         let query = match self.editor.path.clone() {
             Some(p) if p.extension().is_some_and(|e| e == "ql") => p,
