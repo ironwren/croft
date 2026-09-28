@@ -4206,6 +4206,11 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
     lines
 }
 
+/// [`ansi_rows`] for another module's model of a pane (#694's pane host).
+pub(crate) fn ansi_rows_from(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
+    ansi_rows(term, top)
+}
+
 /// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
 /// last cell).
 pub fn row_wraps(term: &Term<VoidListener>, line_idx: i32) -> bool {
