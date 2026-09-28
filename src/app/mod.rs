@@ -3176,6 +3176,9 @@ pub struct App {
     /// views): the file it writes or why not, and the status lines for
     /// each.
     codeql_doc_job: Option<CodeqlDocJob>,
+    /// The CodeQL results table last walked (#578), so the walk goes on
+    /// once the code it opened has the focus.
+    codeql_results_walk: Option<PathBuf>,
     /// The AST being read for the AST Viewer (#578): the tree or why not,
     /// and the view it fills in.
     codeql_ast_job: Option<(
@@ -5529,6 +5532,7 @@ impl App {
             codeql_pack_job: None,
             codeql_ast_job: None,
             codeql_doc_job: None,
+            codeql_results_walk: None,
             codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
             codeql_cli_source: crate::codeql_cli::Source::Fallback,
             codeql_cli_latest: None,
@@ -26456,6 +26460,107 @@ impl App {
         };
     }
 
+    /// Walk a CodeQL results table (#578, VS Code's `codeQLQueryResults`
+    /// up/down/left/right): move its cursor by (`rows`, `cols`) and open
+    /// the code of the cell's entity, else of the first entity in its row.
+    /// The table is the active results sheet, else the one walked last,
+    /// so the walk goes on once the code has the focus.
+    fn walk_codeql_results(&mut self, rows: isize, cols: isize) {
+        use crate::codeql_query as cq;
+        let active = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| self.editor.sheet.is_some() && cq::locations_path(p).is_file());
+        let on_table = active.is_some();
+        let Some(table) = active.or_else(|| self.codeql_results_walk.clone()) else {
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        // The active tab when it is the table, else a tab showing it.
+        let tab = if on_table {
+            Some(&mut *self.editor)
+        } else {
+            self.editor
+                .editors
+                .iter_mut()
+                .find(|t| t.path.as_deref() == Some(table.as_path()) && t.sheet.is_some())
+        };
+        let Some(sheet) = tab.and_then(|t| t.sheet.as_mut()) else {
+            self.codeql_results_walk = None;
+            self.status = String::from("Open a CodeQL results table first");
+            return;
+        };
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        if data.rows.is_empty() {
+            self.status = String::from("The results table is empty");
+            return;
+        }
+        let step = |at: usize, by: isize, len: usize| -> usize {
+            (at as isize + by).clamp(0, len.saturating_sub(1) as isize) as usize
+        };
+        data.cur_row = step(data.cur_row, rows, data.rows.len());
+        data.cur_col = step(data.cur_col, cols, data.col_widths.len().max(1));
+        let (cells, col) = (data.rows[data.cur_row].clone(), data.cur_col);
+        let row = data.cur_row + 1;
+        self.codeql_results_walk = Some(table.clone());
+        let saved: Vec<cq::RowLocs> = std::fs::read_to_string(cq::locations_path(&table))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let Some(locs) = cq::row_locations(&saved, &cells) else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(loc) = locs
+            .get(col)
+            .cloned()
+            .flatten()
+            .or_else(|| locs.iter().flatten().next().cloned())
+        else {
+            self.status = format!("Result {row} has no location");
+            return;
+        };
+        let Some(path) = self.codeql_source_file(&loc.path) else {
+            self.status = format!("{} is not on this machine", loc.path.display());
+            return;
+        };
+        if self.editor.path.as_deref() == Some(table.as_path()) {
+            self.editor.pin_active();
+        }
+        let (line, column) = (loc.line.max(1) - 1, loc.column.max(1) - 1);
+        self.status = match self.open_at(&path, line as usize, column as usize) {
+            Ok(()) => format!("Result {row}: {}:{}", path.display(), loc.line),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
+    }
+
+    /// A source file a CodeQL result names, on this machine: the path
+    /// itself, else its copy in an extracted source archive or in a
+    /// database's `src` folder, which both mirror the original paths.
+    fn codeql_source_file(&self, path: &Path) -> Option<PathBuf> {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let extracted = std::fs::read_dir(Self::codeql_source_cache_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path());
+        let src = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path())
+            .databases
+            .into_iter()
+            .map(|d| d.path.join("src"));
+        extracted
+            .chain(src)
+            .map(|root| root.join(rel))
+            .find(|p| p.is_file())
+    }
+
     /// Decode `bqrs` to CSV, one file per result set (#578): the main set
     /// (`#select`) to `out`, each other beside it as `results-<set>.csv`.
     /// `bqrs decode` without a set writes them all into one CSV, header
@@ -26477,6 +26582,16 @@ impl App {
         for (name, _) in &sets {
             let file = cq::result_set_file(out, name, *name == main);
             run(cq::decode_set_args(bqrs, &file, name))?;
+            // Where each cell's entity is, for walking the results in the
+            // code. Optional: a table without it still opens.
+            let raw = file.with_extension("entities.json");
+            if run(cq::decode_locations_args(bqrs, &raw, name)).is_ok()
+                && let Ok(text) = std::fs::read_to_string(&raw)
+                && let Ok(json) = serde_json::to_string(&cq::parse_row_locations(&text))
+            {
+                let _ = std::fs::write(cq::locations_path(&file), json);
+            }
+            let _ = std::fs::remove_file(&raw);
         }
         Ok(())
     }
@@ -46834,6 +46949,10 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlResultsUp => self.walk_codeql_results(-1, 0),
+            Cmd::CodeqlResultsDown => self.walk_codeql_results(1, 0),
+            Cmd::CodeqlResultsLeft => self.walk_codeql_results(0, -1),
+            Cmd::CodeqlResultsRight => self.walk_codeql_results(0, 1),
             Cmd::SheetSortByColumn => self.sort_sheet_by_column(),
             Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
             Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
