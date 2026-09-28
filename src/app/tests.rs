@@ -55099,6 +55099,128 @@ fn sarif_enter_opens_the_location_and_keeps_the_viewer_tab() {
 }
 
 #[test]
+fn a_sarif_result_whose_file_is_only_in_the_log_opens_the_logs_copy() {
+    // #577: `artifacts[].contents` is the file when it is not on this
+    // machine: text opens read-only at the result, binary in the hex viewer.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("embedded.sarif");
+        std::fs::write(
+            &log,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T"}},
+              "artifacts":[
+                {"location":{"uri":"file:///build/gen/query.c"},"contents":{"text":"line one\nline two\nint bad;\n"}},
+                {"location":{"uri":"file:///build/blob.bin"},"contents":{"binary":"AAEC/w=="}}],
+              "results":[
+                {"ruleId":"R1","message":{"text":"text"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///build/gen/query.c","index":0},"region":{"startLine":3,"startColumn":5}}}]},
+                {"ruleId":"R2","message":{"text":"bin"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"file:///build/blob.bin","index":1}}}]}]}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        let select = |app: &mut App, rule: &str| {
+            let view = app.editor.sarif.as_mut().unwrap();
+            let rows = view.rows();
+            view.selected = rows
+                .iter()
+                .position(|r| matches!(r, crate::sarif::view::Row::Item { entry } if view.entries[*entry].rule_id == rule))
+                .unwrap();
+        };
+        select(&mut app, "R1");
+        app.open_selected_sarif_result();
+        let opened = app.editor.path.clone().expect("a copy opened");
+        assert!(
+            opened.starts_with(croft_cache_dir()),
+            "{opened:?}: {}",
+            app.status
+        );
+        assert_eq!(opened.file_name().unwrap(), "query.c");
+        assert_eq!(app.editor.lines[2], "int bad;");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+        assert!(app.status.contains("read-only"), "{}", app.status);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&opened).unwrap().permissions().mode() & 0o222,
+            0
+        );
+
+        app.editor.open_preview(&log).unwrap();
+        select(&mut app, "R2");
+        app.open_selected_sarif_result();
+        let opened = app.editor.path.clone().expect("a copy opened");
+        assert_eq!(std::fs::read(&opened).unwrap(), [0, 1, 2, 255]);
+        assert!(
+            app.editor.has_non_text_view(),
+            "binary opens in the hex viewer"
+        );
+    });
+}
+
+#[test]
+fn a_sarif_log_rewritten_on_disk_keeps_the_readers_place() {
+    // #577: a rebuild that rewrites the log (a scan re-run) used to reopen
+    // the viewer from scratch, losing the selection, filter, folds and any
+    // log added with `o`.
+    let tmp = tempfile::tempdir().unwrap();
+    let result = |rule: &str, line: u32| {
+        format!(
+            r#"{{"ruleId":"{rule}","level":"warning","message":{{"text":"{rule} here"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"src/{rule}.rs"}},"region":{{"startLine":{line}}}}}}}]}}"#
+        )
+    };
+    let log_of = |results: &[String]| {
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"lint"}}}},"results":[{}]}}]}}"#,
+            results.join(",")
+        )
+    };
+    let main = tmp.path().join("main.sarif");
+    let extra = tmp.path().join("extra.sarif");
+    std::fs::write(&main, log_of(&[result("Aa", 1), result("Bb", 2)])).unwrap();
+    std::fs::write(&extra, log_of(&[result("Cc", 3)])).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&main).unwrap();
+    {
+        let view = app.editor.sarif.as_mut().unwrap();
+        let log = crate::sarif::load::parse_log(&std::fs::read_to_string(&extra).unwrap()).unwrap();
+        assert!(view.add_log(&extra, log));
+        view.query_text = String::from("-Cc");
+        view.filters
+            .hidden_levels
+            .insert(crate::sarif::semantics::Level::Note);
+        view.collapsed.insert(String::from("some-group"));
+        let rows = view.rows();
+        view.selected = rows
+            .iter()
+            .position(|r| matches!(r, crate::sarif::view::Row::Item { entry } if view.entries[*entry].rule_id == "Bb"))
+            .unwrap();
+    }
+    // The scan runs again: a new result lands first, shifting the others.
+    std::fs::write(
+        &main,
+        log_of(&[result("Zz", 9), result("Aa", 1), result("Bb", 2)]),
+    )
+    .unwrap();
+    app.editor.revert_to_disk().unwrap();
+    let view = app.editor.sarif.as_ref().unwrap();
+    assert_eq!(view.logs.len(), 2, "the added log is still there");
+    assert_eq!(view.query_text, "-Cc");
+    assert!(
+        view.filters
+            .hidden_levels
+            .contains(&crate::sarif::semantics::Level::Note)
+    );
+    assert!(view.collapsed.contains("some-group"));
+    assert_eq!(view.entries.len(), 4, "the rewritten log was read");
+    assert_eq!(
+        view.selected_entry().map(|e| e.rule_id.as_str()),
+        Some("Bb"),
+        "the same result stays selected though it moved"
+    );
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
