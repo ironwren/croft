@@ -57077,6 +57077,35 @@ fn view_cfg_reads_a_real_functions_control_flow() {
 }
 
 #[test]
+fn a_csv_sheet_sorts_by_the_cursors_column_from_the_palette() {
+    // #578: raw results as a sortable table. Any CSV sheet sorts.
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("results.csv");
+    std::fs::write(&csv, "name,count\nb,10\nA,9\nc,100\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Open a CSV or TSV file to sort it");
+    app.editor.open(&csv).unwrap();
+    let sheet = app.editor.sheet.as_mut().expect("a CSV opens as a sheet");
+    sheet.sheets[0].cur_col = 1;
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Sorted by count, ascending");
+    let rows = |app: &App| -> Vec<String> {
+        app.editor.sheet.as_ref().unwrap().sheets[0]
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect()
+    };
+    assert_eq!(rows(&app), ["9", "10", "100"]);
+    assert!(app.editor.dirty, "a reorder is an edit");
+    app.run_command(Command::SheetSortByColumn);
+    assert_eq!(app.status, "Sorted by count, descending");
+    assert_eq!(rows(&app), ["100", "10", "9"]);
+}
+
+#[test]
 fn a_runs_result_sets_are_picked_from_a_list() {
     // #578: raw results with a result-set picker. Each set is its own CSV.
     use crate::codeql_query::RunStatus;
