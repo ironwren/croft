@@ -46,6 +46,30 @@ fn path(p: &Path) -> String {
     p.display().to_string()
 }
 
+/// The evaluator log of the run whose results are `output`: every run
+/// writes one into its own folder, beside its results.
+pub fn evaluator_log(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.jsonl")
+}
+
+/// The human-readable summary of the run whose results are `output`, made
+/// from its evaluator log on first request.
+pub fn evaluator_log_summary(output: &Path) -> PathBuf {
+    output.with_file_name("evaluator-log.summary.txt")
+}
+
+/// `codeql` arguments summarising the evaluator log `log` as text at `out`
+/// (VS Code's "Show Evaluator Log (Summary Text)").
+pub fn log_summary_args(log: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("log-summary"),
+        String::from("--format=text"),
+        path(log),
+        path(out),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -57,6 +81,7 @@ pub fn analyze_args(query: &Path, db: &Path, out: &Path) -> Vec<String> {
         path(query),
         String::from("--format=sarif-latest"),
         format!("--output={}", path(out)),
+        format!("--evaluator-log={}", path(&evaluator_log(out))),
         String::from("--rerun"),
     ]
 }
@@ -68,6 +93,7 @@ pub fn run_args(query: &Path, db: &Path, bqrs: &Path) -> Vec<String> {
         String::from("run"),
         format!("--database={}", path(db)),
         format!("--output={}", path(bqrs)),
+        format!("--evaluator-log={}", path(&evaluator_log(bqrs))),
         path(query),
     ]
 }
@@ -762,6 +788,7 @@ mod tests {
                 "/w/q.ql",
                 "--format=sarif-latest",
                 "--output=/out/r.sarif",
+                "--evaluator-log=/out/evaluator-log.jsonl",
                 "--rerun"
             ]
         );
@@ -772,7 +799,21 @@ mod tests {
                 "run",
                 "--database=/dbs/app",
                 "--output=/out/r.bqrs",
+                "--evaluator-log=/out/evaluator-log.jsonl",
                 "/w/q.ql"
+            ]
+        );
+        assert_eq!(
+            log_summary_args(
+                &evaluator_log(Path::new("/out/results.csv")),
+                &evaluator_log_summary(Path::new("/out/results.csv"))
+            ),
+            vec![
+                "generate",
+                "log-summary",
+                "--format=text",
+                "/out/evaluator-log.jsonl",
+                "/out/evaluator-log.summary.txt"
             ]
         );
         assert_eq!(

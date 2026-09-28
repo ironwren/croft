@@ -55561,6 +55561,78 @@ fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar()
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
+    // #578: every run writes an evaluator log beside its results. "Show
+    // Evaluator Log (Raw JSON)" opens it; "(Summary Text)" runs `codeql
+    // generate log-summary` once and opens the text it wrote.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = App::codeql_results_dir().join("1-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 1, RunStatus::Succeeded, out.clone())],
+        );
+        app.run_command(Command::CodeqlShowEvaluatorLog);
+        assert_eq!(app.status, "q.ql has no evaluator log");
+
+        let log = crate::codeql_query::evaluator_log(&out);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "{\"type\":\"LOG_HEADER\"}\n").unwrap();
+        app.run_command(Command::CodeqlShowEvaluatorLog);
+        assert_eq!(app.editor.path.as_deref(), Some(log.as_path()));
+
+        // The fake CLI writes its reply to the path after the log.
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace(
+                "exit 0",
+                "[ \"$1\" = generate ] && echo 'Summary' > \"$5\"\nexit 0",
+            ),
+        )
+        .unwrap();
+        app.run_command(Command::CodeqlShowEvaluatorLogSummary);
+        assert_eq!(app.status, "Summarising the evaluator log\u{2026}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_log_summary() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the summary never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let summary = crate::codeql_query::evaluator_log_summary(&out);
+        assert_eq!(app.status, "Opened the evaluator log summary");
+        assert_eq!(app.editor.path.as_deref(), Some(summary.as_path()));
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate log-summary --format=text {} {}",
+                log.display(),
+                summary.display()
+            )
+        );
+        // Made once: the second request opens the file without the CLI.
+        app.run_command(Command::CodeqlShowEvaluatorLogSummary);
+        assert!(app.codeql_log_summary.is_none());
+        assert_eq!(app.editor.path.as_deref(), Some(summary.as_path()));
+        assert_eq!(
+            Command::from_id("codeql_show_evaluator_log_summary"),
+            Some(Command::CodeqlShowEvaluatorLogSummary)
+        );
+    });
+}
+
 #[test]
 fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());

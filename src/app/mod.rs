@@ -3155,6 +3155,9 @@ pub struct App {
     /// The `codeql version` call behind "CodeQL: Copy Version Information"
     /// (#578): its bare version number, or why it could not be read.
     codeql_version: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The evaluator log summary being generated (#578): where the outcome
+    /// arrives, and the summary file to open once it lands.
+    codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5421,6 +5424,7 @@ impl App {
             codeql_batch: (0, 0),
             codeql_upgrade: None,
             codeql_version: None,
+            codeql_log_summary: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -24303,6 +24307,93 @@ impl App {
             Ok(()) => self.sync_open_file_poll_mtime(),
             Err(e) => self.status = format!("{}: {e}", query.display()),
         }
+    }
+
+    /// The evaluator log of history entry `index`, or why there is none: a
+    /// run croft made before it kept logs, or one still going.
+    fn codeql_history_log(&mut self, index: usize) -> Option<PathBuf> {
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = history.entries.get(index)?;
+        if entry.status == crate::codeql_query::RunStatus::Running {
+            self.status = format!("{} is still running", entry.query_name());
+            return None;
+        }
+        let log = crate::codeql_query::evaluator_log(&entry.output);
+        if log.is_file() {
+            return Some(log);
+        }
+        self.status = format!("{} has no evaluator log", entry.query_name());
+        None
+    }
+
+    /// VS Code's "Show Evaluator Log (Raw JSON)" for history entry `index`.
+    fn show_codeql_evaluator_log(&mut self, index: usize) {
+        let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        match self.editor.open(&log) {
+            Ok(()) => self.sync_open_file_poll_mtime(),
+            Err(e) => self.status = format!("{}: {e}", log.display()),
+        }
+    }
+
+    /// VS Code's "Show Evaluator Log (Summary Text)" for history entry
+    /// `index`: `codeql generate log-summary` on a worker thread the first
+    /// time, then the summary it wrote beside the log.
+    fn show_codeql_evaluator_log_summary(&mut self, index: usize) {
+        let Some(log) = self.codeql_history_log(index) else {
+            return;
+        };
+        let summary = crate::codeql_query::evaluator_log_summary(&log);
+        if summary.is_file() {
+            match self.editor.open(&summary) {
+                Ok(()) => self.sync_open_file_poll_mtime(),
+                Err(e) => self.status = format!("{}: {e}", summary.display()),
+            }
+            return;
+        }
+        if self.codeql_log_summary.is_some() {
+            self.status = String::from("An evaluator log summary is already being made");
+            return;
+        }
+        let program = self.codeql_program.clone();
+        let args = crate::codeql_query::log_summary_args(&log, &summary);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::codeql_command(&program, &args));
+        });
+        self.status = String::from("Summarising the evaluator log\u{2026}");
+        self.codeql_log_summary = Some((rx, summary));
+    }
+
+    /// Open a finished evaluator log summary (#578), or say why the CLI
+    /// could not make it.
+    pub fn drain_codeql_log_summary(&mut self) -> bool {
+        let Some((rx, _)) = self.codeql_log_summary.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the summary stopped unexpectedly"))
+            }
+        };
+        let Some((_, summary)) = self.codeql_log_summary.take() else {
+            return false;
+        };
+        match outcome.and_then(|()| {
+            self.editor
+                .open(&summary)
+                .map_err(|e| format!("{}: {e}", summary.display()))
+        }) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = String::from("Opened the evaluator log summary");
+            }
+            Err(why) => self.status = format!("Could not summarise the evaluator log: {why}"),
+        }
+        true
     }
 
     /// VS Code's "Open Results Directory" for history entry `index`. The
@@ -44207,6 +44298,16 @@ impl App {
             },
             Cmd::CodeqlCancelQueue => self.cancel_codeql_queue(),
             Cmd::CodeqlCopyVersion => self.copy_codeql_version(),
+            Cmd::CodeqlShowEvaluatorLog => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_evaluator_log(i);
+                }
+            }
+            Cmd::CodeqlShowEvaluatorLogSummary => {
+                if let Some(i) = self.current_codeql_history() {
+                    self.show_codeql_evaluator_log_summary(i);
+                }
+            }
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),
@@ -62768,8 +62869,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
         let spinner_changed = spinner_phase != last_spinner_phase;
         let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed =
-            app.drain_codeql_run() | app.drain_codeql_upgrade() | app.drain_codeql_version();
+        let codeql_changed = app.drain_codeql_run()
+            | app.drain_codeql_upgrade()
+            | app.drain_codeql_version()
+            | app.drain_codeql_log_summary();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
