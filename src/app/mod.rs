@@ -61347,18 +61347,18 @@ fn agent_ledger_key(root: &Path) -> String {
 
 /// A CodeQL database upgrade in flight (#578): where its outcome arrives,
 /// and the database's name and folder.
+type CodeqlUpgrade = (
+    std::sync::mpsc::Receiver<Result<(), String>>,
+    String,
+    PathBuf,
+);
+
 /// A GitHub Code Search in flight: the variant analysis list its
 /// repositories go into, and its outcome: the repositories found, and why
 /// a page after the first failed, cutting the results short.
 type CodeqlCodeSearch = (
     String,
     std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
-);
-
-type CodeqlUpgrade = (
-    std::sync::mpsc::Receiver<Result<(), String>>,
-    String,
-    PathBuf,
 );
 
 pub(crate) fn croft_cache_dir() -> PathBuf {
