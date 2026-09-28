@@ -2684,6 +2684,9 @@ impl WorkerState {
             }
             self.docs
                 .retain(|_, doc| (doc.language, doc.project_root.clone()) != key);
+            // Respawn as a re-probe, not a first attempt, so a set that comes
+            // back short is marked incomplete and tried again.
+            self.clients.insert(key.clone(), Vec::new());
             self.ensure_clients(key.0, &key.1).await;
             self.restarts.restarted.store(true, Ordering::Relaxed);
         }
@@ -9400,6 +9403,10 @@ while True:
         handle.block_on(state.restart_dead_servers());
         assert_eq!(started(5).len(), 5, "a short set must be restarted");
         assert!(restarted.load(Ordering::Relaxed));
+        assert!(
+            state.restarts.incomplete.contains(&key),
+            "a restart that comes back short again must stay marked"
+        );
         handle.block_on(state.shutdown_all());
     }
 
