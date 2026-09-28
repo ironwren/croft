@@ -124,6 +124,25 @@ fn gh_error(out: &std::process::Output) -> String {
     err.trim().lines().next().unwrap_or("gh failed").to_string()
 }
 
+/// Spawn `cmd`, trying again for a moment while its program is "Text file
+/// busy" (ETXTBSY). A file just written is busy while any process forked
+/// meanwhile still holds the write descriptor, until that child execs,
+/// which takes microseconds. A freshly installed or updated `gh` can hit it,
+/// and a test's stand-in script hits it whenever another test forks.
+fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    const ETXTBSY: i32 = 26;
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -135,7 +154,7 @@ fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<
         } else {
             Stdio::null()
         });
-    let mut child = cmd.spawn().map_err(|e| format!("could not run gh: {e}"))?;
+    let mut child = spawn_retrying_busy(&mut cmd).map_err(|e| format!("could not run gh: {e}"))?;
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
         let _ = pipe.write_all(input.as_bytes());
     }
@@ -346,6 +365,36 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.display().to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_still_open_for_writing_is_run_once_it_is_released() {
+        // Exec of a file open for writing fails with ETXTBSY, as it does
+        // for a stand-in script while a forked sibling holds its descriptor.
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("busy");
+        std::fs::write(&path, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let busy = Command::new(&path).output().unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(26), "{busy}");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+        let mut cmd = Command::new(&path);
+        cmd.stdout(Stdio::piped());
+        let out = spawn_retrying_busy(&mut cmd)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        release.join().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
     }
 
     #[test]

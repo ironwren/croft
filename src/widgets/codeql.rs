@@ -86,6 +86,9 @@ pub enum Action {
     AddVariantOwner,
     /// Open the variant analysis config file in an editor tab.
     OpenVariantConfig,
+    /// Submitted variant analysis `.0` (in the order runs are remembered):
+    /// open its per-repository report.
+    VariantRun(usize),
 }
 
 /// The languages CodeQL analyses, as VS Code's Language view lists them.
@@ -165,6 +168,8 @@ pub struct CodeqlPanel {
     pub variant_error: bool,
     /// Folded variant analysis lists, by name.
     pub folded_lists: std::collections::HashSet<String>,
+    /// A line per submitted variant analysis, oldest first (#578).
+    pub variant_runs: Vec<String>,
 }
 
 impl CodeqlPanel {
@@ -267,6 +272,14 @@ impl CodeqlPanel {
             Some(Hit::Action(Action::VariantList(i))) => Some(Item::List(i)),
             Some(Hit::Action(Action::VariantRepo(l, j))) => Some(Item::Repo(l, j)),
             Some(Hit::Action(Action::VariantOwner(i))) => Some(Item::Owner(i)),
+            _ => None,
+        }
+    }
+
+    /// The remembered variant analysis whose row is selected.
+    pub fn selected_variant_run(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::VariantRun(i))) => Some(i),
             _ => None,
         }
     }
@@ -398,6 +411,12 @@ impl CodeqlPanel {
                 (Action::AddVariantOwner, "Add owner"),
             ] {
                 out.push(Line::Action(a, label.to_string()));
+            }
+        }
+        if !self.variant_runs.is_empty() {
+            out.push(Line::Text("Runs (newest first):"));
+            for (i, label) in self.variant_runs.iter().enumerate().rev() {
+                out.push(Line::Action(Action::VariantRun(i), label.clone()));
             }
         }
     }

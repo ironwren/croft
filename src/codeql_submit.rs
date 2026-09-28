@@ -249,6 +249,318 @@ pub struct Submitted {
     #[serde(default)]
     pub skipped: usize,
     pub submitted_at: u64,
+    /// The last progress read back from GitHub, when it has been.
+    #[serde(default)]
+    pub progress: Option<RunProgress>,
+}
+
+/// How far one repository of a run has got.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoProgress {
+    pub nwo: String,
+    /// GitHub's `analysis_status`: `pending`, `in_progress`, `succeeded`,
+    /// `failed`, `canceled` or `timed_out`.
+    pub status: String,
+    #[serde(default)]
+    pub results: Option<u64>,
+    #[serde(default)]
+    pub failure: Option<String>,
+}
+
+/// A run's progress as GitHub reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunProgress {
+    /// The run's own `status`: `in_progress`, `succeeded`, `failed` or
+    /// `cancelled`.
+    pub status: String,
+    #[serde(default)]
+    pub failure: Option<String>,
+    pub repos: Vec<RepoProgress>,
+}
+
+/// Repository statuses that will not change again.
+fn repo_finished(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "canceled" | "timed_out")
+}
+
+impl RunProgress {
+    /// Whether GitHub will report nothing new for the run.
+    pub fn is_done(&self) -> bool {
+        self.status != "in_progress"
+    }
+
+    /// Repositories finished, and those the run covers.
+    pub fn counts(&self) -> (usize, usize) {
+        let done = self
+            .repos
+            .iter()
+            .filter(|r| repo_finished(&r.status))
+            .count();
+        (done, self.repos.len())
+    }
+
+    /// Results across the repositories that reported a count.
+    pub fn results(&self) -> u64 {
+        self.repos.iter().filter_map(|r| r.results).sum()
+    }
+}
+
+/// `gh` arguments reading run `id`'s progress from `controller`.
+pub fn progress_args(controller: &str, id: u64) -> Vec<String> {
+    vec![
+        String::from("api"),
+        format!("repos/{controller}/code-scanning/codeql/variant-analyses/{id}"),
+    ]
+}
+
+/// The progress in GitHub's answer to [`progress_args`].
+pub fn parse_progress(json: &str) -> Result<RunProgress, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("GitHub's answer was not JSON: {e}"))?;
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| String::from("GitHub's answer gave the run no status"))?
+        .to_string();
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let repos = v
+        .get("scanned_repositories")
+        .and_then(|r| r.as_array())
+        .map(|repos| {
+            repos
+                .iter()
+                .filter_map(|r| {
+                    Some(RepoProgress {
+                        nwo: r.get("repository")?.get("full_name")?.as_str()?.to_string(),
+                        status: text(r, "analysis_status")
+                            .unwrap_or_else(|| String::from("pending")),
+                        results: r.get("result_count").and_then(|c| c.as_u64()),
+                        failure: text(r, "failure_message"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(RunProgress {
+        status,
+        failure: text(&v, "failure_reason"),
+        repos,
+    })
+}
+
+/// The side bar's line for `run`.
+pub fn run_label(run: &Submitted) -> String {
+    let name = run.query.file_name().unwrap_or_default().to_string_lossy();
+    match &run.progress {
+        None => format!("{name} · submitted"),
+        Some(p) => {
+            let (done, total) = p.counts();
+            let state = match p.status.as_str() {
+                "in_progress" => "running",
+                other => other,
+            };
+            format!(
+                "{name} · {state} · {done}/{total} repos · {} results",
+                p.results()
+            )
+        }
+    }
+}
+
+/// A Markdown report of `run`: its status, then a row per repository with
+/// its status, result count and any failure, each repository linked.
+pub fn run_report(run: &Submitted) -> String {
+    let name = run.query.file_name().unwrap_or_default().to_string_lossy();
+    let mut out = format!(
+        "# Variant analysis {} of {name}\n\nController: {}  \nLanguage: {}  \nRun: {}\n\n",
+        run.id,
+        run.controller,
+        run.language,
+        run.url()
+    );
+    let Some(p) = &run.progress else {
+        out.push_str("No progress read from GitHub yet.\n");
+        return out;
+    };
+    let (done, total) = p.counts();
+    out.push_str(&format!(
+        "Status: {} · {done}/{total} repositories · {} results\n",
+        p.status,
+        p.results()
+    ));
+    if let Some(why) = &p.failure {
+        out.push_str(&format!("Failure: {why}\n"));
+    }
+    if run.skipped > 0 {
+        out.push_str(&format!("Skipped by GitHub: {}\n", run.skipped));
+    }
+    if !repos_with_results(run).is_empty() {
+        out.push_str(
+            "Results: press v on the run in the CodeQL side bar, or run \"CodeQL: Open Variant Analysis Results\".\n",
+        );
+    }
+    out.push_str("\n| Repository | Status | Results | Failure |\n|---|---|---|---|\n");
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    for r in &p.repos {
+        out.push_str(&format!(
+            "| [{nwo}](https://github.com/{nwo}) | {} | {} | {} |\n",
+            r.status,
+            r.results.map(|n| n.to_string()).unwrap_or_default(),
+            r.failure.as_deref().map(cell).unwrap_or_default(),
+            nwo = r.nwo
+        ));
+    }
+    out
+}
+
+/// `gh` arguments reading repository `nwo`'s part of run `id`: its status
+/// and where its results are.
+pub fn repo_task_args(controller: &str, id: u64, nwo: &str) -> Vec<String> {
+    vec![
+        String::from("api"),
+        format!("repos/{controller}/code-scanning/codeql/variant-analyses/{id}/repos/{nwo}"),
+    ]
+}
+
+/// Where a repository's results are, from GitHub's answer to
+/// [`repo_task_args`]: the artifact's (signed, short-lived) URL, and the
+/// commit its database was built from.
+pub fn parse_artifact(json: &str) -> Result<(String, Option<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("GitHub's answer was not JSON: {e}"))?;
+    let url = v
+        .get("artifact_url")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| String::from("GitHub has no results for it"))?;
+    let sha = v
+        .get("database_commit_sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok((url.to_string(), sha))
+}
+
+/// The repositories of `run` whose results are worth fetching: those that
+/// succeeded with at least one result.
+pub fn repos_with_results(run: &Submitted) -> Vec<String> {
+    run.progress
+        .iter()
+        .flat_map(|p| &p.repos)
+        .filter(|r| r.status == "succeeded" && r.results.unwrap_or(0) > 0)
+        .map(|r| r.nwo.clone())
+        .collect()
+}
+
+/// One repository's results: its SARIF log, or its table as CSV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoResults {
+    Sarif(String),
+    Table(String),
+}
+
+/// One SARIF log holding every repository's runs, each run marked with its
+/// repository and commit (`versionControlProvenance`) so a location that is
+/// not on this machine can be opened on GitHub.
+pub fn combine_sarif(parts: &[(String, Option<String>, String)]) -> Result<String, String> {
+    let mut runs = Vec::new();
+    for (nwo, sha, text) in parts {
+        let log: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("{nwo}'s SARIF: {e}"))?;
+        for mut run in log
+            .get("runs")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let mut provenance =
+                serde_json::json!({ "repositoryUri": format!("https://github.com/{nwo}") });
+            if let Some(sha) = sha {
+                provenance["revisionId"] = serde_json::json!(sha);
+            }
+            run["versionControlProvenance"] = serde_json::json!([provenance]);
+            run["automationDetails"] = serde_json::json!({ "id": format!("{nwo}/") });
+            runs.push(run);
+        }
+    }
+    let log = serde_json::json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": runs,
+    });
+    serde_json::to_string_pretty(&log).map_err(|e| e.to_string())
+}
+
+/// One CSV of every repository's table, a `repository` column first. The
+/// header is the first table's; each table's own header row is dropped.
+pub fn combine_csv(parts: &[(String, String)]) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut out = String::new();
+    for (i, (nwo, csv)) in parts.iter().enumerate() {
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap_or_default();
+        if i == 0 {
+            out.push_str(&format!("\"repository\",{header}\n"));
+        }
+        for line in lines.filter(|l| !l.is_empty()) {
+            out.push_str(&format!("{},{line}\n", quote(nwo)));
+        }
+    }
+    out
+}
+
+/// Whether croft fetches an artifact from `url`: GitHub hands out https
+/// links only; tests serve theirs from a local port.
+pub fn artifact_url_allowed(url: &str) -> bool {
+    url.starts_with("https://") || (cfg!(test) && url.starts_with("http://127.0.0.1:"))
+}
+
+/// The file called `name` in `dir` or a folder below it (a results
+/// archive may nest its files a level or two down), shallowest first.
+pub fn find_named(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut level = vec![dir.to_path_buf()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for d in &level {
+            let direct = d.join(name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            if let Ok(entries) = std::fs::read_dir(d) {
+                let mut dirs: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                dirs.sort();
+                next.extend(dirs);
+            }
+        }
+        level = next;
+    }
+    None
+}
+
+/// The most one repository's results archive may expand to.
+pub const ARTIFACT_LIMIT: u64 = 2 << 30;
+
+/// Replace the remembered run `id` in the file at `path` with `run`.
+pub fn update_submitted(path: &Path, run: &Submitted) -> std::io::Result<()> {
+    let mut runs = load_submitted(path);
+    match runs
+        .iter_mut()
+        .find(|r| r.id == run.id && r.controller == run.controller)
+    {
+        Some(slot) => *slot = run.clone(),
+        None => runs.push(run.clone()),
+    }
+    let text = serde_json::to_string_pretty(&runs).map_err(std::io::Error::other)?;
+    std::fs::write(path, text)
 }
 
 impl Submitted {
@@ -295,6 +607,7 @@ pub fn parse_submission(
         workflow_run: v.get("actions_workflow_run_id").and_then(|r| r.as_u64()),
         skipped,
         submitted_at,
+        progress: None,
     })
 }
 
@@ -438,5 +751,145 @@ mod tests {
         }
         let ids: Vec<u64> = load_submitted(&path).iter().map(|r| r.id).collect();
         assert_eq!(ids, [5, 6]);
+    }
+    #[test]
+    fn a_runs_progress_counts_finished_repositories_and_results() {
+        let json = r#"{"id": 7, "status": "in_progress",
+            "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 3},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "failed", "failure_message": "no | db\nhere"},
+                {"repository": {"full_name": "e/f"}, "analysis_status": "in_progress"},
+                {"repository": {"full_name": "g/h"}, "analysis_status": "succeeded", "result_count": 0}
+            ]}"#;
+        let p = parse_progress(json).unwrap();
+        assert!(!p.is_done());
+        assert_eq!((p.counts(), p.results()), ((3, 4), 3));
+        let mut run = parse_submission(
+            r#"{"id": 7, "actions_workflow_run_id": 1}"#,
+            "me/ctl",
+            Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        assert_eq!(run_label(&run), "Find.ql · submitted");
+        assert!(run_report(&run).contains("No progress read"));
+        run.progress = Some(p);
+        assert_eq!(run_label(&run), "Find.ql · running · 3/4 repos · 3 results");
+        let report = run_report(&run);
+        assert!(
+            report.contains("| [a/b](https://github.com/a/b) | succeeded | 3 |  |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| failed |  | no \\| db here |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Run: https://github.com/me/ctl/actions/runs/1"),
+            "{report}"
+        );
+
+        let done = parse_progress(r#"{"status": "cancelled", "failure_reason": ""}"#).unwrap();
+        assert!(done.is_done() && done.repos.is_empty() && done.failure.is_none());
+        assert!(parse_progress(r#"{"message": "Not Found"}"#).is_err());
+        assert_eq!(
+            progress_args("me/ctl", 7),
+            [
+                "api",
+                "repos/me/ctl/code-scanning/codeql/variant-analyses/7"
+            ]
+        );
+    }
+
+    #[test]
+    fn updating_a_remembered_run_replaces_it_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runs.json");
+        let run = |id: u64| {
+            parse_submission(
+                &format!(r#"{{"id": {id}}}"#),
+                "a/b",
+                Path::new("/q.ql"),
+                "go",
+                0,
+            )
+            .unwrap()
+        };
+        record_submitted(&path, run(1)).unwrap();
+        record_submitted(&path, run(2)).unwrap();
+        let mut first = run(1);
+        first.progress = parse_progress(r#"{"status": "succeeded"}"#).ok();
+        update_submitted(&path, &first).unwrap();
+        let runs = load_submitted(&path);
+        assert_eq!(runs.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+        assert!(runs[0].progress.as_ref().is_some_and(|p| p.is_done()));
+    }
+    #[test]
+    fn repository_results_are_found_and_combined_per_repository() {
+        let task = r#"{"analysis_status": "succeeded", "artifact_url": "https://x/a.zip", "database_commit_sha": "abc"}"#;
+        assert_eq!(
+            parse_artifact(task).unwrap(),
+            (String::from("https://x/a.zip"), Some(String::from("abc")))
+        );
+        assert!(parse_artifact(r#"{"analysis_status": "failed", "artifact_url": ""}"#).is_err());
+        assert_eq!(
+            repo_task_args("me/ctl", 7, "a/b"),
+            [
+                "api",
+                "repos/me/ctl/code-scanning/codeql/variant-analyses/7/repos/a/b"
+            ]
+        );
+
+        let mut run =
+            parse_submission(r#"{"id": 7}"#, "me/ctl", Path::new("/q.ql"), "go", 0).unwrap();
+        run.progress = parse_progress(
+            r#"{"status": "succeeded", "scanned_repositories": [
+                {"repository": {"full_name": "a/b"}, "analysis_status": "succeeded", "result_count": 2},
+                {"repository": {"full_name": "c/d"}, "analysis_status": "succeeded", "result_count": 0},
+                {"repository": {"full_name": "e/f"}, "analysis_status": "failed"}]}"#,
+        )
+        .ok();
+        assert_eq!(repos_with_results(&run), ["a/b"]);
+
+        let one = r#"{"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "CodeQL"}}, "results": [{"message": {"text": "x"}}]}]}"#;
+        let combined = combine_sarif(&[
+            (
+                String::from("a/b"),
+                Some(String::from("abc")),
+                one.to_string(),
+            ),
+            (String::from("c/d"), None, one.to_string()),
+        ])
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&combined).unwrap();
+        assert_eq!(v["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["runs"][0]["versionControlProvenance"][0],
+            serde_json::json!({"repositoryUri": "https://github.com/a/b", "revisionId": "abc"})
+        );
+        assert!(
+            v["runs"][1]["versionControlProvenance"][0]
+                .get("revisionId")
+                .is_none()
+        );
+        assert!(
+            crate::sarif::load::parse_log(&combined).is_ok(),
+            "the viewer reads it"
+        );
+        assert!(combine_sarif(&[(String::from("a/b"), None, String::from("{"))]).is_err());
+
+        let csv = combine_csv(&[
+            (String::from("a/b"), String::from("\"col\"\n\"1\"\n")),
+            (String::from("c/\"d"), String::from("\"col\"\n\"2\"\n\n")),
+        ]);
+        assert_eq!(
+            csv,
+            "\"repository\",\"col\"\n\"a/b\",\"1\"\n\"c/\"\"d\",\"2\"\n"
+        );
+        assert!(artifact_url_allowed(
+            "https://objects.githubusercontent.com/x"
+        ));
+        assert!(!artifact_url_allowed("http://example.com/x"));
     }
 }
