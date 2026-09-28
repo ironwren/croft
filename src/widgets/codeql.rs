@@ -75,6 +75,13 @@ pub enum Action {
     EvalDependency(Option<usize>),
     /// Forget the evaluator log shown.
     ClearEvalLog,
+    /// Read, or read again, the endpoints of the current database for the
+    /// Model Editor.
+    OpenModelEditor,
+    /// Fold or unfold the Model Editor group endpoint `.0` belongs to.
+    ModelGroup(usize),
+    /// Model Editor endpoint `.0`: go to its code.
+    ModelEndpoint(usize),
     SelectLanguage(usize),
     /// Make the listed database at this index the current one.
     SelectDatabase(usize),
@@ -188,6 +195,8 @@ pub struct CodeqlPanel {
     pub ast: Option<crate::codeql_ast::AstView>,
     /// The evaluator log the Evaluator Log Viewer section shows.
     pub evallog: Option<crate::codeql_evallog::LogView>,
+    /// The endpoints the Method Modeling section shows.
+    pub model: Option<crate::codeql_model::ModelView>,
 }
 
 impl CodeqlPanel {
@@ -626,10 +635,55 @@ impl CodeqlPanel {
                         out.push(Line::Text("query history item."));
                     }
                 },
-                Section::MethodModeling => {
-                    out.push(Line::Text("Select a method in the model editor to"));
-                    out.push(Line::Text("see and edit its model here."));
-                }
+                Section::MethodModeling => match &self.model {
+                    Some(view) => {
+                        out.push(Line::Action(
+                            Action::OpenModelEditor,
+                            format!("Refresh \u{b7} {} ({})", view.database, view.language),
+                        ));
+                        use crate::codeql_model::ModelRow;
+                        let rows = view.rows();
+                        for (at, row) in rows.iter().enumerate() {
+                            out.push(match row {
+                                ModelRow::Group(group, modeled, total) => {
+                                    let mark = if view.folded.contains(group) {
+                                        '\u{25b8}'
+                                    } else {
+                                        '\u{25be}'
+                                    };
+                                    // A group's endpoints follow it; one is
+                                    // enough to name the group.
+                                    let first = rows[at..].iter().find_map(|r| match r {
+                                        ModelRow::Endpoint(i, _) => Some(*i),
+                                        _ => None,
+                                    });
+                                    let first = first.unwrap_or_else(|| {
+                                        view.endpoints
+                                            .iter()
+                                            .position(|e| e.group() == *group)
+                                            .unwrap_or(0)
+                                    });
+                                    Line::Action(
+                                        Action::ModelGroup(first),
+                                        format!("{mark} {group}  {modeled}/{total} modeled"),
+                                    )
+                                }
+                                ModelRow::Endpoint(i, text) => {
+                                    Line::Action(Action::ModelEndpoint(*i), text.clone())
+                                }
+                            });
+                        }
+                    }
+                    None => {
+                        out.push(Line::Text("Model the library methods of the"));
+                        out.push(Line::Text("current database as sources, sinks"));
+                        out.push(Line::Text("or summaries."));
+                        out.push(Line::Action(
+                            Action::OpenModelEditor,
+                            "Open Model Editor".to_string(),
+                        ));
+                    }
+                },
             }
         }
         out
