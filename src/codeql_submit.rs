@@ -549,6 +549,205 @@ pub fn find_named(dir: &Path, name: &str) -> Option<PathBuf> {
 /// The most one repository's results archive may expand to.
 pub const ARTIFACT_LIMIT: u64 = 2 << 30;
 
+/// The fields of one CSV line, as `codeql bqrs decode --format=csv` writes
+/// them: comma separated, quoted with `""` for a quote inside.
+pub fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            ('"', _) => quoted = !quoted,
+            (',', false) => fields.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// One repository's part of an export.
+struct RepoExport {
+    nwo: String,
+    lines: Vec<String>,
+    count: usize,
+    /// Its table's header is written.
+    table: bool,
+}
+
+/// The index of `nwo`'s part in `repos`, added when it is new.
+fn repo_entry(repos: &mut Vec<RepoExport>, nwo: &str) -> usize {
+    match repos.iter().position(|r| r.nwo == nwo) {
+        Some(i) => i,
+        None => {
+            repos.push(RepoExport {
+                nwo: nwo.to_string(),
+                lines: Vec::new(),
+                count: 0,
+                table: false,
+            });
+            repos.len() - 1
+        }
+    }
+}
+
+/// The Markdown files exporting `run`'s results (VS Code's "Export
+/// results"): `_summary.md`, which sorts first (a gist shows it on top),
+/// listing each repository with its result count and a link to its own
+/// file, then a file per repository. `sarif` is the combined log
+/// [`combine_sarif`] made; each alert is its message and a link to its line
+/// on GitHub. `csv` is the table [`combine_csv`] made, split back by its
+/// repository column.
+pub fn export_markdown(
+    run: &Submitted,
+    sarif: Option<&str>,
+    csv: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut repos: Vec<RepoExport> = Vec::new();
+    let mut add = Vec::new();
+    if let Some(text) = sarif {
+        let log: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("the results' SARIF: {e}"))?;
+        for r in log["runs"].as_array().into_iter().flatten() {
+            let vcs = &r["versionControlProvenance"][0];
+            let Some(nwo) = vcs["repositoryUri"]
+                .as_str()
+                .and_then(|u| u.strip_prefix("https://github.com/"))
+            else {
+                continue;
+            };
+            let rev = vcs["revisionId"].as_str().unwrap_or("HEAD");
+            for result in r["results"].as_array().into_iter().flatten() {
+                let message = result["message"]["text"].as_str().unwrap_or("(no message)");
+                let loc = &result["locations"][0]["physicalLocation"];
+                let line = match loc["artifactLocation"]["uri"].as_str() {
+                    Some(uri) => {
+                        let at = loc["region"]["startLine"].as_i64().unwrap_or(0);
+                        let shown = if at > 0 {
+                            format!("{uri}:{at}")
+                        } else {
+                            uri.to_string()
+                        };
+                        let fragment = if at > 0 {
+                            format!("#L{at}")
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "- {} ([{shown}](https://github.com/{nwo}/blob/{rev}/{}{fragment}))",
+                            md_cell(message),
+                            uri.trim_start_matches('/')
+                        )
+                    }
+                    None => format!("- {}", md_cell(message)),
+                };
+                add.push((nwo.to_string(), line));
+            }
+        }
+    }
+    for (nwo, line) in add {
+        let i = repo_entry(&mut repos, &nwo);
+        repos[i].lines.push(line);
+        repos[i].count += 1;
+    }
+    if let Some(text) = csv {
+        let mut lines = text.lines();
+        let header: Vec<String> = lines
+            .next()
+            .map(csv_fields)
+            .unwrap_or_default()
+            .into_iter()
+            .skip(1)
+            .collect();
+        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        for line in lines.filter(|l| !l.is_empty()) {
+            let mut fields = csv_fields(line);
+            if fields.is_empty() {
+                continue;
+            }
+            let nwo = fields.remove(0);
+            rows.push((nwo, fields));
+        }
+        for (nwo, fields) in rows {
+            let i = repo_entry(&mut repos, &nwo);
+            if !repos[i].table {
+                // Alerts and a table for one repository: the table follows.
+                if !repos[i].lines.is_empty() {
+                    repos[i].lines.push(String::new());
+                }
+                let cells: Vec<String> = header.iter().map(|h| md_cell(h)).collect();
+                repos[i].lines.push(format!("| {} |", cells.join(" | ")));
+                repos[i]
+                    .lines
+                    .push(format!("|{}", "---|".repeat(header.len().max(1))));
+                repos[i].table = true;
+            }
+            let cells: Vec<String> = fields.iter().map(|f| md_cell(f)).collect();
+            repos[i].lines.push(format!("| {} |", cells.join(" | ")));
+            repos[i].count += 1;
+        }
+    }
+    let name = run
+        .query
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let file_of = |nwo: &str| format!("{}.md", nwo.replace('/', "-"));
+    let total: usize = repos.iter().map(|r| r.count).sum();
+    let mut summary = format!(
+        "# Variant analysis {} of {name}\n\nQuery: `{name}` ({})  \nController: {}  \nRun: {}\n\n{total} results in {} repositor{}\n\n| Repository | Results |\n|---|---|\n",
+        run.id,
+        run.language,
+        run.controller,
+        run.url(),
+        repos.len(),
+        if repos.len() == 1 { "y" } else { "ies" }
+    );
+    let mut files = Vec::new();
+    for r in &repos {
+        summary.push_str(&format!(
+            "| [{}]({}) | {} |\n",
+            r.nwo,
+            file_of(&r.nwo),
+            r.count
+        ));
+        files.push((
+            file_of(&r.nwo),
+            format!(
+                "# {} in [{nwo}](https://github.com/{nwo})\n\n{} results\n\n{}\n",
+                name,
+                r.count,
+                r.lines.join("\n"),
+                nwo = r.nwo
+            ),
+        ));
+    }
+    files.insert(0, (String::from("_summary.md"), summary));
+    Ok(files)
+}
+
+/// `gh` arguments creating a secret gist of `files`, described by `desc`.
+pub fn gist_args(desc: &str, files: &[PathBuf]) -> Vec<String> {
+    let mut args = vec![
+        String::from("gist"),
+        String::from("create"),
+        String::from("--desc"),
+        desc.to_string(),
+    ];
+    args.extend(files.iter().map(|f| f.display().to_string()));
+    args
+}
+
 /// Replace the remembered run `id` in the file at `path` with `run`.
 pub fn update_submitted(path: &Path, run: &Submitted) -> std::io::Result<()> {
     let mut runs = load_submitted(path);
@@ -891,5 +1090,81 @@ mod tests {
             "https://objects.githubusercontent.com/x"
         ));
         assert!(!artifact_url_allowed("http://example.com/x"));
+    }
+    #[test]
+    fn an_export_is_a_summary_and_a_file_per_repository() {
+        assert_eq!(
+            csv_fields(r#""a","b ""c"", d",3,"#),
+            ["a", "b \"c\", d", "3", ""]
+        );
+        let run = parse_submission(
+            r#"{"id": 9, "actions_workflow_run_id": 5}"#,
+            "me/ctl",
+            Path::new("/w/Find.ql"),
+            "python",
+            0,
+        )
+        .unwrap();
+        let one = |msg: &str, line: i64| {
+            format!(
+                r#"{{"runs": [{{"tool": {{"driver": {{"name": "CodeQL"}}}}, "results": [{{"message": {{"text": "{msg}"}}, "locations": [{{"physicalLocation": {{"artifactLocation": {{"uri": "src/x.py"}}, "region": {{"startLine": {line}}}}}}}]}}]}}]}}"#
+            )
+        };
+        let sarif = combine_sarif(&[
+            (
+                String::from("a/b"),
+                Some(String::from("abc")),
+                one("bad | thing", 4),
+            ),
+            (String::from("c/d"), None, one("other", 0)),
+        ])
+        .unwrap();
+        let csv = combine_csv(&[(
+            String::from("e/f"),
+            String::from("\"name\",\"n\"\n\"x\",\"1\"\n\"y|z\",\"2\"\n"),
+        )]);
+        let files = export_markdown(&run, Some(&sarif), Some(&csv)).unwrap();
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["_summary.md", "a-b.md", "c-d.md", "e-f.md"]);
+        let summary = &files[0].1;
+        assert!(
+            summary.starts_with("# Variant analysis 9 of Find.ql\n"),
+            "{summary}"
+        );
+        assert!(summary.contains("4 results in 3 repositories"), "{summary}");
+        assert!(summary.contains("| [a/b](a-b.md) | 1 |"), "{summary}");
+        assert!(summary.contains("| [e/f](e-f.md) | 2 |"), "{summary}");
+        assert!(
+            summary.contains("Run: https://github.com/me/ctl/actions/runs/5"),
+            "{summary}"
+        );
+        assert!(
+            files[1].1.contains(
+                "- bad \\| thing ([src/x.py:4](https://github.com/a/b/blob/abc/src/x.py#L4))"
+            ),
+            "{}",
+            files[1].1
+        );
+        assert!(
+            files[2]
+                .1
+                .contains("- other ([src/x.py](https://github.com/c/d/blob/HEAD/src/x.py))"),
+            "{}",
+            files[2].1
+        );
+        assert!(
+            files[3]
+                .1
+                .contains("| name | n |\n|---|---|\n| x | 1 |\n| y\\|z | 2 |"),
+            "{}",
+            files[3].1
+        );
+        let empty = export_markdown(&run, None, None).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].1.contains("0 results in 0 repositories"));
+        assert_eq!(
+            gist_args("d", &[PathBuf::from("/t/_summary.md")]),
+            ["gist", "create", "--desc", "d", "/t/_summary.md"]
+        );
     }
 }
