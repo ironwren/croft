@@ -8248,6 +8248,7 @@ impl App {
                 let resolver = crate::sarif::resolve::Resolver {
                     roots,
                     learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                    open: self.open_file_paths(),
                     ..Default::default()
                 };
                 let log_index = view.logs.iter().position(|l| l.path == loaded.path);
@@ -57750,6 +57751,7 @@ impl App {
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
                 learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                open: self.open_file_paths(),
                 ..Default::default()
             };
             let found = resolver.resolve(run, artifact, &|p| p.is_file());
@@ -58470,6 +58472,7 @@ impl App {
         let resolver = crate::sarif::resolve::Resolver {
             roots,
             learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+            open: self.open_file_paths(),
             ..Default::default()
         };
         let open_text = |p: &std::path::Path| -> Option<String> {
@@ -58525,6 +58528,14 @@ impl App {
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 
+    /// The paths of the files open in editor tabs, for SARIF resolution.
+    fn open_file_paths(&self) -> Vec<PathBuf> {
+        self.editor
+            .iter_tabs()
+            .filter_map(|t| t.path.clone())
+            .collect()
+    }
+
     /// Open a location from the selected result's details (a step, a frame, a
     /// related location), resolving it the way the result's own location is
     /// resolved and keeping the viewer tab.
@@ -58548,6 +58559,7 @@ impl App {
             let resolver = crate::sarif::resolve::Resolver {
                 roots,
                 learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+                open: self.open_file_paths(),
                 ..Default::default()
             };
             let artifact = crate::sarif::model::ArtifactLocation {
