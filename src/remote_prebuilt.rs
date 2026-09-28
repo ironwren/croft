@@ -32,10 +32,17 @@ const RELEASES: &str = "https://github.com/vitali87/croft/releases/download";
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether this croft may use a release artifact for the remote: installed
-/// from crates.io (its source is the published crate). `cargo install --git`
-/// checkouts are arbitrary commits, not releases, so they do not qualify.
+/// from crates.io (its source is the published crate), or a release binary
+/// itself, whose baked `CARGO_MANIFEST_DIR` is the CI checkout it was built
+/// in and does not exist here (#261). `cargo install --git` checkouts are
+/// arbitrary commits, not releases, so they do not qualify.
 pub fn eligible(manifest_dir: &str) -> bool {
-    manifest_dir.contains("/registry/src/")
+    eligible_with(manifest_dir, Path::new(manifest_dir).exists())
+}
+
+/// [`eligible`], given whether `manifest_dir` exists on this machine.
+pub fn eligible_with(manifest_dir: &str, exists: bool) -> bool {
+    manifest_dir.contains("/registry/src/") || !exists
 }
 
 /// The archive and checksum URLs for `version` (no `v`) and `triple`.
@@ -311,18 +318,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_crates_io_install_is_eligible() {
-        assert!(eligible(
-            "/home/u/.cargo/registry/src/index.crates.io-1/croft-software-0.1.9"
+    fn only_a_crates_io_install_or_a_release_binary_is_eligible() {
+        assert!(eligible_with(
+            "/home/u/.cargo/registry/src/index.crates.io-1/croft-software-0.1.9",
+            true
         ));
         assert!(
-            !eligible("/home/u/.cargo/git/checkouts/croft-abc/1234"),
+            !eligible_with("/home/u/.cargo/git/checkouts/croft-abc/1234", true),
             "an arbitrary commit"
         );
         assert!(
-            !eligible("/home/u/src/croft"),
+            !eligible_with("/home/u/src/croft", true),
             "a source checkout cross-compiles"
         );
+        assert!(
+            eligible_with("/home/runner/work/croft/croft", false),
+            "a release binary, built in a checkout that is not here"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!eligible(&tmp.path().display().to_string()), "it exists");
+        assert!(eligible(&tmp.path().join("gone").display().to_string()));
     }
 
     #[test]
