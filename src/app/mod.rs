@@ -5264,6 +5264,9 @@ impl App {
                 crate::triggers::triggers_path(),
                 crate::problem_matchers::matchers_path(),
                 crate::macros::macros_path(),
+                // The settings layer config sync brings from the connecting
+                // machine (#262): applied on arrival like the files above.
+                crate::config_layers::synced_config_path(),
             ]),
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
