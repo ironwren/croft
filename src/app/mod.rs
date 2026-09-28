@@ -38275,6 +38275,7 @@ impl App {
         }
         if self.editor.sarif.is_some() {
             self.handle_sarif_key(key);
+            self.refresh_sarif_preview();
             return;
         }
         // Image preview tabs are read-only. PDF tabs page with every
@@ -57410,6 +57411,7 @@ impl App {
                 Some(target) => self.open_sarif_loc(&target),
                 None => self.status = String::from("This message has no location links"),
             },
+            KeyCode::Char(' ') => view.toggle_preview(),
             KeyCode::Enter => {
                 if view.selected_entry().is_some() {
                     self.open_selected_sarif_result();
@@ -57498,51 +57500,17 @@ impl App {
     /// tab: it is pinned first, so the preview open lands in a new tab
     /// instead of replacing the list the user is working through.
     fn open_selected_sarif_result(&mut self) {
-        use crate::sarif::region::{ColumnKind, column_kind};
-        let root = self.workspace_root().to_path_buf();
-        let Some((path, line, column, kind, uri, place, embedded)) =
-            self.editor.sarif.as_ref().and_then(|v| {
-                let e = v.selected_entry()?;
-                let loaded = v.logs.get(e.log)?;
-                let run = loaded.log.runs.get(e.run)?;
-                let result = run.results.as_ref()?.get(e.result)?;
-                let physical = result.locations.first()?.physical_location.as_ref()?;
-                let artifact = physical.artifact_location.as_ref()?;
-                let mut roots = vec![root.clone()];
-                if let Some(dir) = loaded.path.parent() {
-                    roots.push(dir.to_path_buf());
-                }
-                let resolver = crate::sarif::resolve::Resolver {
-                    roots,
-                    learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
-                    open: self.open_file_paths(),
-                    ..Default::default()
-                };
-                let found = resolver.resolve(run, artifact, &|p| p.is_file());
-                let region = physical.region.as_ref();
-                let line = region.and_then(|r| r.start_line).unwrap_or(1).max(1) - 1;
-                let column = region.and_then(|r| r.start_column).unwrap_or(1).max(1) - 1;
-                let place = region.cloned().map(|r| {
-                    (
-                        r,
-                        physical.context_region.clone(),
-                        crate::sarif::region::newline_sequences(run),
-                    )
-                });
-                let embedded = found
-                    .is_none()
-                    .then(|| crate::sarif::resolve::embedded_contents(run, artifact))
-                    .flatten();
-                Some((
-                    found,
-                    line,
-                    column,
-                    column_kind(run),
-                    e.uri.clone(),
-                    place,
-                    embedded,
-                ))
-            })
+        use crate::sarif::region::ColumnKind;
+        let Some(crate::sarif::view::SelectedPlace {
+            path,
+            line,
+            column,
+            kind,
+            uri,
+            region: place,
+            embedded,
+            ..
+        }) = self.sarif_selected_place()
         else {
             self.status = String::from("This result has no location to open");
             return;
@@ -57577,12 +57545,7 @@ impl App {
         // region gets its line, and a snippet that moved is followed. The
         // text is the open buffer's when the file is open (it may be
         // edited), else the disk's.
-        let text = self
-            .editor
-            .iter_tabs()
-            .find(|t| t.path.as_deref() == Some(path.as_path()) && !t.has_non_text_view())
-            .map(|t| t.lines.join("\n"))
-            .or_else(|| std::fs::read_to_string(&path).ok());
+        let text = self.sarif_file_text(&path);
         let located = place
             .zip(text)
             .and_then(|((region, context, newlines), text)| {
@@ -57614,6 +57577,101 @@ impl App {
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
+    }
+
+    /// Where the selected SARIF result points, looked up in the workspace,
+    /// the learned prefixes, the open files and the log's folder.
+    fn sarif_selected_place(&self) -> Option<crate::sarif::view::SelectedPlace> {
+        let resolver = crate::sarif::resolve::Resolver {
+            roots: vec![self.workspace_root().to_path_buf()],
+            learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
+            open: self.open_file_paths(),
+            ..Default::default()
+        };
+        self.editor
+            .sarif
+            .as_ref()?
+            .selected_place(resolver, &|p| p.is_file())
+    }
+
+    /// `path`'s text as the editor has it when it is open (it may be
+    /// edited), else as it is on disk.
+    fn sarif_file_text(&self, path: &Path) -> Option<String> {
+        self.editor
+            .iter_tabs()
+            .find(|t| t.path.as_deref() == Some(path) && !t.has_non_text_view())
+            .map(|t| t.lines.join("\n"))
+            .or_else(|| std::fs::read_to_string(path).ok())
+    }
+
+    /// Work out Space's source preview for the selected result when it is
+    /// on and not yet worked out for this result (#577).
+    fn refresh_sarif_preview(&mut self) {
+        use crate::sarif::resolve::Embedded;
+        use crate::sarif::view::{PREVIEW_RADIUS, SourcePreview, source_window};
+        let Some(entry) = self.editor.sarif.as_ref().and_then(|v| v.preview_due()) else {
+            return;
+        };
+        let empty = |title: String| SourcePreview {
+            entry,
+            title,
+            first: 1,
+            target: 0,
+            lines: Vec::new(),
+        };
+        let preview = match self.sarif_selected_place() {
+            None => empty(String::from("This result has no location to preview.")),
+            Some(p) => {
+                let (title, text) = match (&p.path, &p.embedded) {
+                    (Some(path), _) => (path.display().to_string(), self.sarif_file_text(path)),
+                    (None, Some(Embedded::Text(t))) => {
+                        (format!("{} (the log's copy)", p.uri), Some(t.clone()))
+                    }
+                    (None, Some(Embedded::Binary(_))) => (
+                        format!("{} is binary; Enter opens it in the hex viewer.", p.uri),
+                        None,
+                    ),
+                    (None, None) => (
+                        format!("{} is not on this machine; Enter to locate it.", p.uri),
+                        None,
+                    ),
+                };
+                match text {
+                    None => empty(title),
+                    Some(text) => {
+                        let line = p
+                            .region
+                            .as_ref()
+                            .and_then(|(region, context, newlines)| {
+                                crate::sarif::region::locate(
+                                    region,
+                                    context.as_ref(),
+                                    &text,
+                                    newlines,
+                                    p.kind,
+                                )
+                            })
+                            .map_or(p.line as usize, |(pos, _)| pos.line);
+                        let (first, lines) = source_window(&text, line, PREVIEW_RADIUS);
+                        let target = if lines.is_empty() {
+                            0
+                        } else {
+                            (line + 1).min(first + lines.len() - 1)
+                        };
+                        SourcePreview {
+                            entry,
+                            title,
+                            first,
+                            target,
+                            lines,
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(view) = self.editor.sarif.as_mut() {
+            view.preview = Some(preview);
+        }
     }
 
     /// Every located result of the first open SARIF viewer as
@@ -64767,6 +64825,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
         app.sync_sarif_step_marks();
+        app.refresh_sarif_preview();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();
