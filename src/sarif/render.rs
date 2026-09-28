@@ -266,10 +266,29 @@ pub fn render(
                     let cell: String = col.cell(e).chars().take(w).collect();
                     cells.push_str(&format!("{cell:<w$} "));
                 }
-                let rest = format!(" {pos:<8} {cells}{}", e.message);
+                let lead = format!(" {pos:<8} {cells}");
+                let rest = format!("{lead}{}", e.message);
                 let rest_w = (list_w as usize).saturating_sub(3);
                 let padded = format!("{rest:<rest_w$}");
                 buf.set_stringn(inner.x + 3, y, &padded, rest_w, base);
+                // The filter's words, marked where the message shows them.
+                if !view.query_text.is_empty() {
+                    use unicode_width::UnicodeWidthStr;
+                    let q = super::view::parse_query(&view.query_text);
+                    let lead_w = lead.width();
+                    for (a, b) in super::view::highlight_ranges(&q, &e.message) {
+                        let x0 = lead_w + e.message[..a].width();
+                        let x1 = (lead_w + e.message[..b].width()).min(rest_w);
+                        for x in x0..x1 {
+                            if let Some(cell) = buf.cell_mut((inner.x + 3 + x as u16, y)) {
+                                cell.set_style(
+                                    Style::default()
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
