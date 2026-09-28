@@ -23483,6 +23483,62 @@ impl App {
         );
     }
 
+    /// VS Code's "CodeQL: Quick Query" (#578): open a scratch query for the
+    /// selected database's language, kept in croft's cache so it outlives
+    /// the session. The first time, its pack is written; until `codeql pack
+    /// install` has left a lock file, its library dependency is installed.
+    fn open_codeql_quick_query(&mut self) {
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)) else {
+            self.status = String::from("Add a CodeQL database and select it first");
+            return;
+        };
+        let Some(module) = db
+            .language
+            .as_deref()
+            .and_then(crate::codeql_query::language_module)
+        else {
+            self.status = format!("CodeQL database {} has no language croft knows", db.name);
+            return;
+        };
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("quick-query")
+            .join(module);
+        let query = dir.join("quick-query.ql");
+        let fresh = !query.is_file();
+        if fresh {
+            let (pack, source) = crate::codeql_query::quick_query(module);
+            let written = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(dir.join("qlpack.yml"), pack))
+                .and_then(|()| std::fs::write(&query, source));
+            if let Err(e) = written {
+                self.status = format!("Could not create the quick query: {e}");
+                return;
+            }
+        }
+        match self.editor.open(&query) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", query.display());
+                return;
+            }
+        }
+        if !dir.join("codeql-pack.lock.yml").is_file() {
+            self.start_codeql_pack_job(
+                crate::codeql_query::pack_install_args(&dir),
+                format!("Installing codeql/{module}-all for the quick query\u{2026}"),
+                format!("Quick query ready: codeql/{module}-all is installed"),
+                format!("Could not install codeql/{module}-all for the quick query"),
+            );
+        } else {
+            self.status = format!("Opened the {module} quick query");
+        }
+    }
+
     /// Ask which packs "CodeQL: Download Packs" fetches (#578).
     fn prompt_download_codeql_packs(&mut self) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
@@ -44408,6 +44464,7 @@ impl App {
                 }
             },
             Cmd::CodeqlDownloadPacks => self.prompt_download_codeql_packs(),
+            Cmd::CodeqlQuickQuery => self.open_codeql_quick_query(),
             Cmd::CodeqlShowEvaluatorLog => {
                 if let Some(i) = self.current_codeql_history() {
                     self.show_codeql_evaluator_log(i);

@@ -55727,6 +55727,63 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_codeql_quick_query_opens_for_the_databases_language() {
+    // #578: VS Code's "CodeQL: Quick Query". The first time, croft writes
+    // a scratch pack for the selected database's language and installs its
+    // library; later it reopens the same file, edits and all.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlQuickQuery);
+        let query = app.editor.path.clone().expect("the quick query is open");
+        assert!(
+            query.ends_with("quick-query/rust/quick-query.ql"),
+            "{}",
+            query.display()
+        );
+        assert!(app.editor.lines.iter().any(|l| l == "import rust"));
+        let dir = query.parent().unwrap().to_path_buf();
+        assert!(
+            std::fs::read_to_string(dir.join("qlpack.yml"))
+                .unwrap()
+                .contains("codeql/rust-all")
+        );
+        assert_eq!(
+            app.status,
+            "Installing codeql/rust-all for the quick query\u{2026}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.drain_codeql_pack_job() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the install never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.status,
+            "Quick query ready: codeql/rust-all is installed"
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls.trim(), format!("pack install {}", dir.display()));
+
+        // A real install leaves a lock file, which says it is done.
+        std::fs::write(dir.join("codeql-pack.lock.yml"), "lockVersion: 1.0.0\n").unwrap();
+        std::fs::write(&query, "import rust\nselect 2\n").unwrap();
+        app.run_command(Command::CodeqlQuickQuery);
+        assert_eq!(app.status, "Opened the rust quick query");
+        assert!(app.editor.lines.iter().any(|l| l == "select 2"));
+        assert!(app.codeql_pack_job.is_none(), "no second install");
+    });
+}
+
 #[test]
 fn codeql_query_history_palette_commands_act_on_the_selected_or_newest_run() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());

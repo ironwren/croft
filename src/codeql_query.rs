@@ -214,6 +214,19 @@ pub fn parse_pack_list(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pack file and query of VS Code's "CodeQL: Quick Query" for the
+/// library `module` (see [`language_module`]): a throwaway pack depending on
+/// `codeql/<module>-all`, and a query importing it that selects nothing yet.
+pub fn quick_query(module: &str) -> (String, String) {
+    let pack = format!(
+        "name: croft/quick-query-{module}\nversion: 0.0.0\ndependencies:\n  codeql/{module}-all: \"*\"\n"
+    );
+    let query = format!(
+        "/**\n * A quick query: edit it and run \"CodeQL: Run Query on Selected Database\".\n */\n\nimport {module}\n\nselect \"\"\n"
+    );
+    (pack, query)
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
@@ -782,6 +795,15 @@ mod tests {
             ]
         );
         assert!(parse_pack_list("  , ").is_empty());
+    }
+
+    #[test]
+    fn a_quick_query_imports_its_languages_library() {
+        let (pack, query) = quick_query("python");
+        assert!(pack.contains("name: croft/quick-query-python\n"));
+        assert!(pack.contains("  codeql/python-all: \"*\"\n"));
+        assert!(query.contains("\nimport python\n"));
+        assert_eq!(output_for(&query), Output::Table);
     }
 
     #[test]
