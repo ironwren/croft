@@ -92,6 +92,10 @@ pub struct Entry {
     pub line: i64,
     pub column: i64,
     pub tags: Vec<String>,
+    /// The taxa the result and its rule name (#577): the result's `taxa`
+    /// and the rule's `relationships` targets, as `CWE-89` when the
+    /// taxonomy is CWE, else the taxon id as written.
+    pub taxa: Vec<String>,
     /// The user applied a fix for it or marked it fixed (#577).
     pub fixed: bool,
 }
@@ -208,10 +212,24 @@ pub enum Field {
     Tag,
     Tool,
     Message,
+    /// A CWE number, however written (`89`, `cwe-89`, `CWE-089`), matched
+    /// against the rule's CWE taxa and its `external/cwe/cwe-089` tags.
+    Cwe,
 }
 
+/// The query's clauses: whitespace separates AND-ed clauses, `|` the
+/// alternatives within one. Spaces around a `|` are ignored, so `a | b`
+/// is the same alternative as `a|b` rather than three clauses.
 pub fn parse_query(text: &str) -> Query {
-    let clauses = text
+    let mut joined = String::new();
+    for (i, word) in text.split_whitespace().enumerate() {
+        let glue = i > 0 && !joined.ends_with('|') && !word.starts_with('|');
+        if glue {
+            joined.push(' ');
+        }
+        joined.push_str(word);
+    }
+    let clauses = joined
         .split_whitespace()
         .map(|clause| {
             clause
@@ -238,6 +256,7 @@ fn parse_term(alt: &str) -> Term {
             "tag" => (Some(Field::Tag), value),
             "tool" => (Some(Field::Tool), value),
             "msg" => (Some(Field::Message), value),
+            "cwe" => (Some(Field::Cwe), value),
             _ => (None, rest),
         },
         _ => (None, rest),
@@ -258,15 +277,41 @@ fn term_hits(t: &Term, e: &Entry) -> bool {
         Some(Field::Tag) => e.tags.iter().any(|g| has(g)),
         Some(Field::Tool) => has(&e.tool),
         Some(Field::Message) => has(&e.message),
+        Some(Field::Cwe) => cwe_number(&t.needle).is_some_and(|want| {
+            e.taxa
+                .iter()
+                .chain(&e.tags)
+                .any(|s| cwe_number(s) == Some(want))
+        }),
         None => {
             has(&e.rule_id)
                 || has(&e.rule_name)
                 || has(&e.file)
                 || has(&e.message)
                 || e.tags.iter().any(|g| has(g))
+                || e.taxa.iter().any(|g| has(g))
         }
     };
     hit != t.negated
+}
+
+/// The CWE number in `s`: `89` alone, or after `cwe` and an optional `-`
+/// (`CWE-89`, `external/cwe/cwe-089`). Leading zeros do not matter.
+pub fn cwe_number(s: &str) -> Option<u32> {
+    let lower = s.to_ascii_lowercase();
+    let digits = match lower.rfind("cwe") {
+        Some(i) => lower[i + 3..].trim_start_matches(['-', '_', ' ']),
+        None => lower.as_str(),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    // A bare needle must be all digits; after `cwe` the number may be
+    // followed by more text (`cwe-89: SQL injection`).
+    if end == 0 || (lower.rfind("cwe").is_none() && end != digits.len()) {
+        return None;
+    }
+    digits[..end].parse().ok()
 }
 
 pub fn matches(q: &Query, e: &Entry) -> bool {
@@ -1152,6 +1197,29 @@ fn entry_for(
             tags.push(t);
         }
     }
+    let taxon = |r: &crate::sarif::model::ReportingDescriptorReference| {
+        let id = r.id.clone()?;
+        let cwe = r
+            .tool_component
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+            .is_some_and(|n| n.eq_ignore_ascii_case("cwe"));
+        Some(if cwe && id.chars().all(|c| c.is_ascii_digit()) {
+            format!("CWE-{id}")
+        } else {
+            id
+        })
+    };
+    let mut taxa: Vec<String> = result.taxa.iter().filter_map(taxon).collect();
+    for t in rule
+        .iter()
+        .flat_map(|r| &r.relationships)
+        .filter_map(|rel| taxon(&rel.target))
+    {
+        if !taxa.contains(&t) {
+            taxa.push(t);
+        }
+    }
     Entry {
         log,
         run: run_index,
@@ -1169,6 +1237,7 @@ fn entry_for(
         line: region.and_then(|r| r.start_line).unwrap_or(0),
         column: region.and_then(|r| r.start_column).unwrap_or(0),
         tags,
+        taxa,
         fixed: false,
     }
 }
@@ -1224,6 +1293,7 @@ mod tests {
             line,
             column: 1,
             tags: vec![],
+            taxa: vec![],
             fixed: false,
         }
     }
@@ -1315,6 +1385,62 @@ mod tests {
             .map(|e| e.result)
             .collect();
         assert_eq!(hits, vec![1, 2]);
+        // Spaces around the bar are the same alternative, not three
+        // AND-ed clauses (#577).
+        for spaced in ["header | unused", "header |unused", "header| unused"] {
+            assert_eq!(parse_query(spaced), q, "{spaced:?}");
+        }
+        // A bar with nothing on one side is not an empty alternative.
+        assert_eq!(parse_query("header |"), parse_query("header"));
+    }
+
+    #[test]
+    fn a_cwe_filter_matches_taxa_and_tags_however_written() {
+        assert_eq!(cwe_number("89"), Some(89));
+        assert_eq!(cwe_number("CWE-089"), Some(89));
+        assert_eq!(cwe_number("external/cwe/cwe-089"), Some(89));
+        assert_eq!(cwe_number("cwe-79: XSS"), Some(79));
+        assert_eq!(cwe_number("8x9"), None);
+        assert_eq!(cwe_number("security"), None);
+        let mut v = sample();
+        v.entries[0].tags = vec![String::from("external/cwe/cwe-089")];
+        v.entries[1].taxa = vec![String::from("CWE-79")];
+        let hits = |q: &str| -> Vec<usize> {
+            let q = parse_query(q);
+            v.entries
+                .iter()
+                .filter(|e| matches(&q, e))
+                .map(|e| e.result)
+                .collect()
+        };
+        assert_eq!(hits("cwe:89"), vec![v.entries[0].result]);
+        assert_eq!(hits("cwe:CWE-0089"), vec![v.entries[0].result]);
+        assert_eq!(hits("cwe:79"), vec![v.entries[1].result]);
+        assert_eq!(
+            hits("cwe:89 | cwe:79"),
+            vec![v.entries[0].result, v.entries[1].result]
+        );
+        assert!(hits("cwe:8").is_empty(), "a number, not a prefix");
+        assert_eq!(
+            hits("CWE-79"),
+            vec![v.entries[1].result],
+            "taxa are searched too"
+        );
+    }
+
+    #[test]
+    fn a_results_taxa_come_from_the_result_and_its_rule() {
+        let log = crate::sarif::load::parse_log(
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"T","rules":[
+                {"id":"R1","relationships":[{"target":{"id":"89","toolComponent":{"name":"CWE"}}}]}]}},
+              "results":[{"ruleId":"R1","message":{"text":"m"},
+                "taxa":[{"id":"OWASP-A03","toolComponent":{"name":"OWASP"}},{"id":"89","toolComponent":{"name":"CWE"}}]}]}]}"#,
+        )
+        .unwrap();
+        let run = &log.runs[0];
+        let result = &run.results.as_ref().unwrap()[0];
+        let e = entry_for(run, result, (0, 0, 0), &[]);
+        assert_eq!(e.taxa, ["OWASP-A03", "CWE-89"]);
     }
 
     #[test]
