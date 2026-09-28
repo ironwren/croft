@@ -1664,7 +1664,7 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        assert_eq!(v.refresh_added_logs(), [added.clone()]);
+        assert_eq!(v.refresh_added_logs(), std::slice::from_ref(&added));
         assert_eq!(v.entries.len(), 4);
         assert_eq!(v.selected_entry().map(|e| e.rule_id.as_str()), Some("B2"));
         assert!(v.refresh_added_logs().is_empty(), "read once per change");
