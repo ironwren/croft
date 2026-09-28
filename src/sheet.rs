@@ -282,10 +282,6 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
     })
 }
 
-impl SheetData {
-    /// Overwrite one body cell (#177), growing a short row (the csv
-    /// reader is `flexible`, so ragged rows are real) and refreshing the
-    /// column widths so the grid re-lays-out immediately.
     /// Sort the body rows by column `col` (#578, a sortable results
     /// table): ascending, or descending when they already are ascending,
     /// so sorting the same column again reverses it. Cells that both read
@@ -321,6 +317,10 @@ impl SheetData {
         ascending
     }
 
+impl SheetData {
+    /// Overwrite one body cell (#177), growing a short row (the csv
+    /// reader is `flexible`, so ragged rows are real) and refreshing the
+    /// column widths so the grid re-lays-out immediately.
     pub fn set_cell(&mut self, row: usize, col: usize, value: String) {
         let Some(r) = self.rows.get_mut(row) else {
             return;
