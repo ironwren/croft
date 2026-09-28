@@ -924,6 +924,16 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// A query waiting in a batch run (#578): run from its file on the
+/// current database, or with `source` and `database` set, from that text
+/// on that database ("Run Query on Multiple Databases").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRun {
+    pub query: PathBuf,
+    pub source: Option<String>,
+    pub database: Option<PathBuf>,
+}
+
 /// One query history entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
