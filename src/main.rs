@@ -68,6 +68,7 @@ mod outline_syntax;
 mod output;
 mod pair;
 mod pair_host;
+mod pane_host;
 mod pdf;
 mod plot;
 mod port_detect;

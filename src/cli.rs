@@ -217,6 +217,26 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         text: bool,
     },
+    /// Internal: hold one terminal pane's shell in a process of its own, so
+    /// it outlives croft (#694). croft starts it; not for manual use.
+    #[command(hide = true)]
+    PaneHost {
+        /// The socket the pane attaches to.
+        #[arg(long)]
+        socket: PathBuf,
+        /// The pane's size, COLSxROWS.
+        #[arg(long, default_value = "80x24")]
+        size: String,
+        /// The shell's working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// KEY=VALUE set for the shell; repeatable.
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// The shell and its arguments, after `--`.
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
     /// Internal: the multiplayer session host/client (croft's dtach
     /// replacement; see docs/MULTIPLAYER.md). `croft attach` and the remote
     /// launcher drive this; it is not intended for manual use.
@@ -605,6 +625,35 @@ impl Cli {
                 height,
                 text,
             ),
+            Some(CliCommand::PaneHost {
+                socket,
+                size,
+                cwd,
+                env,
+                argv,
+            }) => {
+                let (cols, rows) = crate::pane_host::parse_size(&size)
+                    .with_context(|| format!("--size {size:?} is not COLSxROWS"))?;
+                let env = env
+                    .iter()
+                    .map(|e| {
+                        crate::pane_host::parse_env(e)
+                            .with_context(|| format!("--env {e:?} is not KEY=VALUE"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let code = crate::pane_host::serve(&crate::pane_host::PaneSpec {
+                    socket,
+                    cwd,
+                    env,
+                    cols,
+                    rows,
+                    argv,
+                })?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
             Some(CliCommand::SessionHost {
                 probe,
                 serve,
