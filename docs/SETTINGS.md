@@ -214,7 +214,7 @@ recent scrollback redrawn, including what it printed while croft was down.
 - Closing a pane, or quitting croft normally, still ends its shell.
 - A host no croft has reattached to for a week ends its shell.
 - It applies to shell panes opened after the change, not to task or run
-  panes, and only on Linux.
+  panes, on Linux and macOS.
 - A pane whose host cannot start is an ordinary pane.
 
 ## Notification sinks

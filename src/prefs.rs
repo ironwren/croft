@@ -359,8 +359,8 @@ pub struct Prefs {
     /// Keep each terminal pane's shell in a process of its own (#694), so a
     /// croft that is killed or crashes leaves the shells and their jobs
     /// running, and the next croft in the workspace reattaches to them.
-    /// Closing a pane or quitting croft still ends its shell. Linux only;
-    /// off by default. Applies to panes opened after the change.
+    /// Closing a pane or quitting croft still ends its shell. Linux and
+    /// macOS; off by default. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_persistent_panes: bool,
     /// What exported navigator comments start with (#368), marking them as
