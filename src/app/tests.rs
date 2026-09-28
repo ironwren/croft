@@ -55299,6 +55299,101 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
 }
 
 #[test]
+fn sarif_filter_words_are_highlighted_in_the_results() {
+    // Its own cache: the saved column choice (another test's) would push
+    // the message out of the row.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        // #577: the filter's words are marked where a result's message shows them.
+        let (tmp, log) = sarif_fixture();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().set_query("user");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let (y, line) = (0..buf.area.height)
+            .map(|y| {
+                let s: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                (y, s)
+            })
+            .find(|(_, s)| s.contains("Query built from user input."))
+            .expect("the row is drawn");
+        let at = line[..line.find("user input").unwrap()].chars().count() as u16;
+        let marked = |x: u16| {
+            buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        };
+        assert!((at..at + 4).all(marked), "\"user\" is marked");
+        assert!(!marked(at + 4) && !marked(at - 2), "and nothing around it");
+    });
+}
+
+#[test]
+fn a_sarif_results_steps_are_drawn_in_their_own_files_only() {
+    // #577: the selected result's analysis steps appear after their lines,
+    // in the file each step is in and no other.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/a.rs"),
+        "fn a() {\n    let x = input();\n    sink(x);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/b.rs"),
+        "fn input() -> String {\n    read()\n}\n",
+    )
+    .unwrap();
+    let step = |uri: &str, line: u32, msg: &str| {
+        format!(
+            r#"{{"location":{{"message":{{"text":"{msg}"}},"physicalLocation":{{"artifactLocation":{{"uri":"{uri}"}},"region":{{"startLine":{line}}}}}}}}}"#
+        )
+    };
+    let log = tmp.path().join("flow.sarif");
+    std::fs::write(
+        &log,
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{{"ruleId":"R1","message":{{"text":"tainted"}},
+              "locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"src/a.rs"}},"region":{{"startLine":3}}}}}}],
+              "codeFlows":[{{"threadFlows":[{{"locations":[{},{},{}]}}]}}]}}]}}]}}"#,
+            step("src/b.rs", 2, "source"),
+            step("src/a.rs", 2, "assigned"),
+            step("src/a.rs", 3, "sink")
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&log).unwrap();
+    app.open_selected_sarif_result();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/a.rs").as_path())
+    );
+    app.sync_sarif_step_marks();
+    let labels = |app: &App, line: usize| -> Vec<String> {
+        app.editor
+            .inlay_spans_for_test(line)
+            .iter()
+            .map(|(_, l, _)| l.trim().to_string())
+            .collect()
+    };
+    assert_eq!(labels(&app, 1), ["\u{25c2} step 2: assigned"]);
+    assert_eq!(labels(&app, 2), ["\u{25c2} step 3: sink"]);
+    assert!(
+        labels(&app, 0).is_empty(),
+        "b.rs's step is not drawn in a.rs"
+    );
+    // The mark sits after the line's text.
+    let (col, _, _) = &app.editor.inlay_spans_for_test(1)[0];
+    assert_eq!(*col, "    let x = input();".chars().count());
+}
+
+#[test]
 fn sarif_filter_typing_narrows_the_list() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

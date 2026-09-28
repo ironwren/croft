@@ -3785,6 +3785,8 @@ pub struct App {
     sarif_diag_signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     /// When the SARIF viewers' added logs were last checked for changes.
     sarif_added_polled: Option<std::time::Instant>,
+    /// The selection and open files the SARIF step marks were drawn for.
+    sarif_step_signature: Option<SarifStepSignature>,
     /// Every (file, source key) SARIF diagnostics were published under, so a
     /// closed log's results can be withdrawn exactly.
     sarif_published: Vec<(PathBuf, String)>,
@@ -5667,6 +5669,7 @@ impl App {
             code_lens_requested: std::collections::HashMap::new(),
             sarif_diag_signature: Vec::new(),
             sarif_added_polled: None,
+            sarif_step_signature: None,
             sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
             completion_popup: None,
@@ -58749,6 +58752,97 @@ impl App {
         };
     }
 
+    /// Draw the selected SARIF result's analysis steps in the files they
+    /// lie in (#577): each step with a location is labelled after its line
+    /// ("step 2: user input"), in that file's tab and no other. Recomputed
+    /// when the selection or the set of open files changes.
+    pub fn sync_sarif_step_marks(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        let open = self.open_file_paths();
+        let selected = self
+            .editor
+            .editors
+            .iter()
+            .find_map(|t| t.sarif.as_ref())
+            .and_then(|v| v.selected_entry().map(|e| (e.log, e.run, e.result)));
+        let signature = (selected, open.clone());
+        if self.sarif_step_signature.as_ref() == Some(&signature) {
+            return;
+        }
+        self.sarif_step_signature = Some(signature);
+        let learned = crate::sarif::resolve::saved_prefixes(self.workspace_root());
+        let mut by_file: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
+            std::collections::HashMap::new();
+        if let Some(view) = self
+            .editor
+            .editors
+            .iter_mut()
+            .find_map(|t| t.sarif.as_mut())
+            && selected.is_some()
+        {
+            let log_dir = view
+                .selected_entry()
+                .and_then(|e| view.logs.get(e.log))
+                .and_then(|l| l.path.parent().map(Path::to_path_buf));
+            let run = view
+                .selected_entry()
+                .and_then(|e| view.logs.get(e.log)?.log.runs.get(e.run).cloned());
+            let steps: Vec<(String, i64, String)> = view
+                .details()
+                .map(|d| {
+                    d.threads
+                        .iter()
+                        .flat_map(|t| &t.steps)
+                        .filter_map(|s| {
+                            let loc = s.location.as_ref()?;
+                            (!loc.uri.is_empty() && loc.line > 0)
+                                .then(|| (loc.uri.clone(), loc.line, s.message.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(run) = run {
+                let mut roots = vec![root];
+                roots.extend(log_dir);
+                let resolver = crate::sarif::resolve::Resolver {
+                    roots,
+                    learned,
+                    open,
+                    ..Default::default()
+                };
+                for (n, (uri, line, message)) in steps.into_iter().enumerate() {
+                    let artifact = crate::sarif::model::ArtifactLocation {
+                        uri: Some(uri),
+                        ..Default::default()
+                    };
+                    let Some(path) = resolver.resolve(&run, &artifact, &|p| p.is_file()) else {
+                        continue;
+                    };
+                    let message: String = message.chars().take(60).collect();
+                    let label = if message.is_empty() {
+                        format!("step {}", n + 1)
+                    } else {
+                        format!("step {}: {message}", n + 1)
+                    };
+                    by_file
+                        .entry(path)
+                        .or_default()
+                        .push(((line - 1) as usize, label));
+                }
+            }
+        }
+        for tab in self.editor.editors.iter_mut() {
+            let marks = tab
+                .path
+                .as_ref()
+                .and_then(|p| by_file.get(p))
+                .cloned()
+                .unwrap_or_default();
+            let path = (!marks.is_empty()).then(|| tab.path.clone()).flatten();
+            tab.set_step_marks(path, marks);
+        }
+    }
+
     /// The paths of the files open in editor tabs, for SARIF resolution.
     fn open_file_paths(&self) -> Vec<PathBuf> {
         self.editor
@@ -63484,6 +63578,10 @@ struct VariantExport {
     failed: Vec<(String, String)>,
 }
 
+/// The selected SARIF result (log, run, result) and the open files that
+/// step marks were last drawn for (#577).
+type SarifStepSignature = (Option<(usize, usize, usize)>, Vec<PathBuf>);
+
 /// One unfinished variant analysis and what reading its progress gave.
 type CodeqlRunPoll = (
     crate::codeql_submit::Submitted,
@@ -65005,6 +65103,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
+        app.sync_sarif_step_marks();
         app.sync_git_gutters();
         app.sync_blame();
         app.sync_provenance();

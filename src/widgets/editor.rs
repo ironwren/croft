@@ -24,6 +24,8 @@ use crate::widgets::scrollbar;
 /// PDF / spreadsheet branches in `open`, so larger media keep their
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// The colour of a SARIF analysis step drawn after its line (#577).
+const STEP_MARK_COLOR: Color = Color::Rgb(0x4f, 0xc1, 0xff);
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// An image's pixel size from its header alone. Opening a tab decoded the
@@ -2927,6 +2929,11 @@ pub struct Editor {
     /// file after a tab switch, exactly as `diagnostics_path` does.
     inlay_hints: Vec<crate::lsp::manager::InlayHintItem>,
     inlay_path: Option<PathBuf>,
+    /// The selected SARIF result's analysis steps in this file (#577), as
+    /// `(0-based line, label)`, drawn after their lines' text. `step_path`
+    /// guards them like `inlay_path`: steps belong to one file only.
+    step_marks: Vec<(usize, String)>,
+    step_path: Option<PathBuf>,
     /// Occurrences of the symbol under the caret (LSP documentHighlight),
     /// already converted to `(row, start_char, end_char, write)` against the
     /// current buffer. Cleared on every edit — the server's columns are
@@ -3203,6 +3210,8 @@ impl Editor {
             diagnostic_spans: Vec::new(),
             inlay_hints: Vec::new(),
             inlay_path: None,
+            step_marks: Vec::new(),
+            step_path: None,
             occurrences: Vec::new(),
             inlay_spans: Vec::new(),
             doc_links: Vec::new(),
@@ -6267,7 +6276,10 @@ impl Editor {
         let colors_same_file = self.color_path.as_deref() == self.path.as_deref();
         let hints_live = same_file && !self.inlay_hints.is_empty();
         let colors_live = colors_same_file && !self.color_infos.is_empty();
-        if !hints_live && !colors_live {
+        let steps_live = self.step_path.is_some()
+            && self.step_path.as_deref() == self.path.as_deref()
+            && !self.step_marks.is_empty();
+        if !hints_live && !colors_live && !steps_live {
             self.inlay_spans = Vec::new();
             return;
         }
@@ -6297,10 +6309,34 @@ impl Editor {
                 ));
             }
         }
+        // SARIF analysis steps (#577): after the line's own text.
+        if steps_live {
+            for (line, label) in &self.step_marks {
+                let Some(text) = self.lines.get(*line) else {
+                    continue;
+                };
+                spans[*line].push((
+                    text.chars().count(),
+                    format!("  \u{25c2} {label}"),
+                    Some(STEP_MARK_COLOR),
+                ));
+            }
+        }
         for line in &mut spans {
             line.sort_by_key(|(c, _, _)| *c);
         }
         self.inlay_spans = spans;
+    }
+
+    /// Show the selected SARIF result's analysis steps that lie in `path`
+    /// (#577), or none. A tab showing another file draws nothing.
+    pub fn set_step_marks(&mut self, path: Option<PathBuf>, marks: Vec<(usize, String)>) {
+        if self.step_path == path && self.step_marks == marks {
+            return;
+        }
+        self.step_path = path;
+        self.step_marks = marks;
+        self.recompute_inlay_spans();
     }
 
     /// Inlay hints of logical line `line`, or nothing in wrap mode: the
@@ -6312,6 +6348,11 @@ impl Editor {
             return &[];
         }
         self.inlay_spans.get(line).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
+        self.row_inlay_spans(line)
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when
