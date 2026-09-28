@@ -56002,6 +56002,73 @@ fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
     });
 }
 
+#[test]
+fn codeql_results_are_exported_to_a_new_file_only() {
+    // #578: VS Code's "Export Results" copies the newest successful run's
+    // results (a failed run later on is passed over) to a file the user
+    // names, suggesting one in the workspace, and never overwrites.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlExportResults);
+        assert_eq!(
+            app.status,
+            "There is no successful CodeQL query run to export"
+        );
+        assert!(app.input_prompt.is_none());
+
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                (
+                    "q.ql",
+                    2,
+                    RunStatus::Succeeded,
+                    App::codeql_results_dir().join("2-q/results.csv"),
+                ),
+                (
+                    "r.ql",
+                    5,
+                    RunStatus::Failed(String::from("x")),
+                    App::codeql_results_dir().join("5-r/results.sarif"),
+                ),
+            ],
+        );
+        app.run_command(Command::CodeqlExportResults);
+        let dest = app.workspace_root().join("q-results.csv");
+        assert_eq!(
+            app.input_prompt.as_ref().expect("the prompt opens").value,
+            dest.display().to_string()
+        );
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            format!("Exported results to {}", dest.display())
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "col0\n1\n");
+
+        std::fs::write(&dest, "mine").unwrap();
+        app.run_command(Command::CodeqlExportResults);
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            format!(
+                "{} already exists; export the results to a new file",
+                dest.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        assert_eq!(
+            Command::from_id("codeql_export_results"),
+            Some(Command::CodeqlExportResults)
+        );
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn a_codeql_query_runs_on_each_named_database_with_its_own_history_entry() {

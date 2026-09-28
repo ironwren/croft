@@ -915,6 +915,30 @@ impl History {
             .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
             .map(|(i, _)| i)
     }
+
+    /// The index of the most recent run that succeeded, whatever the order.
+    pub fn newest_success(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.status == RunStatus::Succeeded)
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+}
+
+/// The file name "CodeQL: Export Results" suggests for the results
+/// `output` of `query`: `<query-stem>-results.<csv|sarif>`.
+pub fn export_file_name(query: &Path, output: &Path) -> String {
+    let stem = query
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = output
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("csv"));
+    format!("{stem}-results.{ext}")
 }
 
 #[cfg(test)]
@@ -1056,6 +1080,41 @@ mod tests {
         assert_eq!(history.perf_partner(4), None);
         assert_eq!(history.perf_partner(2), None);
         assert_eq!(history.perf_partner(9), None);
+    }
+
+    #[test]
+    fn export_takes_the_newest_success_under_the_querys_name() {
+        let entry = |started: u64, status: RunStatus| HistoryEntry {
+            query: PathBuf::from("/w/q.ql"),
+            database: String::from("db"),
+            database_path: None,
+            started,
+            seconds: 1,
+            status,
+            output: PathBuf::from("/r/results.csv"),
+            name: None,
+        };
+        let mut history = History {
+            entries: vec![
+                entry(5, RunStatus::Failed(String::from("x"))),
+                entry(3, RunStatus::Succeeded),
+                entry(4, RunStatus::Running),
+                entry(1, RunStatus::Succeeded),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(history.newest_success(), Some(1));
+        history.entries.remove(1);
+        history.entries.remove(2);
+        assert_eq!(history.newest_success(), None);
+        assert_eq!(
+            export_file_name(Path::new("/w/q.ql"), Path::new("/r/results.sarif")),
+            "q-results.sarif"
+        );
+        assert_eq!(
+            export_file_name(Path::new("/w/s.qls"), Path::new("/r/results.csv")),
+            "s-results.csv"
+        );
     }
 
     #[test]

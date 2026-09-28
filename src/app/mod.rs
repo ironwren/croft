@@ -25092,6 +25092,73 @@ impl App {
         true
     }
 
+    /// VS Code's "Export Results" (#578): ask where to copy the results of
+    /// the selected history entry, else of the newest successful run,
+    /// suggesting `<query-stem>-results.<csv|sarif>` in the workspace.
+    fn prompt_export_codeql_results(&mut self) {
+        use crate::codeql_query::{History, RunStatus};
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let history = History::load(&Self::codeql_history_path());
+        let Some(entry) = self
+            .codeql
+            .selected_history()
+            .filter(|&i| i < history.entries.len())
+            .or_else(|| history.newest_success())
+            .and_then(|i| history.entries.get(i))
+        else {
+            self.status = String::from("There is no successful CodeQL query run to export");
+            return;
+        };
+        if entry.status != RunStatus::Succeeded {
+            self.status = format!(
+                "{} did not succeed, so it has no results to export",
+                entry.query_name()
+            );
+            return;
+        }
+        if !entry.output.is_file() {
+            self.status = format!("The results of {} are gone", entry.query_name());
+            return;
+        }
+        let dest = self
+            .workspace_root()
+            .join(crate::codeql_query::export_file_name(
+                &entry.query,
+                &entry.output,
+            ));
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::CodeqlExportResults {
+                    output: entry.output.clone(),
+                },
+                format!("Export the results of {}", entry.query_name()),
+                "the file to copy the results to",
+            )
+            .with_value(dest.display().to_string()),
+        );
+    }
+
+    /// Copy the results at `output` to the typed path; an existing file is
+    /// never overwritten.
+    fn submit_export_codeql_results(&mut self, output: &Path, value: &str) {
+        if value.trim().is_empty() {
+            self.status = String::from("Name a file to export the results to");
+            return;
+        }
+        let dest = self.typed_path(value);
+        if dest.exists() {
+            self.status = format!(
+                "{} already exists; export the results to a new file",
+                dest.display()
+            );
+            return;
+        }
+        self.status = match std::fs::copy(output, &dest) {
+            Ok(_) => format!("Exported results to {}", dest.display()),
+            Err(e) => format!("Could not export the results to {}: {e}", dest.display()),
+        };
+    }
+
     /// VS Code's "CodeQL: Preview Query Help" (#578): the help of the open
     /// `.ql` query, else of the query the selected or newest history entry
     /// ran, rendered to Markdown by `codeql generate query-help` on a worker
@@ -30536,6 +30603,10 @@ impl App {
             InputPurpose::CodeqlRunOnDatabases { query } => {
                 self.close_input_prompt();
                 self.submit_run_codeql_on_databases(&query, &value);
+            }
+            InputPurpose::CodeqlExportResults { output } => {
+                self.close_input_prompt();
+                self.submit_export_codeql_results(&output, &value);
             }
             InputPurpose::CodeqlVariantCodeSearch { list } => {
                 self.close_input_prompt();
@@ -45962,6 +46033,7 @@ impl App {
                 }
             }
             Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
+            Cmd::CodeqlExportResults => self.prompt_export_codeql_results(),
             Cmd::CodeqlRunQuerySuite => self.run_codeql_query_suite(),
             Cmd::CodeqlRunQueryOnMultipleDatabases => self.prompt_run_codeql_on_databases(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),

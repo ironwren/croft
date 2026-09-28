@@ -99,6 +99,10 @@ pub enum InputPurpose {
     CodeqlRunOnDatabases {
         query: PathBuf,
     },
+    /// Where to copy the query results at `output` (#578).
+    CodeqlExportResults {
+        output: PathBuf,
+    },
     /// A GitHub Code Search query whose repositories go into the variant
     /// analysis list called `list` (#578).
     CodeqlVariantCodeSearch {
