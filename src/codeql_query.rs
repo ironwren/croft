@@ -1363,6 +1363,7 @@ mod tests {
             status,
             output: PathBuf::from("/r/results.csv"),
             name: None,
+            results: None,
         };
         let mut history = History {
             entries: vec![
