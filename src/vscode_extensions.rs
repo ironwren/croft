@@ -541,6 +541,12 @@ pub const TABLE: &[Mapping] = &[
         note: "MD025/MD018/MD009/MD012 checks run on open .md tabs, surfacing as squiggles and PROBLEMS entries",
     },
     Mapping {
+        vscode: "arr.marksman",
+        croft: "lsp-markdown",
+        status: Status::Builtin,
+        note: "marksman ships built in",
+    },
+    Mapping {
         vscode: "bierner.markdown-mermaid",
         croft: "",
         status: Status::None,

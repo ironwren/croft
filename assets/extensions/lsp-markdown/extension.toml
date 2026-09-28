@@ -1,0 +1,31 @@
+# Bundled croft extension: Markdown language support.
+# marksman is the de facto standard Markdown server (Helix's default): link and
+# heading completion, go-to-definition across files, references, heading
+# rename, broken-link diagnostics, and document / workspace symbols. It ships
+# as one self-contained binary per platform, published bare rather than
+# archived (`archive = "raw"`); the mac build is universal. Upstream publishes
+# no checksums, signatures or attestations, so every asset's SHA-256 is pinned
+# here and a download that does not match is refused before it is written.
+# PATH-first, so a marksman from brew/nix/mason wins. The release has no
+# bionic build, so on Termux the install reroutes to `pkg install marksman`
+# (Termux builds the same release against its own dotnet). The built-in
+# Markdown lint (src/markdown_lint.rs) keeps running beside it. Bump by editing
+# the release tag in every URL and re-pinning every digest.
+id = "lsp-markdown"
+name = "Markdown (marksman)"
+description = "Markdown language support via marksman."
+builtin = true
+api_version = 1
+
+[[languages]]
+id = "markdown"
+extensions = ["md", "markdown"]
+root_markers = [".marksman.toml"]
+
+[[language_servers]]
+name = "marksman"
+command = "marksman"
+args = ["server"]
+language = "markdown"
+priority = 0
+provision = { kind = "binary", bin = "marksman", archive = "raw", termux_pkg = "marksman", targets = { "macos" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos", "linux-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-x64", "linux-aarch64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-arm64" }, sha256 = { "macos" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b", "linux-x86_64" = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087", "linux-aarch64" = "db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb" } }

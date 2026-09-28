@@ -20,6 +20,7 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
     include_str!("../../assets/extensions/lsp-lua/extension.toml"),
+    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
     include_str!("../../assets/extensions/codeql/extension.toml"),
 ];
 
@@ -341,6 +342,57 @@ mod tests {
         }
         assert_eq!(r.for_extension("c")[0].name, "clangd");
         assert_eq!(r.for_extension("cpp")[0].name, "clangd");
+    }
+
+    #[test]
+    fn bundled_manifest_registers_marksman_for_markdown_as_a_pinned_raw_binary() {
+        // #834: Markdown had no server. marksman ships bare per-platform
+        // binaries and upstream publishes no checksums, so every download
+        // target must carry a pinned digest: a target without one is refused
+        // at install, and a map with none would install unverified.
+        use crate::lsp::install::{ArchiveKind, Provision};
+        let r = ServerRegistry::with_defaults();
+        let md = r.for_language(Language::MARKDOWN);
+        assert_eq!(md.len(), 1, "one server for markdown");
+        assert_eq!(md[0].name, "marksman");
+        assert_eq!(md[0].command, "marksman");
+        assert_eq!(md[0].args, vec!["server".to_string()]);
+        let Some(Provision::Binary {
+            bin,
+            archive,
+            bin_path,
+            termux_pkg,
+            targets,
+            sha256,
+        }) = &md[0].provision
+        else {
+            panic!("marksman must carry a Binary provision");
+        };
+        assert_eq!(*bin, "marksman");
+        assert_eq!(*archive, ArchiveKind::Raw, "the asset is the executable");
+        assert_eq!(*bin_path, None, "a raw asset lands at <name>/<bin>");
+        assert_eq!(
+            *termux_pkg,
+            Some("marksman"),
+            "Termux reroutes to `pkg install marksman`"
+        );
+        let keys: Vec<&str> = targets.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["linux-aarch64", "linux-x86_64", "macos"]);
+        for (key, _) in targets.iter() {
+            let digest = sha256.iter().find(|(k, _)| k == key).map(|(_, d)| *d);
+            assert!(
+                digest.is_some_and(|d| d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())),
+                "{key} must pin a sha256: {digest:?}"
+            );
+        }
+        assert_eq!(
+            sha256.len(),
+            targets.len(),
+            "no digest for a platform without a download"
+        );
+        for ext in ["md", "markdown"] {
+            assert_eq!(r.for_extension(ext)[0].name, "marksman");
+        }
     }
 
     #[test]
