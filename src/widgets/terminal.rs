@@ -4084,8 +4084,8 @@ impl PaneBackend {
     }
 
     /// The terminal's foreground process group: `tcgetpgrp` on a PTY croft
-    /// holds, the shell's `tpgid` from `/proc` for a hosted one (the same
-    /// value, read without the master).
+    /// holds, the shell's `tpgid` from the process table for a hosted one
+    /// (the same value, read without the master).
     fn process_group_leader(&self) -> Option<i32> {
         match self {
             PaneBackend::Local { master, .. } => master.process_group_leader(),
@@ -4132,16 +4132,45 @@ impl PaneBackend {
 }
 
 /// The foreground process group of the terminal `pid` (a session leader)
-/// controls: field 8 (`tpgid`) of `/proc/<pid>/stat`. Linux only, which is
-/// where hosted panes run.
+/// controls: field 8 (`tpgid`) of `/proc/<pid>/stat` on Linux, the BSD
+/// info's `e_tpgid` from `proc_pidinfo` on macOS. Hosted panes run only
+/// where one of these answers.
+#[cfg(target_os = "linux")]
 fn foreground_group_of(pid: i32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_tpgid(&stat)
 }
 
+#[cfg(target_os = "macos")]
+fn foreground_group_of(pid: i32) -> Option<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // Our own child's info needs no entitlement, as for its cwd above.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    let tpgid = info.e_tpgid as i32;
+    (tpgid > 0).then_some(tpgid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn foreground_group_of(_pid: i32) -> Option<i32> {
+    None
+}
+
 /// `tpgid` from a `/proc/<pid>/stat` line. The command name is in
 /// parentheses and may hold spaces or parentheses itself, so the fields
 /// are counted from the LAST `)`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_tpgid(stat: &str) -> Option<i32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     // state ppid pgrp session tty_nr tpgid
@@ -4150,10 +4179,11 @@ fn parse_tpgid(stat: &str) -> Option<i32> {
 }
 
 /// Whether new shell panes go in pane hosts (#694): the
-/// `terminal_persistent_panes` setting, on Linux, where a hosted pane can
-/// still read its foreground process group.
+/// `terminal_persistent_panes` setting, on Linux and macOS, where a hosted
+/// pane can still read its foreground process group.
 fn persistent_panes_enabled() -> bool {
-    cfg!(target_os = "linux") && crate::prefs::Prefs::load_or_default().terminal_persistent_panes
+    cfg!(any(target_os = "linux", target_os = "macos"))
+        && crate::prefs::Prefs::load_or_default().terminal_persistent_panes
 }
 
 /// What a pane needs from wherever its shell runs: bytes to it, bytes from
