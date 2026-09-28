@@ -42778,6 +42778,58 @@ fn a_recorded_frames_rows_wrap_at_the_width_its_header_declares() {
 /// `last_inner` alone moves here, without a `resize`: it is what the branch
 /// reads, and the claim under test is the ORDER of two events, not the
 /// content of the frame between them.
+/// #356's playback criterion with `agg`, the GIF converter: a recording
+/// with colour, a resize and a wrapped line converts without complaint.
+/// Set `CROFT_TEST_AGG` to an agg binary (`cargo install --git
+/// https://github.com/asciinema/agg`).
+#[test]
+#[ignore = "needs agg; set CROFT_TEST_AGG"]
+fn a_recorded_cast_converts_to_a_gif_with_agg() {
+    let agg = std::env::var("CROFT_TEST_AGG").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let size = |app: &mut App, w: u16, h: u16| {
+        app.terminals[0].last_inner = ratatui::layout::Rect {
+            x: 1,
+            y: 1,
+            width: w,
+            height: h,
+        };
+        app.terminals[0].resize(w, h);
+    };
+    size(&mut app, 60, 10);
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+    app.terminals[0].feed_bytes_for_test(
+        b"\x1b[1;31mbold red\x1b[0m \x1b[30;42mblack on green\x1b[0m \x1b[4;34munderlined\x1b[0m\r\n",
+    );
+    app.record_active_screen();
+    size(&mut app, 40, 8);
+    app.terminals[0].feed_bytes_for_test(
+        "a line long enough to wrap at forty columns, with \u{4e00} wide text\r\n".as_bytes(),
+    );
+    app.record_active_screen();
+    app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
+
+    let cast = std::fs::read_dir(app.workspace_root())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "cast"))
+        .expect("a .cast file was written");
+    let gif = tmp.path().join("out.gif");
+    let out = std::process::Command::new(&agg)
+        .arg(&cast)
+        .arg(&gif)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "agg refused the cast: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&gif).unwrap();
+    assert!(bytes.starts_with(b"GIF89a"), "a GIF was written");
+}
+
 #[test]
 fn a_recorded_resize_precedes_the_frame_it_was_drawn_for() {
     let tmp = tempfile::tempdir().unwrap();
