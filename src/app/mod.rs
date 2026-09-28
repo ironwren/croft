@@ -58225,9 +58225,6 @@ impl App {
         self.status = format!("Applied \"{what}\" to {} file(s), unsaved", edits.len());
     }
 
-    /// Open a location from the selected result's details (a step, a frame, a
-    /// related location), resolving it the way the result's own location is
-    /// resolved and keeping the viewer tab.
     /// The paths of the files open in editor tabs, for SARIF resolution.
     fn open_file_paths(&self) -> Vec<PathBuf> {
         self.editor
@@ -58236,6 +58233,9 @@ impl App {
             .collect()
     }
 
+    /// Open a location from the selected result's details (a step, a frame, a
+    /// related location), resolving it the way the result's own location is
+    /// resolved and keeping the viewer tab.
     fn open_sarif_loc(&mut self, target: &crate::sarif::details::LocRef) {
         use crate::sarif::region::{ColumnKind, column_kind};
         if target.uri.is_empty() {
