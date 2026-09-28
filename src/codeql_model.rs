@@ -98,6 +98,232 @@ pub fn parse_endpoints(json: &str) -> Vec<Endpoint> {
         .collect()
 }
 
+/// Which extensible predicate a model row goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Which {
+    Source,
+    Sink,
+    Summary,
+}
+
+impl Which {
+    pub fn extensible(self) -> &'static str {
+        match self {
+            Which::Source => "sourceModel",
+            Which::Sink => "sinkModel",
+            Which::Summary => "summaryModel",
+        }
+    }
+
+    /// The kind a new model of this sort starts from.
+    pub fn default_kind(self) -> &'static str {
+        match self {
+            Which::Source => "remote",
+            Which::Sink => "command-injection",
+            Which::Summary => "taint",
+        }
+    }
+}
+
+/// One model the user made: a row of `sourceModel` / `sinkModel` (`type,
+/// path, kind`) or `summaryModel` (`type, path, input, output, kind`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Model {
+    pub which: Which,
+    /// The `type` column: the endpoint's top package.
+    pub ty: String,
+    /// The access path to the endpoint (`Member[core].Member[run]`); a
+    /// source or sink's own step (`ReturnValue`, `Argument[0,cmd:]`) is
+    /// in `input` / `output`.
+    pub path: String,
+    pub input: String,
+    pub output: String,
+    pub kind: String,
+}
+
+impl Model {
+    /// Its row in the model file, as the language's extensible predicate
+    /// reads it.
+    pub fn row(&self) -> Vec<String> {
+        let at = |step: &str| format!("{}.{step}", self.path);
+        match self.which {
+            Which::Source => vec![self.ty.clone(), at(&self.output), self.kind.clone()],
+            Which::Sink => vec![self.ty.clone(), at(&self.input), self.kind.clone()],
+            Which::Summary => vec![
+                self.ty.clone(),
+                self.path.clone(),
+                self.input.clone(),
+                self.output.clone(),
+                self.kind.clone(),
+            ],
+        }
+    }
+
+    /// A line saying what it models.
+    pub fn describe(&self) -> String {
+        match self.which {
+            Which::Source => format!("source {} ({})", self.output, self.kind),
+            Which::Sink => format!("sink {} ({})", self.input, self.kind),
+            Which::Summary => format!(
+                "summary {} \u{2192} {} ({})",
+                self.input, self.output, self.kind
+            ),
+        }
+    }
+}
+
+impl Endpoint {
+    /// The access path to the endpoint from its package, in the form the
+    /// Python models use: each module and class a `Member[..]`, an
+    /// instance method reached through `Instance`. `None` for a class
+    /// itself, which is not modeled here.
+    pub fn access_path(&self) -> Option<String> {
+        if self.function.is_empty() {
+            return None;
+        }
+        let mut steps: Vec<String> = self
+            .class
+            .split('.')
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("Member[{p}]"))
+            .collect();
+        if self.kind == "InstanceMethod" {
+            steps.push(String::from("Instance"));
+        }
+        steps.push(format!("Member[{}]", self.function));
+        Some(steps.join("."))
+    }
+
+    /// Its arguments as model steps: `Argument[0,cmd:]` reaches the first
+    /// argument by position or by keyword. A method's `self` or `cls` is
+    /// not an argument of the call.
+    pub fn arguments(&self) -> Vec<String> {
+        let inner = self
+            .params
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let method = matches!(self.kind.as_str(), "InstanceMethod" | "ClassMethod");
+        inner
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .skip(usize::from(method))
+            .map(|p| p.trim_start_matches('*').to_string())
+            .enumerate()
+            .map(|(i, name)| format!("Argument[{i},{name}:]"))
+            .collect()
+    }
+
+    /// The models this endpoint can take, as the Model Editor offers them:
+    /// a source at its return value, a sink at each argument, a summary
+    /// from each argument to the return value.
+    pub fn choices(&self) -> Vec<Model> {
+        let Some(path) = self.access_path() else {
+            return Vec::new();
+        };
+        let model = |which: Which, input: &str, output: &str| Model {
+            which,
+            ty: self.namespace.clone(),
+            path: path.clone(),
+            input: input.to_string(),
+            output: output.to_string(),
+            kind: which.default_kind().to_string(),
+        };
+        let mut out = vec![model(Which::Source, "", "ReturnValue")];
+        for a in self.arguments() {
+            out.push(model(Which::Sink, &a, ""));
+        }
+        for a in self.arguments() {
+            out.push(model(Which::Summary, &a, "ReturnValue"));
+        }
+        out
+    }
+}
+
+/// The model pack croft keeps the models of database `db` (language
+/// `lang`) in: its folder under `.github/codeql/extensions`, where VS Code
+/// keeps model packs too, and its pack name.
+pub fn model_pack(root: &std::path::Path, db: &str, lang: &str) -> (std::path::PathBuf, String) {
+    let slug: String = format!("{db}-{lang}")
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    (
+        root.join(".github/codeql/extensions").join(&slug),
+        format!("croft/{slug}"),
+    )
+}
+
+/// The pack file of a model pack named `name` extending `lang`'s library.
+pub fn pack_yml(name: &str, lang: &str) -> String {
+    format!(
+        "name: {name}\nversion: 0.0.0\nlibrary: true\nextensionTargets:\n  codeql/{lang}-all: \"*\"\ndataExtensions:\n  - models/**/*.yml\n"
+    )
+}
+
+/// The data extension file holding `models` for `lang`'s library.
+pub fn models_yml(lang: &str, models: &[Model]) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut out = String::from("extensions:\n");
+    for which in [Which::Source, Which::Sink, Which::Summary] {
+        let rows: Vec<&Model> = models.iter().filter(|m| m.which == which).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "  - addsTo:\n      pack: codeql/{lang}-all\n      extensible: {}\n    data:\n",
+            which.extensible()
+        ));
+        for m in rows {
+            let cells: Vec<String> = m.row().iter().map(|c| quote(c)).collect();
+            out.push_str(&format!("      - [{}]\n", cells.join(", ")));
+        }
+    }
+    if models.is_empty() {
+        out.push_str("  []\n");
+    }
+    out
+}
+
+/// The model packs in `root`'s `.github/codeql/extensions`, by name: what
+/// query runs pass as `--model-packs`.
+pub fn workspace_model_packs(root: &std::path::Path) -> Vec<String> {
+    let dir = root.join(".github/codeql/extensions");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let text = std::fs::read_to_string(e.path().join("codeql-pack.yml")).ok()?;
+            if !text.contains("extensionTargets") {
+                return None;
+            }
+            text.lines()
+                .find_map(|l| l.strip_prefix("name:"))
+                .map(|n| n.trim().trim_matches('"').to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The arguments a query run needs to use `root`'s model packs, empty when
+/// it has none.
+pub fn model_pack_args(root: &std::path::Path) -> Vec<String> {
+    let packs = workspace_model_packs(root);
+    if packs.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec![format!(
+        "--additional-packs={}",
+        root.join(".github/codeql/extensions").display()
+    )];
+    args.extend(packs.iter().map(|p| format!("--model-packs={p}")));
+    args
+}
+
 /// The Model Editor the side bar's Method Modeling section shows: the
 /// database and language it is for, the endpoints by group, and which
 /// groups are folded.
@@ -107,6 +333,8 @@ pub struct ModelView {
     pub language: String,
     pub endpoints: Vec<Endpoint>,
     pub folded: HashSet<String>,
+    /// The models the user made, kept in the model pack.
+    pub models: Vec<Model>,
 }
 
 /// One row of the section.
@@ -138,7 +366,8 @@ impl ModelView {
     }
 
     /// The rows to show: each group, and its endpoints unless folded.
-    /// Modeled endpoints are marked ✓, the rest ○.
+    /// Endpoints CodeQL models are marked ✓, ones the user modeled ●, the
+    /// rest ○.
     pub fn rows(&self) -> Vec<ModelRow> {
         let mut out = Vec::new();
         for (group, members) in self.groups() {
@@ -153,7 +382,18 @@ impl ModelView {
             }
             for i in members {
                 let e = &self.endpoints[i];
-                let mark = if e.supported { '\u{2713}' } else { '\u{25cb}' };
+                let yours = e.access_path().is_some_and(|p| {
+                    self.models
+                        .iter()
+                        .any(|m| m.ty == e.namespace && m.path == p)
+                });
+                let mark = if e.supported {
+                    '\u{2713}'
+                } else if yours {
+                    '\u{25cf}'
+                } else {
+                    '\u{25cb}'
+                };
                 out.push(ModelRow::Endpoint(i, format!("  {mark} {}", e.label())));
             }
         }
@@ -172,6 +412,84 @@ impl ModelView {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn an_endpoints_models_are_written_the_way_the_cli_reads_them() {
+        let eps = parse_endpoints(ROWS);
+        let run = &eps[0];
+        assert_eq!(
+            run.access_path().as_deref(),
+            Some("Member[core].Member[run]")
+        );
+        assert_eq!(run.arguments(), ["Argument[0,cmd:]", "Argument[1,shell:]"]);
+        let go = &eps[2];
+        assert_eq!(
+            go.access_path().as_deref(),
+            Some("Member[core].Member[Runner].Instance.Member[go]")
+        );
+        assert_eq!(
+            go.arguments(),
+            ["Argument[0,what:]"],
+            "self is not an argument"
+        );
+        assert_eq!(eps[1].access_path(), None, "a class itself");
+        let choices = run.choices();
+        assert_eq!(choices.len(), 5, "a source, two sinks, two summaries");
+        let sink = choices.iter().find(|m| m.which == Which::Sink).unwrap();
+        // The rows the real CLI applied in #578's check: with them,
+        // py/command-line-injection found the flow it missed without.
+        assert_eq!(
+            sink.row(),
+            [
+                "mylib",
+                "Member[core].Member[run].Argument[0,cmd:]",
+                "command-injection"
+            ]
+        );
+        assert_eq!(
+            choices[0].row(),
+            ["mylib", "Member[core].Member[run].ReturnValue", "remote"]
+        );
+        let summary = choices.iter().find(|m| m.which == Which::Summary).unwrap();
+        assert_eq!(
+            summary.row(),
+            [
+                "mylib",
+                "Member[core].Member[run]",
+                "Argument[0,cmd:]",
+                "ReturnValue",
+                "taint"
+            ]
+        );
+        let yml = models_yml("python", &[choices[0].clone(), sink.clone()]);
+        assert_eq!(
+            yml,
+            "extensions:\n  - addsTo:\n      pack: codeql/python-all\n      extensible: sourceModel\n    data:\n      - ['mylib', 'Member[core].Member[run].ReturnValue', 'remote']\n  - addsTo:\n      pack: codeql/python-all\n      extensible: sinkModel\n    data:\n      - ['mylib', 'Member[core].Member[run].Argument[0,cmd:]', 'command-injection']\n"
+        );
+    }
+
+    #[test]
+    fn model_packs_are_named_found_and_passed_to_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(model_pack_args(root).is_empty(), "no packs, no arguments");
+        let (pack, name) = model_pack(root, "My DB", "python");
+        assert_eq!(pack, root.join(".github/codeql/extensions/my-db-python"));
+        assert_eq!(name, "croft/my-db-python");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("codeql-pack.yml"), pack_yml(&name, "python")).unwrap();
+        assert_eq!(workspace_model_packs(root), ["croft/my-db-python"]);
+        assert_eq!(
+            model_pack_args(root),
+            [
+                format!(
+                    "--additional-packs={}",
+                    root.join(".github/codeql/extensions").display()
+                ),
+                String::from("--model-packs=croft/my-db-python")
+            ]
+        );
+    }
 
     /// Real `FrameworkModeEndpoints.ql` rows (python-queries 1.8.11) for a
     /// package with `core.run`, `class core.Runner` and `Runner.go`.

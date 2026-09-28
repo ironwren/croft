@@ -56855,6 +56855,152 @@ fn wait_for_codeql(app: &mut App) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_published_codeql_pack_is_downloaded_and_run_on_the_database() {
+    // #578: "Run Queries in Published Pack": download the pack, analyze
+    // the database with it (or the part after `:`), open its SARIF.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"runs":[{"results":[{}]}]}"#, 0, "");
+
+        app.run_command(Command::CodeqlRunPublishedPack);
+        let prompt = app.input_prompt.as_mut().expect("which pack");
+        prompt.value = String::from("python-queries");
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            "\"python-queries\" is not a pack: write scope/name"
+        );
+        assert!(app.codeql_run.is_none());
+
+        app.run_command(Command::CodeqlRunPublishedPack);
+        app.input_prompt.as_mut().unwrap().value =
+            String::from("codeql/python-queries@1.8.11:Security/CWE-078");
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            "Running codeql/python-queries@1.8.11:Security/CWE-078 on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        assert!(
+            app.status
+                .starts_with("codeql/python-queries@1.8.11:Security/CWE-078 finished in "),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls[0], "pack download codeql/python-queries@1.8.11");
+        assert!(
+            calls[1].starts_with(&format!(
+                "database analyze {} codeql/python-queries@1.8.11:Security/CWE-078 --format=sarif-latest",
+                tmp.path().join("dbs/app").display()
+            )),
+            "{}",
+            calls[1]
+        );
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let entry = &history.entries[history.newest().unwrap()];
+        assert_eq!(entry.status, crate::codeql_query::RunStatus::Succeeded);
+        assert_eq!(entry.results, Some(1));
+        assert_eq!(
+            app.editor.path.as_ref(),
+            Some(&entry.output),
+            "its SARIF is open"
+        );
+
+        // A failed download stops before the analysis.
+        let bin = tempfile::tempdir().unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "A fatal error occurred: no such pack");
+        app.run_command(Command::CodeqlRunPublishedPack);
+        app.input_prompt.as_mut().unwrap().value = String::from("acme/missing");
+        app.submit_input_prompt();
+        wait_for_codeql(&mut app);
+        assert!(
+            app.status.starts_with("acme/missing failed: "),
+            "{}",
+            app.status
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(calls, "pack download acme/missing\n");
+    });
+}
+
+/// Run a published pack's command-injection query through croft against the
+/// real CLI and registry (#578), on a Flask app that runs a request argument.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and the pack registry; set CROFT_TEST_CODEQL"]
+fn real_published_pack_runs_on_the_selected_database() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "import os\nfrom flask import Flask, request\napp = Flask(__name__)\n\n@app.route(\"/\")\ndef index():\n    os.system(request.args[\"cmd\"])\n    return \"\"\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("flask"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        app.run_codeql_published_pack("codeql/python-queries:Security/CWE-078/CommandInjection.ql");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while app.codeql_run.is_some() {
+            app.drain_codeql_run();
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let entry = &history.entries[history.newest().unwrap()];
+        assert_eq!(
+            entry.status,
+            crate::codeql_query::RunStatus::Succeeded,
+            "{}",
+            app.status
+        );
+        let sarif = std::fs::read_to_string(&entry.output).unwrap();
+        assert!(
+            sarif.contains("\"ruleId\":\"py/command-line-injection\""),
+            "{sarif}"
+        );
+        assert_eq!(entry.results, Some(1));
+    });
+}
+
 /// A workspace with `q.ql` open and database "app" current.
 fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     let db = tmp.join("dbs/app");
@@ -58178,6 +58324,227 @@ fn the_model_editor_lists_a_databases_endpoints_by_group() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn modeling_an_endpoint_writes_a_model_pack_that_runs_use() {
+    // #578: the Model Editor models sources, sinks and summaries. A model
+    // lands in a model pack under .github/codeql/extensions, and query
+    // runs pass it as a model pack.
+    use crate::widgets::codeql::{Action, Line};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        app.codeql.model = Some(crate::codeql_model::ModelView {
+            database: String::from("lib"),
+            language: String::from("python"),
+            endpoints: crate::codeql_model::parse_endpoints(
+                r#"{"tuples":[[{"label":"Function run"},"mylib","core","run","(cmd,shell)",false,"core.py","",{"label":"Function"}]]}"#,
+            ),
+            ..Default::default()
+        });
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        let row = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::ModelEndpoint(0), _)))
+            .unwrap();
+        app.codeql.selected = row;
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        let picker = app.list_picker.as_ref().expect("what to model it as");
+        assert_eq!(picker.title, "Model run(cmd,shell)");
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "source ReturnValue (remote)",
+                "sink Argument[0,cmd:] (command-injection)",
+                "sink Argument[1,shell:] (command-injection)",
+                "summary Argument[0,cmd:] \u{2192} ReturnValue (taint)",
+                "summary Argument[1,shell:] \u{2192} ReturnValue (taint)",
+            ]
+        );
+        app.list_picker.as_mut().unwrap().selected = 1;
+        app.confirm_list_picker();
+        let prompt = app.input_prompt.as_ref().expect("its kind");
+        assert_eq!(prompt.value, "command-injection");
+        app.submit_input_prompt();
+        let pack = tmp.path().join(".github/codeql/extensions/lib-python");
+        assert!(
+            app.status
+                .starts_with("Modeled run(cmd,shell) as a sink Argument[0,cmd:]"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(pack.join("models/lib-python.model.yml")).unwrap(),
+            "extensions:\n  - addsTo:\n      pack: codeql/python-all\n      extensible: sinkModel\n    data:\n      - ['mylib', 'Member[core].Member[run].Argument[0,cmd:]', 'command-injection']\n"
+        );
+        assert!(
+            std::fs::read_to_string(pack.join("codeql-pack.yml"))
+                .unwrap()
+                .starts_with("name: croft/lib-python\n")
+        );
+        assert!(
+            app.codeql.lines().iter().any(|l| matches!(
+                l,
+                Line::Action(Action::ModelEndpoint(0), t) if t == "  \u{25cf} run(cmd,shell)"
+            )),
+            "marked as modeled by you"
+        );
+
+        // A query run now uses the pack.
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(calls.contains("--model-packs=croft/lib-python"), "{calls}");
+
+        // Removing its models empties the extension.
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.selected = app
+            .codeql
+            .lines()
+            .iter()
+            .position(|l| matches!(l, Line::Action(Action::ModelEndpoint(0), _)))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        let rows = &app.list_picker.as_ref().unwrap().rows;
+        let remove = rows
+            .iter()
+            .position(|r| r.id == "0:remove")
+            .expect("remove is offered");
+        app.list_picker.as_mut().unwrap().selected = remove;
+        app.confirm_list_picker();
+        assert!(
+            app.status
+                .starts_with("Removed the models of run(cmd,shell)"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(pack.join("models/lib-python.model.yml")).unwrap(),
+            "extensions:\n  []\n"
+        );
+    });
+}
+
+/// #578's Model Editor end to end against the real CLI: model a library
+/// function as a source and another as a sink, and the command-injection
+/// query, run through croft, finds the flow it misses without them.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-queries; set CROFT_TEST_CODEQL"]
+fn real_models_made_in_the_model_editor_change_what_a_query_finds() {
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("mylib")).unwrap();
+        std::fs::write(src.join("mylib/__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("mylib/core.py"),
+            "import os\n\ndef run(cmd, shell=True):\n    return os.system(cmd)\n\ndef fetch():\n    return \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "from mylib.core import run, fetch\nrun(fetch())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("lib"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let resolved = std::process::Command::new(&codeql)
+            .args([
+                "resolve",
+                "queries",
+                "--format=json",
+                "codeql/python-queries:Security/CWE-078/CommandInjection.ql",
+            ])
+            .output()
+            .unwrap();
+        let query = crate::codeql_ast::first_query(&String::from_utf8_lossy(&resolved.stdout))
+            .expect("the command-injection query");
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        let run_query = |app: &mut App| -> String {
+            app.editor.open(&query).unwrap();
+            app.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            while app.codeql_run.is_some() {
+                app.drain_codeql_run();
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let history = crate::codeql_query::History::load(&App::codeql_history_path());
+            std::fs::read_to_string(&history.entries[history.newest().unwrap()].output)
+                .unwrap_or_else(|e| panic!("{e}: {}", app.status))
+        };
+        let before = run_query(&mut app);
+        assert!(before.contains("\"results\":[]"), "no flow yet: {before}");
+
+        app.run_command(crate::widgets::command_palette::Command::CodeqlOpenModelEditor);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        while !app.drain_codeql_model() {
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let find = |app: &App, f: &str| {
+            app.codeql
+                .model
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}", app.status))
+                .endpoints
+                .iter()
+                .position(|e| e.function == f)
+                .unwrap()
+        };
+        let (fetch, run) = (find(&app, "fetch"), find(&app, "run"));
+        app.choose_codeql_model(&format!("{fetch}:0"));
+        app.submit_input_prompt(); // remote source at ReturnValue
+        app.choose_codeql_model(&format!("{run}:1"));
+        app.submit_input_prompt(); // command-injection sink at Argument[0,cmd:]
+        let after = run_query(&mut app);
+        assert!(
+            after.contains("\"ruleId\":\"py/command-line-injection\""),
+            "{after}"
+        );
+    });
+}
+
 /// #578's Model Editor against the real CLI: a Python library's
 /// framework-mode endpoints, read from a database built in the test.
 #[cfg(unix)]
@@ -58861,6 +59228,110 @@ fn codeql_runs_every_workspace_query_or_the_ones_selected_in_the_explorer() {
         );
         drain_one_codeql_run(&mut app);
         assert_eq!(app.status, "Ran 2 CodeQL queries");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_query_runs_on_each_database_checked_in_the_list() {
+    // #578: "Run Query on Multiple Databases": check databases in a list,
+    // and the open query, as edited, runs on each in the list's order.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        for name in ["lib", "gone"] {
+            let path = tmp.path().join("dbs").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            store.databases.push(crate::codeql_db::DbEntry {
+                name: name.to_string(),
+                path,
+                language: None,
+                added: 0,
+                former_names: Vec::new(),
+            });
+        }
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.editor.lines[0] = String::from("select 2");
+
+        app.run_command(Command::CodeqlRunQueryOnDatabases);
+        let labels = |app: &App| -> Vec<String> {
+            let picker = app.list_picker.as_ref().expect("the databases");
+            picker.rows.iter().map(|r| r.label.clone()).collect()
+        };
+        assert_eq!(
+            app.list_picker.as_ref().unwrap().title,
+            "Run q.ql on databases"
+        );
+        assert_eq!(
+            labels(&app),
+            [
+                "\u{25b6} Run on the checked database",
+                "[x] app (rust)",
+                "[ ] lib",
+                "[ ] gone",
+            ]
+        );
+        // Check lib and gone, the cursor staying on the row picked.
+        for row in [2, 3] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+            assert_eq!(app.list_picker.as_ref().unwrap().selected, row);
+        }
+        assert_eq!(labels(&app)[0], "\u{25b6} Run on the 3 checked databases");
+        assert_eq!(labels(&app)[3], "[x] gone");
+        // Unchecking all of them refuses to run.
+        for row in [1, 2, 3] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+        }
+        app.list_picker.as_mut().unwrap().selected = 0;
+        app.confirm_list_picker();
+        assert_eq!(app.status, "Check at least one database to run on");
+        for row in [3, 2, 1] {
+            app.list_picker.as_mut().unwrap().selected = row;
+            app.confirm_list_picker();
+        }
+
+        app.list_picker.as_mut().unwrap().selected = 0;
+        app.confirm_list_picker();
+        assert!(app.list_picker.is_none());
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 1/3: q.ql on app\u{2026}"
+        );
+        // gone disappears before its turn: skipped, the rest still run.
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.databases.retain(|db| db.name != "gone");
+        store.save(&App::codeql_db_store_path()).unwrap();
+        drain_one_codeql_run(&mut app);
+        assert_eq!(
+            app.status,
+            "Running CodeQL queries 2/3: q.ql on lib\u{2026}"
+        );
+        drain_one_codeql_run(&mut app);
+        assert!(app.codeql_run.is_none());
+        assert_eq!(app.status, "Ran 3 CodeQL queries, 1 failed");
+
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let ran: Vec<&str> = history
+            .entries
+            .iter()
+            .map(|e| e.database.as_str())
+            .collect();
+        assert_eq!(ran.len(), 2);
+        assert!(ran.contains(&"app") && ran.contains(&"lib"), "{ran:?}");
+        for e in &history.entries {
+            let text =
+                std::fs::read_to_string(crate::codeql_query::query_text_path(&e.output, &e.query))
+                    .unwrap();
+            assert_eq!(text, "select 2", "the buffer, not the file");
+        }
     });
 }
 
