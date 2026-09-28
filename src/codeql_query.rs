@@ -505,6 +505,21 @@ pub fn failure_reason(stderr: &str) -> String {
     parts.join(" · ")
 }
 
+/// Where a run keeps the text of `query` as it was run (#578, "View Query
+/// Text"): a `query` folder beside the run's `output`, under the query's
+/// own file name, so the tab reads as the query.
+pub fn query_text_path(output: &Path, query: &Path) -> PathBuf {
+    let name = query
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("query.ql"));
+    output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("query")
+        .join(name)
+}
+
 /// `codeql` arguments printing the CLI's bare version number.
 pub fn version_args() -> Vec<String> {
     vec![String::from("version"), String::from("--format=terse")]
