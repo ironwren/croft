@@ -3188,6 +3188,10 @@ pub struct App {
     /// The variant analysis being bundled and submitted (#578).
     codeql_variant_submit:
         Option<std::sync::mpsc::Receiver<Result<crate::codeql_submit::Submitted, String>>>,
+    /// The read of unfinished variant analyses' progress in flight, and
+    /// when the last one started (#578).
+    codeql_variant_poll: Option<std::sync::mpsc::Receiver<Vec<CodeqlRunPoll>>>,
+    codeql_variant_polled: Option<std::time::Instant>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5466,6 +5470,8 @@ impl App {
             codeql_cli_net: crate::codeql_cli::Net::default(),
             codeql_code_search: None,
             codeql_variant_submit: None,
+            codeql_variant_poll: None,
+            codeql_variant_polled: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23344,6 +23350,7 @@ impl App {
             Hit::Action(Action::AddVariantList) => self.prompt_add_codeql_variant_list(),
             Hit::Action(Action::AddVariantOwner) => self.prompt_add_codeql_variant_owner(),
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
+            Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
             Hit::Action(Action::ViewAst) => {
                 self.status = String::from("The AST viewer is not available yet (#578)");
             }
@@ -23358,6 +23365,7 @@ impl App {
     /// cannot be read is reported, and the section says so rather than
     /// showing it empty.
     fn refresh_codeql_variant(&mut self) {
+        self.refresh_codeql_variant_runs();
         match crate::codeql_variant::VariantConfig::load(&Self::codeql_variant_path()) {
             Ok(config) => {
                 self.codeql.variant = config;
@@ -25185,6 +25193,133 @@ impl App {
         }
     }
 
+    /// Mirror the remembered variant analyses into the side bar.
+    fn refresh_codeql_variant_runs(&mut self) {
+        self.codeql.variant_runs =
+            crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path())
+                .iter()
+                .map(crate::codeql_submit::run_label)
+                .collect();
+    }
+
+    /// Open the report of remembered variant analysis `index`: its status
+    /// and a row per repository. It is written from the last progress read;
+    /// an unfinished run is read again at once.
+    fn open_codeql_variant_run(&mut self, index: usize) {
+        let runs = crate::codeql_submit::load_submitted(&Self::codeql_variant_runs_path());
+        let Some(run) = runs.get(index) else {
+            return;
+        };
+        if !run.progress.as_ref().is_some_and(|p| p.is_done()) {
+            self.codeql_variant_polled = None;
+        }
+        let path = croft_cache_dir()
+            .join("codeql")
+            .join("variant-reports")
+            .join(format!(
+                "{}-{}.md",
+                run.controller.replace('/', "-"),
+                run.id
+            ));
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, crate::codeql_submit::run_report(run)));
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        match self.editor.open(&path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+            }
+            Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    /// Follow submitted variant analyses (#578): every
+    /// [`CODEQL_VARIANT_POLL`], read the progress of those GitHub has not
+    /// finished, off the UI thread, and record what comes back. A run
+    /// finishing says so on the status line. Runs older than
+    /// [`CODEQL_VARIANT_FOLLOW`] are left alone: GitHub keeps their results
+    /// only so long, and one that never finishes would be read forever.
+    /// Nothing is read until the side bar has loaded the runs (opening the
+    /// CodeQL view, or a submission), so a session that never touches
+    /// CodeQL never calls GitHub for it. Returns true when progress landed.
+    pub fn poll_codeql_variant_runs(&mut self) -> bool {
+        use crate::codeql_submit as cs;
+        if let Some(rx) = self.codeql_variant_poll.as_ref() {
+            let polled = match rx.try_recv() {
+                Ok(p) => p,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+            };
+            self.codeql_variant_poll = None;
+            let path = Self::codeql_variant_runs_path();
+            for (mut run, outcome) in polled {
+                let Ok(progress) = outcome else { continue };
+                let was_done = run.progress.as_ref().is_some_and(|p| p.is_done());
+                if progress.is_done() && !was_done {
+                    let (done, total) = progress.counts();
+                    self.status = format!(
+                        "Variant analysis {} of {} {}: {done}/{total} repositories, {} results",
+                        run.id,
+                        run.query.file_name().unwrap_or_default().to_string_lossy(),
+                        progress.status,
+                        progress.results()
+                    );
+                }
+                run.progress = Some(progress);
+                let _ = cs::update_submitted(&path, &run);
+            }
+            self.refresh_codeql_variant_runs();
+            return true;
+        }
+        if self.codeql.variant_runs.is_empty()
+            || self.disabled_extensions.contains("codeql")
+            || self
+                .codeql_variant_polled
+                .is_some_and(|t| t.elapsed() < CODEQL_VARIANT_POLL)
+        {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let unfinished: Vec<cs::Submitted> = cs::load_submitted(&Self::codeql_variant_runs_path())
+            .into_iter()
+            .filter(|r| !r.progress.as_ref().is_some_and(|p| p.is_done()))
+            .filter(|r| now.saturating_sub(r.submitted_at) < CODEQL_VARIANT_FOLLOW.as_secs())
+            .collect();
+        self.codeql_variant_polled = Some(std::time::Instant::now());
+        if unfinished.is_empty() {
+            return false;
+        }
+        let gh = self.gh_program.to_string_lossy().into_owned();
+        let root = self.active_workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let polled = unfinished
+                .into_iter()
+                .map(|run| {
+                    let outcome = crate::pr_review::run_gh(
+                        &gh,
+                        &cs::progress_args(&run.controller, run.id),
+                        &root,
+                        crate::pr_review::GH_TIMEOUT,
+                    )
+                    .and_then(|answer| cs::parse_progress(&answer));
+                    (run, outcome)
+                })
+                .collect();
+            let _ = tx.send(polled);
+        });
+        self.codeql_variant_poll = Some(rx);
+        false
+    }
+
     /// Where submitted variant analyses are remembered (#578).
     fn codeql_variant_runs_path() -> PathBuf {
         croft_cache_dir().join("codeql-variant-analyses.json")
@@ -25334,7 +25469,12 @@ impl App {
                 let id = run.id;
                 match crate::codeql_submit::record_submitted(&Self::codeql_variant_runs_path(), run)
                 {
-                    Ok(()) => format!("Variant analysis {id} of {name} submitted{skipped}: {url}"),
+                    Ok(()) => {
+                        // Follow it from now on, starting with the next tick.
+                        self.codeql_variant_polled = None;
+                        self.refresh_codeql_variant_runs();
+                        format!("Variant analysis {id} of {name} submitted{skipped}: {url}")
+                    }
                     Err(e) => format!(
                         "Variant analysis {id} of {name} submitted{skipped}: {url} (not remembered: {e})"
                     ),
@@ -62338,6 +62478,18 @@ type CodeqlUpgrade = (
     PathBuf,
 );
 
+/// One unfinished variant analysis and what reading its progress gave.
+type CodeqlRunPoll = (
+    crate::codeql_submit::Submitted,
+    Result<crate::codeql_submit::RunProgress, String>,
+);
+
+/// How often unfinished variant analyses are read again (#578).
+const CODEQL_VARIANT_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long after submitting a variant analysis croft follows it (#578).
+const CODEQL_VARIANT_FOLLOW: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 /// A GitHub Code Search in flight: the variant analysis list its
 /// repositories go into, and its outcome: the repositories found, and why
 /// a page after the first failed, cutting the results short.
@@ -63796,7 +63948,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()
-            | app.drain_codeql_variant_submit();
+            | app.drain_codeql_variant_submit()
+            | app.poll_codeql_variant_runs();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
