@@ -26236,6 +26236,18 @@ impl App {
     /// `query run` into a table decoded as CSV. The run happens on a worker
     /// thread; [`Self::drain_codeql_run`] collects it.
     fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+        self.run_codeql_file_with(query, source, None);
+    }
+
+    /// [`Self::run_codeql_file`], or with `quick` a quick evaluation of a
+    /// span of `query` through the CLI's query server (#578), recorded in
+    /// the history like any run and decoded to a table.
+    fn run_codeql_file_with(
+        &mut self,
+        query: PathBuf,
+        source: &str,
+        quick: Option<crate::codeql_qs::QuickEval>,
+    ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
@@ -26267,7 +26279,10 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = cq::output_for(source);
+        let kind = match quick {
+            Some(_) => Output::Table,
+            None => cq::output_for(source),
+        };
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
@@ -26292,15 +26307,20 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
-            name: None,
+            name: quick.as_ref().map(|q| q.title()),
             results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
-        let name = query
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = match &quick {
+            Some(q) => q.title(),
+            None => query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        // Where the query server looks for the workspace's own packs.
+        let packs: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // A fresh flag per run, so a late cancel never stops the next one.
@@ -26310,9 +26330,16 @@ impl App {
             let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
-                .and_then(|()| match kind {
-                    Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
-                    Output::Table => {
+                .and_then(|()| match (quick, kind) {
+                    (Some(q), _) => {
+                        let bqrs = dir.join("results.bqrs");
+                        crate::codeql_qs::run_quick_eval(
+                            &program, &db.path, &query, &bqrs, &packs, q.span, q.count, &cancel,
+                        )
+                        .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
+                    }
+                    (None, Output::Sarif) => run(cq::analyze_args(&query, &db.path, &output)),
+                    (None, Output::Table) => {
                         let bqrs = dir.join("results.bqrs");
                         run(cq::run_args(&query, &db.path, &bqrs))
                             .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
@@ -26327,6 +26354,41 @@ impl App {
         self.codeql_run = Some((rx, std::time::Instant::now()));
         self.codeql_run_name = name.clone();
         self.status = format!("Running {name} on {}\u{2026}", db.name);
+    }
+
+    /// CodeQL: Quick Evaluation, and its count variant (#578): evaluate the
+    /// predicate under the cursor, or the selected expression, of the open
+    /// query on the current database, through the CLI's query server.
+    fn quick_eval_codeql(&mut self, count: bool) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to quick-evaluate part of it");
+            return;
+        };
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let selection = self.editor.selection.map(|s| s.normalised());
+        let Some((span, label)) = crate::codeql_qs::span_at(
+            &self.editor.lines,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            selection,
+        ) else {
+            self.status = String::from("Put the cursor on a predicate, or select an expression");
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        self.run_codeql_file_with(
+            query,
+            &source,
+            Some(crate::codeql_qs::QuickEval { span, count, label }),
+        );
     }
 
     /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
@@ -46772,6 +46834,9 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::SheetSortByColumn => self.sort_sheet_by_column(),
+            Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
+            Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
             Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
             Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
@@ -57355,6 +57420,43 @@ impl App {
             KeyCode::Right => diff.scroll_right_by(4),
             _ => {}
         }
+    }
+
+    /// Sheet: Sort by Column (#578): sort the open CSV/TSV sheet's rows by
+    /// the cursor's column, reversing when it is already sorted that way.
+    /// A reorder is an edit, as in a spreadsheet: it marks the sheet
+    /// unsaved. xlsx is left out, since its edits are written back by
+    /// row, and so are the read-only kinds.
+    fn sort_sheet_by_column(&mut self) {
+        let Some(sheet) = self.editor.sheet.as_mut() else {
+            self.status = String::from("Open a CSV or TSV file to sort it");
+            return;
+        };
+        if !matches!(
+            sheet.kind,
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv
+        ) {
+            self.status = String::from("Sorting is for CSV and TSV sheets");
+            return;
+        }
+        let current = sheet.current_sheet;
+        let Some(data) = sheet.sheets.get_mut(current) else {
+            return;
+        };
+        let col = data.cur_col;
+        let name = data
+            .headers
+            .get(col)
+            .filter(|h| !h.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        let ascending = data.sort_by_column(col);
+        sheet.dirty = true;
+        self.editor.dirty = true;
+        self.status = format!(
+            "Sorted by {name}, {}",
+            if ascending { "ascending" } else { "descending" }
+        );
     }
 
     fn handle_sheet_key(&mut self, key: KeyEvent) {
