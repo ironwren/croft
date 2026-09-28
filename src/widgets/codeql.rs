@@ -276,6 +276,14 @@ impl CodeqlPanel {
         }
     }
 
+    /// The remembered variant analysis whose row is selected.
+    pub fn selected_variant_run(&self) -> Option<usize> {
+        match self.selected_hit() {
+            Some(Hit::Action(Action::VariantRun(i))) => Some(i),
+            _ => None,
+        }
+    }
+
     /// The list whose line, or one of whose repositories, is selected: where
     /// an added repository goes.
     pub fn selected_variant_list(&self) -> Option<usize> {
