@@ -57500,6 +57500,260 @@ fn a_real_qlref_opens_the_query_in_the_pack_it_depends_on() {
     });
 }
 
+/// A stand-in `codeql` whose `execute query-server2` speaks the query
+/// server's framed JSON-RPC: it answers `registerDatabases`, and answers
+/// `runQuery` with `result` (a JSON object), writing `bqrs` to the output
+/// path first. Every request is logged to `requests.jsonl`; `bqrs decode`
+/// copies `csv` to its output.
+#[cfg(unix)]
+fn fake_query_server(dir: &std::path::Path, result: &str, csv: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(dir.join("result.json"), result).unwrap();
+    std::fs::write(dir.join("reply.csv"), csv).unwrap();
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys, shutil
+d = {dir:?}
+args = sys.argv[1:]
+if args[:2] == ["execute", "query-server2"]:
+    inp, out = sys.stdin.buffer, sys.stdout.buffer
+    while True:
+        n = None
+        while True:
+            line = inp.readline()
+            if not line:
+                sys.exit(0)
+            line = line.strip()
+            if not line and n is not None:
+                break
+            if line.lower().startswith(b"content-length:"):
+                n = int(line.split(b":")[1])
+        msg = json.loads(inp.read(n))
+        with open(d + "/requests.jsonl", "a") as f:
+            f.write(json.dumps(msg) + "\n")
+        if msg["method"] == "evaluation/runQuery":
+            open(msg["params"]["body"]["outputPath"], "w").write("bqrs")
+            res = json.load(open(d + "/result.json"))
+        else:
+            res = {{}}
+        body = json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": res}}).encode()
+        out.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        out.flush()
+for a in args:
+    if a.startswith("--output="):
+        shutil.copy(d + "/reply.csv", a[len("--output="):])
+"#,
+        dir = dir.display().to_string()
+    );
+    let program = dir.join("codeql");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    program
+}
+
+#[cfg(unix)]
+#[test]
+fn quick_evaluation_runs_the_predicate_at_the_cursor_through_the_query_server() {
+    // #578: Quick Evaluation (and its count) of the predicate under the
+    // cursor, recorded in the query history like a run.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(
+            tmp.path(),
+            "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
+        );
+        app.codeql_program = fake_query_server(
+            bin.path(),
+            r#"{"resultType": 0, "message": "", "evaluationTime": 384}"#,
+            "\"c\"\n\"run()\"\n",
+        );
+        let query = tmp.path().join("q.ql");
+        app.editor.cursor_row = 2;
+        app.editor.cursor_col = 13;
+        app.run_command(Command::CodeqlQuickEval);
+        assert_eq!(
+            app.status,
+            "Running Quick evaluation of isCall on app\u{2026}"
+        );
+        wait_for_codeql(&mut app);
+        assert!(app.status.contains("finished"), "{}", app.status);
+        assert!(
+            app.codeql.history[0].contains("Quick evaluation of isCall"),
+            "{}",
+            app.codeql.history[0]
+        );
+        let requests: Vec<serde_json::Value> =
+            std::fs::read_to_string(bin.path().join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(requests[0]["method"], "evaluation/registerDatabases");
+        assert_eq!(requests[1]["method"], "evaluation/runQuery");
+        let body = &requests[1]["params"]["body"];
+        assert_eq!(body["queryPath"], query.display().to_string());
+        assert_eq!(
+            body["target"]["quickEval"]["quickEvalPos"],
+            serde_json::json!({"fileName": query.display().to_string(), "line": 3, "column": 11, "endLine": 3, "endColumn": 16})
+        );
+        assert!(body["target"]["quickEval"].get("countOnly").is_none());
+
+        // The count variant says so, in the request and the history.
+        app.editor.open(&query).unwrap();
+        app.editor.cursor_row = 2;
+        app.editor.cursor_col = 13;
+        app.run_command(Command::CodeqlQuickEvalCount);
+        wait_for_codeql(&mut app);
+        assert!(app.codeql.history[0].contains("Quick evaluation count of isCall"));
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(bin.path().join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            last["params"]["body"]["target"]["quickEval"]["countOnly"],
+            true
+        );
+
+        // The server's refusal is the run's reason.
+        std::fs::write(
+            bin.path().join("result.json"),
+            r#"{"resultType": 2, "message": "ERROR: The selection is not a valid quick-eval target. (q.ql:1,1-6)\n", "evaluationTime": -1}"#,
+        )
+        .unwrap();
+        app.editor.open(&query).unwrap();
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 2;
+        app.run_command(Command::CodeqlQuickEval);
+        wait_for_codeql(&mut app);
+        assert!(
+            app.status.ends_with(
+                "failed: ERROR: The selection is not a valid quick-eval target. (q.ql:1,1-6)"
+            ),
+            "{}",
+            app.status
+        );
+
+        // Unsaved edits, and nothing under the cursor, are refused first.
+        app.editor.open(&query).unwrap();
+        app.editor.cursor_row = 1;
+        app.editor.cursor_col = 0;
+        app.run_command(Command::CodeqlQuickEval);
+        assert_eq!(
+            app.status,
+            "Put the cursor on a predicate, or select an expression"
+        );
+        app.editor.dirty = true;
+        app.run_command(Command::CodeqlQuickEval);
+        assert!(
+            app.status.starts_with("Save the query first"),
+            "{}",
+            app.status
+        );
+    });
+}
+
+/// #578's quick evaluation against the real CLI's query server: a
+/// predicate's tuples, and their count.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the CodeQL CLI and codeql/python-all; set CROFT_TEST_CODEQL"]
+fn quick_evaluation_against_a_real_query_server() {
+    use crate::widgets::command_palette::Command;
+    let codeql = std::path::PathBuf::from(std::env::var("CROFT_TEST_CODEQL").unwrap());
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("app.py"),
+            "def run(cmd):\n    print(cmd)\n\nrun(input())\n",
+        )
+        .unwrap();
+        let db = tmp.path().join("db");
+        let made = std::process::Command::new(&codeql)
+            .args(["database", "create", "--language=python", "--source-root"])
+            .arg(&src)
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        crate::codeql_db::DatabaseStore {
+            databases: vec![crate::codeql_db::DbEntry {
+                name: String::from("py"),
+                path: db,
+                language: Some(String::from("python")),
+                added: 0,
+                former_names: Vec::new(),
+            }],
+            current: Some(0),
+            sort_by: None,
+        }
+        .save(&App::codeql_db_store_path())
+        .unwrap();
+        let pack = tmp.path().join("q");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("qlpack.yml"),
+            "name: me/q\nversion: 0.0.1\ndependencies:\n  codeql/python-all: \"*\"\n",
+        )
+        .unwrap();
+        let installed = std::process::Command::new(&codeql)
+            .args(["pack", "install"])
+            .arg(&pack)
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let query = pack.join("Quick.ql");
+        std::fs::write(
+            &query,
+            "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
+        )
+        .unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.codeql_program = codeql;
+        let run = |app: &mut App, command: Command| {
+            app.editor.open(&query).unwrap();
+            app.editor.cursor_row = 2;
+            app.editor.cursor_col = 13;
+            app.run_command(command);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+            while app.codeql_run.is_some() {
+                app.drain_codeql_run();
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(app.status.contains("finished"), "{}", app.status);
+            std::fs::read_to_string(app.editor.path.as_ref().unwrap()).unwrap()
+        };
+        let tuples = run(&mut app, Command::CodeqlQuickEval);
+        assert_eq!(
+            tuples.lines().count(),
+            4,
+            "a header and three calls: {tuples}"
+        );
+        let counts = run(&mut app, Command::CodeqlQuickEvalCount);
+        assert!(counts.contains("\"Total tuples\",3"), "{counts}");
+    });
+}
+
 /// #578's AST Viewer against the real CLI: build a Python database, read
 /// the AST of its source file, and find the function in it. Needs a
 /// `codeql` with the codeql/python-all pack downloaded; set

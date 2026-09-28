@@ -17,6 +17,7 @@ mod codeql_cfg;
 mod codeql_cli;
 mod codeql_db;
 mod codeql_evallog;
+mod codeql_qs;
 mod codeql_query;
 mod codeql_submit;
 mod codeql_variant;
