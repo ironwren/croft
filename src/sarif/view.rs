@@ -880,7 +880,6 @@ impl SarifView {
         true
     }
 
-    /// Close log `index`. The last log stays: closing it is closing the tab.
     /// The results that are not problems: `pass`, `notApplicable` and
     /// `informational` (§3.27.9). `K` hides or shows them together.
     pub const NON_PROBLEM_KINDS: [Kind; 3] = [Kind::Pass, Kind::NotApplicable, Kind::Informational];
@@ -916,6 +915,7 @@ impl SarifView {
         closed
     }
 
+    /// Close log `index`. The last log stays: closing it is closing the tab.
     pub fn remove_log(&mut self, index: usize) -> bool {
         if self.logs.len() <= 1 || index >= self.logs.len() {
             return false;
