@@ -26457,8 +26457,13 @@ impl App {
             InputPurpose::CodeqlRunOnDatabases { query },
             format!("Run {name} on Databases"),
             format!(
-                "names separated by commas, or * for all: {}",
-                names.join(", ")
+                "names or #numbers separated by commas, or * for all: {}",
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| format!("#{} {n}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         ));
     }

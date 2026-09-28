@@ -312,40 +312,66 @@ pub fn parse_pack_list(input: &str) -> Vec<String> {
 }
 
 /// The databases "Run Query on Multiple Databases" runs on, from what the
-/// user typed: `*` for all of `names`, else names separated by commas, each
-/// matched exactly. Indices into `names`, in the order typed, once each.
+/// user typed: `*` for all of `names`, else a comma-separated list where
+/// each item is `#N` (the Nth database, 1-based: the one key that is never
+/// ambiguous) or a name matched exactly. Indices into `names`, in the order
+/// typed, once each. A name several databases share is refused, and so is
+/// input that reads both as one name holding commas and as a list of other
+/// names, rather than silently picking one reading.
 pub fn parse_database_selection(input: &str, names: &[String]) -> Result<Vec<usize>, String> {
-    if input.trim() == "*" {
+    let input = input.trim();
+    if input == "*" {
         return Ok((0..names.len()).collect());
     }
-    // A name matching more than one database cannot say which it means.
-    let only = |name: &str| -> Result<Option<usize>, String> {
-        let mut hits = names.iter().enumerate().filter(|(_, n)| n.as_str() == name);
+    let one = |item: &str| -> Result<Option<usize>, String> {
+        if let Some(n) = item.strip_prefix('#') {
+            return match n.trim().parse::<usize>() {
+                Ok(n) if (1..=names.len()).contains(&n) => Ok(Some(n - 1)),
+                _ => Err(format!("There is no CodeQL database {item}")),
+            };
+        }
+        let mut hits = names.iter().enumerate().filter(|(_, n)| n.as_str() == item);
         match (hits.next(), hits.next()) {
             (Some((i, _)), None) => Ok(Some(i)),
             (Some(_), Some(_)) => Err(format!(
-                "Several CodeQL databases are called {name}; rename one to pick it"
+                "Several CodeQL databases are called {item}; pick one by its #number"
             )),
             _ => Ok(None),
         }
     };
-    // The whole input first, so a name holding a comma can still be picked.
-    if let Some(i) = only(input.trim())? {
-        return Ok(vec![i]);
-    }
+    // The whole input as one name holding commas (never a `#N` key).
+    let whole = if input.contains(',') && !input.starts_with('#') {
+        one(input)?
+    } else {
+        None
+    };
     let mut picked = Vec::new();
-    for name in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let Some(i) = only(name)? else {
-            return Err(format!("There is no CodeQL database called {name}"));
-        };
-        if !picked.contains(&i) {
-            picked.push(i);
+    let mut missing = None;
+    for item in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match one(item) {
+            Ok(Some(i)) => {
+                if !picked.contains(&i) {
+                    picked.push(i);
+                }
+            }
+            Ok(None) => {
+                missing.get_or_insert_with(|| item.to_string());
+            }
+            Err(e) if whole.is_none() => return Err(e),
+            Err(_) => missing = Some(String::new()),
         }
     }
-    if picked.is_empty() {
-        return Err(String::from("Name at least one database, or * for all"));
+    match (whole, missing) {
+        (Some(_), None) => Err(format!(
+            "\"{input}\" is both one database's name and a list of others; pick by #number"
+        )),
+        (Some(i), Some(_)) => Ok(vec![i]),
+        (None, Some(item)) => Err(format!("There is no CodeQL database called {item}")),
+        (None, None) if picked.is_empty() => {
+            Err(String::from("Name at least one database, or * for all"))
+        }
+        (None, None) => Ok(picked),
     }
-    Ok(picked)
 }
 
 /// The pack file and query of VS Code's "CodeQL: Quick Query" for the
@@ -1082,7 +1108,8 @@ mod tests {
             parse_database_selection(" , ", &names),
             Err(String::from("Name at least one database, or * for all"))
         );
-        // A name with a comma is picked whole; a shared name is refused.
+        // A name with a comma is picked whole; a shared name is refused and
+        // `#N` picks any one database unambiguously.
         let names = vec![
             String::from("a, b"),
             String::from("twin"),
@@ -1092,9 +1119,24 @@ mod tests {
         assert_eq!(
             parse_database_selection("twin", &names),
             Err(String::from(
-                "Several CodeQL databases are called twin; rename one to pick it"
+                "Several CodeQL databases are called twin; pick one by its #number"
             ))
         );
+        assert_eq!(parse_database_selection("#3, #1", &names), Ok(vec![2, 0]));
+        assert_eq!(
+            parse_database_selection("#4", &names),
+            Err(String::from("There is no CodeQL database #4"))
+        );
+        // Both readings possible: refused, never silently one of them.
+        let names = vec![String::from("a"), String::from("b"), String::from("a, b")];
+        assert_eq!(
+            parse_database_selection("a, b", &names),
+            Err(String::from(
+                "\"a, b\" is both one database's name and a list of others; pick by #number"
+            ))
+        );
+        assert_eq!(parse_database_selection("#1, #2", &names), Ok(vec![0, 1]));
+        assert_eq!(parse_database_selection("#3", &names), Ok(vec![2]));
     }
 
     #[test]

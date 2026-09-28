@@ -56465,7 +56465,7 @@ fn a_codeql_query_runs_on_each_named_database_with_its_own_history_entry() {
             app.run_command(Command::CodeqlRunQueryOnMultipleDatabases);
             let prompt = app.input_prompt.as_mut().expect("the prompt opens");
             assert!(
-                prompt.placeholder.ends_with("* for all: app, lib"),
+                prompt.placeholder.ends_with("* for all: #1 app, #2 lib"),
                 "{}",
                 prompt.placeholder
             );
