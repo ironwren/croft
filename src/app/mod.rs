@@ -57732,7 +57732,7 @@ impl App {
                         InputPurpose::SarifColumns,
                         String::from("SARIF Columns"),
                         String::from(
-                            "rule, level, kind, baseline, suppression, tool (empty for none)",
+                            "rule, level, kind, baseline, suppression, tool, rank (empty for none)",
                         ),
                     )
                     .with_value(current),
