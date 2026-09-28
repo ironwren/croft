@@ -2074,13 +2074,15 @@ struct ServerRestarts {
     /// Keys whose servers used up [`MAX_RESTARTS`]: left down until the
     /// workspace re-roots or croft restarts, so a crash loop cannot spin.
     gave_up: std::collections::HashSet<ClientKey>,
-    /// Keys whose restart brought back only some of their servers. The next
-    /// pass restarts them as a set again: a non-empty list is never re-probed,
-    /// and a lone missing server cannot be added to documents the others hold.
-    incomplete: std::collections::HashSet<ClientKey>,
+    /// Keys whose restart lost a server that ran before it, with the names
+    /// of the servers that ran. The next pass restarts them as a set again: a
+    /// non-empty list is never re-probed, and a lone missing server cannot be
+    /// added to documents the others hold.
+    incomplete: HashMap<ClientKey, Vec<String>>,
     /// Set by [`WorkerState::restart_dead_servers`] for the respawn it has
-    /// already counted, so `ensure_clients` does not count it again.
-    prepaid: bool,
+    /// already counted, so `ensure_clients` does not count it again: the
+    /// servers that ran before it, which the respawn must bring back.
+    respawn: Option<Vec<String>>,
     /// Raised after a restart; the app polls it to re-open its tabs.
     restarted: Arc<AtomicBool>,
 }
@@ -2637,7 +2639,7 @@ impl WorkerState {
             .iter()
             .filter(|(key, clients)| {
                 !self.restarts.gave_up.contains(*key)
-                    && (self.restarts.incomplete.contains(*key)
+                    && (self.restarts.incomplete.contains_key(*key)
                         || clients.iter().any(|managed| {
                             // A client in use is not a dead one; skip it rather
                             // than wait on the lock.
@@ -2654,6 +2656,14 @@ impl WorkerState {
                 continue;
             };
             let names: Vec<&str> = clients.iter().map(|c| c.name.as_str()).collect();
+            // A server that never came up is not one the restart lost; a set
+            // still short from the last restart keeps what it is missing.
+            let expected = self
+                .restarts
+                .incomplete
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| names.iter().map(|n| n.to_string()).collect());
             if !self.restarts.try_restart(&key, std::time::Instant::now()) {
                 let msg = format!(
                     "{} stopped {MAX_RESTARTS} times in 10 minutes; leaving it off until croft restarts or the workspace reopens",
@@ -2690,7 +2700,7 @@ impl WorkerState {
             // Respawn as a re-probe, not a first attempt, so a set that comes
             // back short is marked incomplete and tried again.
             self.clients.insert(key.clone(), Vec::new());
-            self.restarts.prepaid = true;
+            self.restarts.respawn = Some(expected);
             self.ensure_clients(key.0, &key.1).await;
             self.restarts.restarted.store(true, Ordering::Relaxed);
         }
@@ -2710,7 +2720,8 @@ impl WorkerState {
                 .clients
                 .get(&key)
                 .is_some_and(|clients| clients.is_empty());
-        let prepaid = std::mem::take(&mut self.restarts.prepaid);
+        let respawn = self.restarts.respawn.take();
+        let prepaid = respawn.is_some();
         let mut should_try = !self.restarts.gave_up.contains(&key) && (first_attempt || empty);
         // An empty list left by a restart whose respawn failed is re-probed
         // by every request. Each re-probe is another restart and spends the
@@ -2741,7 +2752,6 @@ impl WorkerState {
                 .iter()
                 .filter_map(|config| resolve_config(config, first_attempt))
                 .collect();
-            let wanted = resolved.len();
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -2968,12 +2978,21 @@ impl WorkerState {
             if !first_attempt && !spawned.is_empty() {
                 self.restarts.restarted.store(true, Ordering::Relaxed);
             }
-            // A restart that brought back only some servers is retried as a
-            // set by the next `restart_dead_servers` pass.
-            if !first_attempt && !spawned.is_empty() && spawned.len() < wanted {
-                self.restarts.incomplete.insert(key.clone());
-            } else {
-                self.restarts.incomplete.remove(&key);
+            // A restart that lost a server which ran before it is retried as
+            // a set by the next `restart_dead_servers` pass. One that never
+            // came up is not a reason to restart the others.
+            match respawn {
+                Some(expected)
+                    if !spawned.is_empty()
+                        && expected
+                            .iter()
+                            .any(|name| !spawned.iter().any(|c| &c.name == name)) =>
+                {
+                    self.restarts.incomplete.insert(key.clone(), expected);
+                }
+                _ => {
+                    self.restarts.incomplete.remove(&key);
+                }
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -9401,33 +9420,93 @@ while True:
         );
         handle.block_on(state.shutdown_all());
 
-        // A restart that brings back only some of a key's servers is tried
-        // again as a set, not left short a server until croft restarts.
-        let broken = root.join("broken_lsp.py");
-        std::fs::write(&broken, "import sys\nsys.exit(1)\n").expect("write broken server");
+        // A restart that loses a server which ran before it is tried again as
+        // a set, not left short a server until croft restarts. The flaky
+        // server runs until its flag file exists, then fails at launch.
+        let flag = root.join("flaky.off");
+        let flaky = root.join("flaky_lsp.py");
+        std::fs::write(
+            &flaky,
+            format!(
+                "import os, sys\nif os.path.exists({:?}): sys.exit(1)\n{}",
+                flag.display().to_string(),
+                std::fs::read_to_string(&script).expect("read fake server")
+            ),
+        )
+        .expect("write flaky server");
         state.registry.register(
             Language::PYTHON,
             ServerConfig {
-                name: "fake-broken",
+                name: "fake-flaky",
                 command: python.display().to_string(),
-                args: vec![broken.display().to_string()],
+                args: vec![
+                    flaky.display().to_string(),
+                    log.display().to_string(),
+                    pids.display().to_string(),
+                ],
                 language: Language::PYTHON,
                 initialization_options: None,
                 provision: None,
             },
         );
+        let kill_one = |state: &WorkerState, pid: i32| {
+            // SAFETY: plain kill(2) on a pid this test's server wrote.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.clients[&key]
+                .iter()
+                .any(|m| m.client.try_lock().is_ok_and(|c| c.has_exited()))
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the client never noticed the kill"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // A server that never came up is not one a restart lost: the others
+        // are restarted once for their own crash, and then left alone.
+        std::fs::write(&flag, "").expect("write flag");
         state.restarts.attempts.clear();
-        state.clients.insert(key.clone(), Vec::new());
+        state.clients.remove(&key);
         handle.block_on(state.ensure_clients(key.0, &key.1));
-        assert_eq!(started(4).len(), 4);
+        let pid = *started(4).last().expect("recorder pid");
         assert_eq!(state.clients[&key].len(), 1, "only the recorder came up");
-        assert!(state.restarts.incomplete.contains(&key));
+        kill_one(&state, pid);
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(5).len(), 5);
+        assert!(
+            !state.restarts.incomplete.contains_key(&key),
+            "a server that never ran must not make the set incomplete"
+        );
+        handle.block_on(state.restart_dead_servers());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started(0).len(), 5, "a live set is not restarted again");
+        handle.block_on(state.shutdown_all());
+
+        // Both run; one crashes and the flaky one does not come back.
+        std::fs::remove_file(&flag).expect("remove flag");
+        state.restarts.attempts.clear();
+        state.clients.remove(&key);
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        let pid = *started(7).last().expect("server pid");
+        assert_eq!(state.clients[&key].len(), 2, "both servers came up");
+        assert!(!state.restarts.incomplete.contains_key(&key));
+        std::fs::write(&flag, "").expect("write flag");
+        kill_one(&state, pid);
         restarted.store(false, Ordering::Relaxed);
         handle.block_on(state.restart_dead_servers());
-        assert_eq!(started(5).len(), 5, "a short set must be restarted");
+        assert_eq!(started(8).len(), 8);
+        assert_eq!(state.clients[&key].len(), 1, "only the recorder came back");
         assert!(restarted.load(Ordering::Relaxed));
+        assert!(state.restarts.incomplete.contains_key(&key));
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(9).len(), 9, "a short set must be restarted");
         assert!(
-            state.restarts.incomplete.contains(&key),
+            state.restarts.incomplete.contains_key(&key),
             "a restart that comes back short again must stay marked"
         );
 
