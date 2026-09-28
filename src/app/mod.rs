@@ -26479,6 +26479,19 @@ impl App {
     /// run` into a table decoded as CSV. The run happens on a worker
     /// thread; [`Self::drain_codeql_run`] collects it.
     fn run_codeql_file(&mut self, query: PathBuf, source: &str, db: Option<&Path>) {
+        self.run_codeql_file_with(query, source, db, None);
+    }
+
+    /// [`Self::run_codeql_file`], or with `quick` a quick evaluation of a
+    /// span of `query` through the CLI's query server (#578), recorded in
+    /// the history like any run and decoded to a table.
+    fn run_codeql_file_with(
+        &mut self,
+        query: PathBuf,
+        source: &str,
+        db: Option<&Path>,
+        quick: Option<crate::codeql_qs::QuickEval>,
+    ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
@@ -26522,7 +26535,10 @@ impl App {
             n += 1;
             dir = PathBuf::from(format!("{}-{n}", base.display()));
         }
-        let kind = cq::output_of(&query, source);
+        let kind = match quick {
+            Some(_) => Output::Table,
+            None => cq::output_of(&query, source),
+        };
         let output = dir.join(match kind {
             Output::Sarif => "results.sarif",
             Output::Table => "results.csv",
@@ -26547,15 +26563,20 @@ impl App {
             seconds: 0,
             status: RunStatus::Running,
             output: output.clone(),
-            name: None,
+            name: quick.as_ref().map(|q| q.title()),
             results: None,
         });
         let _ = history.save(&Self::codeql_history_path());
         self.refresh_codeql_history();
-        let name = query
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = match &quick {
+            Some(q) => q.title(),
+            None => query
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        // Where the query server looks for the workspace's own packs.
+        let packs: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // A fresh flag per run, so a late cancel never stops the next one.
@@ -26565,13 +26586,20 @@ impl App {
             let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))
-                .and_then(|()| match kind {
-                    Output::Sarif if cq::is_suite(&query) => {
+                .and_then(|()| match (quick, kind) {
+                    (Some(q), _) => {
+                        let bqrs = dir.join("results.bqrs");
+                        crate::codeql_qs::run_quick_eval(
+                            &program, &db.path, &query, &bqrs, &packs, q.span, q.count, &cancel,
+                        )
+                        .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
+                    }
+                    (None, Output::Sarif) if cq::is_suite(&query) => {
                         Self::check_codeql_suite(&program, &query)
                             .and_then(|()| run(cq::analyze_args(&query, &db.path, &output)))
                     }
-                    Output::Sarif => run(cq::analyze_args(&query, &db.path, &output)),
-                    Output::Table => {
+                    (None, Output::Sarif) => run(cq::analyze_args(&query, &db.path, &output)),
+                    (None, Output::Table) => {
                         let bqrs = dir.join("results.bqrs");
                         run(cq::run_args(&query, &db.path, &bqrs))
                             .and_then(|()| Self::codeql_decode_sets(&program, &bqrs, &output, &run))
@@ -26611,6 +26639,42 @@ impl App {
             "the suite selects queries that are not alert queries ({}); run those on their own",
             tables.join(", ")
         ))
+    }
+
+    /// CodeQL: Quick Evaluation, and its count variant (#578): evaluate the
+    /// predicate under the cursor, or the selected expression, of the open
+    /// query on the current database, through the CLI's query server.
+    fn quick_eval_codeql(&mut self, count: bool) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to quick-evaluate part of it");
+            return;
+        };
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let selection = self.editor.selection.map(|s| s.normalised());
+        let Some((span, label)) = crate::codeql_qs::span_at(
+            &self.editor.lines,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+            selection,
+        ) else {
+            self.status = String::from("Put the cursor on a predicate, or select an expression");
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        self.run_codeql_file_with(
+            query,
+            &source,
+            None,
+            Some(crate::codeql_qs::QuickEval { span, count, label }),
+        );
     }
 
     /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
@@ -47177,6 +47241,8 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
+            Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
             Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
             Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
