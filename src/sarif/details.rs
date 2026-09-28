@@ -70,8 +70,14 @@ pub struct Details {
     pub description: String,
     /// `help` (markdown when present).
     pub help: String,
+    /// Whether `description` and `help` are the markdown forms.
+    pub description_markdown: bool,
+    pub help_markdown: bool,
     /// The message split into text and links.
     pub message: Vec<Segment>,
+    /// The message's markdown form (§3.11.4), when the log gives one; the
+    /// Info tab shows it in place of the text.
+    pub message_markdown: Option<String>,
     pub level: Level,
     pub kind: Kind,
     pub baseline: BaselineState,
@@ -167,13 +173,17 @@ pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
     let component = sem::rule_component(run, result);
     let text = sem::message_text(&result.message, rule, Some(component));
     let pick = |m: &Option<crate::sarif::model::MultiformatMessageString>| {
-        m.as_ref()
-            .map(|m| m.markdown.clone().unwrap_or_else(|| m.text.clone()))
+        m.as_ref().map(|m| match &m.markdown {
+            Some(md) => (md.clone(), true),
+            None => (m.text.clone(), false),
+        })
     };
-    let description = rule
+    let (description, description_markdown) = rule
         .and_then(|r| pick(&r.full_description).or_else(|| pick(&r.short_description)))
         .unwrap_or_default();
-    let help = rule.and_then(|r| pick(&r.help)).unwrap_or_default();
+    let (help, help_markdown) = rule.and_then(|r| pick(&r.help)).unwrap_or_default();
+    let markdown = sem::message_markdown(&result.message, rule, Some(component));
+    let message_markdown = (markdown != text).then_some(markdown);
     let justification = result.suppressions.iter().flatten().find_map(|s| {
         s.justification
             .as_deref()
@@ -274,7 +284,10 @@ pub fn details(run: &Run, result: &SarifResult, roots: &[PathBuf]) -> Details {
         help_uri: rule.and_then(|r| r.help_uri.clone()),
         description,
         help,
+        description_markdown,
+        help_markdown,
         message: sem::segments(&text),
+        message_markdown,
         level: sem::effective_level(result, rule),
         kind: sem::result_kind(result),
         baseline: sem::baseline_state(result),
@@ -483,6 +496,23 @@ mod tests {
         assert_eq!(d.description, "Building a query from **user input**.");
         assert_eq!(d.help, "Use `?` parameters.");
         assert_eq!(d.help_uri.as_deref(), Some("https://codeql.github.com/sql"));
+        assert!(d.description_markdown && d.help_markdown);
+        // The message has no markdown form: the Info tab shows its text.
+        assert_eq!(d.message_markdown, None);
+    }
+
+    #[test]
+    fn a_markdown_message_is_kept_for_the_info_tab_with_its_arguments() {
+        let log = parse_log(
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"t","rules":[{"id":"R","shortDescription":{"text":"plain"}}]}},
+            "results":[{"ruleId":"R","message":{"text":"'{0}' is unused.","markdown":"`{0}` is **unused**.","arguments":["x"]}}]}]}"#,
+        )
+        .unwrap();
+        let run = &log.runs[0];
+        let d = details(run, &run.results.as_ref().unwrap()[0], &[]);
+        assert_eq!(d.message_markdown.as_deref(), Some("`x` is **unused**."));
+        assert_eq!(d.message, vec![Segment::Text("'x' is unused.".into())]);
+        assert!(!d.description_markdown);
     }
 
     #[test]
