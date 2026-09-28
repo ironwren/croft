@@ -57101,6 +57101,65 @@ fn a_variant_runs_repository_list_is_copied_and_its_logs_opened() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn a_running_codeql_query_shows_in_the_status_bar_and_a_click_cancels_it() {
+    // #578: progress and cancellation in the status bar. The run is killed
+    // mid-flight and recorded as cancelled, not failed.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.run_command(Command::CodeqlCancelRunningQuery);
+        assert_eq!(app.status, "No CodeQL query is running");
+
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replace("exit 0", "exec sleep 30"),
+        )
+        .unwrap();
+        app.run_command(Command::CodeqlRunQuery);
+        let started = std::time::Instant::now();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("CodeQL q.ql 0:0"), "{screen}");
+        let chip = app.status_codeql_rect;
+        assert!(chip.width > 0, "the chip is a click target");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x + 1,
+            row: chip.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.status.starts_with("Cancelling"), "{}", app.status);
+        wait_for_codeql(&mut app);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "killed, not waited out"
+        );
+        assert_eq!(app.status, "q.ql cancelled");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(
+            history.entries[0].status,
+            crate::codeql_query::RunStatus::Cancelled
+        );
+        assert!(
+            app.codeql.history[0].ends_with("cancelled"),
+            "{}",
+            app.codeql.history[0]
+        );
+        term.draw(|f| app.render(f)).unwrap();
+        assert!(!screen_text(&term).contains("CodeQL q.ql"), "the chip goes");
+        assert_eq!(app.status_codeql_rect, ratatui::layout::Rect::default());
+    });
+}
+
 #[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
