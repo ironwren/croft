@@ -2074,6 +2074,10 @@ struct ServerRestarts {
     /// Keys whose servers used up [`MAX_RESTARTS`]: left down until the
     /// workspace re-roots or croft restarts, so a crash loop cannot spin.
     gave_up: std::collections::HashSet<ClientKey>,
+    /// Keys whose restart brought back only some of their servers. The next
+    /// pass restarts them as a set again: a non-empty list is never re-probed,
+    /// and a lone missing server cannot be added to documents the others hold.
+    incomplete: std::collections::HashSet<ClientKey>,
     /// Raised after a restart; the app polls it to re-open its tabs.
     restarted: Arc<AtomicBool>,
 }
@@ -2630,14 +2634,15 @@ impl WorkerState {
             .iter()
             .filter(|(key, clients)| {
                 !self.restarts.gave_up.contains(*key)
-                    && clients.iter().any(|managed| {
-                        // A client in use is not a dead one; skip it rather
-                        // than wait on the lock.
-                        managed
-                            .client
-                            .try_lock()
-                            .is_ok_and(|client| client.has_exited())
-                    })
+                    && (self.restarts.incomplete.contains(*key)
+                        || clients.iter().any(|managed| {
+                            // A client in use is not a dead one; skip it rather
+                            // than wait on the lock.
+                            managed
+                                .client
+                                .try_lock()
+                                .is_ok_and(|client| client.has_exited())
+                        }))
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -2659,6 +2664,7 @@ impl WorkerState {
                     .into_iter()
                     .filter(|m| m.client.try_lock().map_or(true, |c| !c.has_exited()))
                     .collect();
+                self.restarts.incomplete.remove(&key);
                 self.clients.insert(key, alive);
                 continue;
             }
@@ -2710,6 +2716,7 @@ impl WorkerState {
                 .iter()
                 .filter_map(|config| resolve_config(config, first_attempt))
                 .collect();
+            let wanted = resolved.len();
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -2935,6 +2942,13 @@ impl WorkerState {
             // servers have none of them (#694).
             if !first_attempt && !spawned.is_empty() {
                 self.restarts.restarted.store(true, Ordering::Relaxed);
+            }
+            // A restart that brought back only some servers is retried as a
+            // set by the next `restart_dead_servers` pass.
+            if !first_attempt && !spawned.is_empty() && spawned.len() < wanted {
+                self.restarts.incomplete.insert(key.clone());
+            } else {
+                self.restarts.incomplete.remove(&key);
             }
             self.clients.insert(key.clone(), spawned);
         }
@@ -9360,6 +9374,32 @@ while True:
             restarted.load(Ordering::Relaxed),
             "a recovered empty list must make the app re-open its tabs"
         );
+        handle.block_on(state.shutdown_all());
+
+        // A restart that brings back only some of a key's servers is tried
+        // again as a set, not left short a server until croft restarts.
+        let broken = root.join("broken_lsp.py");
+        std::fs::write(&broken, "import sys\nsys.exit(1)\n").expect("write broken server");
+        state.registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-broken",
+                command: python.display().to_string(),
+                args: vec![broken.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        state.clients.insert(key.clone(), Vec::new());
+        handle.block_on(state.ensure_clients(key.0, &key.1));
+        assert_eq!(started(4).len(), 4);
+        assert_eq!(state.clients[&key].len(), 1, "only the recorder came up");
+        assert!(state.restarts.incomplete.contains(&key));
+        restarted.store(false, Ordering::Relaxed);
+        handle.block_on(state.restart_dead_servers());
+        assert_eq!(started(5).len(), 5, "a short set must be restarted");
+        assert!(restarted.load(Ordering::Relaxed));
         handle.block_on(state.shutdown_all());
     }
 
