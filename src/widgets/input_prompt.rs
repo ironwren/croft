@@ -95,6 +95,10 @@ pub enum InputPurpose {
     CodeqlAddVariantOwner,
     /// The CodeQL packs to download from the registry (#578).
     CodeqlDownloadPacks,
+    /// The databases to run `query` on, by name, or `*` for all (#578).
+    CodeqlRunOnDatabases {
+        query: PathBuf,
+    },
     /// A GitHub Code Search query whose repositories go into the variant
     /// analysis list called `list` (#578).
     CodeqlVariantCodeSearch {

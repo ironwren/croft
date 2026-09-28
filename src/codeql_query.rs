@@ -262,6 +262,28 @@ pub fn parse_pack_list(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// The databases "Run Query on Multiple Databases" runs on, from what the
+/// user typed: `*` for all of `names`, else names separated by commas, each
+/// matched exactly. Indices into `names`, in the order typed, once each.
+pub fn parse_database_selection(input: &str, names: &[String]) -> Result<Vec<usize>, String> {
+    if input.trim() == "*" {
+        return Ok((0..names.len()).collect());
+    }
+    let mut picked = Vec::new();
+    for name in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(i) = names.iter().position(|n| n == name) else {
+            return Err(format!("There is no CodeQL database called {name}"));
+        };
+        if !picked.contains(&i) {
+            picked.push(i);
+        }
+    }
+    if picked.is_empty() {
+        return Err(String::from("Name at least one database, or * for all"));
+    }
+    Ok(picked)
+}
+
 /// The pack file and query of VS Code's "CodeQL: Quick Query" for the
 /// library `module` (see [`language_module`]): a throwaway pack depending on
 /// `codeql/<module>-all`, and a query importing it that selects nothing yet.
@@ -950,6 +972,28 @@ mod tests {
             ]
         );
         assert!(parse_pack_list("  , ").is_empty());
+    }
+
+    #[test]
+    fn databases_are_picked_by_name_or_all_with_a_star() {
+        let names = vec![
+            String::from("app"),
+            String::from("lib one"),
+            String::from("cli"),
+        ];
+        assert_eq!(parse_database_selection(" * ", &names), Ok(vec![0, 1, 2]));
+        assert_eq!(
+            parse_database_selection("cli, lib one,,cli", &names),
+            Ok(vec![2, 1])
+        );
+        assert_eq!(
+            parse_database_selection("app, web", &names),
+            Err(String::from("There is no CodeQL database called web"))
+        );
+        assert_eq!(
+            parse_database_selection(" , ", &names),
+            Err(String::from("Name at least one database, or * for all"))
+        );
     }
 
     #[test]

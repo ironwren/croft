@@ -3145,8 +3145,10 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
         std::time::Instant,
     )>,
-    /// Queries "Run Queries in Pack" has yet to start, in order (#578).
-    codeql_run_queue: std::collections::VecDeque<PathBuf>,
+    /// Queries "Run Queries in Pack" and "Run Query on Multiple Databases"
+    /// have yet to start, in order, each with the database it runs on: the
+    /// current one when `None` (#578).
+    codeql_run_queue: std::collections::VecDeque<(PathBuf, Option<PathBuf>)>,
     /// How many queries the pack run holds and how many have failed so
     /// far, for the status line; the total is 0 when no pack run is on.
     codeql_batch: (usize, usize),
@@ -23370,7 +23372,7 @@ impl App {
                 // A side-bar row runs the file as saved, as VS Code's
                 // Queries view does.
                 match std::fs::read_to_string(&path) {
-                    Ok(source) => self.run_codeql_file(path, &source),
+                    Ok(source) => self.run_codeql_file(path, &source, None),
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
@@ -26016,7 +26018,7 @@ impl App {
             }
         };
         let source = self.editor.lines.join("\n");
-        self.run_codeql_file(query, &source);
+        self.run_codeql_file(query, &source, None);
     }
 
     /// VS Code's "CodeQL: Run Query Suite" (#578): the open `.qls` suite on
@@ -26034,12 +26036,12 @@ impl App {
         self.run_codeql_query();
     }
 
-    /// Run `query`, whose text is `source`, on the current database (#578):
-    /// alerts, and every query of a `.qls` suite, through `database
-    /// analyze` into SARIF, anything else through `query run` into a table
-    /// decoded as CSV. The run happens on a worker thread;
-    /// [`Self::drain_codeql_run`] collects it.
-    fn run_codeql_file(&mut self, query: PathBuf, source: &str) {
+    /// Run `query`, whose text is `source`, on the database at `db`, else
+    /// the current one (#578): alerts, and every query of a `.qls` suite,
+    /// through `database analyze` into SARIF, anything else through `query
+    /// run` into a table decoded as CSV. The run happens on a worker
+    /// thread; [`Self::drain_codeql_run`] collects it.
+    fn run_codeql_file(&mut self, query: PathBuf, source: &str, db: Option<&Path>) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
         if self.codeql_run.is_some() {
             self.status = String::from("A CodeQL query is already running");
@@ -26050,9 +26052,21 @@ impl App {
             return;
         }
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
-        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
-            self.status = String::from("Add a CodeQL database and select it first");
-            return;
+        let db = match db {
+            Some(path) => {
+                let Some(db) = store.databases.iter().find(|d| d.path == path).cloned() else {
+                    self.status = format!("{} is no longer a CodeQL database here", path.display());
+                    return;
+                };
+                db
+            }
+            None => {
+                let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+                    self.status = String::from("Add a CodeQL database and select it first");
+                    return;
+                };
+                db
+            }
         };
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -26221,7 +26235,66 @@ impl App {
             return;
         }
         self.codeql_batch = (queries.len(), 0);
-        self.codeql_run_queue = queries.into();
+        self.codeql_run_queue = queries.into_iter().map(|q| (q, None)).collect();
+        self.start_next_queued_codeql();
+    }
+
+    /// VS Code's "CodeQL: Run Query on Multiple Databases" (#578): ask
+    /// which databases the open query or suite runs on.
+    fn prompt_run_codeql_on_databases(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let query = match self.editor.path.clone() {
+            Some(p) if p.extension().is_some_and(|e| e == "ql" || e == "qls") => p,
+            _ => {
+                self.status = String::from("Open a .ql query or .qls suite to run it");
+                return;
+            }
+        };
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        if store.databases.is_empty() {
+            self.status = String::from("Add a CodeQL database first");
+            return;
+        }
+        let names: Vec<&str> = store.databases.iter().map(|d| d.name.as_str()).collect();
+        let name = query
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.open_input_prompt(InputPrompt::new(
+            InputPurpose::CodeqlRunOnDatabases { query },
+            format!("Run {name} on Databases"),
+            format!(
+                "names separated by commas, or * for all: {}",
+                names.join(", ")
+            ),
+        ));
+    }
+
+    /// Queue one run of `query` per database named in `value`, each with
+    /// its own history entry, through the pack run's queue.
+    fn submit_run_codeql_on_databases(&mut self, query: &Path, value: &str) {
+        if self.codeql_run.is_some() {
+            self.status = String::from("A CodeQL query is already running");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let names: Vec<String> = store.databases.iter().map(|d| d.name.clone()).collect();
+        let picked = match crate::codeql_query::parse_database_selection(value, &names) {
+            Ok(picked) => picked,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        self.codeql_batch = (picked.len(), 0);
+        self.codeql_run_queue = picked
+            .into_iter()
+            .map(|i| (query.to_path_buf(), Some(store.databases[i].path.clone())))
+            .collect();
         self.start_next_queued_codeql();
     }
 
@@ -26232,12 +26305,13 @@ impl App {
     fn start_next_queued_codeql(&mut self) {
         let (total, _) = self.codeql_batch;
         while self.codeql_run.is_none() {
-            let Some(path) = self.codeql_run_queue.pop_front() else {
+            let Some((path, db)) = self.codeql_run_queue.pop_front() else {
                 let failed = self.codeql_batch.1;
                 self.codeql_batch = (0, 0);
+                let queries = if total == 1 { "query" } else { "queries" };
                 self.status = match failed {
-                    0 => format!("Ran {total} CodeQL queries"),
-                    n => format!("Ran {total} CodeQL queries, {n} failed"),
+                    0 => format!("Ran {total} CodeQL {queries}"),
+                    n => format!("Ran {total} CodeQL {queries}, {n} failed"),
                 };
                 return;
             };
@@ -26250,7 +26324,7 @@ impl App {
                     continue;
                 }
             };
-            self.run_codeql_file(path, &source);
+            self.run_codeql_file(path, &source, db.as_deref());
             if self.codeql_run.is_none() {
                 // Refused (the database went away meanwhile): the rest
                 // would be refused too.
@@ -30458,6 +30532,10 @@ impl App {
             InputPurpose::CodeqlExportVariantResults { index } => {
                 self.close_input_prompt();
                 self.start_export_codeql_variant_results(index, &value);
+            }
+            InputPurpose::CodeqlRunOnDatabases { query } => {
+                self.close_input_prompt();
+                self.submit_run_codeql_on_databases(&query, &value);
             }
             InputPurpose::CodeqlVariantCodeSearch { list } => {
                 self.close_input_prompt();
@@ -45885,6 +45963,7 @@ impl App {
             }
             Cmd::CodeqlPreviewQueryHelp => self.preview_codeql_query_help(),
             Cmd::CodeqlRunQuerySuite => self.run_codeql_query_suite(),
+            Cmd::CodeqlRunQueryOnMultipleDatabases => self.prompt_run_codeql_on_databases(),
             Cmd::CodeqlSetUpController => self.prompt_codeql_controller(),
             Cmd::CodeqlAddVariantRepo => self.prompt_add_codeql_variant_repo(),
             Cmd::CodeqlAddVariantList => self.prompt_add_codeql_variant_list(),

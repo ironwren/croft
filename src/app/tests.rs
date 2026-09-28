@@ -56004,6 +56004,98 @@ fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_query_runs_on_each_named_database_with_its_own_history_entry() {
+    // #578: VS Code's "CodeQL: Run Query on Multiple Databases" asks which
+    // databases, by name or `*` for all, and queues one run per database
+    // through the pack run's queue.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let lib = tmp.path().join("dbs/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mut store = crate::codeql_db::DatabaseStore::load(&App::codeql_db_store_path());
+        store.databases.push(crate::codeql_db::DbEntry {
+            name: String::from("lib"),
+            path: lib.clone(),
+            language: Some(String::from("rust")),
+            added: 0,
+            former_names: Vec::new(),
+        });
+        store.save(&App::codeql_db_store_path()).unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "col0\n1\n", 0, "");
+        let ask = |app: &mut App, typed: &str| {
+            app.run_command(Command::CodeqlRunQueryOnMultipleDatabases);
+            let prompt = app.input_prompt.as_mut().expect("the prompt opens");
+            assert!(
+                prompt.placeholder.ends_with("* for all: app, lib"),
+                "{}",
+                prompt.placeholder
+            );
+            for c in typed.chars() {
+                prompt.push_char(c);
+            }
+            app.submit_input_prompt();
+        };
+
+        ask(&mut app, "app, web");
+        assert_eq!(app.status, "There is no CodeQL database called web");
+        assert!(app.codeql_run.is_none());
+
+        ask(&mut app, "*");
+        assert!(
+            app.status
+                .starts_with("Running CodeQL queries 1/2: q.ql on app"),
+            "{}",
+            app.status
+        );
+        wait_for_codeql(&mut app);
+        assert_eq!(app.status, "Ran 2 CodeQL queries");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let mut ran: Vec<(&str, Option<&std::path::Path>)> = history
+            .entries
+            .iter()
+            .map(|e| (e.database.as_str(), e.database_path.as_deref()))
+            .collect();
+        ran.sort();
+        assert_eq!(
+            ran,
+            vec![
+                ("app", Some(tmp.path().join("dbs/app").as_path())),
+                ("lib", Some(lib.as_path())),
+            ]
+        );
+        assert!(
+            history
+                .entries
+                .iter()
+                .all(|e| e.status == crate::codeql_query::RunStatus::Succeeded)
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.contains(&format!("--database={} ", lib.display())),
+            "{calls}"
+        );
+
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        ask(&mut app, "lib");
+        wait_for_codeql(&mut app);
+        assert_eq!(app.status, "Ran 1 CodeQL query");
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        assert_eq!(history.entries.len(), 3);
+        assert_eq!(history.entries[history.newest().unwrap()].database, "lib");
+        assert_eq!(
+            Command::from_id("codeql_run_query_on_multiple_databases"),
+            Some(Command::CodeqlRunQueryOnMultipleDatabases)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
     // #578: VS Code's "CodeQL: Run Query Suite" runs the open .qls on the
     // selected database; a suite only runs through `database analyze`, so
