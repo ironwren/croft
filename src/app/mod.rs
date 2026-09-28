@@ -3186,6 +3186,8 @@ pub struct App {
     /// when the last one started (#578).
     codeql_variant_poll: Option<std::sync::mpsc::Receiver<Vec<CodeqlRunPoll>>>,
     codeql_variant_polled: Option<std::time::Instant>,
+    /// The fetch of a variant analysis's results in flight (#578).
+    codeql_variant_results: Option<std::sync::mpsc::Receiver<VariantResults>>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5464,6 +5466,7 @@ impl App {
             codeql_variant_submit: None,
             codeql_variant_poll: None,
             codeql_variant_polled: None,
+            codeql_variant_results: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -23123,7 +23126,8 @@ impl App {
     /// In the Variant Analysis Repositories section `a` adds a repository
     /// (into the selected list), `l` a list, `o` an owner, `s` adds the
     /// repositories a GitHub Code Search finds to the selected list and `g`
-    /// opens the selected repository or owner on GitHub; Enter selects what a run
+    /// opens the selected repository or owner on GitHub; on a submitted run,
+    /// Enter opens its report and `v` its results; Enter selects what a run
     /// targets, Space folds a list, F2 renames a list and Delete removes an
     /// entry, asking first for a list.
     fn handle_codeql_key(&mut self, key: KeyEvent) {
@@ -23185,6 +23189,9 @@ impl App {
                 if let Some(i) = db {
                     self.add_codeql_database_source(i);
                 }
+            }
+            KeyCode::Char('v') if self.codeql.selected_variant_run().is_some() => {
+                self.open_codeql_variant_results(self.codeql.selected_variant_run());
             }
             KeyCode::Char('v') => {
                 if let Some(i) = run {
@@ -23989,16 +23996,22 @@ impl App {
             );
             return;
         };
+        self.open_url_for_user(&url);
+    }
+
+    /// Open `url` in the user's browser: through the relay or a detected
+    /// URL on a remote session, and never from a test.
+    fn open_url_for_user(&mut self, url: &str) {
         if cfg!(test) {
             // Tests never start a browser.
             self.status = format!("Open {url}");
             return;
         }
         if self.drop_relay_active() || is_remote_session() {
-            self.open_detected_url(&url);
+            self.open_detected_url(url);
             return;
         }
-        self.status = match open_url(&url) {
+        self.status = match open_url(url) {
             Ok(()) => format!("Opened {url}"),
             Err(e) => format!("Could not open a browser ({e}): {url}"),
         };
@@ -25156,6 +25169,200 @@ impl App {
         });
         self.codeql_variant_poll = Some(rx);
         false
+    }
+
+    /// Fetch the results of remembered variant analysis `index` (the newest
+    /// when `None`) and open them (#578): each repository that succeeded
+    /// with results has its artifact downloaded (once; later opens use the
+    /// copy), its alerts gathered into one SARIF log, one run per
+    /// repository, and its tables into one CSV with a repository column.
+    /// The fetching happens on a worker thread;
+    /// [`Self::drain_codeql_variant_results`] opens what it made.
+    fn open_codeql_variant_results(&mut self, index: Option<usize>) {
+        use crate::codeql_submit as cs;
+        if self.codeql_variant_results.is_some() {
+            self.status = String::from("Variant analysis results are already being fetched");
+            return;
+        }
+        let runs = cs::load_submitted(&Self::codeql_variant_runs_path());
+        let Some(run) = index.map_or(runs.last(), |i| runs.get(i)).cloned() else {
+            self.status = String::from("No variant analysis has been submitted yet");
+            return;
+        };
+        let repos = cs::repos_with_results(&run);
+        if repos.is_empty() {
+            self.status = match &run.progress {
+                None => format!(
+                    "Variant analysis {} has not reported any progress yet",
+                    run.id
+                ),
+                Some(_) => format!("Variant analysis {} has no results yet", run.id),
+            };
+            return;
+        }
+        let dir = croft_cache_dir()
+            .join("codeql")
+            .join("variant-results")
+            .join(format!("{}-{}", run.controller.replace('/', "-"), run.id));
+        let gh = self.gh_program.to_string_lossy().into_owned();
+        let program = self.codeql_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let count = repos.len();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::fetch_codeql_variant_results(
+                &gh, &program, &root, &run, &repos, &dir,
+            ));
+        });
+        self.codeql_variant_results = Some(rx);
+        self.status = format!(
+            "Fetching the results of {count} repositor{}\u{2026}",
+            if count == 1 { "y" } else { "ies" }
+        );
+    }
+
+    /// The worker behind [`Self::open_codeql_variant_results`].
+    fn fetch_codeql_variant_results(
+        gh: &str,
+        program: &Path,
+        root: &Path,
+        run: &crate::codeql_submit::Submitted,
+        repos: &[String],
+        dir: &Path,
+    ) -> VariantResults {
+        use crate::codeql_submit::{self as cs, RepoResults};
+        let mut sarif = Vec::new();
+        let mut tables = Vec::new();
+        let mut failed = Vec::new();
+        for nwo in repos {
+            let repo_dir = dir.join(nwo.replace('/', "-"));
+            let fetched = (|| -> Result<(Option<String>, RepoResults), String> {
+                let sha_file = repo_dir.join("commit");
+                if !repo_dir.join("done").is_file() {
+                    let answer = crate::pr_review::run_gh(
+                        gh,
+                        &cs::repo_task_args(&run.controller, run.id, nwo),
+                        root,
+                        crate::pr_review::GH_TIMEOUT,
+                    )?;
+                    let (url, sha) = cs::parse_artifact(&answer)?;
+                    if !cs::artifact_url_allowed(&url) {
+                        return Err(String::from(
+                            "GitHub gave a results link croft will not fetch",
+                        ));
+                    }
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                    std::fs::create_dir_all(&repo_dir)
+                        .map_err(|e| format!("{}: {e}", repo_dir.display()))?;
+                    let resp = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(300))
+                        .build()
+                        .get(&url)
+                        .call()
+                        .map_err(|e| format!("download failed: {e}"))?;
+                    let zip = repo_dir.join("results.zip");
+                    let mut f = std::fs::File::create(&zip).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut resp.into_reader(), &mut f)
+                        .map_err(|e| format!("download failed: {e}"))?;
+                    crate::codeql_db::extract_zip(&zip, &repo_dir, Some(cs::ARTIFACT_LIMIT))?;
+                    let _ = std::fs::remove_file(&zip);
+                    std::fs::write(&sha_file, sha.unwrap_or_default())
+                        .map_err(|e| e.to_string())?;
+                    std::fs::write(repo_dir.join("done"), "").map_err(|e| e.to_string())?;
+                }
+                let sha = std::fs::read_to_string(&sha_file)
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let found = |name: &str| cs::find_named(&repo_dir, name);
+                if let Some(path) = found("results.sarif") {
+                    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    return Ok((sha, RepoResults::Sarif(text)));
+                }
+                let bqrs = found("results.bqrs")
+                    .ok_or_else(|| String::from("its results hold neither SARIF nor BQRS"))?;
+                let csv = repo_dir.join("results.csv");
+                if !csv.is_file() {
+                    Self::codeql_command(program, &crate::codeql_query::decode_args(&bqrs, &csv))?;
+                }
+                let text = std::fs::read_to_string(&csv).map_err(|e| e.to_string())?;
+                Ok((sha, RepoResults::Table(text)))
+            })();
+            match fetched {
+                Ok((sha, RepoResults::Sarif(text))) => sarif.push((nwo.clone(), sha, text)),
+                Ok((_, RepoResults::Table(text))) => tables.push((nwo.clone(), text)),
+                Err(why) => failed.push((nwo.clone(), why)),
+            }
+        }
+        let write = |name: &str, text: String| -> Result<PathBuf, String> {
+            let path = dir.join(name);
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(path)
+        };
+        let sarif_path = match sarif.is_empty() {
+            true => None,
+            false => Some(write("results.sarif", cs::combine_sarif(&sarif)?)?),
+        };
+        let csv_path = match tables.is_empty() {
+            true => None,
+            false => Some(write("results.csv", cs::combine_csv(&tables))?),
+        };
+        Ok(VariantResultFiles {
+            sarif: sarif_path,
+            csv: csv_path,
+            repos: sarif.len() + tables.len(),
+            failed,
+        })
+    }
+
+    /// Open the results a finished fetch made: the SARIF log in the viewer
+    /// (else the CSV), saying what else there is and what failed.
+    pub fn drain_codeql_variant_results(&mut self) -> bool {
+        let Some(rx) = self.codeql_variant_results.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the fetch stopped without answering"))
+            }
+        };
+        self.codeql_variant_results = None;
+        let files = match outcome {
+            Ok(files) => files,
+            Err(why) => {
+                self.status = format!("Could not open the variant analysis results: {why}");
+                return true;
+            }
+        };
+        let failed = match files.failed.as_slice() {
+            [] => String::new(),
+            [(nwo, why)] => format!("; {nwo} failed: {why}"),
+            [(nwo, why), rest @ ..] => {
+                format!("; {nwo} failed: {why} (and {} more)", rest.len())
+            }
+        };
+        let Some(open) = files.sarif.clone().or_else(|| files.csv.clone()) else {
+            self.status = format!("No repository's results could be fetched{failed}");
+            return true;
+        };
+        if let Err(e) = self.editor.open(&open) {
+            self.status = format!("{}: {e}", open.display());
+            return true;
+        }
+        self.sync_open_file_poll_mtime();
+        self.focus_pane(Pane::Editor);
+        let tables = match (&files.sarif, &files.csv) {
+            (Some(_), Some(csv)) => format!("; tables in {}", csv.display()),
+            _ => String::new(),
+        };
+        self.status = format!(
+            "Results of {} repositor{}{tables}{failed}",
+            files.repos,
+            if files.repos == 1 { "y" } else { "ies" }
+        );
+        true
     }
 
     /// Where submitted variant analyses are remembered (#578).
@@ -45179,6 +45386,9 @@ impl App {
             Cmd::CodeqlOpenVariantConfig => self.open_codeql_variant_config(),
             Cmd::CodeqlOpenVariantOnGithub => self.open_codeql_variant_on_github(),
             Cmd::CodeqlRunVariantAnalysis => self.run_codeql_variant_analysis(),
+            Cmd::CodeqlOpenVariantResults => {
+                self.open_codeql_variant_results(self.codeql.selected_variant_run())
+            }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
@@ -57627,10 +57837,12 @@ impl App {
             return;
         }
         let root = self.workspace_root().to_path_buf();
+        let mut on_github = None;
         let Some((path, kind)) = self.editor.sarif.as_ref().and_then(|v| {
             let e = v.selected_entry()?;
             let loaded = v.logs.get(e.log)?;
             let run = loaded.log.runs.get(e.run)?;
+            on_github = crate::sarif::resolve::github_blob_url(run, &target.uri, target.line);
             let mut roots = vec![root.clone()];
             if let Some(dir) = loaded.path.parent() {
                 roots.push(dir.to_path_buf());
@@ -57652,7 +57864,12 @@ impl App {
             return;
         };
         let Some(path) = path else {
-            self.status = format!("Cannot find {} on this machine", target.uri);
+            // A variant analysis result lives in another repository; its
+            // run says which, at which commit.
+            match on_github {
+                Some(url) => self.open_url_for_user(&url),
+                None => self.status = format!("Cannot find {} on this machine", target.uri),
+            }
             return;
         };
         let line = target.line.max(1) - 1;
@@ -62306,6 +62523,18 @@ type CodeqlUpgrade = (
     PathBuf,
 );
 
+/// What fetching a variant analysis's results made (#578): the combined
+/// SARIF log and table, how many repositories they hold, and the
+/// repositories whose results could not be fetched, with why.
+struct VariantResultFiles {
+    sarif: Option<PathBuf>,
+    csv: Option<PathBuf>,
+    repos: usize,
+    failed: Vec<(String, String)>,
+}
+
+type VariantResults = Result<VariantResultFiles, String>;
+
 /// One unfinished variant analysis and what reading its progress gave.
 type CodeqlRunPoll = (
     crate::codeql_submit::Submitted,
@@ -63775,7 +64004,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()
             | app.drain_codeql_variant_submit()
-            | app.poll_codeql_variant_runs();
+            | app.poll_codeql_variant_runs()
+            | app.drain_codeql_variant_results();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
