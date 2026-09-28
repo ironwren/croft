@@ -57412,6 +57412,72 @@ fn a_runs_query_text_is_kept_as_it_was_when_it_ran() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn codeql_accept_test_output_accepts_the_open_test_or_the_failed_ones() {
+    // #578: accept a failing CodeQL test's actual output as expected,
+    // through `codeql test accept`.
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("test/Find");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(tmp.path().join("test/qlpack.yml"), "name: t\ntests: .\n").unwrap();
+        std::fs::write(dir.join("Find.qlref"), "Find.ql\n").unwrap();
+        std::fs::write(dir.join("Find.expected"), "old\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.set_codeql_program(fake_codeql(bin.path(), "", 0, ""));
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_pack_job() {
+                assert!(std::time::Instant::now() < deadline, "never finished");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        assert_eq!(
+            Command::from_id("codeql_accept_test_output"),
+            Some(Command::CodeqlAcceptTestOutput)
+        );
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        assert!(
+            app.status.starts_with("No CodeQL test to accept"),
+            "{}",
+            app.status
+        );
+
+        // The open file's test, but no run has left output yet.
+        app.editor.open(&dir.join("Find.expected")).unwrap();
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        assert!(app.status.starts_with("No actual output"), "{}", app.status);
+
+        std::fs::write(dir.join("Find.actual"), "new\n").unwrap();
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        wait(&mut app);
+        assert_eq!(app.status, "Accepted the output of Find.qlref as expected");
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!("test accept {}", dir.join("Find.qlref").display())
+        );
+
+        // With no test file open: the tests the last run failed.
+        app.editor
+            .open(&tmp.path().join("test/qlpack.yml"))
+            .unwrap();
+        app.testing.apply_case(crate::testing::model::TestCase {
+            name: String::from("test/Find::Find.qlref"),
+            status: crate::testing::model::TestStatus::Failed,
+        });
+        app.run_command(Command::CodeqlAcceptTestOutput);
+        wait(&mut app);
+        assert_eq!(app.status, "Accepted the output of Find.qlref as expected");
+    });
+}
+
 #[test]
 fn running_a_query_needs_an_open_ql_file_and_a_database() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
