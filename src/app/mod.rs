@@ -3165,7 +3165,10 @@ pub struct App {
     codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
     /// The evaluator log viewer being prepared (#578): where the rendered
     /// tree (or why there is none) arrives, and the tab label to show it in.
-    codeql_log_viewer: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    codeql_log_viewer: Option<CodeqlLogViewerJob>,
+    /// The Model Editor's endpoints being read (#578): the endpoints or why
+    /// not, and the database and language they are for.
+    codeql_model_job: Option<CodeqlModelJob>,
     /// The performance comparison being prepared (#578): where the rendered
     /// table (or why there is none) arrives, and the tab label to show it in.
     codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
@@ -5528,6 +5531,7 @@ impl App {
             codeql_version: None,
             codeql_log_summary: None,
             codeql_log_viewer: None,
+            codeql_model_job: None,
             codeql_perf_compare: None,
             codeql_pack_job: None,
             codeql_ast_job: None,
@@ -23589,6 +23593,64 @@ impl App {
             Hit::Action(Action::OpenVariantConfig) => self.open_codeql_variant_config(),
             Hit::Action(Action::VariantRun(i)) => self.open_codeql_variant_run(i),
             Hit::Action(Action::ViewAst) => self.view_codeql_ast(),
+            Hit::Action(Action::OpenModelEditor) => self.open_codeql_model_editor(),
+            Hit::Action(Action::ModelGroup(i)) => {
+                if let Some(view) = self.codeql.model.as_mut()
+                    && let Some(group) = view.endpoints.get(i).map(|e| e.group())
+                {
+                    view.toggle(&group);
+                }
+            }
+            Hit::Action(Action::ModelEndpoint(i)) => {
+                let Some(e) = self
+                    .codeql
+                    .model
+                    .as_ref()
+                    .and_then(|v| v.endpoints.get(i))
+                    .cloned()
+                else {
+                    return;
+                };
+                let modeled = if e.supported {
+                    "modeled by CodeQL"
+                } else {
+                    "not modeled"
+                };
+                let Some(loc) = e.location.clone() else {
+                    self.status = format!("{}: {modeled}; no location", e.label());
+                    return;
+                };
+                let Some(path) = self.codeql_source_file(&loc.path) else {
+                    self.status = format!("{} is not on this machine", loc.path.display());
+                    return;
+                };
+                let (line, column) = (loc.line.max(1) - 1, loc.column.max(1) - 1);
+                self.status = match self.open_at(&path, line as usize, column as usize) {
+                    Ok(()) => format!("{} ({}): {modeled}", e.label(), e.kind),
+                    Err(err) => format!("{}: {err}", path.display()),
+                };
+            }
+            Hit::Action(Action::ClearEvalLog) => {
+                self.codeql.evallog = None;
+                self.status = String::from("Cleared the evaluator log");
+            }
+            Hit::Action(Action::EvalPredicate(i)) => {
+                if let Some(view) = self.codeql.evallog.as_mut() {
+                    view.toggle(i);
+                }
+            }
+            Hit::Action(Action::EvalDependency(target)) => match target {
+                Some(i) => {
+                    if let Some(view) = self.codeql.evallog.as_mut() {
+                        view.open.insert(i);
+                    }
+                    self.codeql.select_evallog_predicate(i);
+                }
+                None => {
+                    self.status =
+                        String::from("That predicate is not in this log (it was cached or inlined)")
+                }
+            },
             Hit::Action(Action::ClearAst) => {
                 self.codeql.ast = None;
                 self.status = String::from("Cleared the AST");
@@ -25207,14 +25269,11 @@ impl App {
             .unwrap_or_default();
         let program = self.codeql_program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let name = query.clone();
         std::thread::spawn(move || {
-            let tree = Self::codeql_log_predicates(&program, &log)
-                .map(|parsed| crate::codeql_evallog::render(&name, &parsed));
-            let _ = tx.send(tree);
+            let _ = tx.send(Self::codeql_log_predicates(&program, &log));
         });
         self.status = String::from("Reading the evaluator log\u{2026}");
-        self.codeql_log_viewer = Some((rx, format!("Evaluator Log ({query})")));
+        self.codeql_log_viewer = Some((rx, query));
     }
 
     /// Show a prepared evaluator log tree (#578) in a tab with every
@@ -25230,10 +25289,21 @@ impl App {
                 Err(String::from("the viewer stopped unexpectedly"))
             }
         };
-        let Some((_, label)) = self.codeql_log_viewer.take() else {
+        let Some((_, query)) = self.codeql_log_viewer.take() else {
             return false;
         };
-        match outcome.and_then(|text| {
+        let label = format!("Evaluator Log ({query})");
+        match outcome.and_then(|predicates| {
+            let text = crate::codeql_evallog::render(&query, &predicates);
+            // The side bar's Evaluator Log Viewer shows the same tree.
+            self.codeql.evallog = Some(crate::codeql_evallog::LogView {
+                query: query.clone(),
+                predicates,
+                ..Default::default()
+            });
+            self.codeql
+                .collapsed
+                .remove(&crate::widgets::codeql::Section::EvaluatorLog);
             self.editor
                 .open_text_buffer(Path::new(&label), &text)
                 .map_err(|e| e.to_string())
@@ -26388,6 +26458,58 @@ impl App {
         );
     }
 
+    /// CodeQL: Debug Query (#578): evaluate the open query up to its first
+    /// breakpoint, the way VS Code's CodeQL debugger stops at one: the
+    /// predicate the breakpoint's line defines or calls is quick-evaluated.
+    /// With no breakpoints the whole query runs.
+    fn debug_codeql_query(&mut self) {
+        let Some(query) = self
+            .editor
+            .path
+            .clone()
+            .filter(|p| p.extension().is_some_and(|e| e == "ql"))
+        else {
+            self.status = String::from("Open a .ql query to debug it");
+            return;
+        };
+        let lines: Vec<usize> = self
+            .editor
+            .breakpoints
+            .get(&query)
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            self.run_codeql_query();
+            return;
+        }
+        if self.editor.dirty {
+            self.status = String::from("Save the query first: the query server reads it from disk");
+            return;
+        }
+        let target = lines.iter().find_map(|&line| {
+            let text = self.editor.lines.get(line.checked_sub(1)?)?;
+            crate::codeql_qs::breakpoint_target(text, line as u32)
+        });
+        let Some((span, name)) = target else {
+            self.status = format!(
+                "No predicate at the breakpoint on line {}: put it on a line that defines or calls one",
+                lines[0]
+            );
+            return;
+        };
+        let source = self.editor.lines.join("\n");
+        let label = format!("{name} (breakpoint on line {})", span.line);
+        self.run_codeql_file_with(
+            query,
+            &source,
+            Some(crate::codeql_qs::QuickEval {
+                span,
+                count: false,
+                label,
+            }),
+        );
+    }
+
     /// [`Self::codeql_command`], killing `codeql` as soon as `cancel` is
     /// raised (#578). Its output is drained on threads of its own, so a
     /// chatty CLI never blocks on a full pipe while this polls.
@@ -26974,6 +27096,105 @@ impl App {
             format!("Results of {name} (CSV)"),
             format!("Could not decode the results of {name}"),
         ));
+    }
+
+    /// CodeQL: Open Model Editor (#578): read the current database's
+    /// library endpoints with its language's model-editor query, off the
+    /// UI thread; [`Self::drain_codeql_model`] lists them under Method
+    /// Modeling.
+    fn open_codeql_model_editor(&mut self) {
+        use crate::codeql_query as cq;
+        if self.codeql_model_job.is_some() {
+            self.status = String::from("The model editor is already reading endpoints");
+            return;
+        }
+        let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        let Some(db) = store.current.and_then(|i| store.databases.get(i)).cloned() else {
+            self.status = String::from("Select a CodeQL database first");
+            return;
+        };
+        let Some(lang) = db.language.clone() else {
+            self.status = format!("CodeQL database {} does not say its language", db.name);
+            return;
+        };
+        let dir = Self::codeql_contextual_dir("model");
+        let program = self.codeql_program.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lang_for = lang.clone();
+        std::thread::spawn(move || {
+            let read = || -> Result<Vec<crate::codeql_model::Endpoint>, String> {
+                let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+                std::fs::create_dir_all(&dir).map_err(io)?;
+                let suite = dir.join("endpoints.qls");
+                std::fs::write(&suite, crate::codeql_model::endpoints_suite(&lang_for))
+                    .map_err(io)?;
+                let listed =
+                    Self::codeql_stdout(&program, &crate::codeql_ast::resolve_args(&suite))?;
+                let query = crate::codeql_ast::first_query(&listed).ok_or_else(|| {
+                    format!(
+                        "no model-editor query for {lang_for}; download the \
+                         codeql/{lang_for}-queries pack with CodeQL: Download Packs"
+                    )
+                })?;
+                let bqrs = dir.join("endpoints.bqrs");
+                Self::codeql_command(&program, &cq::run_args(&query, &db.path, &bqrs))?;
+                let json = dir.join("endpoints.json");
+                Self::codeql_command(
+                    &program,
+                    &cq::decode_locations_args(&bqrs, &json, "#select"),
+                )?;
+                let endpoints = crate::codeql_model::parse_endpoints(
+                    &std::fs::read_to_string(&json).map_err(io)?,
+                );
+                if endpoints.is_empty() {
+                    return Err(String::from(
+                        "the database has no library endpoints to model (is it a library?)",
+                    ));
+                }
+                Ok(endpoints)
+            };
+            let _ = tx.send(read());
+        });
+        self.status = format!("Reading the endpoints of {}\u{2026}", db.name);
+        self.codeql_model_job = Some((rx, db.name, lang));
+    }
+
+    /// List a finished endpoints read under Method Modeling (#578), or say
+    /// why there is none.
+    pub fn drain_codeql_model(&mut self) -> bool {
+        let Some((rx, ..)) = self.codeql_model_job.as_ref() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(String::from("the endpoints read stopped unexpectedly"))
+            }
+        };
+        let Some((_, database, language)) = self.codeql_model_job.take() else {
+            return false;
+        };
+        match outcome {
+            Ok(endpoints) => {
+                let modeled = endpoints.iter().filter(|e| e.supported).count();
+                self.status = format!(
+                    "{} endpoints of {database}, {modeled} modeled by CodeQL",
+                    endpoints.len()
+                );
+                self.codeql.model = Some(crate::codeql_model::ModelView {
+                    database,
+                    language,
+                    endpoints,
+                    ..Default::default()
+                });
+                self.codeql
+                    .collapsed
+                    .remove(&crate::widgets::codeql::Section::MethodModeling);
+            }
+            Err(why) => self.status = format!("Could not read the endpoints: {why}"),
+        }
+        true
     }
 
     /// CodeQL: View AST (#578): the AST of the open file, read from the
@@ -46942,6 +47163,8 @@ impl App {
                 self.open_codeql_variant_results(self.codeql.selected_variant_run())
             }
             Cmd::CodeqlRunTests => self.run_codeql_tests(),
+            Cmd::CodeqlDebugQuery => self.debug_codeql_query(),
+            Cmd::CodeqlDebugSelection => self.quick_eval_codeql(false),
             Cmd::CodeqlResultsUp => self.walk_codeql_results(-1, 0),
             Cmd::CodeqlResultsDown => self.walk_codeql_results(1, 0),
             Cmd::CodeqlResultsLeft => self.walk_codeql_results(0, -1),
@@ -46950,6 +47173,7 @@ impl App {
             Cmd::CodeqlQuickEval => self.quick_eval_codeql(false),
             Cmd::CodeqlQuickEvalCount => self.quick_eval_codeql(true),
             Cmd::CodeqlViewAst => self.view_codeql_ast(),
+            Cmd::CodeqlOpenModelEditor => self.open_codeql_model_editor(),
             Cmd::CodeqlOpenReferencedFile => self.open_codeql_referenced_file(),
             Cmd::CodeqlViewAlertsCsv => self.view_codeql_alerts(true),
             Cmd::CodeqlViewAlertsSarif => self.view_codeql_alerts(false),
@@ -64564,6 +64788,21 @@ type CodeqlDocJob = (
     String,
 );
 
+/// An evaluator log being read for its viewer (#578): the predicates, or
+/// why not, and the query whose log it is.
+type CodeqlLogViewerJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
+    String,
+);
+
+/// The Model Editor's endpoints being read (#578): the endpoints, or why
+/// not, and the database and language they are for.
+type CodeqlModelJob = (
+    std::sync::mpsc::Receiver<Result<Vec<crate::codeql_model::Endpoint>, String>>,
+    String,
+    String,
+);
+
 /// A CodeQL database upgrade or cache cleanup in flight (#578): where its
 /// outcome arrives, which job it is, and the database's name and folder.
 type CodeqlUpgrade = (
@@ -66063,6 +66302,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let ext_index_changed = app.drain_ext_index_refresh();
         let codeql_changed = app.drain_codeql_run()
             | app.drain_codeql_ast()
+            | app.drain_codeql_model()
             | app.drain_codeql_doc()
             | app.drain_codeql_upgrade()
             | app.drain_codeql_version()
