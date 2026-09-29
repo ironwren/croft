@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use unicode_width::UnicodeWidthStr;
 
 const MAX_LINE_LEN: usize = 200;
 
@@ -815,6 +816,30 @@ fn replace_in_line(
 /// All confirmation always agree (#860).
 fn count_in_line(line: &str, matcher: &RegexMatcher) -> usize {
     replace_in_line(line, matcher, None, "", SearchOpts::default()).1
+}
+
+/// The leading context a result row keeps before its first match when that
+/// match, and `need` cells with it (the match plus any replace preview), would
+/// not fit in `avail` cells after `lead`; `None` when it fits, so a row whose
+/// match shows is drawn exactly as its line reads (#860). The row then opens
+/// on the last cells of `lead`, half the room the match leaves, so context
+/// shows on both sides. Cut plainly, with no "…" marker: croft draws none.
+fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+    if lead.width() + need <= avail {
+        return None;
+    }
+    let keep = avail.saturating_sub(need) / 2;
+    let mut width = 0;
+    let mut start = lead.len();
+    for (i, c) in lead.char_indices().rev() {
+        width += c.width().unwrap_or(0);
+        if width > keep {
+            break;
+        }
+        start = i;
+    }
+    Some(lead[start..].to_string())
 }
 
 /// `replacement` with each numbered capture reference braced (`$1_old` to
@@ -2392,7 +2417,23 @@ impl Widget for &mut SearchPanel {
             // replacement (capture refs honoured) in green beside it — the
             // bad-pattern catch before Replace All commits anything.
             let preview = self.replace_open && !self.replace.is_empty();
-            for (chunk, is_match) in split_for_highlight(&hit.line_text, needle, self.opts) {
+            let mut chunks = split_for_highlight(&hit.line_text, needle, self.opts);
+            // A match past the row's edge was clipped away with everything
+            // after it (#860): drop leading context so it shows.
+            if let Some(first) = chunks.iter().position(|(_, is_match)| *is_match) {
+                let prefix_w: usize = spans.iter().map(Span::width).sum();
+                let avail = usize::from(row_width).saturating_sub(prefix_w);
+                let matched = &chunks[first].0;
+                let mut need = matched.width();
+                if preview {
+                    need += expand_replacement(matched, needle, &self.replace, self.opts).width();
+                }
+                let lead: String = chunks[..first].iter().map(|(t, _)| t.as_str()).collect();
+                if let Some(kept) = trim_leading_context(&lead, avail, need) {
+                    chunks.splice(..first, std::iter::once((kept, false)));
+                }
+            }
+            for (chunk, is_match) in chunks {
                 if is_match && preview {
                     let new_text = expand_replacement(&chunk, needle, &self.replace, self.opts);
                     spans.push(Span::styled(
@@ -4373,5 +4414,106 @@ mod tests {
         write(&tmp.path().join("a.txt"), "foo foo foo\n");
         panel.run_query();
         assert_eq!(panel.result_counts(), (3, 1), "three results, one file");
+    }
+
+    /// The rendered text of the row for `path_line` (e.g. "a.txt:1:"), with
+    /// the side bar's borders stripped.
+    fn result_row(buf: &Buffer, path_line: &str) -> String {
+        buffer_to_string(buf)
+            .lines()
+            .find(|l| l.contains(path_line))
+            .unwrap_or_else(|| panic!("no row for {path_line}"))
+            .trim_matches(|c| c == '│' || c == ' ')
+            .to_string()
+    }
+
+    fn render_panel(panel: &mut SearchPanel, width: u16) -> Buffer {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(panel, area, &mut buf);
+        buf
+    }
+
+    /// #860 (the issue's GIF): a match that starts past the side bar's width
+    /// was clipped away with everything after it, so the row showed only
+    /// leading context and the highlighted match (and its replace preview)
+    /// was invisible. The row now drops leading context instead, plainly
+    /// (no "…"), so the match and the replacement beside it show.
+    #[test]
+    fn a_match_past_the_panel_width_drops_leading_context_to_show() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("a.txt"),
+            "date,category,amount,description,payee,note\n",
+        );
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "note".into();
+        panel.run_query();
+        let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+        assert!(row.contains("note"), "the match is visible: {row:?}");
+        assert!(row.starts_with("a.txt:1: "), "{row:?}");
+        assert!(!row.contains('…'), "no ellipsis: {row:?}");
+        panel.replace_open = true;
+        panel.replace = "memo".into();
+        let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+        assert!(
+            row.contains("notememo"),
+            "the match and its replacement both show: {row:?}"
+        );
+    }
+
+    /// #860 negative: a match that shows where it is (near the start, or
+    /// ending exactly on the row's last cell) is drawn exactly as its line
+    /// reads, leading context and all, and the context after it is cut at
+    /// the edge as before.
+    #[test]
+    fn a_match_that_already_shows_renders_as_before() {
+        let tmp = TempDir::new().unwrap();
+        // 40 wide: 38 inside the border, " a.txt:1: " takes 10, 28 remain.
+        let near = "note,date,category,amount,description,payee";
+        let edge = "date,category,amount,xxxnote,payee,description";
+        assert_eq!(
+            edge.find("note").unwrap() + 4,
+            28,
+            "fixture: ends on the edge"
+        );
+        write(&tmp.path().join("a.txt"), &format!("{near}\n"));
+        write(&tmp.path().join("b.txt"), &format!("{edge}\n"));
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "note".into();
+        panel.run_query();
+        let buf = render_panel(&mut panel, 40);
+        assert_eq!(
+            result_row(&buf, "a.txt:1:"),
+            format!("a.txt:1: {}", &near[..28])
+        );
+        assert_eq!(
+            result_row(&buf, "b.txt:1:"),
+            format!("a.txt:1: {}", &edge[..28]).replacen("a.txt", "b.txt", 1)
+        );
+    }
+
+    /// #860 negative: the trim is by display width, so leading context of
+    /// double-width characters is dropped whole (never half a glyph), and
+    /// the match still shows.
+    #[test]
+    fn leading_context_of_wide_characters_is_dropped_whole() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("a.txt"),
+            "日本語のテキストが長く続いた後にnoteがある\n",
+        );
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "note".into();
+        panel.run_query();
+        let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+        assert!(row.contains("note"), "{row:?}");
+        assert!(row.starts_with("a.txt:1: "), "{row:?}");
+        assert!(!row.contains('…'), "{row:?}");
     }
 }
