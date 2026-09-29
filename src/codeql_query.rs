@@ -42,6 +42,55 @@ pub fn output_for(source: &str) -> Output {
     }
 }
 
+/// Whether `query` is a query suite (`.qls`), which `database analyze`
+/// runs whole.
+pub fn is_suite(query: &Path) -> bool {
+    query.extension().is_some_and(|e| e == "qls")
+}
+
+/// `codeql` arguments listing the queries a suite selects, as JSON.
+pub fn resolve_suite_args(suite: &Path) -> Vec<String> {
+    vec![
+        String::from("resolve"),
+        String::from("queries"),
+        String::from("--format=json"),
+        path(suite),
+    ]
+}
+
+/// The file names of the queries in `resolved` (the JSON array `codeql
+/// resolve queries` prints) whose results are not alerts, going by each
+/// file's text as `read` gives it. `database analyze`, the only way to run
+/// a suite, cannot produce their tables, so a suite holding any is refused
+/// up front rather than failing inside the CLI.
+pub fn table_queries_in_suite(
+    resolved: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<PathBuf> = serde_json::from_str(resolved)
+        .map_err(|e| format!("could not read the suite's queries: {e}"))?;
+    Ok(paths
+        .iter()
+        .filter(|p| read(p).is_some_and(|src| output_for(&src) == Output::Table))
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
+/// How the file `query`, whose text is `source`, is run and read: a suite
+/// always through `database analyze` into SARIF, since only that runs one;
+/// a single query by its `@kind`.
+pub fn output_of(query: &Path, source: &str) -> Output {
+    if is_suite(query) {
+        Output::Sarif
+    } else {
+        output_for(source)
+    }
+}
+
 fn path(p: &Path) -> String {
     p.display().to_string()
 }
@@ -50,6 +99,21 @@ fn path(p: &Path) -> String {
 /// writes one into its own folder, beside its results.
 pub fn evaluator_log(output: &Path) -> PathBuf {
     output.with_file_name("evaluator-log.jsonl")
+}
+
+/// The folder the run whose results are `output` writes its query log into
+/// (`--logdir`), beside its results.
+pub fn query_log_dir(output: &Path) -> PathBuf {
+    output.with_file_name("logs")
+}
+
+/// The newest of `logs`, each a `*.log` file with its modification time:
+/// the latest time wins, the greater file name breaks a tie.
+pub fn newest_query_log(logs: Vec<(PathBuf, std::time::SystemTime)>) -> Option<PathBuf> {
+    logs.into_iter()
+        .filter(|(p, _)| p.extension().is_some_and(|e| e == "log"))
+        .max_by(|(a, at), (b, bt)| at.cmp(bt).then_with(|| a.file_name().cmp(&b.file_name())))
+        .map(|(p, _)| p)
 }
 
 /// The human-readable summary of the run whose results are `output`, made
@@ -88,6 +152,19 @@ pub fn log_predicates_args(log: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// `codeql` arguments rendering the help of `query`, its `.qhelp` or `.md`
+/// beside it, as Markdown at `out` (VS Code's "CodeQL: Preview Query
+/// Help").
+pub fn query_help_args(query: &Path, out: &Path) -> Vec<String> {
+    vec![
+        String::from("generate"),
+        String::from("query-help"),
+        String::from("--format=markdown"),
+        format!("--output={}", path(out)),
+        path(query),
+    ]
+}
+
 /// `codeql` arguments running `query` on `db` into SARIF at `out`.
 /// `--rerun` because a history entry run again means run again, not
 /// "reuse the cached answer".
@@ -100,6 +177,7 @@ pub fn analyze_args(query: &Path, db: &Path, out: &Path) -> Vec<String> {
         String::from("--format=sarif-latest"),
         format!("--output={}", path(out)),
         format!("--evaluator-log={}", path(&evaluator_log(out))),
+        format!("--logdir={}", path(&query_log_dir(out))),
         String::from("--rerun"),
     ]
 }
@@ -112,6 +190,7 @@ pub fn run_args(query: &Path, db: &Path, bqrs: &Path) -> Vec<String> {
         format!("--database={}", path(db)),
         format!("--output={}", path(bqrs)),
         format!("--evaluator-log={}", path(&evaluator_log(bqrs))),
+        format!("--logdir={}", path(&query_log_dir(bqrs))),
         path(query),
     ]
 }
@@ -1273,6 +1352,30 @@ impl History {
             .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
             .map(|(i, _)| i)
     }
+
+    /// The index of the most recent run that succeeded, whatever the order.
+    pub fn newest_success(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.status == RunStatus::Succeeded)
+            .max_by_key(|(i, e)| (e.started, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+    }
+}
+
+/// The file name "CodeQL: Export Results" suggests for the results
+/// `output` of `query`: `<query-stem>-results.<csv|sarif>`.
+pub fn export_file_name(query: &Path, output: &Path) -> String {
+    let stem = query
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = output
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("csv"));
+    format!("{stem}-results.{ext}")
 }
 
 #[cfg(test)]
@@ -1533,6 +1636,29 @@ mod tests {
     }
 
     #[test]
+    fn a_suite_holding_table_queries_is_found_out() {
+        let read = |p: &Path| -> Option<String> {
+            Some(match p.file_name()?.to_str()? {
+                "Alert.ql" => String::from("/** @kind problem */ select 1"),
+                _ => String::from("select 1"),
+            })
+        };
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql","/q/Table.ql"]"#, read),
+            Ok(vec![String::from("Table.ql")])
+        );
+        assert_eq!(
+            table_queries_in_suite(r#"["/q/Alert.ql"]"#, read),
+            Ok(vec![])
+        );
+        assert!(table_queries_in_suite("not json", read).is_err());
+        assert_eq!(
+            resolve_suite_args(Path::new("/s.qls")),
+            ["resolve", "queries", "--format=json", "/s.qls"]
+        );
+    }
+
+    #[test]
     fn a_quick_query_imports_its_languages_library() {
         let (pack, query) = quick_query("python");
         assert!(pack.contains("name: croft/quick-query-python\n"));
@@ -1596,6 +1722,42 @@ mod tests {
     }
 
     #[test]
+    fn export_takes_the_newest_success_under_the_querys_name() {
+        let entry = |started: u64, status: RunStatus| HistoryEntry {
+            query: PathBuf::from("/w/q.ql"),
+            database: String::from("db"),
+            database_path: None,
+            started,
+            seconds: 1,
+            status,
+            output: PathBuf::from("/r/results.csv"),
+            name: None,
+            results: None,
+        };
+        let mut history = History {
+            entries: vec![
+                entry(5, RunStatus::Failed(String::from("x"))),
+                entry(3, RunStatus::Succeeded),
+                entry(4, RunStatus::Running),
+                entry(1, RunStatus::Succeeded),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(history.newest_success(), Some(1));
+        history.entries.remove(1);
+        history.entries.remove(2);
+        assert_eq!(history.newest_success(), None);
+        assert_eq!(
+            export_file_name(Path::new("/w/q.ql"), Path::new("/r/results.sarif")),
+            "q-results.sarif"
+        );
+        assert_eq!(
+            export_file_name(Path::new("/w/s.qls"), Path::new("/r/results.csv")),
+            "s-results.csv"
+        );
+    }
+
+    #[test]
     fn version_information_names_croft_the_cli_and_the_platform() {
         let text = version_information("0.1.9", &Ok(String::from("2.19.3\n")));
         let platform = format!(
@@ -1635,6 +1797,41 @@ mod tests {
     }
 
     #[test]
+    fn a_suite_always_reads_as_sarif() {
+        let suite = "- queries: .\n- include:\n    kind: table\n";
+        assert!(is_suite(Path::new("/w/s.qls")));
+        assert!(!is_suite(Path::new("/w/q.ql")));
+        assert_eq!(output_of(Path::new("/w/s.qls"), suite), Output::Sarif);
+        assert_eq!(output_of(Path::new("/w/q.ql"), "select 1"), Output::Table);
+        assert_eq!(output_of(Path::new("/w/q.ql"), PROBLEM), Output::Sarif);
+    }
+
+    #[test]
+    fn the_newest_query_log_is_the_latest_log_file() {
+        let t = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let p = |s: &str| PathBuf::from(format!("/out/logs/{s}"));
+        assert_eq!(newest_query_log(Vec::new()), None);
+        assert_eq!(newest_query_log(vec![(p("notes.txt"), t(9))]), None);
+        assert_eq!(
+            newest_query_log(vec![
+                (p("execute-b.log"), t(2)),
+                (p("execute-a.log"), t(3)),
+                (p("later.txt"), t(4)),
+            ]),
+            Some(p("execute-a.log"))
+        );
+        assert_eq!(
+            newest_query_log(vec![(p("execute-b.log"), t(3)), (p("execute-a.log"), t(3))]),
+            Some(p("execute-b.log")),
+            "a tie goes to the greater name"
+        );
+        assert_eq!(
+            query_log_dir(Path::new("/out/r.sarif")),
+            Path::new("/out/logs")
+        );
+    }
+
+    #[test]
     fn argument_lists_name_the_database_query_and_output() {
         let (q, db) = (Path::new("/w/q.ql"), Path::new("/dbs/app"));
         assert_eq!(
@@ -1647,6 +1844,7 @@ mod tests {
                 "--format=sarif-latest",
                 "--output=/out/r.sarif",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "--rerun"
             ]
         );
@@ -1658,6 +1856,7 @@ mod tests {
                 "--database=/dbs/app",
                 "--output=/out/r.bqrs",
                 "--evaluator-log=/out/evaluator-log.jsonl",
+                "--logdir=/out/logs",
                 "/w/q.ql"
             ]
         );
@@ -1698,6 +1897,16 @@ mod tests {
             ]
         );
         assert_eq!(upgrade_args(db), vec!["database", "upgrade", "/dbs/app"]);
+        assert_eq!(
+            query_help_args(q, Path::new("/cache/help/q.md")),
+            vec![
+                "generate",
+                "query-help",
+                "--format=markdown",
+                "--output=/cache/help/q.md",
+                "/w/q.ql"
+            ]
+        );
     }
 
     #[test]
