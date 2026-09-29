@@ -65854,3 +65854,58 @@ fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
         _ => panic!("File: New File… must open the New File prompt"),
     }
 }
+
+/// #860 negative: the Search side bar's `Alt` toggles belong to its inputs.
+/// From the editor, `Alt+C` / `W` / `R` / `D` leave the toggles and the
+/// include / exclude rows alone, and inside the inputs only a bare `Alt`
+/// flips one (`Ctrl+Alt+C` is not Match Case).
+#[test]
+fn search_alt_toggles_stay_inside_the_search_inputs() {
+    use crate::widgets::search::SearchOpts;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    app.set_sidebar_view(SidebarView::Search);
+    app.focus_pane(Pane::Editor);
+    for c in ['c', 'w', 'r', 'd'] {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::ALT))
+            .unwrap();
+    }
+    assert_eq!(app.search.opts, SearchOpts::default());
+    assert!(!app.search.details_open);
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(
+        app.focus == Pane::Tree,
+        "fixture: the Search input has focus"
+    );
+    app.handle_key(key(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(!app.search.opts.case_sensitive, "only a bare Alt toggles");
+}
+
+/// #860 negative: Replace in Files only ever opens the row; with it open
+/// and text in both fields, the chord keeps the query, the replacement and
+/// the toggles as they were.
+#[test]
+fn replace_in_files_keeps_what_the_search_already_holds() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("foo");
+    app.search.replace = String::from("bar");
+    app.search.opts.whole_word = true;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(
+        KeyCode::Char('H'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.search.replace_open);
+    assert_eq!(app.search.field, SearchField::Replace);
+    assert_eq!(app.search.query, "foo");
+    assert_eq!(app.search.replace, "bar");
+    assert!(app.search.opts.whole_word);
+}

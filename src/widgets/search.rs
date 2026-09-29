@@ -4324,4 +4324,54 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].matches, 2);
     }
+
+    /// #860 regression, through the render alone: the header counts
+    /// occurrences ("4 results in 2 files"), where it counted hit lines
+    /// ("3 matches") against Replace All's 4 occurrences.
+    #[test]
+    fn the_rendered_header_counts_two_matches_on_a_line_as_two() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "foo foo\nfoo\n");
+        write(&tmp.path().join("b.txt"), "foo\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "foo".into();
+        panel.run_query();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("4 results in 2 files"), "{text}");
+    }
+
+    /// #860 negative: one occurrence in one file is singular on both
+    /// counts ("1 result in 1 file"), and a line matched twice in one file
+    /// still names one file.
+    #[test]
+    fn the_header_is_singular_for_one_result_and_counts_files_once() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "foo\nbar\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "foo".into();
+        panel.run_query();
+        assert_eq!(panel.result_counts(), (1, 1));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("1 result in 1 file"), "{text}");
+        assert!(!text.contains("1 results"), "{text}");
+        write(&tmp.path().join("a.txt"), "foo foo foo\n");
+        panel.run_query();
+        assert_eq!(panel.result_counts(), (3, 1), "three results, one file");
+    }
 }
