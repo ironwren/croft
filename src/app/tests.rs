@@ -20901,6 +20901,43 @@ fn the_update_chord_starts_the_offered_rebuild_once() {
     assert_eq!(app.status, "croft is already updating in the background");
 }
 
+// #865 guard: only Ctrl/Cmd+Shift+F9 reaches the updater. With a rebuild on
+// offer, Shift+F9 still opens the conditional-breakpoint editor and
+// Ctrl+Shift+Alt+F9 falls to the Shift+Alt logpoint arm; neither starts the
+// rebuild or relaunches.
+#[test]
+fn only_ctrl_or_cmd_shift_f9_reaches_the_updater() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("def456"));
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::SHIFT));
+    assert_eq!(app.status, "Open a file to set a conditional breakpoint");
+    let _ = app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ));
+    assert_eq!(app.status, "Open a file to set a logpoint");
+    assert!(app.self_install.is_none(), "no rebuild started");
+    assert!(!app.pending_reexec && !app.quit, "and no relaunch");
+}
+
+// #865 guard: a bare F9 in a focused terminal with no debug session belongs
+// to the shell (htop's F9 kill) even with an update ready, where it used to
+// relaunch croft; it toggles no breakpoint either.
+#[test]
+fn bare_f9_in_a_focused_terminal_is_the_shells_even_with_an_update_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.update_status = UpdateStatus::Ready;
+    let _ = app.handle_key(key(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(!app.pending_reexec && !app.quit, "croft did not relaunch");
+    assert!(
+        app.editor.breakpoints.is_empty(),
+        "nor toggled a breakpoint"
+    );
+}
+
 #[test]
 fn bare_f10_reaches_the_shell_when_terminal_is_focused_with_no_debug_session() {
     let tmp = tempfile::tempdir().unwrap();
