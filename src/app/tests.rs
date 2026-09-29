@@ -20779,6 +20779,11 @@ fn a_debugged_script_runs_under_the_interpreter_run_uses() {
 
     let venv = make_venv(root, ".venv");
     assert_eq!(super::project_python_for(&pkg, root), venv);
+    assert_eq!(
+        super::debuggee_python(&pkg, root, std::env::var_os("PATH").as_deref()),
+        Some(venv.clone()),
+        "F5's debuggee is Run's interpreter"
+    );
     let req =
         crate::dap::session::launch_request(&file, &super::project_python_for(&pkg, root), false);
     assert_eq!(
@@ -20807,7 +20812,8 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
         let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
         let rc = resolve(&cfg, &ctx).unwrap();
         let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
-        let req = debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root));
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        let req = debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter));
         req["arguments"]["python"].clone()
     };
     let program = r#"[{"name":"P","type":"python","program":"${workspaceFolder}/app/main.py"}]"#;
@@ -20851,11 +20857,13 @@ fn a_venv_above_the_workspace_is_not_the_debuggee_interpreter() {
     let pkg = root.join("pkg");
     std::fs::create_dir_all(&pkg).unwrap();
 
-    let py = super::project_python_for(&pkg, &root);
-    assert_ne!(
-        py, outside,
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, None),
+        None,
         "a venv above the workspace is not the project's"
     );
+    let py = super::project_python_for(&pkg, &root);
+    assert_ne!(py, outside, "nor Run's");
     assert!(!py.starts_with(tmp.path()), "got {}", py.display());
 }
 
@@ -20870,8 +20878,162 @@ fn a_nearer_venv_beats_the_workspace_roots_for_the_debuggee() {
     std::fs::create_dir_all(&svc).unwrap();
     let svc_venv = make_venv(&svc, "venv");
 
+    assert_eq!(
+        super::debuggee_python(&svc, root, None),
+        Some(svc_venv.clone())
+    );
     assert_eq!(super::project_python_for(&svc, root), svc_venv);
+    assert_eq!(
+        super::debuggee_python(root, root, None),
+        Some(root_venv.clone())
+    );
     assert_eq!(super::project_python_for(root, root), root_venv);
+}
+
+/// A stand-in venv interpreter ([`make_venv`]) whose `pyvenv.cfg` says it
+/// is Python `version`.
+fn make_venv_of(dir: &Path, venv_name: &str, version: &str) -> PathBuf {
+    let py = make_venv(dir, venv_name);
+    std::fs::write(
+        dir.join(venv_name).join("pyvenv.cfg"),
+        format!("home = /usr/bin\ninclude-system-site-packages = false\nversion = {version}\n"),
+    )
+    .unwrap();
+    py
+}
+
+/// #864: a debuggee interpreter older than 3.14 is named, since 3.14 is
+/// attach's floor (PEP 768) and not launch's.
+#[test]
+fn a_debuggee_older_than_3_14_is_named_with_the_attach_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py = make_venv_of(tmp.path(), ".venv", "3.12.4");
+    assert_eq!(
+        super::debuggee_python_note(&py),
+        Ok(Some(String::from(
+            "under Python 3.12 (.venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864 guard: 3.14 and newer say nothing, and neither does an interpreter
+/// whose version cannot be read (the launch then speaks for itself).
+#[test]
+fn a_3_14_debuggee_or_an_unreadable_one_gets_no_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let py314 = make_venv_of(tmp.path(), "py314", "3.14.0");
+    assert_eq!(super::debuggee_python_note(&py314), Ok(None));
+    let py315 = make_venv_of(tmp.path(), "py315", "3.15.1");
+    assert_eq!(super::debuggee_python_note(&py315), Ok(None));
+    let unknown = make_venv(tmp.path(), "unknown");
+    assert_eq!(super::debuggee_python_note(&unknown), Ok(None));
+}
+
+/// #864: an interpreter below debugpy's own floor (3.10) cannot host the
+/// debuggee at all, so the launch refuses it by name. 3.10 itself is fine.
+#[test]
+fn a_debuggee_debugpy_cannot_run_under_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = make_venv_of(tmp.path(), ".venv", "3.9.18");
+    assert_eq!(
+        super::debuggee_python_note(&old),
+        Err(String::from(
+            "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+"
+        ))
+    );
+    let floor = make_venv_of(tmp.path(), "venv", "3.10.0");
+    assert_eq!(
+        super::debuggee_python_note(&floor),
+        Ok(Some(String::from(
+            "under Python 3.10 (venv); attach needs 3.14+"
+        )))
+    );
+}
+
+/// #864: a launch.json config's version check reads the interpreter the
+/// request actually runs: its `python` (a path or a command line) or the
+/// legacy `pythonPath`, and nothing for a request that names neither.
+#[test]
+fn a_launch_requests_own_interpreter_is_the_one_checked() {
+    use serde_json::json;
+    let python =
+        |args: serde_json::Value| super::launch_request_python(&json!({ "arguments": args }));
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.9" })),
+        Some(PathBuf::from("/opt/py/bin/python3.9"))
+    );
+    assert_eq!(
+        python(json!({ "python": ["/p/.venv/bin/python", "-X", "dev"] })),
+        Some(PathBuf::from("/p/.venv/bin/python"))
+    );
+    assert_eq!(
+        python(json!({ "pythonPath": "/legacy/python" })),
+        Some(PathBuf::from("/legacy/python"))
+    );
+    assert_eq!(python(json!({ "program": "a.py" })), None);
+}
+
+/// #864, through F5: a project venv debugpy cannot run under is refused
+/// before any adapter starts, on the status line and the panel.
+#[test]
+fn f5_refuses_a_project_venv_too_old_for_debugpy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    make_venv_of(&root, ".venv", "3.9.18");
+    let file = root.join("main.py");
+    std::fs::write(&file, "print('hi')\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    if started {
+        app.debug_stop();
+    }
+    assert_eq!(
+        app.status, "Python 3.9 (.venv) is too old to debug: debugpy needs 3.10+",
+        "a session started: {started}"
+    );
+    assert!(!started);
+    assert!(app.run_debug.feedback_is_error);
+}
+
+/// #864 regression guard: with no venv and no `python3` on PATH, a bare
+/// `python3` cannot start, where the launch used to run under the debug
+/// venv. Nothing is found, so the launch keeps the debug venv's python; a
+/// `python3` on PATH is still preferred, as for Run.
+#[test]
+fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = tmp.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let no_python = std::env::join_paths([&empty]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, &root, Some(&no_python)), None);
+    assert_eq!(super::debuggee_python(&pkg, &root, None), None, "no PATH");
+
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("python3"), b"#!/bin/sh\n").unwrap();
+    let with_python = std::env::join_paths([&empty, &bin]).unwrap();
+    assert_eq!(
+        super::debuggee_python(&pkg, &root, Some(&with_python)),
+        Some(bin.join("python3"))
+    );
+}
+
+/// #864 guard: the fallback never overrides a venv the project has, even
+/// with nothing on PATH.
+#[test]
+fn a_project_venv_is_the_debuggee_whatever_path_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let venv = make_venv(root, ".venv");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let empty = std::env::join_paths([root.join("empty-bin")]).unwrap();
+    assert_eq!(super::debuggee_python(&pkg, root, Some(&empty)), Some(venv));
 }
 
 #[test]
@@ -65256,6 +65418,110 @@ fn f5_debugs_a_script_against_the_project_venv_and_names_its_exception() {
         "status {status:?}"
     );
     assert!(status.contains("ValueError: boom 42"), "{status}");
+}
+
+/// A real `python3 -m venv --without-pip` at `dir`, and its purelib
+/// site-packages directory.
+fn real_venv(dir: &Path) -> PathBuf {
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(dir.join("bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    PathBuf::from(String::from_utf8(site.stdout).unwrap().trim())
+}
+
+/// #864 against a real debugpy: F5 under a project venv older than 3.14
+/// names its version, on the status line and as the Debug Console's first
+/// line, and still debugs. Skipped when `python3` is already 3.14+.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_names_a_project_python_older_than_3_14() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    real_venv(&root.join(".venv"));
+    let version = std::process::Command::new(root.join(".venv/bin/python"))
+        .args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let (major, minor) = version.split_once('.').unwrap();
+    let minor: u32 = minor.parse().unwrap();
+    if major != "3" || !(10..14).contains(&minor) {
+        eprintln!("python3 is {version}: nothing to name");
+        return;
+    }
+    let file = root.join("main.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.debug_start_or_continue();
+    let started = !app.debug_sessions.is_empty();
+    let status = app.status.clone();
+    let console = app.debug_console.clone();
+    app.debug_stop();
+    let want = format!("Debugging main.py under Python {version} (.venv); attach needs 3.14+");
+    assert!(started, "{status}");
+    assert!(status.starts_with(&want), "{status}");
+    assert!(
+        status.contains("F10 step over"),
+        "the key hints stay: {status}"
+    );
+    assert_eq!(console.first(), Some(&want), "{console:?}");
+}
+
+/// #864 against a real debugpy: Debug Test at Cursor runs pytest under
+/// the venv nearest the test file, as F5 and Live Run pick it, not only a
+/// workspace-root `.venv`. The only venv here is `svc/venv`, holding a
+/// stand-in `pytest` module that records `sys.prefix`; the root-only lookup
+/// ran a `python3` without it.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn debug_test_at_cursor_runs_pytest_under_the_nearest_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("pytest.ini"), "[pytest]\n").unwrap();
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let site = real_venv(&svc.join("venv"));
+    let pytest = site.join("pytest");
+    std::fs::create_dir_all(&pytest).unwrap();
+    std::fs::write(pytest.join("__init__.py"), "").unwrap();
+    let main = pytest.join("__main__.py");
+    std::fs::write(&main, "import sys\nprefix = sys.prefix\nprint(prefix)\n").unwrap();
+    let test = svc.join("test_app.py");
+    std::fs::write(&test, "def test_prefix():\n    assert True\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&test).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor
+        .breakpoints
+        .entry(main.clone())
+        .or_default()
+        .insert(3);
+    app.debug_test_at_cursor();
+    let prefix = debug_until_local(&mut app, "prefix", 90);
+    let status = app.status.clone();
+    app.debug_stop();
+    let prefix = prefix.unwrap_or_else(|| panic!("no stop in pytest; status {status:?}"));
+    assert!(prefix.contains("svc/venv"), "sys.prefix {prefix}");
 }
 
 /// #250, against a real lldb-dap: a Rust binary that needs a CLI argument
