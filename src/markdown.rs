@@ -2372,6 +2372,78 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_character_cell_is_padded_by_screen_cells() {
+        // #861, read off the rendered text alone: `食費 (food)` is nine
+        // characters but eleven cells, so its column is eleven cells wide
+        // and every shorter cell is padded out to it.
+        let lines =
+            render("| category | amount |\n| --- | --- |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "category    \u{2502} amount",
+                "食費 (food) \u{2502} 300   ",
+                "rent        \u{2502} 1200  ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_takes_no_cell_in_a_table() {
+        // #861 guard, the other way round from a wide character: `café`
+        // spelled with a combining accent is five characters but four
+        // cells, and must not be padded as five.
+        let lines = render("| name | n |\n| --- | --- |\n| cafe\u{301} | 1 |\n| tea | 2 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "name \u{2502} n",
+                "cafe\u{301} \u{2502} 1",
+                "tea  \u{2502} 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_cell_in_an_aligned_column_is_blank_padding() {
+        // #861 guard: a row that stops short leaves a blank cell as wide as
+        // its column, whatever the column's alignment, so the seams of the
+        // rows below do not move.
+        let lines = render("| a | b |\n| --- | ---: |\n| x |\n| yy | 12 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(rows, ["a  \u{2502}  b", "x  \u{2502}   ", "yy \u{2502} 12"]);
+    }
+
+    #[test]
+    fn a_tables_alignment_does_not_carry_into_the_next_table() {
+        // #861 guard: the delimiter row's alignment belongs to its own
+        // table. A plain table after a right-aligned one is left-aligned.
+        let lines =
+            render("| n |\n| ---: |\n| 1 |\n| 100 |\n\ntext\n\n| m |\n| --- |\n| 1 |\n| 100 |");
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let ones: Vec<&String> = rows.iter().filter(|r| r.trim() == "1").collect();
+        assert_eq!(
+            ones,
+            ["  1", "1  "],
+            "right-aligned in the first table, left in the second: {rows:#?}"
+        );
+    }
+
+    #[test]
     fn links_underline_and_rules_draw() {
         let lines = render("see [the docs](https://example.com)\n\n---");
         let link = lines[0]
