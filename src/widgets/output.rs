@@ -727,6 +727,99 @@ mod tests {
         assert_eq!(p.selected, 0, "the first name's row selects Git");
     }
 
+    /// Renders `p` into a fresh `w`x`h` buffer and returns the buffer.
+    fn render_buf(p: &mut OutputPanel, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        buf
+    }
+
+    fn cells(buf: &Buffer, y: u16, xs: std::ops::RangeInclusive<u16>) -> String {
+        xs.map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// #846 negative: a body too short for both border rows and a name
+    /// (two rows under the toolbar) keeps the bare list: no border glyph is
+    /// drawn over a name, and each name is still the click target of its row.
+    #[test]
+    fn a_body_too_short_for_the_border_keeps_the_bare_list() {
+        let mut p = OutputPanel::new();
+        p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
+        p.dropdown_open = true;
+        let buf = render_buf(&mut p, 40, 3);
+        for y in 1..3 {
+            let row = cells(&buf, y, 0..=39);
+            assert!(
+                !row.contains(['╭', '╮', '╰', '╯', '│', '─']),
+                "row {y} carries no border: {row:?}"
+            );
+        }
+        assert!(cells(&buf, 1, 1..=15).contains("Git"));
+        assert!(cells(&buf, 2, 1..=15).contains("ruff"));
+        let targets: Vec<(u16, usize)> = p.dropdown_items.iter().map(|&(r, i)| (r.y, i)).collect();
+        assert_eq!(targets, vec![(1, 0), (2, 1)], "two rows, two names");
+        assert!(p.click(3, 2));
+        assert_eq!(p.selected, 1, "the second row selects ruff");
+    }
+
+    /// #846 negative: with more channels than fit, the scrollbar sits inside
+    /// the border, on its own column: the border's corners and sides stay
+    /// whole and no name is overpainted by the track.
+    #[test]
+    fn an_overflowing_list_keeps_the_border_and_its_scrollbar_inside() {
+        let mut p = OutputPanel::new();
+        p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
+        p.dropdown_open = true;
+        // 1 toolbar + 6 body rows: the border takes two, four names fit.
+        let buf = render_buf(&mut p, 40, 7);
+        // "chan-00" + a space either side + the scrollbar column + border.
+        let (left, right) = (1u16, 12u16);
+        assert_eq!(
+            cells(&buf, 1, left..=right),
+            format!("╭{}╮", "─".repeat(10))
+        );
+        assert_eq!(
+            cells(&buf, 6, left..=right),
+            format!("╰{}╯", "─".repeat(10))
+        );
+        for y in 2..6 {
+            let name = format!("chan-{:02}", y - 2);
+            assert_eq!(cells(&buf, y, left..=left + 8), format!("│ {name}"));
+            assert_eq!(cells(&buf, y, right..=right), "│", "right side, row {y}");
+        }
+        assert_eq!(p.dropdown_items.len(), 4);
+        for &(r, _) in &p.dropdown_items {
+            assert!(
+                r.x > left && r.x + r.width < right,
+                "{r:?} inside the border"
+            );
+        }
+    }
+
+    /// #846 negative: a channel name wider than the body is cut inside the
+    /// box, which never grows past the body; the right border stays drawn on
+    /// every row.
+    #[test]
+    fn a_long_channel_name_is_cut_inside_the_right_border() {
+        let mut p = OutputPanel::new();
+        p.channels = vec!["Git".into(), "a-very-long-channel-name-for-the-box".into()];
+        p.dropdown_open = true;
+        let buf = render_buf(&mut p, 20, 8);
+        // The box spans the body's width less the column it starts after.
+        let right = 19u16;
+        assert_eq!(cells(&buf, 1, right..=right), "╮");
+        assert_eq!(cells(&buf, 2, right..=right), "│");
+        assert_eq!(cells(&buf, 3, right..=right), "│");
+        assert_eq!(cells(&buf, 4, right..=right), "╯");
+        let long_row = cells(&buf, 3, 1..=right);
+        assert!(long_row.starts_with("│ a-very-long"), "{long_row:?}");
+        assert!(
+            long_row.ends_with(" │"),
+            "a space before the border: {long_row:?}"
+        );
+    }
+
     #[test]
     fn empty_shows_a_hint() {
         let mut p = OutputPanel::new();
