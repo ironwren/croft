@@ -64925,6 +64925,84 @@ fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
     });
 }
 
+/// #863: at 80x24 every built-in step shows its whole caption and the keys
+/// that move the tour. One clamped line of progress, caption and keys cut
+/// the keys first, and the theme picker the palette step opens covered the
+/// caption's start.
+#[test]
+fn every_tour_caption_shows_whole_with_its_keys_at_80_columns() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Draw, then read the caption panel back off the screen: every
+        // row but the last is the wrapped caption, the last the keys.
+        let mut check = |app: &mut App, when: &str| {
+            let step = app.tour.as_ref().and_then(|r| r.tour.current()).unwrap();
+            let caption = step.caption_text();
+            let progress = app.tour.as_ref().unwrap().tour.progress();
+            term.draw(|f| app.render(f)).unwrap();
+            let buf = term.backend().buffer();
+            let (panel, _) = app.tour_caption_panel(buf.area).expect("a panel");
+            let row = |y: u16| {
+                (panel.x..panel.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            let body: Vec<String> = (panel.y..panel.bottom() - 1).map(row).collect();
+            assert_eq!(
+                words(&body.join(" ")),
+                words(&caption),
+                "{when}: the caption is cut: {body:#?}"
+            );
+            let keys = row(panel.bottom() - 1);
+            assert!(
+                keys.contains("Enter next \u{b7} Esc leave") && keys.contains(&progress),
+                "{when}: the keys row lost its hint: {keys:?}"
+            );
+            assert!(body.len() <= 3, "{when}: {} caption rows", body.len());
+            panel
+        };
+        let mut steps = 0;
+        let mut saw_picker = false;
+        while app.tour.is_some() && steps < 20 {
+            let action = app
+                .tour
+                .as_ref()
+                .unwrap()
+                .tour
+                .current()
+                .unwrap()
+                .action
+                .clone();
+            check(&mut app, &format!("{action:?}"));
+            if matches!(action, crate::tour::TourAction::Palette(_)) {
+                // Enter runs the typed command: the theme picker, a menu
+                // standing the frame's height along the left.
+                app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                assert!(app.context_menu.is_some(), "the theme picker opened");
+                let panel = check(&mut app, "the theme picker");
+                let menu = app.menu_rect().unwrap();
+                assert!(
+                    !panel.intersects(menu),
+                    "the picker {menu:?} covers the caption {panel:?}"
+                );
+                saw_picker = true;
+            }
+            app.close_all_modals_for_test();
+            app.advance_tour();
+            steps += 1;
+        }
+        assert_eq!(steps, 8, "every built-in step was checked");
+        assert!(saw_picker, "the theme picker step was checked");
+    });
+}
+
 /// #377: Esc mid-tour closes the sample's tabs too, an edited one
 /// included, so no save can write a scratch file back.
 #[test]

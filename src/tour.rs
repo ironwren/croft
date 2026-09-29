@@ -5,6 +5,11 @@
 //! action and the caption shown while it is on screen. Contributors extend
 //! it, and a platform can ship its own (a Termux tour driven by the
 //! on-screen keyboard, say) without touching this code.
+//!
+//! A caption writes the command modifier as `{mod}` (`{mod}+P`), and the
+//! tour spells it as this platform's: `Cmd` on macOS, `Ctrl` elsewhere
+//! (#863). A literal `Cmd+P` told a Linux user to press a key that does
+//! nothing there.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -45,6 +50,20 @@ pub enum TourAction {
 pub struct TourStep {
     pub action: TourAction,
     pub caption: String,
+}
+
+impl TourStep {
+    /// The caption as shown: `{mod}` spelled as this platform's command
+    /// modifier.
+    pub fn caption_text(&self) -> String {
+        expand_caption(&self.caption, crate::keymap::mod_key_name())
+    }
+}
+
+/// `caption` with every `{mod}` spelled `modifier`. Takes the name rather
+/// than asking for it so a test can expand for a platform it is not on.
+pub fn expand_caption(caption: &str, modifier: &str) -> String {
+    caption.replace("{mod}", modifier)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -227,6 +246,16 @@ mod tests {
         }
         assert_eq!(actions.last(), Some(&&TourAction::Done));
         assert!(tour.steps.iter().all(|s| !s.caption.is_empty()));
+        // #863: a chord is written with the placeholder, never one
+        // platform's own modifier, and nothing unexpanded reaches the screen.
+        for s in &tour.steps {
+            assert!(
+                !s.caption.contains("Cmd"),
+                "spell the modifier {{mod}}: {}",
+                s.caption
+            );
+            assert!(!s.caption_text().contains('{'), "{}", s.caption_text());
+        }
         // Every file the tour opens exists in the sample project.
         let files: Vec<&str> = sample_files().iter().map(|(p, _)| *p).collect();
         for s in &tour.steps {
@@ -234,6 +263,34 @@ mod tests {
                 assert!(files.contains(&p.as_str()), "{p} is in the sample");
             }
         }
+    }
+
+    #[test]
+    fn captions_name_the_platform_s_command_modifier() {
+        // #863: `{mod}` is Cmd on macOS and Ctrl elsewhere, as `mod` is in
+        // keybindings.json.
+        assert_eq!(expand_caption("{mod}+P finds", "Cmd"), "Cmd+P finds");
+        assert_eq!(
+            expand_caption("{mod}+Shift+P, or {mod}+click", "Ctrl"),
+            "Ctrl+Shift+P, or Ctrl+click"
+        );
+        let want = if cfg!(target_os = "macos") {
+            "Cmd+P"
+        } else {
+            "Ctrl+P"
+        };
+        let step = TourStep {
+            action: TourAction::QuickOpen,
+            caption: String::from("{mod}+P"),
+        };
+        assert_eq!(step.caption_text(), want);
+        let tour = Tour::parse(TOUR_JSON).unwrap();
+        assert!(
+            tour.steps
+                .iter()
+                .any(|s| s.caption_text().contains(&format!("{want} "))),
+            "the built-in tour teaches {want}"
+        );
     }
 
     #[test]
