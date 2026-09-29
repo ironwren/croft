@@ -56,7 +56,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
@@ -171,7 +171,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the merge-base with the PR base resolves.
           fetch-depth: 0
@@ -203,7 +203,7 @@ jobs:
     name: clippy + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The suite's terminal tests drive /bin/zsh (the shim they exist to
       # cover) and the PDF tests rasterise through poppler's pdftoppm - the
       # same binaries croft needs at runtime on a Linux box. The runner
@@ -292,7 +292,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the target to the PINNED toolchain
@@ -336,7 +336,7 @@ jobs:
     name: Android build (aarch64-linux-android)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the Android target to the PINNED toolchain
