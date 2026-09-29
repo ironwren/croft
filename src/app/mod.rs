@@ -21128,18 +21128,7 @@ impl App {
             }
             // Cmd+K →: close the editors to the right of the active tab.
             KeyCode::Right if plain => {
-                let from = self.editor.active_index();
-                self.record_closed_tabs_where(|i, ed| i > from && !ed.pinned);
-                let removed = self.editor.close_to_right(from);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
+                self.close_tabs_to_right(self.editor.active_index());
                 true
             }
             // Cmd+K S: mark the active file as the compare anchor.
@@ -21245,17 +21234,11 @@ impl App {
             // chord below). Must precede the case-insensitive 'p' arm, which
             // would swallow the shifted press.
             KeyCode::Char('P') if shifted && plain => {
-                if self.editor.keep_open(self.editor.active_index()) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
+                self.keep_tab_open(self.editor.active_index());
                 true
             }
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'p') => {
-                let idx = self.editor.active_index();
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
+                self.toggle_tab_pin(self.editor.active_index());
                 true
             }
             // Cmd+K Shift+O: move the active tab into a new window. Must precede
@@ -46313,6 +46296,13 @@ impl App {
                 })
                 .collect();
         palette.set_extension_commands(ext_commands);
+        // VS Code offers Pin Editor on an unpinned tab and Unpin Editor on
+        // a pinned one (#852), never the one that would do nothing.
+        palette.set_hidden(vec![if self.editor.is_pinned(self.editor.active_index()) {
+            crate::widgets::command_palette::Command::PinEditor
+        } else {
+            crate::widgets::command_palette::Command::UnpinEditor
+        }]);
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -47784,6 +47774,15 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The tab menu's rows (#852), on the active tab and through the
+            // same methods its clicks and the Cmd+K chords use.
+            Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.editor.active_index()),
+            Cmd::CloseSavedEditors => self.close_saved_tabs(),
+            Cmd::CloseAllEditors => self.close_all_tabs(),
+            Cmd::PinEditor => self.set_active_tab_pinned(true),
+            Cmd::UnpinEditor => self.set_active_tab_pinned(false),
+            Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
             Cmd::SplitEditor => self.split_editor(),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
@@ -57130,45 +57129,12 @@ impl App {
                     self.collapse_split_if_empty();
                 }
             }
-            MenuAction::CloseOtherTabs(keep_idx) => {
-                self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
-                let removed = self.editor.close_others(keep_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 other tab")
-                    } else {
-                        format!("Closed {removed} other tabs")
-                    };
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::CloseTabsToRight(from_idx) => {
-                self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
-                let removed = self.editor.close_to_right(from_idx);
-                if removed > 0 {
-                    self.sync_open_file_poll_mtime();
-                    self.status = if removed == 1 {
-                        String::from("Closed 1 tab to the right")
-                    } else {
-                        format!("Closed {removed} tabs to the right")
-                    };
-                    self.poke_cursor();
-                }
-            }
+            MenuAction::CloseOtherTabs(keep_idx) => self.close_other_tabs(keep_idx),
+            MenuAction::CloseTabsToRight(from_idx) => self.close_tabs_to_right(from_idx),
             MenuAction::CloseAllTabs => self.close_all_tabs(),
             MenuAction::CloseSavedTabs => self.close_saved_tabs(),
-            MenuAction::KeepTabOpen(idx) => {
-                if self.editor.keep_open(idx) {
-                    self.status = String::from("Kept tab open");
-                    self.poke_cursor();
-                }
-            }
-            MenuAction::ToggleTabPin(idx) => {
-                let pinned = self.editor.toggle_pin(idx);
-                self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
-                self.poke_cursor();
-            }
+            MenuAction::KeepTabOpen(idx) => self.keep_tab_open(idx),
+            MenuAction::ToggleTabPin(idx) => self.toggle_tab_pin(idx),
             MenuAction::SplitEditor => self.split_editor(),
             MenuAction::SplitEditorLeft => {
                 self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
@@ -57446,11 +57412,92 @@ impl App {
         }
     }
 
-    /// Cmd+K W / tab context "Close All": close every tab in EVERY editor
-    /// group, not just the focused one, collapsing any split back to a single
-    /// blank pane. A side-by-side layout (e.g. `cgr duplicates` diffs) would
-    /// otherwise only empty the clicked group and look like a single close
-    /// once the blank group collapsed away.
+    /// Tab context "Close Others" and View: Close Other Editors in Group
+    /// (#852): close every tab of the focused group but `keep_idx` and the
+    /// pinned ones, recording each for Reopen Closed Editor.
+    fn close_other_tabs(&mut self, keep_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
+        let removed = self.editor.close_others(keep_idx);
+        if removed == 0 {
+            self.status = String::from("No other tabs to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 other tab")
+        } else {
+            format!("Closed {removed} other tabs")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K →, tab context "Close to the Right" and View: Close Editors to
+    /// the Right in Group (#852): close the focused group's unpinned tabs
+    /// right of `from_idx`, recording each for Reopen Closed Editor.
+    fn close_tabs_to_right(&mut self, from_idx: usize) {
+        self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
+        let removed = self.editor.close_to_right(from_idx);
+        if removed == 0 {
+            self.status = String::from("No tabs to the right to close");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.status = if removed == 1 {
+            String::from("Closed 1 tab to the right")
+        } else {
+            format!("Closed {removed} tabs to the right")
+        };
+        self.poke_cursor();
+    }
+
+    /// Cmd+K ⇧P, tab context "Keep Open" and View: Keep Editor (#852):
+    /// promote the preview tab at `idx` so the next single-click open does
+    /// not replace it.
+    fn keep_tab_open(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+        } else if self.editor.keep_open(idx) {
+            self.status = String::from("Kept tab open");
+            self.poke_cursor();
+        } else {
+            self.status = String::from("Tab is already kept open");
+        }
+    }
+
+    /// Cmd+K P and tab context "Pin" / "Unpin": flip the pin of the tab at
+    /// `idx`. The welcome screen's placeholder is not a tab to pin.
+    fn toggle_tab_pin(&mut self, idx: usize) {
+        if self.editor.is_blank_initial() {
+            self.status = String::from("No editor is open");
+            return;
+        }
+        let pinned = self.editor.toggle_pin(idx);
+        self.status = String::from(if pinned { "Pinned tab" } else { "Unpinned tab" });
+        self.poke_cursor();
+    }
+
+    /// View: Pin Editor (`pin`) / View: Unpin Editor (#852): the active
+    /// tab's pin, through the tab menu's toggle. Each is a no-op on a tab
+    /// already in that state, so a key bound to one never does the other.
+    fn set_active_tab_pinned(&mut self, pin: bool) {
+        let idx = self.editor.active_index();
+        if !self.editor.is_blank_initial() && self.editor.is_pinned(idx) == pin {
+            self.status = String::from(if pin {
+                "Tab is already pinned"
+            } else {
+                "Tab is not pinned"
+            });
+            return;
+        }
+        self.toggle_tab_pin(idx);
+    }
+
+    /// Cmd+K W / tab context "Close All" / View: Close All Editors (#852):
+    /// close every tab in EVERY editor group, not just the focused one,
+    /// collapsing any split back to a single blank pane. A side-by-side
+    /// layout (e.g. `cgr duplicates` diffs) would otherwise only empty the
+    /// clicked group and look like a single close once the blank group
+    /// collapsed away.
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
         if self.editor_layout.is_split() {
@@ -57475,8 +57522,9 @@ impl App {
     }
 
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu and the `Cmd+K U` chord so both
-    /// surfaces produce the same status line and split-collapse behavior.
+    /// changes. Shared by the tab context menu, the `Cmd+K U` chord and View:
+    /// Close Saved Editors in Group (#852) so every surface produces the same
+    /// status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
         let removed = self.editor.close_saved();
         if removed == 0 {

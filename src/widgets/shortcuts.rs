@@ -417,6 +417,21 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_close_tab_key",
             },
             ShortcutEntry {
+                keys: "Cmd+K →",
+                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group; View: Close Other Editors in Group closes all but it)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K U / Cmd+K W",
+                description: "Close the saved tabs, keeping unsaved ones / every tab in every split (palette: View: Close Saved Editors in Group / View: Close All Editors)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K P / Cmd+K Shift+P",
+                description: "Pin or unpin the active tab / keep the preview tab open (palette: View: Pin Editor, View: Unpin Editor, View: Keep Editor)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+1..9",
                 description: "Jump to that tab (when no vim chord is pending)",
                 handler: "",

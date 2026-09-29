@@ -116,6 +116,18 @@ pub enum Command {
     RestoreSnapshot,
     CloseEditor,
     ReopenClosedEditor,
+    /// The editor tab menu's close / pin / keep rows as commands (#852),
+    /// VS Code's names, each on the active tab of the focused group.
+    CloseOtherEditors,
+    CloseEditorsToTheRight,
+    CloseSavedEditors,
+    CloseAllEditors,
+    /// View: Pin Editor / Unpin Editor. The palette offers only the one
+    /// that applies to the active tab, as VS Code does
+    /// (`CommandPalette::set_hidden`); both stay bindable.
+    PinEditor,
+    UnpinEditor,
+    KeepEditor,
     SplitEditor,
     QuickOpen,
     TakeTheTour,
@@ -520,6 +532,13 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RestoreSnapshot,
     Command::CloseEditor,
     Command::ReopenClosedEditor,
+    Command::CloseOtherEditors,
+    Command::CloseEditorsToTheRight,
+    Command::CloseSavedEditors,
+    Command::CloseAllEditors,
+    Command::PinEditor,
+    Command::UnpinEditor,
+    Command::KeepEditor,
     Command::SplitEditor,
     Command::QuickOpen,
     Command::TakeTheTour,
@@ -883,6 +902,13 @@ impl Command {
             Command::RestoreSnapshot => "Local History: Restore Snapshot",
             Command::CloseEditor => "View: Close Editor",
             Command::ReopenClosedEditor => "View: Reopen Closed Editor",
+            Command::CloseOtherEditors => "View: Close Other Editors in Group",
+            Command::CloseEditorsToTheRight => "View: Close Editors to the Right in Group",
+            Command::CloseSavedEditors => "View: Close Saved Editors in Group",
+            Command::CloseAllEditors => "View: Close All Editors",
+            Command::PinEditor => "View: Pin Editor",
+            Command::UnpinEditor => "View: Unpin Editor",
+            Command::KeepEditor => "View: Keep Editor",
             Command::SplitEditor => "View: Split Editor",
             Command::QuickOpen => "Go to File",
             Command::TakeTheTour => "Help: Take the Tour",
@@ -1238,6 +1264,17 @@ impl Command {
             Command::SelectAll => "Cmd+A",
             Command::CloseEditor => "Cmd+W",
             Command::ReopenClosedEditor => "Cmd+K Shift+W",
+            // No chord: the tab menu's ⌥⌘T hint is iTerm2's own New Tab
+            // chord, which croft leaves alone.
+            Command::CloseOtherEditors => "",
+            Command::CloseEditorsToTheRight => "Cmd+K →",
+            Command::CloseSavedEditors => "Cmd+K U",
+            Command::CloseAllEditors => "Cmd+K W",
+            // One chord toggles, as VS Code's `Ctrl+K Shift+Enter` serves
+            // both through their `when` clauses.
+            Command::PinEditor => "Cmd+K P",
+            Command::UnpinEditor => "Cmd+K P",
+            Command::KeepEditor => "Cmd+K Shift+P",
             Command::SplitEditor => "Cmd+\\",
             Command::QuickOpen => "Cmd+P",
             Command::TakeTheTour => "",
@@ -1596,6 +1633,13 @@ impl Command {
             Command::RestoreSnapshot => "restore_snapshot",
             Command::CloseEditor => "close_editor",
             Command::ReopenClosedEditor => "reopen_closed_editor",
+            Command::CloseOtherEditors => "close_other_editors",
+            Command::CloseEditorsToTheRight => "close_editors_to_the_right",
+            Command::CloseSavedEditors => "close_saved_editors",
+            Command::CloseAllEditors => "close_all_editors",
+            Command::PinEditor => "pin_editor",
+            Command::UnpinEditor => "unpin_editor",
+            Command::KeepEditor => "keep_editor",
             Command::SplitEditor => "split_editor",
             Command::QuickOpen => "quick_open",
             Command::TakeTheTour => "help_take_the_tour",
@@ -1848,10 +1892,13 @@ impl Command {
 
     /// An extra word the palette matches this command on, beyond its
     /// title: "layout" for the Customize Layout commands (#852), whose
-    /// VS Code names mostly don't say it. Empty for the rest.
+    /// VS Code names mostly don't say it, and the tab menu's "Keep Open"
+    /// for View: Keep Editor. Empty for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
+        } else if self == Command::KeepEditor {
+            "keep open"
         } else {
             ""
         }
@@ -1916,6 +1963,11 @@ pub struct CommandPalette {
     /// separate from the built-in registry and merged into `results` on each
     /// re-rank.
     pub extensions: Vec<ExtensionCommand>,
+    /// Built-ins left out of the list because they do not apply right now,
+    /// VS Code's `when` clause for its palette (#852: Pin Editor on a pinned
+    /// tab). They stay commands: keybindings.json and the Keyboard
+    /// Shortcuts editor still reach them.
+    pub hidden: Vec<Command>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -1929,6 +1981,7 @@ impl CommandPalette {
             cursor: 0,
             results: Vec::new(),
             extensions: Vec::new(),
+            hidden: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -1942,6 +1995,15 @@ impl CommandPalette {
     /// then re-rank. Called by the app when opening the palette.
     pub fn set_extension_commands(&mut self, extensions: Vec<ExtensionCommand>) {
         self.extensions = extensions;
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Leave `hidden` out of the list (see [`CommandPalette::hidden`]),
+    /// then re-rank. Called by the app when opening the palette.
+    pub fn set_hidden(&mut self, hidden: Vec<Command>) {
+        self.hidden = hidden;
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
@@ -2049,7 +2111,8 @@ impl CommandPalette {
     }
 
     /// Re-rank the command list against the current query, over built-ins AND
-    /// injected extension commands. An empty query shows every command in
+    /// injected extension commands, less the `hidden` built-ins. An empty
+    /// query shows every command in
     /// declaration order (built-ins first, then extensions); otherwise rows are
     /// kept only when their lower-cased title fuzzy-matches the needle, ranked
     /// by score (best first), ties broken by declaration order for stability.
@@ -2057,6 +2120,7 @@ impl CommandPalette {
     fn refresh_results(&mut self) {
         let all: Vec<PaletteItem> = ALL_COMMANDS
             .iter()
+            .filter(|c| !self.hidden.contains(c))
             .map(|&c| PaletteItem::Builtin(c))
             .chain(self.extensions.iter().cloned().map(PaletteItem::Extension))
             .collect();
@@ -2392,6 +2456,63 @@ mod tests {
             Some(&builtin(Command::ToggleStatusBar))
         );
         assert!(!palette.results.contains(&builtin(Command::ToggleZenMode)));
+    }
+
+    /// #852 (comment 3): each editor-tab action is in the palette under
+    /// VS Code's title, as the top row for that title, showing the chord
+    /// croft has for it (Close Others has none: the tab menu's ⌥⌘T is not a
+    /// chord croft binds).
+    #[test]
+    fn the_editor_tab_commands_are_found_under_their_vscode_titles() {
+        let mut palette = CommandPalette::new();
+        for (title, chord) in [
+            ("View: Close Other Editors in Group", ""),
+            ("View: Close Editors to the Right in Group", "Cmd+K →"),
+            ("View: Close Saved Editors in Group", "Cmd+K U"),
+            ("View: Close All Editors", "Cmd+K W"),
+            ("View: Pin Editor", "Cmd+K P"),
+            ("View: Unpin Editor", "Cmd+K P"),
+            ("View: Keep Editor", "Cmd+K Shift+P"),
+        ] {
+            palette.set_query(title);
+            let top = palette.results.first();
+            assert_eq!(
+                top.map(PaletteItem::title),
+                Some(title),
+                "the palette's top row for {title:?}"
+            );
+            assert_eq!(
+                top.map(PaletteItem::keybinding_hint),
+                Some(chord),
+                "{title:?}"
+            );
+        }
+    }
+
+    /// #852 (comment 3): the tab menu's own labels find the same commands,
+    /// so a query in the menu's words ("keep open") is not a dead end.
+    #[test]
+    fn the_tab_menu_labels_find_the_editor_tab_commands() {
+        let mut palette = CommandPalette::new();
+        for (label, title) in [
+            ("close others", "View: Close Other Editors in Group"),
+            (
+                "close to the right",
+                "View: Close Editors to the Right in Group",
+            ),
+            ("close saved", "View: Close Saved Editors in Group"),
+            ("close all", "View: Close All Editors"),
+            ("pin", "View: Pin Editor"),
+            ("unpin", "View: Unpin Editor"),
+            ("keep open", "View: Keep Editor"),
+        ] {
+            palette.set_query(label);
+            let titles: Vec<&str> = palette.results.iter().map(PaletteItem::title).collect();
+            assert!(
+                titles.contains(&title),
+                "{label:?} must find {title:?}; it found {titles:?}"
+            );
+        }
     }
 
     #[test]
