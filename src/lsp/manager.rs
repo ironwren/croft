@@ -6272,6 +6272,12 @@ const DOCUMENT_PULL_DEBOUNCE: std::time::Duration = std::time::Duration::from_mi
 /// `ManagedClient::diagnostic_pull_stalled` gives.
 const DOCUMENT_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Generation numbers for document pulls (#866), unique for the whole
+/// session. A per-document count would start over when a document is
+/// closed and reopened, and a pull from before the close could then pass
+/// for the reopened buffer's latest.
+static NEXT_DOCUMENT_PULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// One `textDocument/diagnostic` pull (#866): a server that answers it, the
 /// document, and the generation this pull stands for.
 struct DocumentPull {
@@ -6352,7 +6358,7 @@ fn document_pull_targets<'a>(
                     .document_pull_generations
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let next = generations.get(path).map_or(1, |n| n + 1);
+                let next = NEXT_DOCUMENT_PULL.fetch_add(1, Ordering::Relaxed);
                 generations.insert(path.to_path_buf(), next);
                 next
             };
@@ -7934,6 +7940,38 @@ while True:
                 pulls.lines().count(),
                 1,
                 "the overtaken pull never went out"
+            );
+        });
+    }
+
+    /// #866: a pull still out when its document closes is not the latest
+    /// pull once the document reopens, so its late answer, about the text
+    /// before the close, can never land on the reopened buffer.
+    #[test]
+    fn a_pull_from_before_a_close_is_stale_after_the_reopen() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("a.md");
+        let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
+        stub_runtime().block_on(async {
+            let (managed, _receipt) = document_pull_client(&python, &root, true).await;
+            let before = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            // What `close_doc` does to the document's generation.
+            managed
+                .document_pull_generations
+                .lock()
+                .unwrap()
+                .remove(&file);
+            let after = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            assert!(after[0].is_current(), "the reopened document's pull");
+            assert!(
+                !before[0].is_current(),
+                "the pull from before the close is stale"
             );
         });
     }
