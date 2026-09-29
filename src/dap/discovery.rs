@@ -53,7 +53,7 @@ pub fn attachable_python_targets() -> Vec<PyTarget> {
     );
     let self_pid = std::process::id();
 
-    let mut targets: Vec<PyTarget> = sys
+    let rows: Vec<(u32, PyVersion, PathBuf, String)> = sys
         .processes()
         .iter()
         .filter_map(|(pid, proc_)| {
@@ -74,18 +74,31 @@ pub fn attachable_python_targets() -> Vec<PyTarget> {
             if !version.supports_remote_attach() {
                 return None;
             }
-            let summary = summarize_cmd(proc_.cmd());
-            Some(PyTarget {
-                pid,
-                version,
-                exe: exe.to_path_buf(),
-                label: target_label(pid, version, &summary),
-            })
+            Some((pid, version, exe.to_path_buf(), summarize_cmd(proc_.cmd())))
         })
         .collect();
+    labelled_targets(rows)
+}
 
-    targets.sort_by_key(|t| t.pid);
-    targets
+/// The picker's targets for `(pid, version, exe, command line)` rows, by
+/// pid, each label's PID column padded to the widest PID listed (#868): 4-
+/// and 5-digit PIDs in one list otherwise push the version and command line
+/// out of line from row to row.
+fn labelled_targets(mut rows: Vec<(u32, PyVersion, PathBuf, String)>) -> Vec<PyTarget> {
+    rows.sort_by_key(|(pid, ..)| *pid);
+    let pid_width = rows
+        .iter()
+        .map(|(pid, ..)| pid.to_string().len())
+        .max()
+        .unwrap_or(0);
+    rows.into_iter()
+        .map(|(pid, version, exe, summary)| PyTarget {
+            pid,
+            version,
+            exe,
+            label: target_label(pid, pid_width, version, &summary),
+        })
+        .collect()
 }
 
 /// Run `<exe> --version` and parse the reported CPython version. Older
@@ -141,10 +154,11 @@ fn is_pdb_attach_client(cmd: &[OsString]) -> bool {
     false
 }
 
-/// Build the picker row label: pid, interpreter version, then the command line.
-fn target_label(pid: u32, version: PyVersion, cmd_summary: &str) -> String {
+/// Build the picker row label: pid (left-aligned in `pid_width` columns),
+/// interpreter version, then the command line.
+fn target_label(pid: u32, pid_width: usize, version: PyVersion, cmd_summary: &str) -> String {
     format!(
-        "PID {pid}  ·  Python {}.{}.{}  ·  {cmd_summary}",
+        "PID {pid:<pid_width$}  ·  Python {}.{}.{}  ·  {cmd_summary}",
         version.major, version.minor, version.patch
     )
 }
@@ -163,7 +177,7 @@ mod tests {
 
     #[test]
     fn label_includes_pid_version_and_command() {
-        let label = target_label(4321, v(3, 14, 2), "app.py --serve");
+        let label = target_label(4321, 4, v(3, 14, 2), "app.py --serve");
         assert!(label.contains("PID 4321"));
         assert!(label.contains("3.14.2"));
         assert!(label.contains("app.py --serve"));
@@ -339,5 +353,84 @@ mod tests {
             label.contains("-c import time"),
             "the row names the command line: {label}"
         );
+    }
+
+    /// Where a label's version column starts, in characters.
+    fn version_column(label: &str) -> usize {
+        label[..label.find("Python").expect("a version")]
+            .chars()
+            .count()
+    }
+
+    /// #868: the issue's screenshot has 4- and 5-digit PIDs in one list,
+    /// pushing the columns after them out of line. The PID column is padded
+    /// to the widest PID listed, so every row's version and command line
+    /// start at one column. Rows come out by PID.
+    #[test]
+    fn the_pid_column_is_padded_to_the_widest_pid() {
+        let exe = PathBuf::from("/usr/bin/python3.14");
+        let rows = labelled_targets(vec![
+            (
+                51234,
+                v(3, 14, 2),
+                exe.clone(),
+                String::from("python3.14 worker.py"),
+            ),
+            (
+                812,
+                v(3, 14, 2),
+                exe.clone(),
+                String::from("python3.14 a.py"),
+            ),
+            (
+                4321,
+                v(3, 14, 2),
+                exe.clone(),
+                String::from("python3.14 -m app"),
+            ),
+        ]);
+        assert_eq!(
+            rows.iter().map(|t| t.pid).collect::<Vec<_>>(),
+            vec![812, 4321, 51234]
+        );
+        let columns: Vec<usize> = rows.iter().map(|t| version_column(&t.label)).collect();
+        assert!(columns.iter().all(|c| *c == columns[0]), "{rows:#?}");
+        assert!(
+            rows[0].label.starts_with("PID 812    ·"),
+            "{}",
+            rows[0].label
+        );
+        assert!(
+            rows[2].label.ends_with("·  python3.14 worker.py"),
+            "{}",
+            rows[2].label
+        );
+    }
+
+    /// #868 guard: padding is to the widest PID present, not a fixed width.
+    /// A lone target, or PIDs all as wide, read exactly as before, and an
+    /// empty list stays empty.
+    #[test]
+    fn same_width_pids_are_not_padded() {
+        let exe = PathBuf::from("/usr/bin/python3.14");
+        let one = labelled_targets(vec![(
+            4321,
+            v(3, 14, 2),
+            exe.clone(),
+            String::from("app.py --serve"),
+        )]);
+        assert_eq!(
+            one[0].label,
+            "PID 4321  ·  Python 3.14.2  ·  app.py --serve"
+        );
+        let same = labelled_targets(vec![
+            (4321, v(3, 14, 2), exe.clone(), String::from("a.py")),
+            (1234, v(3, 14, 2), exe.clone(), String::from("b.py")),
+        ]);
+        assert!(
+            same.iter()
+                .all(|t| t.label.starts_with("PID ") && !t.label.contains("   ·"))
+        );
+        assert!(labelled_targets(Vec::new()).is_empty());
     }
 }
