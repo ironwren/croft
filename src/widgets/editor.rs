@@ -2857,6 +2857,11 @@ pub struct Editor {
     /// never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Byte ranges of every string and comment in the buffer (lines joined
+    /// by `\n`), from the same highlight pass as `bracket_colors`. Quote
+    /// auto-pairing reads it to see a string or block comment an earlier
+    /// line opened, which a scan of the caret's line alone cannot (#844).
+    protected_ranges: Vec<(usize, usize)>,
     /// Inline color-literal decorations (the "no colour-swatch decorations"
     /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
     /// per line, the `(start char col, end char col, background, foreground)`
@@ -3192,6 +3197,7 @@ impl Editor {
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            protected_ranges: Vec::new(),
             show_color_swatches: true,
             color_swatches: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
@@ -6075,9 +6081,11 @@ impl Editor {
                 );
                 self.highlights = spans;
                 self.bracket_colors = scan_bracket_colors(&self.lines, &protected);
+                self.protected_ranges = protected;
             }
             None => {
                 self.highlights = vec![Vec::new(); self.lines.len()];
+                self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
                 // the buffer is big enough that the per-edit scan would make
@@ -6785,9 +6793,16 @@ impl Editor {
         }
         // A quote typed inside a string or comment is text there, or that
         // string's closing quote, never an opener: pairing the closing `"`
-        // of `print(f"{x}` left a stray `")` behind (#844).
-        if is_pair_quote(c) && ends_in_string_or_comment(before, self.lang) {
-            return false;
+        // of `print(f"{x}` left a stray `")` behind (#844). One opened on an
+        // earlier line (a docstring body, a block comment) comes from the
+        // highlight pass; the line scan starts where it closes.
+        if is_pair_quote(c) {
+            let Some(from) = self.earlier_construct_end(self.cursor_row, before.len()) else {
+                return false;
+            };
+            if ends_in_string_or_comment(&before[from..], self.lang) {
+                return false;
+            }
         }
         self.pin_on_edit();
         self.push_undo(EditKind::InsertChar);
@@ -6800,6 +6815,28 @@ impl Editor {
         self.recompute_highlights();
         self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
         true
+    }
+
+    /// Where line `row` leaves a string or comment that an earlier line
+    /// opened, as a byte index into the line: `Some(0)` when none reaches the
+    /// line, and `None` while one still covers `caret` (a byte index too).
+    /// Read from the last highlight pass, since a scan of one line cannot
+    /// know it starts inside a docstring or a block comment (#844).
+    fn earlier_construct_end(&self, row: usize, caret: usize) -> Option<usize> {
+        let line_start: usize = self.lines[..row].iter().map(|l| l.len() + 1).sum();
+        let first = self
+            .protected_ranges
+            .partition_point(|&(_, end)| end <= line_start);
+        match self.protected_ranges.get(first) {
+            Some(&(start, end)) if start < line_start => {
+                if end > line_start + caret {
+                    None
+                } else {
+                    Some(end - line_start)
+                }
+            }
+            _ => Some(0),
+        }
     }
 
     /// [`Self::apply_span_edits`] for text another seat wrote (#349): the line
@@ -29931,6 +29968,41 @@ mod tests {
                 format!("{head}\"\"{tail}"),
                 "{lang:?}: {text:?}"
             );
+        }
+    }
+
+    /// The line scan starts every line outside a string, so a quote typed in
+    /// a docstring body, a template literal or a block comment that an
+    /// earlier line opened still paired; the highlight pass knows (#844).
+    #[test]
+    fn a_quote_in_a_string_or_comment_from_an_earlier_line_pairs_only_once_it_closes() {
+        let typed_at_caret = |lang: LangKind, text: &str| {
+            let (head, tail) = text.split_once('|').expect("a caret marker");
+            let mut e = editor_with(&format!("{head}{tail}"));
+            e.lang = Some(lang);
+            e.recompute_highlights();
+            e.cursor_row = head.matches('\n').count();
+            e.cursor_col = head.rsplit('\n').next().unwrap_or("").chars().count();
+            e.insert_char('"');
+            (e.lines.join("\n"), head.to_string(), tail.to_string())
+        };
+        for (lang, text) in [
+            (
+                LangKind::Python,
+                "def f():\n    \"\"\"Doc\n    said | here\n    \"\"\"",
+            ),
+            (LangKind::JavaScript, "const s = `a\nb | c`;"),
+            (LangKind::Rust, "/* start\n   see | */"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+        for (lang, text) in [
+            (LangKind::Python, "doc = \"\"\"a\nb\"\"\" + |"),
+            (LangKind::Rust, "/* a\n b */ f(|"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"\"{tail}"), "{lang:?}: {text:?}");
         }
     }
 
