@@ -52232,6 +52232,101 @@ fn stop_all_false_leaves_the_siblings_running() {
     app.debug_stop();
 }
 
+/// #867: the issue's recording shows "Debug session ended" in the panel
+/// while the status bar still read "Debugging out.p… · F10 step over ·
+/// Shift+F5 stop". A session that ends on its own says so on the status
+/// line as well.
+#[test]
+fn a_session_ending_on_its_own_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debug session ended")
+    );
+    assert_eq!(app.status, "Debug session ended");
+}
+
+/// #867: the run that never reached its breakpoint says that on the
+/// status line too, as the panel does.
+#[test]
+fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(tmp.path().join("out.py"))
+        .or_default()
+        .insert(1);
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(app.status, "Program exited without hitting a breakpoint");
+}
+
+/// #867 guard: the end message is written once, when the session ends. A
+/// status set after that (the user's next action) survives later polls.
+#[test]
+fn a_status_set_after_the_debug_session_ended_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    app.status = String::from("Saved out.py");
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    assert_eq!(app.status, "Saved out.py");
+}
+
+/// #867 guard: a postDebugTask reports after the end, so its message is
+/// the one left on the status line, not the end message.
+#[test]
+fn a_post_debug_task_message_outlives_the_end_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug_post_tasks = vec![String::from("missing")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(
+        app.status
+            .starts_with("postDebugTask \"missing\" not found"),
+        "{}",
+        app.status
+    );
+}
+
+/// #867 guard: when the focused member of a `stopAll` compound ends, the
+/// status keeps saying why the rest stopped rather than the plain end
+/// message.
+#[test]
+fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "{:?}",
+        app.debug_sessions.names()
+    );
+    assert_eq!(
+        app.status,
+        "A ended — stopAll stopped the rest of the compound"
+    );
+}
+
 /// A compound that is REFUSED (here, it names a configuration no
 /// launch.json declares) leaves the running set alone, so it must not leave
 /// its `stopAll` behind either: that set never asked for it.
