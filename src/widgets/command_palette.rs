@@ -1270,7 +1270,7 @@ impl Command {
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
             Command::KeyboardShortcuts => "F1",
-            Command::UpdateCroft => "Ctrl+Shift+F9",
+            Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
             Command::SelectDebugConfig => "",
             Command::AddDebugConfig => "",
@@ -2157,6 +2157,21 @@ mod tests {
         palette.set_query("quick fix");
         assert_eq!(palette.results.first(), Some(&builtin(Command::QuickFix)));
         assert_eq!(Command::QuickFix.keybinding_hint(), "Cmd+.");
+    }
+
+    /// #865: the palette names chords in its macOS spelling, `Cmd` where
+    /// macOS has Cmd, as the other Cmd hints do, so the updater reads
+    /// `Cmd+Shift+F9` here; the status bar picks each platform's own.
+    #[test]
+    fn update_croft_is_reachable_and_shows_its_chord_in_the_palettes_spelling() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("update croft");
+        assert!(
+            palette.results.contains(&builtin(Command::UpdateCroft)),
+            "{:?}",
+            palette.results
+        );
+        assert_eq!(Command::UpdateCroft.keybinding_hint(), "Cmd+Shift+F9");
     }
 
     #[test]
