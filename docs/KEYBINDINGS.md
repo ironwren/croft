@@ -121,7 +121,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 
 ## Command Palette
 
-`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators.
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators. Off macOS the chord reads with `Ctrl` for `Cmd` and `Alt` for `Opt`, and with `Super` for the few chords [LINUX.md](LINUX.md#the-command-modifier) lists without a `Ctrl` form; the Keyboard Shortcuts view does the same.
 
 | Command | Chord | Action |
 |---------|-------|--------|

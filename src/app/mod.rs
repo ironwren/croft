@@ -54070,7 +54070,10 @@ impl App {
             .map(|&cmd| {
                 let shown = match self.keymap.chord_for(cmd) {
                     Some(user) => format!("{user}  (yours)"),
-                    None if !cmd.keybinding_hint().is_empty() => cmd.keybinding_hint().to_string(),
+                    None if !cmd.keybinding_hint().is_empty() => {
+                        crate::widgets::command_palette::platform_hint(cmd.keybinding_hint())
+                            .into_owned()
+                    }
                     None => String::from("\u{2014}"),
                 };
                 ListRow {

@@ -10805,6 +10805,33 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// #843: the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) spells each
+/// chord for Linux: `Cmd` is `Ctrl` there, as LINUX.md says, and a chord
+/// without a `Ctrl` form reads `Super` rather than a `Ctrl` that does
+/// something else (`Ctrl`+`E` is end of line). Hints without `Cmd` are left
+/// as written.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_keyboard_shortcuts_view_spells_chords_for_linux() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_keyboard_shortcuts();
+    let picker = app.list_picker.as_ref().expect("the view opened");
+    let shown = |id: &str| {
+        let row = picker
+            .rows
+            .iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap_or_else(|| panic!("no row for {id}"));
+        row.label.rsplit("  \u{00b7}  ").next().unwrap().to_string()
+    };
+    assert_eq!(shown("toggle_line_comment"), "Ctrl+/");
+    assert_eq!(shown("join_lines"), "Ctrl+Alt+Shift+J");
+    assert_eq!(shown("toggle_vim_mode"), "Super+E");
+    assert_eq!(shown("toggle_terminal"), "Ctrl+J");
+    assert_eq!(shown("move_line_up"), "Alt+\u{2191}");
+}
+
 /// #843: Cmd+F12 has no `Ctrl` form off macOS (`Ctrl`+`F12` is Go to Type
 /// Definition), so the palette's "Go to Implementations" sends Cmd+F12's
 /// request for the symbol at the caret.
