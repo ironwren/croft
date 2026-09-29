@@ -2199,4 +2199,37 @@ mod tests {
         std::fs::write(bin.join("python"), "").unwrap();
         assert_ne!(pytest_launch(tmp.path()).0, bin.join("python"));
     }
+
+    /// #845 guard: only exit 0 and pytest's 5 ("no tests were collected")
+    /// read as a listing that worked. A lister that exits 1, or dies to a
+    /// signal with no exit code at all, is a failed discovery, never an
+    /// empty project, even when it printed a test id before dying.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_that_exits_one_or_dies_to_a_signal_is_a_failed_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        let finished = || {
+            discover(root, &etx);
+            rx.try_iter().find_map(|(_, r)| match r {
+                TestResponse::Finished { ok } => Some(ok),
+                _ => None,
+            })
+        };
+        fake_venv(root, ".venv", "exit 1");
+        assert_eq!(finished(), Some(Some(false)), "exit 1");
+        fake_venv(
+            root,
+            ".venv",
+            "echo tests/test_g.py::test_total\nkill -9 $$",
+        );
+        assert_eq!(finished(), Some(Some(false)), "killed by a signal");
+    }
 }
