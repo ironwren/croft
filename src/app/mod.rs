@@ -20791,8 +20791,7 @@ impl App {
         // `Cmd` held on the second key, for the chords that ask for it. Off
         // macOS `Ctrl` counts, as it does for the leader (#843): VS Code's
         // Linux `Ctrl+K Ctrl+S` is the Keyboard Shortcuts editor.
-        let cmd_held = has_cmd(key.modifiers)
-            || (cfg!(not(target_os = "macos")) && key.modifiers.contains(KeyModifiers::CONTROL));
+        let cmd_held = has_cmd_or_linux_ctrl(key.modifiers);
         match key.code {
             // Cmd+K N in the editor: leave a sticky note on this line (#367).
             // In a terminal the same chord keeps its meaning (below).
@@ -42517,7 +42516,7 @@ impl App {
             .find(|(_, r)| row >= r.lines.0 && row < r.lines.1)
         else {
             self.status = String::from(
-                "Cmd+Enter: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
+                "Run code block: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
             );
             return true;
         };
@@ -47219,6 +47218,14 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            // Cmd+Enter's run from any terminal (#843): the same confirm popup.
+            Cmd::RunCodeBlockAtCursor => {
+                if !self.run_fence_at_cursor() {
+                    self.status = String::from(
+                        "Run code block: open a Markdown file's source (not its preview) and put the caret in a runnable fence",
+                    );
+                }
+            }
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
             Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
@@ -62152,6 +62159,12 @@ fn has_cmd(mods: KeyModifiers) -> bool {
     cmd_active(mods, crate::iterm2_inline::detect_termux())
 }
 
+/// [`has_cmd`], or off macOS a `Ctrl`: the command modifier LINUX.md
+/// promises there (#843), for the chords whose `Ctrl` spelling is free.
+fn has_cmd_or_linux_ctrl(mods: KeyModifiers) -> bool {
+    has_cmd(mods) || (cfg!(not(target_os = "macos")) && mods.contains(KeyModifiers::CONTROL))
+}
+
 /// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
 ///
 /// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
@@ -62838,10 +62851,13 @@ fn is_markdown_preview_key(key: KeyEvent) -> bool {
 }
 
 /// Cmd+Enter (#353): run the shell fence under the caret in a Markdown
-/// source buffer.
+/// source buffer. Off macOS `Ctrl`+`Enter` too (#843): there it only
+/// duplicated `Enter`, and Super reaches croft only over the kitty keyboard
+/// protocol. Where a terminal sends `Ctrl`+`Enter` as a bare `Enter`, the
+/// palette's "Markdown: Run Code Block at Cursor" runs it.
 fn is_run_fence_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Enter)
-        && key.modifiers.contains(KeyModifiers::SUPER)
+        && has_cmd_or_linux_ctrl(key.modifiers)
         // Cmd+Shift+Enter is "insert line above"; Alt chords stay the
         // editor's.
         && !key

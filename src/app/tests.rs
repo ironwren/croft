@@ -10805,6 +10805,173 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// Run the Command Palette row titled `title` the way a user does: open the
+/// palette (Cmd+Shift+P), type the title, pick its row, Enter. Returns false,
+/// running nothing, when no row has that title.
+fn run_from_palette(app: &mut App, title: &str) -> bool {
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    for c in title.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let palette = app.command_palette.as_mut().expect("the palette opened");
+    let Some(row) = palette.results.iter().position(|i| i.title() == title) else {
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        return false;
+    };
+    palette.selected = row;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    true
+}
+
+/// A Markdown source with one runnable `sh` fence, the caret inside it.
+fn markdown_fence_app(dir: &Path) -> App {
+    let mut app = app_with_open_file(dir, "R.md", "# Run\n\n```sh\necho hi\n```\n");
+    app.editor.cursor_row = 3;
+    app
+}
+
+/// #843: Cmd+Enter runs the Markdown fence under the caret (#353), and off
+/// macOS `Ctrl`+`Enter` is that chord. `is_run_fence_key` took Super only,
+/// so without the kitty keyboard protocol the one way to run a fence was
+/// clicking the preview's ▷.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_enter_runs_the_markdown_fence_under_the_caret_off_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    let before = app.editor.lines.clone();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
+        .unwrap();
+    let pending = app
+        .pending_run_block
+        .as_ref()
+        .expect("Ctrl+Enter confirms the fence, as Cmd+Enter does");
+    assert_eq!(pending.pane_name, "R.md:1");
+    assert_eq!(app.editor.lines, before, "no line break typed");
+}
+
+/// #843: the palette's "Markdown: Run Code Block at Cursor" runs the fence on
+/// any terminal, through the same confirm popup as Cmd+Enter.
+#[test]
+fn the_palette_runs_the_markdown_code_block_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    let panes = app.terminals.len();
+    assert!(run_from_palette(
+        &mut app,
+        "Markdown: Run Code Block at Cursor"
+    ));
+    let pending = app.pending_run_block.as_ref().expect("it confirms first");
+    assert_eq!(pending.pane_name, "R.md:1");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(app.terminals.len(), panes, "N runs nothing");
+}
+
+/// Guard (#843): `Ctrl`+`Enter` takes only what Cmd+Enter does. In a buffer
+/// that is not Markdown it still breaks the line; in a fence `Ctrl`+`Shift`+
+/// `Enter` still opens a line above, and neither `Ctrl`+`Alt`+`Enter` nor a
+/// bare `Enter` (what a legacy terminal sends for `Ctrl`+`Enter`) runs it.
+#[test]
+fn ctrl_enter_leaves_other_buffers_and_other_enters_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "abcdef");
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(
+        app.editor.lines,
+        ["abc", "def"],
+        "outside Markdown: a line break"
+    );
+
+    for mods in [
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+        KeyModifiers::NONE,
+    ] {
+        let mut app = markdown_fence_app(tmp.path());
+        let rows = app.editor.lines.len();
+        app.handle_key(key(KeyCode::Enter, mods)).unwrap();
+        assert!(
+            app.pending_run_block.is_none(),
+            "{mods:?}+Enter ran the fence"
+        );
+        if mods != KeyModifiers::CONTROL | KeyModifiers::ALT {
+            assert_eq!(
+                app.editor.lines.len(),
+                rows + 1,
+                "{mods:?}+Enter adds a line"
+            );
+        }
+    }
+}
+
+/// Guard (#843): Cmd+E (vim mode) gets no `Ctrl` form, because `Ctrl`+`E` is
+/// the editor's end of line, as the shell's. It stays that, and never
+/// toggles vim mode.
+#[test]
+fn ctrl_e_stays_end_of_line_and_never_toggles_vim_mode() {
+    let mut app = editor_app_with_lines(&["hello world"]);
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 11);
+    assert!(!app.vim.enabled);
+}
+
+/// Guard (#843): "Markdown: Run Code Block at Cursor" refuses, and says why,
+/// where there is nothing to run: a buffer that is not Markdown, the
+/// rendered preview (its ▷ runs blocks), a caret outside every fence.
+#[test]
+fn run_code_block_at_cursor_refuses_outside_a_markdown_fence() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "```sh\necho hi\n```\n");
+    app.editor.cursor_row = 1;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none());
+    assert!(app.status.contains("Markdown"), "{}", app.status);
+
+    let mut app = markdown_fence_app(tmp.path());
+    app.toggle_markdown_preview();
+    app.status.clear();
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none(), "not from the preview");
+    assert!(app.status.contains("Markdown"), "{}", app.status);
+
+    let mut app = markdown_fence_app(tmp.path());
+    app.editor.cursor_row = 0;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    assert!(app.pending_run_block.is_none());
+    assert!(
+        app.status.contains("inside a runnable shell fence"),
+        "{}",
+        app.status
+    );
+}
+
+/// Guard (#843): on macOS Ctrl+Enter is not the fence chord: Cmd is, and
+/// Ctrl stays the terminal's.
+#[cfg(target_os = "macos")]
+#[test]
+fn ctrl_enter_is_not_the_fence_chord_on_macos() {
+    assert!(!is_run_fence_key(key(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL
+    )));
+    assert!(is_run_fence_key(key(KeyCode::Enter, KeyModifiers::SUPER)));
+}
+
 #[test]
 fn cmd_k_then_s_selects_active_file_for_compare() {
     let tmp = tempfile::tempdir().unwrap();

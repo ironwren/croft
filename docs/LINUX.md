@@ -15,7 +15,7 @@ That includes the `Cmd+K` chords: `Ctrl`+`K` is the leader (`Ctrl`+`K` `B` opens
 
 Outside vim mode the editor's kill-to-end-of-line is the Command Palette's "Kill to End of Line"; bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` to give the key back to it.
 
-A handful of chords have no `Ctrl` form, because in a terminal it is taken or cannot be told apart from another key:
+A handful of chords have no `Ctrl` form, or one a legacy terminal cannot send, because in a terminal it is taken or cannot be told apart from another key:
 
 | Chord | Why not `Ctrl` | Without `Super` |
 |-------|----------------|-----------------|
@@ -24,6 +24,8 @@ A handful of chords have no `Ctrl` form, because in a terminal it is taken or ca
 | `Cmd`+`Opt`+`←` / `→` focus the left / right editor group | `Ctrl`+`Alt`+arrows switch desktop workspaces | click the group |
 | `Cmd`+`]` / `Cmd`+`[` next / previous terminal | `Ctrl`+`[` is `Esc` | click the pane |
 | `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | `Ctrl`+`Shift`+`T` |
+| `Cmd`+`Enter` run the Markdown code block under the caret | `Ctrl`+`Enter` runs it too where the terminal reports it (the kitty keyboard protocol, tmux `extended-keys`), but a legacy terminal sends it as a bare `Enter` | Command Palette "Markdown: Run Code Block at Cursor" |
+| `Cmd`+`E` toggle vim mode | `Ctrl`+`E` is end of line, in the editor as in the shell | Command Palette "Toggle Vim Mode" |
 | `Cmd+K` chords typed in the terminal pane | `Ctrl`+`K` goes to the shell | the ones that act on the active terminal (`R`, `K`, `M`, `D`) work as `Ctrl`+`K` chords from any other pane |
 
 `Cmd` is `Super`, and it reaches croft only over the kitty keyboard protocol: kitty, Ghostty, WezTerm, and Alacritty deliver it natively, so these chords work there. In GNOME Terminal, Konsole, xterm, or tmux, use the right-hand column.

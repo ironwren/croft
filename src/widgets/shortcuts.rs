@@ -337,8 +337,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_markdown_preview_key",
             },
             ShortcutEntry {
-                keys: "Cmd+Enter",
-                description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first)",
+                keys: "Cmd/Ctrl+Enter",
+                description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first; also the palette's Markdown: Run Code Block at Cursor)",
                 handler: "is_run_fence_key",
             },
             ShortcutEntry {
@@ -407,8 +407,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_completion_trigger_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+E",
-                description: "Toggle native modal (vim) editing",
+                keys: "Cmd+E",
+                description: "Toggle native modal (vim) editing (off macOS Ctrl+E is end of line: Super+E, or the palette's Toggle Vim Mode)",
                 handler: "is_vim_toggle_key",
             },
             ShortcutEntry {
