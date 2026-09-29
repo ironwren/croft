@@ -20840,6 +20840,40 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     );
 }
 
+/// #864 guard: the debuggee's interpreter is looked up no higher than the
+/// workspace root, as Run's is. A venv in the folder above the workspace
+/// belongs to some other project and is not picked up.
+#[test]
+fn a_venv_above_the_workspace_is_not_the_debuggee_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = make_venv(tmp.path(), ".venv");
+    let root = tmp.path().join("proj");
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+
+    let py = super::project_python_for(&pkg, &root);
+    assert_ne!(
+        py, outside,
+        "a venv above the workspace is not the project's"
+    );
+    assert!(!py.starts_with(tmp.path()), "got {}", py.display());
+}
+
+/// #864 guard: a nearer venv beats the workspace root's, for the debuggee
+/// exactly as for Run, so a sub-project debugs against its own packages.
+#[test]
+fn a_nearer_venv_beats_the_workspace_roots_for_the_debuggee() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let root_venv = make_venv(root, ".venv");
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+
+    assert_eq!(super::project_python_for(&svc, root), svc_venv);
+    assert_eq!(super::project_python_for(root, root), root_venv);
+}
+
 #[test]
 fn run_active_file_with_no_open_file_records_feedback_and_does_not_spawn_terminal() {
     let tmp = tempfile::tempdir().unwrap();
