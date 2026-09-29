@@ -681,3 +681,100 @@ fn locale_template_accepts_a_full_locale() {
     assert!(filled > 0, "the built-in German entries seed it");
     assert!(stderr.contains("locales/de.json"), "{stderr}");
 }
+
+/// Every string literal croft hands to `tr` at runtime, read from its own
+/// sources, with the file each came from: `tr("…")` calls, and context-menu
+/// labels, which `ContextMenu::localize` runs through `tr` wholesale. Test
+/// code is skipped: its strings are never shown.
+fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
+    let lit = r#""((?:[^"\\]|\\.)*)""#;
+    let patterns: Vec<regex::Regex> = [
+        format!(r"\btr\(\s*{lit}\s*\)"),
+        format!(r"MenuEntry::(?:item|header)\(\s*{lit}"),
+        format!(r"MenuEntry::item\(\s*if [^{{]*\{{\s*{lit}\s*\}}\s*else\s*\{{\s*{lit}\s*\}}"),
+        format!(r"MenuEntry::Submenu\s*\{{\s*label:\s*(?:String::from\(\s*)?{lit}"),
+        format!(r"\(\s*String::from\(\s*{lit}\s*\)\s*,\s*MenuAction::"),
+        format!(r"\(\s*{lit}\s*\.(?:to_string|to_owned|into)\(\)\s*,\s*MenuAction::"),
+    ]
+    .iter()
+    .map(|p| regex::Regex::new(p).unwrap())
+    .collect();
+    let unescape = |s: &str| {
+        let unicode = regex::Regex::new(r"\\u\{([0-9a-fA-F]+)\}").unwrap();
+        let s = unicode.replace_all(s, |c: &regex::Captures| {
+            char::from_u32(u32::from_str_radix(&c[1], 16).unwrap())
+                .unwrap()
+                .to_string()
+        });
+        s.replace("\\\"", "\"").replace("\\\\", "\\")
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut dirs = vec![root.clone()];
+    let mut found = std::collections::BTreeMap::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("app/tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = text
+                .find("#[cfg(test)]\nmod tests")
+                .map_or(text.as_str(), |i| &text[..i]);
+            let file = path.strip_prefix(&root).unwrap().display().to_string();
+            for re in &patterns {
+                for caps in re.captures_iter(text) {
+                    for m in caps.iter().skip(1).flatten() {
+                        found.insert(unescape(m.as_str()), file.clone());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// #849: `croft locale-template` must offer every string croft translates,
+/// not only the palette titles and whatever a built-in catalog happens to
+/// list. Context-menu labels (Close to the Right, Keep Open, the Customize
+/// Layout headers, ...) and `tr("CodeQL")` were missing from every
+/// language's template, so no translator could ever reach them.
+#[test]
+fn locale_template_lists_every_string_croft_translates() {
+    let found = strings_croft_translates();
+    for known in [
+        "Close to the Right",
+        "Panel Alignment",
+        "CodeQL",
+        "Pin",
+        "Unpin",
+    ] {
+        assert!(
+            found.contains_key(known),
+            "the source scan still sees {known:?}; update it with the code"
+        );
+    }
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "xx"])
+        .assert()
+        .success();
+    let template: std::collections::HashMap<String, String> =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let missing: Vec<String> = found
+        .iter()
+        .filter(|(s, _)| !template.contains_key(*s))
+        .map(|(s, file)| format!("{s:?} ({file})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} string(s) croft translates are missing from the template; add them to \
+         i18n::TRANSLATABLE:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+}

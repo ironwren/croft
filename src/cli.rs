@@ -808,7 +808,10 @@ impl Cli {
                     std::process::exit(1);
                 };
                 eprintln!("Save this as locales/{code}.json in croft's config directory.");
-                println!("{}", crate::i18n::template(&code, &[]));
+                println!(
+                    "{}",
+                    crate::i18n::template(&code, crate::i18n::TRANSLATABLE)
+                );
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
