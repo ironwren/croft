@@ -129,12 +129,8 @@ fn summarize_cmd(cmd: &[OsString]) -> String {
 /// earlier attach left running (#868). It is a debugger, not a program to
 /// debug, and listing it beside its target offered to attach to itself.
 fn is_pdb_attach_client(cmd: &[OsString]) -> bool {
-    let args: Vec<_> = cmd.iter().map(|a| a.to_string_lossy()).collect();
-    let Some(module_at) = args.iter().enumerate().find_map(|(i, a)| match a.as_ref() {
-        "-mpdb" => Some(i + 1),
-        "-m" if args.get(i + 1).is_some_and(|m| m == "pdb") => Some(i + 2),
-        _ => None,
-    }) else {
+    let args: Vec<_> = cmd.iter().skip(1).map(|a| a.to_string_lossy()).collect();
+    let Some(module_at) = pdb_arguments_at(&args) else {
         return false;
     };
     // pdb's own options, up to the script it debugs: a `-p` after that is
@@ -152,6 +148,54 @@ fn is_pdb_attach_client(cmd: &[OsString]) -> bool {
         }
     }
     false
+}
+
+/// Where pdb's own arguments start in `args` (an interpreter's argv without
+/// argv[0]) when it runs `-m pdb`, else None (#868). Only the interpreter's
+/// options are read, the way CPython reads them: they end at the script (the
+/// first non-option, or `-` for stdin, or whatever follows `--`), at `-c`,
+/// whose code and everything after it are the program's, and at `-m`, whose
+/// module decides. Short options combine (`-um pdb`), and `-W`, `-X` and
+/// `--check-hash-based-pycs` take a value, from the rest of their group or
+/// the next argument, which is never the script.
+fn pdb_arguments_at(args: &[std::borrow::Cow<'_, str>]) -> Option<usize> {
+    let mut next = 0;
+    while let Some(arg) = args.get(next) {
+        next += 1;
+        if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "" => return None,
+                "check-hash-based-pycs" => next += 1,
+                _ => {}
+            }
+            continue;
+        }
+        // Not an option: the script (`-` is stdin's), where options end.
+        let group = arg.strip_prefix('-').filter(|g| !g.is_empty())?;
+        for (at, flag) in group.char_indices() {
+            let value = &group[at + flag.len_utf8()..];
+            match flag {
+                'c' => return None,
+                'm' => {
+                    let module = if value.is_empty() {
+                        next += 1;
+                        args.get(next - 1)?.as_ref()
+                    } else {
+                        value
+                    };
+                    return (module == "pdb").then_some(next);
+                }
+                'W' | 'X' => {
+                    if value.is_empty() {
+                        next += 1;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Build the picker row label: pid (left-aligned in `pid_width` columns),
@@ -233,6 +277,71 @@ mod tests {
         ] {
             assert!(!is_pdb_attach_client(&argv(target)), "{target:?}");
         }
+    }
+
+    /// #868: only the interpreter's own options are read for `-m pdb`.
+    /// What follows the script, or `-c code`, is the program's own argv, so
+    /// `python3 tool.py -m pdb -p 80` is a program to debug, not pdb.
+    #[test]
+    fn a_programs_own_dash_m_pdb_arguments_are_not_an_attach_client() {
+        let hidden = [
+            &["python3", "tool.py", "-m", "pdb", "-p", "80"][..],
+            &["python3", "-c", "code", "-m", "pdb", "-p", "5"],
+            &["python3", "-X", "dev", "tool.py", "-m", "pdb", "-p", "1"],
+            &["python3", "-", "-m", "pdb", "-p", "1"],
+            &["python3", "--", "tool.py", "-m", "pdb", "-p", "1"],
+        ]
+        .into_iter()
+        .filter(|target| is_pdb_attach_client(&argv(target)))
+        .collect::<Vec<_>>();
+        assert!(hidden.is_empty(), "taken for pdb clients: {hidden:?}");
+    }
+
+    /// #868 guard: interpreter options before `-m pdb` are read through,
+    /// the ones that take a value included, whose value (`dev`, `ignore`,
+    /// `never`) is never taken for the script. A script after such an option
+    /// is still a script.
+    #[test]
+    fn interpreter_options_before_dash_m_pdb_are_read_through() {
+        for client in [
+            &["python3", "-m", "pdb", "-p", "123"][..],
+            &["python3", "-X", "dev", "-m", "pdb", "-p", "123"],
+            &[
+                "python3", "-Xdev", "-W", "ignore", "-u", "-m", "pdb", "--pid", "1",
+            ],
+            &[
+                "python3",
+                "--check-hash-based-pycs",
+                "never",
+                "-m",
+                "pdb",
+                "-p",
+                "1",
+            ],
+        ] {
+            assert!(is_pdb_attach_client(&argv(client)), "{client:?}");
+        }
+        for target in [
+            &["python3", "-W", "ignore", "tool.py"][..],
+            &["python3", "-W", "ignore", "tool.py", "-p", "1"],
+        ] {
+            assert!(!is_pdb_attach_client(&argv(target)), "{target:?}");
+        }
+    }
+
+    /// #868: short options combine as CPython reads them, the last of a
+    /// group taking its value from the next argument: `-um pdb` runs pdb,
+    /// `-uX dev` sets `-X dev`, and `-uc code` ends the options there.
+    #[test]
+    fn combined_short_options_are_read_as_cpython_reads_them() {
+        for client in [
+            &["python3", "-IB", "-um", "pdb", "-p", "1"][..],
+            &["python3", "-uX", "dev", "-mpdb", "-p", "1"],
+        ] {
+            assert!(is_pdb_attach_client(&argv(client)), "{client:?}");
+        }
+        let code_then_args = ["python3", "-uc", "import pdb", "-m", "pdb", "-p", "1"];
+        assert!(!is_pdb_attach_client(&argv(&code_then_args)));
     }
 
     /// #868 guard: only pdb itself is an attach client. A module that merely
