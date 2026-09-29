@@ -6767,18 +6767,26 @@ impl Editor {
             return false;
         }
         // Opener guard: never before a word character. Quote guard: also
-        // never after a word character or the same quote.
+        // never after a word character or the same quote, unless that word is
+        // a Python string prefix, which is part of the opener (`f"` pairs to
+        // `f""`, as VS Code's Python configuration lists it).
         let next_ok = next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c);
-        let prev = if self.cursor_col == 0 {
-            None
-        } else {
-            self.lines
-                .get(self.cursor_row)
-                .and_then(|l| l.chars().nth(self.cursor_col - 1))
-        };
-        let prev_ok =
-            !is_pair_quote(c) || prev.is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c);
+        let before =
+            &self.lines[self.cursor_row][..self.byte_index(self.cursor_row, self.cursor_col)];
+        let prev_ok = !is_pair_quote(c)
+            || before
+                .chars()
+                .next_back()
+                .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c)
+            || (self.lang == Some(LangKind::Python)
+                && is_python_string_prefix(trailing_word(before)));
         if !next_ok || !prev_ok {
+            return false;
+        }
+        // A quote typed inside a string or comment is text there, or that
+        // string's closing quote, never an opener: pairing the closing `"`
+        // of `print(f"{x}` left a stray `")` behind (#844).
+        if is_pair_quote(c) && ends_in_string_or_comment(before, self.lang) {
             return false;
         }
         self.pin_on_edit();
@@ -15309,6 +15317,121 @@ fn ends_in_script_string_or_comment(prefix: &str) -> bool {
         }
     }
     quote.is_some() || block_comment
+}
+
+/// Whether the end of `prefix`, the current line up to the caret, sits inside
+/// a string literal or a comment of `lang`, where a typed quote is never
+/// paired (#844). A lexical scan of the one line rather than the syntax tree:
+/// the string being typed is unterminated, which is exactly where a parser's
+/// error recovery is least trustworthy. A string or block comment opened on
+/// an earlier line goes unseen, which leaves pairing there as it always was.
+fn ends_in_string_or_comment(prefix: &str, lang: Option<LangKind>) -> bool {
+    let line_comment = line_comment_token(lang);
+    // Python's "block comment" is a triple-quoted string, scanned as one.
+    let block_comment = block_comment_tokens(lang).filter(|_| lang != Some(LangKind::Python));
+    // A shell or YAML `#` opens a comment only at the start of a word:
+    // `${#a[@]}` and `a#b` are not comments.
+    let hash_needs_space = matches!(lang, Some(LangKind::Bash | LangKind::Yaml));
+    let mut quote: Option<(char, bool)> = None; // (delimiter, triple-quoted)
+    let mut in_block = false;
+    let mut i = 0;
+    while let Some(c) = prefix[i..].chars().next() {
+        let rest = &prefix[i..];
+        let mut step = c.len_utf8();
+        if in_block {
+            if let Some((_, close)) = block_comment
+                && rest.starts_with(close)
+            {
+                in_block = false;
+                step = close.len();
+            }
+        } else if let Some((q, triple)) = quote {
+            if c == '\\' && backslash_escapes(q, lang) {
+                step += rest[step..].chars().next().map_or(0, char::len_utf8);
+            } else if c == q && (!triple || rest.chars().take(3).eq([q, q, q])) {
+                quote = None;
+                if triple {
+                    step = 3;
+                }
+            }
+        } else if let Some((open, _)) = block_comment
+            && rest.starts_with(open)
+        {
+            in_block = true;
+            step = open.len();
+        } else if line_comment.is_some_and(|t| rest.starts_with(t))
+            && (!hash_needs_space
+                || prefix[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace))
+        {
+            return true;
+        } else if is_pair_quote(c) && quote_opens_string(&prefix[..i], rest, lang) {
+            let triple =
+                lang == Some(LangKind::Python) && c != '`' && rest.chars().take(3).eq([c, c, c]);
+            quote = Some((c, triple));
+            if triple {
+                step = 3;
+            }
+        }
+        i += step;
+    }
+    quote.is_some() || in_block
+}
+
+/// Whether the quote that starts `rest` opens a string, given the line text
+/// `before` it. A `"` always does. A `'` or backtick after a word character is
+/// an apostrophe (`don't`, C++'s `1'000`) unless that word is a Python string
+/// prefix, and a Rust `'` opens a char literal, never a lifetime or a label.
+fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool {
+    let mut chars = rest.chars();
+    let q = chars.next();
+    if q == Some('"') {
+        return true;
+    }
+    let word = trailing_word(before);
+    let prefixed = lang == Some(LangKind::Python) && is_python_string_prefix(word);
+    if !word.is_empty() && !prefixed {
+        return false;
+    }
+    if lang == Some(LangKind::Rust) && q == Some('\'') {
+        return matches!(
+            (chars.next(), chars.next()),
+            (None, _) | (Some('\\'), _) | (Some(_), Some('\''))
+        );
+    }
+    true
+}
+
+/// Whether a backslash escapes the next character inside a `q`-quoted string
+/// of `lang`. Shell, YAML and TOML single quotes and Go's backtick raw strings
+/// take every character literally.
+fn backslash_escapes(q: char, lang: Option<LangKind>) -> bool {
+    !matches!(
+        (q, lang),
+        ('\'', Some(LangKind::Bash | LangKind::Yaml | LangKind::Toml)) | ('`', Some(LangKind::Go))
+    )
+}
+
+/// Python's string prefixes (`f"…"`, `rb'…'`, in any case): letters that
+/// belong to the string's opening quote rather than being a word before it.
+fn is_python_string_prefix(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "f" | "r" | "b" | "u" | "rb" | "br" | "fr" | "rf"
+    )
+}
+
+/// The run of word characters that ends `s`.
+fn trailing_word(s: &str) -> &str {
+    let start = s
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_word_char(c))
+        .last()
+        .map_or(s.len(), |(i, _)| i);
+    &s[start..]
 }
 
 /// Apply the selection background colour to columns `[start_char..end_char)`
@@ -29725,6 +29848,90 @@ mod tests {
         e.cursor_col = 3;
         e.insert_char('\'');
         assert_eq!(e.lines[0], "don'", "no auto-pair after a word character");
+    }
+
+    /// An editor in `lang` with `text` typed into it one key at a time.
+    fn typed(lang: Option<LangKind>, text: &str) -> Editor {
+        let mut e = editor_with("");
+        e.lang = lang;
+        for c in text.chars() {
+            e.insert_char(c);
+        }
+        e
+    }
+
+    #[test]
+    fn python_strings_typed_key_by_key_come_out_exactly_as_typed() {
+        // The f-string's closing `"` used to pair (it follows `}`), leaving a
+        // stray `")` behind; the prefix now opens the pair instead (#844).
+        for text in [
+            "print(f\"{category:<12} {total:>10}\")",
+            "print(f\"{x}\")",
+            "r'\\d'",
+            "x = Rb'\\x00' + fr\"{y}\"",
+        ] {
+            let e = typed(Some(LangKind::Python), text);
+            assert_eq!(e.lines, [text], "typing {text:?}");
+        }
+        let mut e = typed(Some(LangKind::Python), "print(f");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "print(f\"\")", "a string prefix opens the pair");
+        let mut e = typed(Some(LangKind::Python), "elif");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "elif\"", "a word that is not a prefix does not");
+    }
+
+    /// `text` in `lang` with the caret at its `|` (which is not kept), and
+    /// the text either side of the caret.
+    fn with_caret(lang: Option<LangKind>, text: &str) -> (Editor, &str, &str) {
+        let (head, tail) = text.split_once('|').expect("a caret marker");
+        let mut e = editor_with(&format!("{head}{tail}"));
+        e.lang = lang;
+        e.cursor_col = head.chars().count();
+        (e, head, tail)
+    }
+
+    #[test]
+    fn a_quote_typed_inside_a_string_or_comment_never_pairs() {
+        for (lang, text) in [
+            // The #844 line once `f"` had not paired but the `(` had.
+            (Some(LangKind::Python), "print(f\"{x}|)"),
+            (Some(LangKind::Python), "s = 'it is |"),
+            (Some(LangKind::Python), "doc = \"\"\"say \"hi\" |"),
+            (Some(LangKind::Python), "x = 1  # see |"),
+            (Some(LangKind::Rust), "let s = \"a \\\" b |"),
+            (Some(LangKind::Rust), "f(x); // see |"),
+            (Some(LangKind::JavaScript), "/* see |"),
+            (Some(LangKind::Bash), "echo 'a\\' \"b |"),
+            (None, "He said \"hi, |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_quote_outside_strings_and_comments_still_pairs() {
+        for (lang, text) in [
+            (None, "x = |"),
+            (Some(LangKind::Python), "d = {'a': 1, |}"),
+            (Some(LangKind::Python), "doc = \"\"\"a\"\"\" + |"),
+            (Some(LangKind::Rust), "fn f<'a>(s: &'a str) { g(|"),
+            (Some(LangKind::Rust), "let c = '\"'; h(|"),
+            (Some(LangKind::Cpp), "int n = 1'000; f(|"),
+            (Some(LangKind::Bash), "echo ${#a[@]} |"),
+            (Some(LangKind::JavaScript), "/* a */ f(|"),
+            (None, "don't say |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(
+                e.lines[0],
+                format!("{head}\"\"{tail}"),
+                "{lang:?}: {text:?}"
+            );
+        }
     }
 
     #[test]
