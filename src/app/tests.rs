@@ -55342,7 +55342,9 @@ impl CodeqlStandIn {
     }
 
     /// Wait for the run in flight to end, feeding its results to the app
-    /// in the main loop's order.
+    /// in the main loop's order. A run-all only turns the panel busy when
+    /// the worker's start lands, so the end is also the run's "Running …"
+    /// status being settled.
     fn finish(&mut self) {
         let app = &mut self.app;
         crate::test_budget::await_spawned(
@@ -55355,7 +55357,7 @@ impl CodeqlStandIn {
                 }
                 app.sync_coverage();
                 app.tick_test_watch();
-                !app.testing.is_busy()
+                !app.testing.is_busy() && app.test_run_status.is_none()
             },
         );
     }
@@ -55399,6 +55401,146 @@ fn a_coverage_run_that_never_ran_keeps_its_reason_in_the_status() {
     assert_eq!(
         s.app.testing.status_of("test/Find::Find.qlref"),
         Some(crate::testing::model::TestStatus::NotRun)
+    );
+}
+
+/// #856: "CodeQL: Run Tests" put "Running CodeQL tests" in the status bar
+/// and left it there after the run. It now says how the run went, as a
+/// run-at-cursor does.
+#[cfg(unix)]
+#[test]
+fn a_finished_codeql_test_run_replaces_its_running_status_with_the_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app.run_codeql_tests();
+    assert_eq!(s.app.status, "Running CodeQL tests");
+    s.finish();
+    assert!(
+        s.app.status.starts_with("CodeQL tests passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// A task that runs until the test ends it: its `sleep` outlasts any
+/// test, so the only finish its pane reports is the one a test injects.
+fn long_task(label: &str) -> crate::tasks::Task {
+    crate::tasks::Task {
+        label: label.to_string(),
+        command: String::from("sleep 600"),
+        source: String::from("test"),
+        is_build: false,
+        is_default: false,
+        problem_matcher: None,
+        vscode: None,
+    }
+}
+
+/// End the command running in pane `uid` as its shell reports it (the
+/// `133;D` mark: exit code and duration), and let the app drain the pane.
+fn finish_pane_command(app: &mut App, uid: u64, exit: Option<i32>, millis: u64) {
+    app.terminals
+        .iter()
+        .find(|t| t.uid() == uid)
+        .expect("the pane is still open")
+        .finish_command_for_test(exit, std::time::Duration::from_millis(millis));
+    app.drain_terminal_bells();
+}
+
+/// #856 (comment): a task set "Running <label>" and kept it after its pane
+/// was back at the prompt. The pane's command-finished report now replaces
+/// it with the exit code and how long the command took.
+#[test]
+fn a_finished_task_replaces_its_running_status_with_the_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    assert_eq!(app.status, "Running make report");
+    finish_pane_command(&mut app, pane, Some(0), 300);
+    assert_eq!(app.status, "make report finished (exit 0, 0.3 s)");
+
+    let pane = app.run_project_task(long_task("make check")).unwrap();
+    assert_eq!(app.status, "Running make check");
+    finish_pane_command(&mut app, pane, Some(2), 1500);
+    assert_eq!(app.status, "make check failed (exit 2, 1.5 s)");
+}
+
+/// #856 (comment): a runnable fenced block's "Running <pane>" is settled
+/// by its pane's command-finished report, as a task's is.
+#[test]
+fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_block_in_pane(PendingRunBlock {
+        pane_name: String::from("README.md:1"),
+        cwd: tmp.path().to_path_buf(),
+        command: String::from("sleep 600\r"),
+        code: String::from("sleep 600\n"),
+        destructive: false,
+        doc: None,
+        block_line: 0,
+        persist: false,
+        capture_timeout: None,
+    });
+    assert_eq!(app.status, "Running README.md:1");
+    let pane = app
+        .terminals
+        .iter()
+        .find(|t| t.label() == "README.md:1")
+        .expect("the block's pane")
+        .uid();
+    finish_pane_command(&mut app, pane, Some(1), 300);
+    assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
+}
+
+/// #856 guard: a task's finish settles only a status that still shows its
+/// run. Something newer in the bar (a save) stays.
+#[test]
+fn a_task_finishing_after_a_newer_status_leaves_that_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    app.status = String::from("Saved Makefile");
+    finish_pane_command(&mut app, pane, Some(0), 300);
+    assert_eq!(app.status, "Saved Makefile");
+}
+
+/// #856 guard: each task's finish settles its own status only. With task
+/// `a` started after `b`, the bar shows `a`'s run; `b` finishing first
+/// leaves it, and `a` finishing then reports `a`.
+#[test]
+fn a_second_task_finishing_leaves_the_first_tasks_running_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let b = app.run_project_task(long_task("b")).unwrap();
+    let a = app.run_project_task(long_task("a")).unwrap();
+    assert_ne!(a, b, "two tasks, two panes");
+    assert_eq!(app.status, "Running a");
+    finish_pane_command(&mut app, b, Some(0), 300);
+    assert_eq!(app.status, "Running a", "b's end is not a's");
+    finish_pane_command(&mut app, a, Some(0), 300);
+    assert_eq!(app.status, "a finished (exit 0, 0.3 s)");
+}
+
+/// #856 guard: a task's outcome stands in for the long-command notice of a
+/// pane the user left only when the outcome is shown. With a newer status
+/// in the bar, the long task's end still gets the notice.
+#[test]
+fn a_long_task_reports_its_outcome_or_else_the_long_command_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make report")).unwrap();
+    app.focus_pane(Pane::Editor);
+    finish_pane_command(&mut app, pane, Some(0), 12_000);
+    assert_eq!(app.status, "make report finished (exit 0, 12.0 s)");
+
+    let pane = app.run_project_task(long_task("make check")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.status = String::from("Saved Makefile");
+    finish_pane_command(&mut app, pane, Some(0), 12_000);
+    assert_eq!(
+        app.status,
+        "Command in Task: make check finished: exit 0 in 12.0s"
     );
 }
 
