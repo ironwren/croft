@@ -6,7 +6,27 @@ Linux is a first-class target: a session on a Linux box over SSH behaves identic
 
 ## The command modifier
 
-croft mirrors VS Code's Linux convention: the command modifier is `Ctrl`, and every chord works as the same chord with `Ctrl` (`Ctrl`+`P` for Quick Open, `Ctrl`+`Shift`+`E` for the Explorer) with zero setup. kitty, Ghostty, WezTerm, and Alacritty also deliver `Cmd`/`Super` over the kitty keyboard protocol natively, so the `Cmd` chords from the [keybindings reference](KEYBINDINGS.md) reach croft there too if you prefer them.
+croft mirrors VS Code's Linux convention: the command modifier is `Ctrl`, and a `Cmd` chord from the [keybindings reference](KEYBINDINGS.md) works as the same chord with `Ctrl` (`Ctrl`+`P` for Quick Open, `Ctrl`+`Shift`+`E` for the Explorer) with zero setup.
+
+That includes the `Cmd+K` chords: `Ctrl`+`K` is the leader (`Ctrl`+`K` `B` opens Testing, `Ctrl`+`K` `Ctrl`+`S` the Keyboard Shortcuts editor) everywhere except two places that keep `Ctrl`+`K` for themselves:
+
+* the terminal pane, where it goes to the shell (readline's kill-line), and
+* the editor while vim mode is on, where it kills to the end of the line.
+
+Outside vim mode the editor's kill-to-end-of-line is the Command Palette's "Kill to End of Line"; bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` to give the key back to it.
+
+A handful of chords have no `Ctrl` form, because in a terminal it is taken or cannot be told apart from another key:
+
+| Chord | Why not `Ctrl` | Without `Super` |
+|-------|----------------|-----------------|
+| `Cmd`+`\` split editor | `Ctrl`+`\` is the shell's quit signal | Command Palette "View: Split Editor" |
+| `Cmd`+`Shift`+`\` / `Cmd`+`Opt`+`\` go to / select to bracket | a legacy terminal cannot send `Shift` or `Alt` with `Ctrl`+`\` | Command Palette "Go to Bracket" / "Select to Bracket" |
+| `Cmd`+`Opt`+`←` / `→` focus the left / right editor group | `Ctrl`+`Alt`+arrows switch desktop workspaces | click the group |
+| `Cmd`+`]` / `Cmd`+`[` next / previous terminal | `Ctrl`+`[` is `Esc` | click the pane |
+| `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | `Ctrl`+`Shift`+`T` |
+| `Cmd+K` chords typed in the terminal pane | `Ctrl`+`K` goes to the shell | the ones that act on the active terminal (`R`, `K`, `M`, `D`) work as `Ctrl`+`K` chords from any other pane |
+
+`Cmd` is `Super`, and it reaches croft only over the kitty keyboard protocol: kitty, Ghostty, WezTerm, and Alacritty deliver it natively, so these chords work there. In GNOME Terminal, Konsole, xterm, or tmux, use the right-hand column.
 
 ## Nerd Font
 

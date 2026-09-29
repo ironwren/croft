@@ -5,6 +5,7 @@ Every action in croft is reachable from the keyboard. Press `F1` inside croft fo
 Per platform:
 
 * **macOS** — the `Cmd` chords below only reach croft after a one-time terminal setup: `croft setup-iterm2` (see [iTerm2 key mappings](#iterm2-key-mappings)) or `croft setup-ghostty` (see [Ghostty key mappings](#ghostty-key-mappings)).
+* **Linux** — `Ctrl` is the command modifier, as in VS Code: `Cmd` chords work as the same chord with `Ctrl`, the `Cmd+K` chords included (`Ctrl`+`K` leads everywhere except the terminal pane and the vim-mode editor). A handful whose `Ctrl` form is taken need `Super`; [LINUX.md](LINUX.md#the-command-modifier) lists them.
 * **Termux/Android** — there is no Cmd key, so `Ctrl` is the command modifier and every `Cmd` chord works as the same chord with `Ctrl`.
 * **Touch, no hardware keyboard** — every chord comes through croft's built-in on-screen keyboard: tap the editor, terminal, or Search input to raise it, then tap its one-shot `ctrl` / `alt` keys before a letter (e.g. `ctrl` then `p` opens Quick Open); `⌄` dismisses it.
 
@@ -42,7 +43,7 @@ Per platform:
 
 ### `Cmd+K` chords
 
-`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning.
+`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning. On Linux `Ctrl`+`K` leads everywhere except the terminal pane, where it goes to the shell, and the editor while vim mode is on, where it kills to the end of the line; a `Cmd` on the second key (`Cmd+K` `Cmd+S`) is `Ctrl` there too.
 
 | Keys | Action |
 |------|--------|
@@ -283,7 +284,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
-| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard) |
+| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard). On Linux (outside vim mode) and Termux `Ctrl`+`K` is the `Cmd+K` leader instead; the Command Palette's "Kill to End of Line" kills there, or bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |

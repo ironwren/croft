@@ -26,6 +26,7 @@ pub enum Command {
     ToggleBlockComment,
     JoinLines,
     DeleteLine,
+    KillToEndOfLine,
     TransformUpper,
     TransformLower,
     TransformTitle,
@@ -399,6 +400,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleBlockComment,
     Command::JoinLines,
     Command::DeleteLine,
+    Command::KillToEndOfLine,
     Command::TransformUpper,
     Command::TransformLower,
     Command::TransformTitle,
@@ -722,6 +724,7 @@ impl Command {
             Command::ToggleBlockComment => "Toggle Block Comment",
             Command::JoinLines => "Join Lines",
             Command::DeleteLine => "Delete Line",
+            Command::KillToEndOfLine => "Kill to End of Line",
             Command::TransformUpper => "Transform to Uppercase",
             Command::TransformLower => "Transform to Lowercase",
             Command::TransformTitle => "Transform to Title Case",
@@ -1050,6 +1053,15 @@ impl Command {
             Command::MoveLineDown => "Alt+↓",
             Command::JoinLines => "Cmd+Opt+Shift+J",
             Command::DeleteLine => "Cmd+Shift+K",
+            // macOS keeps `Ctrl+K`; off it `Ctrl+K` is the `Cmd+K` leader
+            // except in vim mode (#843), so the palette is the way there.
+            Command::KillToEndOfLine => {
+                if cfg!(target_os = "macos") {
+                    "Ctrl+K"
+                } else {
+                    ""
+                }
+            }
             Command::TransformUpper => "Cmd+Opt+Shift+U",
             Command::TransformLower => "Cmd+Opt+Shift+L",
             Command::TransformTitle => "Cmd+Opt+Shift+C",
@@ -1385,6 +1397,7 @@ impl Command {
             Command::ToggleBlockComment => "toggle_block_comment",
             Command::JoinLines => "join_lines",
             Command::DeleteLine => "delete_line",
+            Command::KillToEndOfLine => "kill_to_end_of_line",
             Command::TransformUpper => "transform_upper",
             Command::TransformLower => "transform_lower",
             Command::TransformTitle => "transform_title",

@@ -93,7 +93,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+K",
-                description: "Chord leader: press, then a follow-up key for extra accelerators",
+                description: "Chord leader: press, then a follow-up key for extra accelerators (off macOS Ctrl+K leads everywhere but the terminal and the vim-mode editor)",
                 handler: "is_cmd_k_leader_key",
             },
             ShortcutEntry {
@@ -588,7 +588,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+K",
-                description: "Kill from cursor to end of line",
+                description: "Kill from cursor to end of line (macOS, or vim mode; elsewhere palette \"Kill to End of Line\")",
                 handler: "is_editor_kill_to_eol_key",
             },
             ShortcutEntry {

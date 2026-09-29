@@ -10698,18 +10698,110 @@ fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
 }
 
 #[test]
-fn cmd_k_leader_is_super_only_off_termux_so_ctrl_k_stays_kill_to_eol() {
-    // The Cmd+K chord leader must arm on SUPER (macOS / forwarded), but NOT on
-    // a bare Ctrl+K off Termux — Ctrl+K is the editor's kill-to-end-of-line and
-    // must not be shadowed by the leader. (On Termux, Ctrl is the documented
-    // cmd surrogate, so the leader does claim Ctrl+K there.)
-    assert!(is_cmd_k_leader_key(key(
-        KeyCode::Char('k'),
-        KeyModifiers::SUPER
-    )));
+fn ctrl_k_leads_off_macos_except_in_the_shell_or_the_vim_editor() {
+    // Super reaches croft only over the kitty keyboard protocol, so off macOS
+    // Ctrl+K arms the leader too, as in VS Code's Linux keymap (#843). The
+    // shell keeps it for readline's kill-line and vim mode for the editor's.
+    assert!(ctrl_k_leads(false, false, false));
     assert!(
-        !is_cmd_k_leader_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL)),
-        "bare Ctrl+K off Termux must fall through to kill-to-end-of-line, not arm the leader"
+        !ctrl_k_leads(false, true, false),
+        "a focused shell keeps Ctrl+K"
+    );
+    assert!(
+        !ctrl_k_leads(false, false, true),
+        "the vim editor keeps kill-line"
+    );
+    assert!(
+        !ctrl_k_leads(true, false, false),
+        "macOS: Ctrl+K kills, Cmd leads"
+    );
+    let ctrl_k = key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+    assert!(is_cmd_k_leader_key(ctrl_k, true));
+    // Off Termux (the test process), a Ctrl+K that does not lead falls
+    // through to the editor's kill-to-end-of-line.
+    assert!(!is_cmd_k_leader_key(ctrl_k, false));
+    for ctrl_leads in [false, true] {
+        let super_k = key(KeyCode::Char('k'), KeyModifiers::SUPER);
+        assert!(
+            is_cmd_k_leader_key(super_k, ctrl_leads),
+            "Cmd+K always leads"
+        );
+        let ctrl_shift_k = key(
+            KeyCode::Char('K'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(
+            !is_cmd_k_leader_key(ctrl_shift_k, ctrl_leads),
+            "Ctrl+Shift+K stays Delete Line"
+        );
+    }
+}
+
+/// #843: on desktop Linux `Ctrl+K` `B` opens Testing and leaves the buffer
+/// alone, while a focused shell and the vim-mode editor keep `Ctrl+K`, and
+/// the palette still kills to the end of the line.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.txt");
+    std::fs::write(&path, "keep this line").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    let ctrl = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL);
+    let at_col_5 = |app: &mut App| {
+        app.focus_pane(Pane::Editor);
+        app.editor.lines = vec![String::from("keep this line")];
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 5;
+    };
+
+    at_col_5(&mut app);
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Ctrl+K arms the leader");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::Testing, "Ctrl+K B: Testing");
+    assert_eq!(
+        app.editor.lines,
+        ["keep this line"],
+        "nothing killed or typed"
+    );
+
+    // Ctrl held on the second key counts as Cmd: VS Code's Linux Ctrl+K
+    // Ctrl+S opens the Keyboard Shortcuts editor.
+    at_col_5(&mut app);
+    app.handle_key(ctrl('k')).unwrap();
+    app.handle_key(ctrl('s')).unwrap();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == ListPurpose::KeyboardShortcuts)
+    );
+    app.list_picker = None;
+
+    // The palette still kills to the end of the line.
+    at_col_5(&mut app);
+    app.run_command(Command::KillToEndOfLine);
+    assert_eq!(app.editor.lines, ["keep "]);
+
+    // Vim mode keeps Ctrl+K as the editor's kill-line.
+    at_col_5(&mut app);
+    app.vim.enabled = true;
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(app.cmd_k_leader.is_none(), "vim mode: Ctrl+K does not lead");
+    assert_eq!(app.editor.lines, ["keep "], "vim mode: Ctrl+K kills");
+    app.vim.enabled = false;
+
+    // A focused shell gets Ctrl+K for itself.
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(ctrl('k')).unwrap();
+    assert!(
+        app.cmd_k_leader.is_none(),
+        "the shell's Ctrl+K is not captured"
     );
 }
 
@@ -15148,9 +15240,12 @@ fn editor_ctrl_e_jumps_to_end_of_line() {
     assert_eq!(app.editor.cursor_col, 11);
 }
 
+/// `Ctrl+K` kills where it is not the `Cmd+K` leader: on macOS, and in vim
+/// mode off it (#843).
 #[test]
 fn editor_ctrl_k_kills_to_end_of_line() {
     let mut app = editor_app_with_lines(&["hello world", "next"]);
+    app.vim.enabled = cfg!(not(target_os = "macos"));
     app.editor.cursor_col = 5;
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
         .unwrap();

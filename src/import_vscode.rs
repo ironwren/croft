@@ -247,6 +247,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
     ("editor.action.deleteLines", "delete_line"),
+    ("deleteAllRight", "kill_to_end_of_line"),
     ("editor.action.joinLines", "join_lines"),
     ("editor.action.transformToUppercase", "transform_upper"),
     ("editor.action.transformToLowercase", "transform_lower"),

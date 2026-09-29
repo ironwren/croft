@@ -12913,6 +12913,21 @@ impl App {
         self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
     }
 
+    /// Kill from the caret to the end of its line, yanking the text to the
+    /// clipboard (emacs `kill-line`). `Ctrl+K` in the editor on macOS and in
+    /// vim mode; elsewhere `Ctrl+K` leads the `Cmd+K` chords (#843), and the
+    /// palette's "Kill to End of Line" is the way here.
+    fn kill_to_end_of_line(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let killed = self.editor.kill_to_eol();
+        if !killed.is_empty() {
+            copy_to_clipboard(&killed);
+            self.status = format!("Killed {} chars", killed.chars().count());
+        }
+    }
+
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
     /// identifier under the cursor; committing fires an LSP `rename` request.
     fn start_rename_symbol(&mut self) {
@@ -20754,6 +20769,17 @@ impl App {
         }
     }
 
+    /// [`ctrl_k_leads`] for the pane that has the keyboard now.
+    fn ctrl_k_leads_here(&self) -> bool {
+        let shell_focused = self.focus == Pane::Terminal
+            && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal);
+        ctrl_k_leads(
+            cfg!(target_os = "macos"),
+            shell_focused,
+            self.vim.enabled && self.focus == Pane::Editor,
+        )
+    }
+
     /// Dispatch the second key of a `Cmd+K`-prefixed chord (VS Code's two-key
     /// model). Returns `true` if the key completed a chord and was consumed,
     /// `false` if it matched nothing (the caller then processes it normally).
@@ -20762,6 +20788,11 @@ impl App {
     fn handle_cmd_k_chord(&mut self, key: KeyEvent) -> bool {
         let plain = !key.modifiers.contains(KeyModifiers::ALT);
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+        // `Cmd` held on the second key, for the chords that ask for it. Off
+        // macOS `Ctrl` counts, as it does for the leader (#843): VS Code's
+        // Linux `Ctrl+K Ctrl+S` is the Keyboard Shortcuts editor.
+        let cmd_held = has_cmd(key.modifiers)
+            || (cfg!(not(target_os = "macos")) && key.modifiers.contains(KeyModifiers::CONTROL));
         match key.code {
             // Cmd+K N in the editor: leave a sticky note on this line (#367).
             // In a terminal the same chord keeps its meaning (below).
@@ -20799,9 +20830,7 @@ impl App {
             // Cmd+K Cmd+S (Cmd held on the second key): the Keyboard Shortcuts
             // editor, VS Code's binding (#612). Before the plain S arm, which
             // keeps Select for Compare.
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'s') && has_cmd(key.modifiers) && !shifted =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') && cmd_held && !shifted => {
                 self.open_keyboard_shortcuts();
                 true
             }
@@ -20895,9 +20924,7 @@ impl App {
             // Cmd+K Cmd+Q: Go to Last Edit Location (VS Code's chord; the
             // second key carries Cmd, which keeps it distinct from the
             // navigator's plain Cmd+K Q below).
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'q') && key.modifiers.contains(KeyModifiers::SUPER) =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') && cmd_held => {
                 self.goto_last_edit_location();
                 true
             }
@@ -21666,10 +21693,9 @@ impl App {
         }
         // Arm the `Cmd+K` leader (VS Code's two-key chord prefix). The next
         // keystroke is interpreted by `handle_cmd_k_chord`, checked at the top
-        // of this fn. Cmd is SUPER everywhere; Ctrl doubles as Cmd only on
-        // Termux — on desktop Linux a bare Ctrl+K stays the editor's
-        // kill-to-end-of-line (see `is_cmd_k_leader_key`).
-        if is_cmd_k_leader_key(key) {
+        // of this fn. Cmd is SUPER everywhere; off macOS Ctrl+K arms it too,
+        // except in a focused shell and the vim-mode editor (`ctrl_k_leads`).
+        if is_cmd_k_leader_key(key, self.ctrl_k_leads_here()) {
             self.cmd_k_leader = Some(std::time::Instant::now());
             return Ok(());
         }
@@ -40313,11 +40339,7 @@ impl App {
             return;
         }
         if is_editor_kill_to_eol_key(key) {
-            let killed = self.editor.kill_to_eol();
-            if !killed.is_empty() {
-                copy_to_clipboard(&killed);
-                self.status = format!("Killed {} chars", killed.chars().count());
-            }
+            self.kill_to_end_of_line();
             return;
         }
         if is_editor_kill_to_bol_key(key) {
@@ -47134,6 +47156,7 @@ impl App {
             }
             Cmd::JoinLines => self.editor.join_lines(),
             Cmd::DeleteLine => self.delete_current_line(),
+            Cmd::KillToEndOfLine => self.kill_to_end_of_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
             Cmd::TransformLower => self.editor.transform_selection_case(CaseTransform::Lower),
             Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
@@ -62502,8 +62525,9 @@ fn is_go_to_symbol_key(key: KeyEvent) -> bool {
 /// `Cmd+K` (macOS) / `Ctrl+K` (Linux / Termux): the leader for croft's
 /// `Cmd+K`-prefixed chords (Color Theme, Close to the Right, Select for /
 /// Compare with Selected, Close All). Rejects Shift and Alt so it never
-/// shadows a future `Cmd+K`+modifier chord.
-fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
+/// shadows a future `Cmd+K`+modifier chord. `ctrl_leads` is
+/// [`ctrl_k_leads`] for the focused pane.
+fn is_cmd_k_leader_key(key: KeyEvent, ctrl_leads: bool) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
@@ -62513,11 +62537,19 @@ fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // SUPER everywhere; CONTROL only on Termux (where Ctrl is the cmd
-    // surrogate). Off Termux a bare Ctrl+K must fall through to the editor's
-    // kill-to-end-of-line rather than arming the leader — using `has_cmd`
-    // keeps this consistent with every other croft chord (e.g. Cmd+\ split).
-    has_cmd(key.modifiers)
+    has_cmd(key.modifiers) || (ctrl_leads && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Whether a bare `Ctrl+K` arms the `Cmd+K` leader (#843). Off macOS it
+/// does, as in VS Code's Linux keymap: Super reaches croft only over the
+/// kitty keyboard protocol, so in GNOME Terminal, Konsole, xterm or tmux no
+/// leader chord was reachable at all. Two places keep `Ctrl+K` for their
+/// own job: a focused shell (readline's kill-line) and the editor in vim
+/// mode (kill to end of line, also the palette's "Kill to End of Line").
+/// On macOS `Ctrl+K` stays kill-line and Cmd leads; on Termux `Ctrl` is
+/// the command key outright ([`cmd_active`]), so this is not consulted.
+fn ctrl_k_leads(macos: bool, shell_focused: bool, vim_editing: bool) -> bool {
+    !macos && !shell_focused && !vim_editing
 }
 
 /// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects
