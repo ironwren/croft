@@ -233,7 +233,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Z",
-                description: "Jump to a directory via zoxide; re-roots the workspace and cd's the active terminal",
+                description: "Jump to a directory via zoxide; re-roots the workspace and cd's the active terminal (also the palette's Explorer: Jump to Directory (zoxide))",
                 handler: "is_tree_zoxide_jump_key",
             },
             ShortcutEntry {
@@ -558,7 +558,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+F12",
-                description: "Go to implementations",
+                description: "Go to implementations (off macOS Ctrl+F12 is Type Definition: the palette's Go to Implementations)",
                 handler: "is_go_to_implementation_key",
             },
             ShortcutEntry {

@@ -10805,6 +10805,62 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// #843: Cmd+F12 has no `Ctrl` form off macOS (`Ctrl`+`F12` is Go to Type
+/// Definition), so the palette's "Go to Implementations" sends Cmd+F12's
+/// request for the symbol at the caret.
+#[test]
+fn the_palette_goes_to_implementations_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "lib.rs", "trait Shape {}\n");
+    app.editor.cursor_col = 7;
+    assert!(app.implementation_request_id.is_none());
+    assert!(run_from_palette(&mut app, "Go to Implementations"));
+    assert!(
+        app.implementation_request_id.is_some(),
+        "the request went to the language servers"
+    );
+}
+
+/// #843: the Explorer's Cmd+Z has no `Ctrl` form, so the palette's
+/// "Explorer: Jump to Directory (zoxide)" opens the same popup, from any pane.
+#[test]
+fn the_palette_opens_the_zoxide_jump_from_any_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(
+        &mut app,
+        "Explorer: Jump to Directory (zoxide)"
+    ));
+    assert!(app.zoxide_jump.is_some());
+}
+
+/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
+/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+#[test]
+fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+}
+
+/// Guard (#843): "Go to Implementations" with no file open sends nothing,
+/// as Cmd+F12 would not.
+#[test]
+fn go_to_implementations_without_a_file_sends_nothing() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::GoToImplementations);
+    assert!(app.implementation_request_id.is_none());
+}
+
 /// #843: Cmd+Opt+←/→ have no `Ctrl` form off macOS (`Ctrl`+`Alt`+arrows
 /// switch desktop workspaces), so the palette carries them, doing what the
 /// chords do, from any pane.

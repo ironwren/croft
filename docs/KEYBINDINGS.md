@@ -138,6 +138,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
 | View: Focus Left Editor Group / View: Focus Right Editor Group | `Cmd`+`Opt`+`←` / `Cmd`+`Opt`+`→` | Move focus to the left / right editor group while split: the Linux route, where `Ctrl`+`Alt`+arrows switch desktop workspaces |
 | Terminal: Focus Next Terminal / Terminal: Focus Previous Terminal | `Cmd`+`]` / `Cmd`+`[` | Focus the terminal pane and cycle to the next / previous terminal: the Linux route, where `Ctrl`+`[` is `Esc` |
+| Go to Implementations | `Cmd`+`F12` | Go to the concrete implementors of the trait / interface at the caret: the Linux route, where `Ctrl`+`F12` is Go to Type Definition |
+| Explorer: Jump to Directory (zoxide) | `Cmd`+`Z` in the Explorer | Open the zoxide jump popup from any pane: the Linux route, where `Ctrl`+`Z` is kept out of the Explorer |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
@@ -184,7 +186,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
+| `Cmd`+`Z` (Linux: `Super`+`Z`, or the Command Palette's "Explorer: Jump to Directory (zoxide)" from any pane) | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
@@ -324,7 +326,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
-| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
+| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface). On Linux `Ctrl`+`F12` is Go to Type Definition, so it is `Super`+`F12` or the Command Palette's "Go to Implementations" |
 | Hover or click/tap (300 ms rest) | Hover popup: any diagnostic over the point first, then type / signature info. A click or tap arms the same dwell, so touch screens (Termux) get the popup by tapping an identifier and resting; releasing the press keeps it open |
 | Hover a tab (300 ms dwell) | Tooltip with the tab's full path (tells two same-named files apart) |
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |

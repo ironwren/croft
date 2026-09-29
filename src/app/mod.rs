@@ -47323,6 +47323,15 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
+            // Cmd+F12's request (#843), which has no `Ctrl` form.
+            Cmd::GoToImplementations => {
+                if self.editor.diff.is_none()
+                    && self.editor.sheet.is_none()
+                    && self.editor.image.is_none()
+                {
+                    self.request_implementation_at_cursor();
+                }
+            }
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -47511,6 +47520,8 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
+            Cmd::ZoxideJump => self.open_zoxide_jump(),
             Cmd::SplitEditor => self.split_editor(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
