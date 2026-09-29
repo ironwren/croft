@@ -3726,6 +3726,12 @@ if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
 # stepped. A sidecar rather than a second field, so a croft from before it,
 # which reads the marker as one pid, still pauses for this build.
 mkdir -p "$HOME/.cache/croft"
+# The script runs under the login shell, and zsh aborts on a glob that
+# matches nothing (NOMATCH), which an empty cache always is (#734).
+# null_glob makes it expand to nothing, as the `[ -f ]` below expects of
+# every other shell. Not `emulate sh`: that also clears ERR_EXIT, and a
+# failed compile would then write the install stamp.
+[ -z "${{ZSH_VERSION:-}}" ] || setopt null_glob
 CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
   [ -f "$CROFT_OLD" ] || continue
@@ -5493,6 +5499,20 @@ Host !blocked *.internal
         seen: &std::path::Path,
         hold: Option<&std::path::Path>,
     ) -> std::process::Command {
+        install_command_under("sh", dir, cargo_exit, systemd_run, seen, hold)
+    }
+
+    /// [`install_command`] under a given shell: the script runs under the
+    /// remote user's login shell, which is often zsh (#734).
+    #[cfg(unix)]
+    fn install_command_under(
+        shell: &str,
+        dir: &std::path::Path,
+        cargo_exit: u8,
+        systemd_run: &str,
+        seen: &std::path::Path,
+        hold: Option<&std::path::Path>,
+    ) -> std::process::Command {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("bin");
         let home = dir.join("home");
@@ -5533,7 +5553,7 @@ exit {cargo_exit}"#
             ),
         );
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std::process::Command::new(shell);
         cmd.arg("-c")
             .arg(remote_install_command("abc123"))
             .env_clear()
@@ -5753,6 +5773,49 @@ exec "$@""#,
         assert!(
             leftover_markers(tmp.path()).is_empty(),
             "a failed build left its marker behind"
+        );
+    }
+
+    /// #734: zsh aborts on a glob that matches nothing, and the marker
+    /// sweep's glob matches nothing on every host with an empty cache, so a
+    /// zsh login shell never reached cargo. It must reach it, and a failed
+    /// compile must still fail the install.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_script_reaches_cargo_under_zsh() {
+        if !crate::lsp::manager::is_on_path("zsh") {
+            eprintln!("SKIPPED: zsh not on PATH");
+            return;
+        }
+        let under_zsh = |dir: &std::path::Path, cargo_exit| {
+            let seen = dir.join("seen");
+            let status = install_command_under("zsh", dir, cargo_exit, "exit 1", &seen, None)
+                .status()
+                .unwrap();
+            (
+                status.success(),
+                std::fs::read_to_string(seen).unwrap_or_default(),
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, seen) = under_zsh(tmp.path(), 0);
+        assert!(ok, "an empty cache must not stop the install under zsh");
+        let mut fields = seen.splitn(3, ' ');
+        let own = fields.next().unwrap();
+        let marked = fields.next().expect("cargo ran under zsh");
+        assert_eq!(own, marked);
+        assert!(leftover_markers(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("home/.cache/croft/install-stamp")).unwrap(),
+            "abc123"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (ok, _) = under_zsh(tmp.path(), 3);
+        assert!(!ok, "a failing compile must fail the install under zsh");
+        assert!(
+            !tmp.path().join("home/.cache/croft/install-stamp").exists(),
+            "a failed compile must not write the install stamp"
         );
     }
 
