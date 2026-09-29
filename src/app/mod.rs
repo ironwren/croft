@@ -501,19 +501,20 @@ fn lldb_dap_missing_message() -> String {
 /// python3. The debug venv's python is only the debugpy ADAPTER host — the
 /// debuggee must be this one, or a pytest module launch can't import pytest.
 fn project_python(root: &Path) -> PathBuf {
+    project_python_on(root, std::env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| PathBuf::from("python3"))
+}
+
+/// [`project_python`] with `path_var` as `PATH`, None where it would fall
+/// back to a bare `python3`: no `.venv` and no `python3` on `path_var`.
+fn project_python_on(root: &Path, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let venv = root.join(".venv").join("bin").join("python");
     if venv.is_file() {
-        return venv;
+        return Some(venv);
     }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("python3");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("python3")
+    std::env::split_paths(path_var?)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Whether `path` is a regular file with the executable bit set — i.e. a
@@ -17250,6 +17251,8 @@ impl App {
         self.refresh_scm_repositories();
         self.run_debug.focus_gradient = gradient;
         self.run_debug.theme = self.theme;
+        self.codeql.focus_gradient = gradient;
+        self.codeql.theme = self.theme;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
@@ -23149,6 +23152,26 @@ impl App {
             .collect();
         match crate::testing::worker::runner_for(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
+                // The interpreter F5 and Live Run pick, from the test file's
+                // folder up (#864), not only a root `.venv`; refused before
+                // any setup when debugpy cannot run under it.
+                let test_dir = self
+                    .editor
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .filter(|dir| dir.starts_with(&root))
+                    .unwrap_or(&root)
+                    .to_path_buf();
+                let project_py =
+                    debuggee_python(&test_dir, &root, std::env::var_os("PATH").as_deref());
+                let note = match project_py.as_deref().map_or(Ok(None), debuggee_python_note) {
+                    Ok(note) => note,
+                    Err(refusal) => {
+                        self.debug_error(refusal);
+                        return;
+                    }
+                };
                 let adapter_py = match crate::dap::install::ensure_debug_venv() {
                     Ok(py) => py,
                     Err(e) => {
@@ -23156,7 +23179,7 @@ impl App {
                         return;
                     }
                 };
-                let project_py = project_python(&root);
+                let project_py = project_py.unwrap_or_else(|| adapter_py.clone());
                 let request =
                     crate::dap::session::pytest_debug_launch_request(&project_py, &root, &name);
                 let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
@@ -23171,10 +23194,15 @@ impl App {
                         self.debug_sessions.replace_with(name.clone(), session);
                         self.run_debug.feedback = Some(format!("Debugging test {name}"));
                         self.run_debug.feedback_is_error = false;
+                        let lead =
+                            with_python_note(format!("Debugging test {name}"), note.as_deref());
                         self.status = self.with_failure_note(format!(
-                            "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                            "{lead} — F5 continue · F10 step over · Shift+F5 stop"
                         ));
                         self.reveal_debug_view();
+                        if note.is_some() {
+                            self.debug_console_push(lead);
+                        }
                     }
                     Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
                 }
@@ -23477,6 +23505,24 @@ impl App {
         }
     }
 
+    /// The four places a CodeQL database comes from, in a picker whose rows
+    /// run the matching side-bar action.
+    fn open_codeql_database_sources(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = CODEQL_DB_SOURCES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| ListRow {
+                id: i.to_string(),
+                label: String::from(*label),
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::CodeqlDbSource, "Add CodeQL Database", rows),
+            "",
+        );
+    }
+
     /// Run what a CodeQL side-bar row offers. Sections and query packs fold;
     /// the language and database lists select; a query row runs; "Create
     /// one" asks for a query name; a variant analysis entry becomes what a
@@ -23586,6 +23632,13 @@ impl App {
                     Err(e) => self.status = format!("{}: {e}", path.display()),
                 }
             }
+            Hit::Action(Action::AddDatabase) => self.open_codeql_database_sources(),
+            Hit::Action(Action::QuickQuery) => {
+                self.run_command(crate::widgets::command_palette::Command::CodeqlQuickQuery)
+            }
+            Hit::Action(Action::ShowEvaluatorLog) => self.run_command(
+                crate::widgets::command_palette::Command::CodeqlShowEvaluatorLogViewer,
+            ),
             Hit::Action(Action::CreateQuery) => self.prompt_create_codeql_query(),
             Hit::Action(Action::SetUpControllerRepository) => self.prompt_codeql_controller(),
             Hit::Action(Action::VariantList(i))
@@ -30037,6 +30090,8 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let name = rc.name.clone();
+        // The debuggee interpreter's note (#864), for a Python launch.
+        let mut python_note = None;
         let result = match rc.kind {
             AdapterKind::Debugpy => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
@@ -30051,12 +30106,27 @@ impl App {
                         let adapter_args =
                             vec![String::from("-m"), String::from("debugpy.adapter")];
                         let program_py =
-                            config_project_python(&rc, &cwd, &self.active_workspace_root());
+                            config_project_python(&rc, &cwd, &self.active_workspace_root(), &py);
+                        let request = configs::debugpy_request(&rc, &program_py);
+                        // Whichever interpreter runs the program, the
+                        // config's own included (#864).
+                        if rc.request == RequestKind::Launch {
+                            match launch_request_python(&request)
+                                .as_deref()
+                                .map_or(Ok(None), debuggee_python_note)
+                            {
+                                Ok(note) => python_note = note,
+                                Err(refusal) => {
+                                    self.debug_error(format!("config \"{name}\": {refusal}"));
+                                    return;
+                                }
+                            }
+                        }
                         crate::dap::session::DapSession::launch_with(
                             &py.to_string_lossy(),
                             &adapter_args,
                             &cwd,
-                            configs::debugpy_request(&rc, &program_py),
+                            request,
                             breakpoints,
                         )
                     }
@@ -30180,9 +30250,12 @@ impl App {
                 };
                 self.run_debug.feedback = Some(format!("{verb} {name}"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("{verb} {name} — F5 continue · F10 step over · Shift+F5 stop");
+                let lead = with_python_note(format!("{verb} {name}"), python_note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
+                if python_note.is_some() {
+                    self.debug_console_push(lead);
+                }
             }
             Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
         }
@@ -30240,16 +30313,6 @@ impl App {
                 return;
             }
         }
-        let py = match crate::dap::install::ensure_debug_venv() {
-            Ok(py) => py,
-            Err(e) => {
-                self.debug_error(format!("Debugger setup failed: {e}"));
-                return;
-            }
-        };
-        let breakpoints = self.collect_editor_breakpoints();
-        let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
-        let py_str = py.to_string_lossy().into_owned();
         let debug_root = self
             .roots
             .owning_root(&path)
@@ -30257,7 +30320,30 @@ impl App {
             .to_path_buf();
         // The debug venv hosts only the adapter; the program runs under
         // the interpreter Run would use, so its packages import (#864).
-        let program_py = project_python_for(path.parent().unwrap_or(&debug_root), &debug_root);
+        // One debugpy cannot run under is refused before any setup.
+        let program_py = debuggee_python(
+            path.parent().unwrap_or(&debug_root),
+            &debug_root,
+            std::env::var_os("PATH").as_deref(),
+        );
+        let note = match program_py.as_deref().map_or(Ok(None), debuggee_python_note) {
+            Ok(note) => note,
+            Err(refusal) => {
+                self.debug_error(refusal);
+                return;
+            }
+        };
+        let py = match crate::dap::install::ensure_debug_venv() {
+            Ok(py) => py,
+            Err(e) => {
+                self.debug_error(format!("Debugger setup failed: {e}"));
+                return;
+            }
+        };
+        let program_py = program_py.unwrap_or_else(|| py.clone());
+        let breakpoints = self.collect_editor_breakpoints();
+        let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
+        let py_str = py.to_string_lossy().into_owned();
         match crate::dap::session::DapSession::launch(
             &py_str,
             &adapter_args,
@@ -30275,9 +30361,14 @@ impl App {
                 self.debug_sessions.replace_with(name.clone(), session);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
-                self.status =
-                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
+                // After the reveal, which clears the console; it outlasts
+                // the status line.
+                if note.is_some() {
+                    self.debug_console_push(lead);
+                }
             }
             Err(e) => {
                 self.debug_error(format!("Failed to start debugger: {e}"));
@@ -34738,6 +34829,11 @@ impl App {
                 }
             }
             ListPurpose::CodeqlModel => self.choose_codeql_model(&row.id),
+            ListPurpose::CodeqlDbSource => {
+                if let Some((action, _)) = CODEQL_DB_SOURCES.get(index) {
+                    self.activate_codeql(crate::widgets::codeql::Hit::Action(*action));
+                }
+            }
             ListPurpose::CodeqlMultiDb => self.choose_codeql_multi_db(&row.id, selected),
             ListPurpose::CodeqlResultSet => {
                 let path = PathBuf::from(&row.id);
@@ -65092,13 +65188,82 @@ fn project_python_for(dir: &Path, workspace_root: &Path) -> PathBuf {
         .unwrap_or_else(|| project_python(workspace_root))
 }
 
+/// The interpreter a debugged Python program in `dir` runs under (#864):
+/// the one Run would use ([`project_python_for`]) when it exists, a venv or
+/// a `python3` on `path_var`. None otherwise, and the launch keeps the debug
+/// venv's own python, where the program always ran, rather than a bare
+/// `python3` that cannot start.
+fn debuggee_python(
+    dir: &Path,
+    workspace_root: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .or_else(|| project_python_on(workspace_root, path_var))
+}
+
+/// What a Python debug launch says about the interpreter its program runs
+/// under (#864). Err is the refusal when debugpy cannot run there at all;
+/// Some is the clause naming one older than attach's 3.14 floor, `under
+/// Python 3.12 (.venv); attach needs 3.14+`; None is for 3.14+, or a version
+/// that cannot be read (the launch then reports for itself).
+fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
+    use crate::dap::install::{DEBUGPY_MIN_PYTHON, python_version, pyvenv_cfg};
+    use crate::dap::remote_attach::MIN_ATTACH_VERSION;
+    let Some(version) = python_version(python) else {
+        return Ok(None);
+    };
+    let (major, minor) = (version.major, version.minor);
+    // A venv by its folder name, as the issue's `.venv`; else the path.
+    let label = pyvenv_cfg(python)
+        .and_then(|cfg| Some(cfg.parent()?.file_name()?.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| python.display().to_string());
+    // Minor versions only: a 3.10.0 debuggee meets debugpy's 3.10 floor.
+    if (major, minor) < (DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor) {
+        return Err(format!(
+            "Python {major}.{minor} ({label}) is too old to debug: debugpy needs {}.{}+",
+            DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor
+        ));
+    }
+    if !version.supports_remote_attach() {
+        return Ok(Some(format!(
+            "under Python {major}.{minor} ({label}); attach needs {}.{}+",
+            MIN_ATTACH_VERSION.major, MIN_ATTACH_VERSION.minor
+        )));
+    }
+    Ok(None)
+}
+
+/// `lead` followed by the note on the debuggee's interpreter, if any (#864).
+fn with_python_note(lead: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{lead} {note}"),
+        None => lead,
+    }
+}
+
+/// The interpreter a debugpy `launch` request runs its program under: its
+/// `python` (a path, or a command line whose first word is one) or legacy
+/// `pythonPath`.
+fn launch_request_python(request: &serde_json::Value) -> Option<PathBuf> {
+    let args = &request["arguments"];
+    let python = args.get("python").or_else(|| args.get("pythonPath"))?;
+    python
+        .as_str()
+        .or_else(|| python.get(0)?.as_str())
+        .map(PathBuf::from)
+}
+
 /// The interpreter a launch.json Python config's program runs under when
 /// the config names none (#864): resolved from the program's directory,
-/// or from `cwd` for a `module` launch, never croft's own debug venv.
+/// or from `cwd` for a `module` launch, as [`debuggee_python`] does, with
+/// `adapter_python` (the debug venv's) only when that finds nothing.
 fn config_project_python(
     rc: &crate::dap::configs::ResolvedConfig,
     cwd: &Path,
     workspace_root: &Path,
+    adapter_python: &Path,
 ) -> PathBuf {
     let dir = rc
         .program
@@ -65106,7 +65271,8 @@ fn config_project_python(
         .map(|p| crate::dap::configs::absolute_in(p, cwd))
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| cwd.to_path_buf());
-    project_python_for(&dir, workspace_root)
+    debuggee_python(&dir, workspace_root, std::env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| adapter_python.to_path_buf())
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";
@@ -65554,6 +65720,27 @@ type CodeqlLogViewerJob = (
     std::sync::mpsc::Receiver<Result<Vec<crate::codeql_evallog::Predicate>, String>>,
     String,
 );
+
+/// The rows of the Add CodeQL Database picker and the side-bar action each
+/// runs.
+const CODEQL_DB_SOURCES: [(crate::widgets::codeql::Action, &str); 4] = [
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromFolder,
+        "From a folder",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromArchive,
+        "From an archive",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromUrl,
+        "From a URL (as a zip file)",
+    ),
+    (
+        crate::widgets::codeql::Action::AddDatabaseFromGithub,
+        "From GitHub",
+    ),
+];
 
 /// The Model Editor's endpoints being read (#578): the endpoints, or why
 /// not, and the database and language they are for.

@@ -3203,6 +3203,116 @@ while True:
         session.disconnect();
     }
 
+    /// Run FAKE_DAP to one stop for `reason`, its `initialize` advertising
+    /// `supportsExceptionInfoRequest` or not, then disconnect. Returns every
+    /// request the adapter saw and every `ExceptionInfo` the session raised.
+    fn one_stop_then_disconnect(
+        reason: &str,
+        supports_exception_info: bool,
+    ) -> (Vec<Value>, Vec<String>) {
+        let mut script = FAKE_DAP
+            .replace(
+                r#""reason": "breakpoint""#,
+                &format!(r#""reason": "{reason}""#),
+            )
+            .replace(
+                "    elif c == \"disconnect\":",
+                r#"    elif c == "exceptionInfo":
+        reply(req, {"exceptionId": "KeyError", "description": "'x'"})
+    elif c == "disconnect":"#,
+            );
+        if supports_exception_info {
+            script = script.replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let mut summaries = Vec::new();
+        let mut drain = |session: &mut DapSession| {
+            for ev in session.poll() {
+                if let DapEvent::ExceptionInfo { summary } = ev {
+                    summaries.push(summary);
+                }
+            }
+        };
+        // The stop's follow-ups all go out together, `threads` among them.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to stop",
+            || {
+                drain(&mut session);
+                requests(&log).iter().any(|q| q["command"] == "threads")
+            },
+        );
+        // Anything the stop sent is logged before the disconnect that follows.
+        session.disconnect();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to log the disconnect",
+            || {
+                drain(&mut session);
+                requests(&log).iter().any(|q| q["command"] == "disconnect")
+            },
+        );
+        (requests(&log), summaries)
+    }
+
+    /// #864 guard: only an `exception` stop asks what was thrown. A
+    /// breakpoint stop, from an adapter that does support `exceptionInfo`,
+    /// sends no such request and reports no exception.
+    #[test]
+    fn a_breakpoint_stop_does_not_ask_what_was_thrown() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (reqs, summaries) = one_stop_then_disconnect("breakpoint", true);
+        assert!(
+            !reqs.iter().any(|q| q["command"] == "exceptionInfo"),
+            "{reqs:?}"
+        );
+        assert!(summaries.is_empty(), "{summaries:?}");
+    }
+
+    /// #864 guard: an adapter that does not advertise
+    /// `supportsExceptionInfoRequest` is not sent one on an exception stop,
+    /// which it would answer with an error.
+    #[test]
+    fn an_exception_stop_skips_exception_info_the_adapter_lacks() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (reqs, summaries) = one_stop_then_disconnect("exception", false);
+        assert!(
+            reqs.iter().any(|q| q["command"] == "stackTrace"),
+            "the stop was handled: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|q| q["command"] == "exceptionInfo"),
+            "{reqs:?}"
+        );
+        assert!(summaries.is_empty(), "{summaries:?}");
+    }
+
     #[test]
     fn set_breakpoints_request_carries_log_messages() {
         // A logpoint is a breakpoint with a `logMessage`: the adapter prints
