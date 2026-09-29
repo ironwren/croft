@@ -120,7 +120,7 @@ Completion, signature help / parameter hints, hover, go-to-definition, rename (p
 * Color swatches (`textDocument/documentColor`): a `■` in the value's color spliced before `#rrggbb`/`rgb()` literals, with a "Change Color Presentation" picker to rewrite the spelling.
 * Inlay hints — inferred types and parameter names spliced inline as dim italic annotations, on by default like VS Code; toggle with **Editor: Toggle Inlay Hints**.
 
-Markdown files get a rendered preview on `Cmd`/`Ctrl`+`Shift`+`V` (VS Code's chord): headings, emphasis, lists, task checkboxes, quotes, aligned tables, links, and fenced code blocks coloured by the editor's own tree-sitter highlighters, reflowing with the pane and following your edits.
+Markdown source is coloured in the editor itself, on the theme's own roles: headings, list and task markers, quotes, bold / italic / strikethrough, inline code, links, table headers, and fenced code blocks and front matter in their own language's colours. It also gets a rendered preview on `Cmd`/`Ctrl`+`Shift`+`V` (VS Code's chord): headings, emphasis, lists, task checkboxes, quotes, aligned tables, links, and fenced code blocks coloured by the editor's own tree-sitter highlighters, reflowing with the pane and following your edits.
 
 Make it yours: rebind any command in `keybindings.json`, define `Tab`-expandable snippets (with tab stops and placeholders) in `snippets.json`, and flip settings from a searchable **Preferences: Open Settings** hub — all under `~/.config/croft/` and reachable from the Command Palette.
 
@@ -240,5 +240,6 @@ Which server runs per language:
 | Bash | `bash-language-server` |
 | TOML | `taplo` |
 | C / C++ | `clangd` |
+| Markdown | `marksman` (link and heading completion, go-to-definition across files, references, heading rename, broken-link diagnostics, OUTLINE symbols), alongside croft's built-in Markdown lint |
 
-croft provisions `vtsls`, `yaml-language-server`, the JSON / HTML / CSS servers, and `bash-language-server` (via npm) and `ty` / `ruff` (via uv, or `pkg` on Termux) for itself on first use. `taplo`, `clangd`, and `rust-analyzer` ship as prebuilt binaries, so croft downloads the right release for your platform into `~/.croft/servers` — a toolchain copy on PATH or in `~/.cargo/bin` always wins, and on Termux `rust-analyzer` comes from `pkg` since the glibc release can't run on bionic. It also picks up `basedpyright` and `gopls` from your PATH if present.
+croft provisions `vtsls`, `yaml-language-server`, the JSON / HTML / CSS servers, and `bash-language-server` (via npm) and `ty` / `ruff` (via uv, or `pkg` on Termux) for itself on first use. `taplo`, `clangd`, `rust-analyzer`, and `marksman` ship as prebuilt binaries, so croft downloads the right release for your platform into `~/.croft/servers` — a toolchain copy on PATH or in `~/.cargo/bin` always wins, and on Termux `rust-analyzer` and `marksman` come from `pkg` since the glibc releases can't run on bionic. marksman's download is checked against a SHA-256 pinned in croft and refused if it does not match. It also picks up `basedpyright` and `gopls` from your PATH if present.

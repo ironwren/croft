@@ -39,7 +39,7 @@ src/
 ├── hex.rs                hex viewer/editor core and the routing fallback for files the text heuristic rejects; pure state + windowed file IO, never loads the file whole
 ├── asciicast.rs          writing a session as an asciicast v2 recording, behind "Session: Record Terminal as Asciicast"; payloads go through `serde_json`, backwards timestamps are clamped
 ├── archive.rs            archive browser core: zip/jar/whl and tar/tar.gz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
-├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal
+├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal; Markdown alone resolves injections (the inline grammar, fenced code by its language, front matter), each with its children included since the block grammar leaves delimiter hints inside the ranges it hands off
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
@@ -1224,7 +1224,7 @@ Per-language LSP config for basedpyright, ruff, ty, vtsls, rust-analyzer and gop
 
 ### lsp/install.rs
 
-Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty and ruff, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android; Binary covers clangd, taplo and rust-analyzer, downloading and unzipping or gunzipping a host-agnostic per-platform release binary, PATH-first including `~/.cargo/bin`.
+Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty and ruff, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable.
 
 **A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
 

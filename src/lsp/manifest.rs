@@ -45,6 +45,7 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/lsp-toml/extension.toml"),
     include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
     include_str!("../../assets/extensions/lsp-lua/extension.toml"),
+    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
     include_str!("../../assets/extensions/dap-python/extension.toml"),
     include_str!("../../assets/extensions/dap-lldb/extension.toml"),
     include_str!("../../assets/extensions/dap-js/extension.toml"),
@@ -412,7 +413,7 @@ pub struct ProvisionDecl {
     #[serde(default)]
     pub archive: Option<ArchiveKindDecl>,
     /// `binary`: literal path to the executable inside the unpacked archive.
-    /// Absent for a single-file `.gz`.
+    /// Absent for a single-file `.gz` or a `raw` asset.
     #[serde(default)]
     pub bin_path: Option<String>,
     /// `binary`: Termux/Android package name for `pkg install`, used when the
@@ -445,6 +446,8 @@ pub enum ArchiveKindDecl {
     /// (cargo-dist's layout).
     #[serde(rename = "tar.xz")]
     TarXz,
+    /// No archive: the asset is the executable itself.
+    Raw,
 }
 
 /// A server registration extracted from a manifest: its priority, the language
@@ -647,6 +650,7 @@ impl ProvisionDecl {
                     ArchiveKindDecl::Gz => ArchiveKind::Gz,
                     ArchiveKindDecl::Zip => ArchiveKind::Zip,
                     ArchiveKindDecl::TarXz => ArchiveKind::TarXz,
+                    ArchiveKindDecl::Raw => ArchiveKind::Raw,
                 },
                 bin_path: self.bin_path.as_deref().map(intern),
                 termux_pkg: self.termux_pkg.as_deref().map(intern),
@@ -953,6 +957,32 @@ provision = { kind = "binary", bin = "csvlens", archive = "tar.xz", targets = { 
             "the archive kind reads `tar.xz`"
         );
         assert_eq!(bin, "csvlens");
+    }
+
+    /// `archive = "raw"` names an asset that is the executable itself (#834).
+    #[test]
+    fn a_raw_archive_kind_parses() {
+        const DECL: &str = r#"
+id = "r"
+name = "r"
+api_version = 1
+
+[[language_servers]]
+name = "rbin"
+command = "rbin"
+language = "markdown"
+provision = { kind = "binary", bin = "rbin", archive = "raw", targets = { "macos" = "https://example.invalid/rbin" } }
+"#;
+        let m = parse(DECL).expect("the manifest parses");
+        let p = m.language_servers[0]
+            .provision
+            .as_ref()
+            .expect("provisioned")
+            .to_provision();
+        let Provision::Binary { archive, .. } = p else {
+            panic!("a binary provision was declared");
+        };
+        assert_eq!(archive, ArchiveKind::Raw, "the archive kind reads `raw`");
     }
 
     const PYTHON: &str = include_str!("../../assets/extensions/lsp-python/extension.toml");

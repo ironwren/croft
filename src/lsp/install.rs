@@ -74,7 +74,8 @@ pub enum Provision {
         archive: ArchiveKind,
         /// Literal path to the executable inside the unpacked archive, relative
         /// to `~/.croft/servers/<name>/`. `None` for a single-file `.gz` whose
-        /// decompressed bytes ARE the binary (placed at `<name>/<bin>`). Set for
+        /// decompressed bytes ARE the binary, or a raw asset that is the binary
+        /// itself (either is placed at `<name>/<bin>`). Set for
         /// `.zip` payloads that carry sibling files the binary needs at a fixed
         /// relative path (e.g. clangd's `clangd_<ver>/bin/clangd` beside `lib/`).
         bin_path: Option<&'static str>,
@@ -108,6 +109,9 @@ pub enum ArchiveKind {
     /// per-target folder; extracted whole, then the named binary is placed at
     /// `<name>/<bin>` wherever it sat in the tree.
     TarXz,
+    /// No archive: the downloaded asset IS the executable (marksman publishes
+    /// bare per-platform binaries). Written as-is and marked executable.
+    Raw,
 }
 
 /// Latest one-line status of a managed install, polled by the app each tick and
@@ -443,6 +447,16 @@ fn extract_gz(bytes: &[u8], target: &Path) -> std::io::Result<()> {
     set_executable(target)
 }
 
+/// Write a raw (unarchived) payload — the downloaded bytes ARE the binary — to
+/// `target` and mark it executable.
+fn extract_raw(bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, bytes)?;
+    set_executable(target)
+}
+
 /// Extract a `.zip` payload whole into `dir` (so the binary keeps its sibling
 /// files, e.g. clangd's `lib/`), then mark the resolved binary executable.
 fn extract_zip(bytes: &[u8], dir: &Path, target: &Path) -> std::io::Result<()> {
@@ -763,6 +777,7 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
         ArchiveKind::Gz => extract_gz(&bytes, &target),
         ArchiveKind::Zip => extract_zip(&bytes, &dir, &target),
         ArchiveKind::TarXz => extract_tar_xz(&bytes, &dir, &target),
+        ArchiveKind::Raw => extract_raw(&bytes, &target),
     };
     if let Err(e) = extracted {
         log_file::log(&format!("lsp[{name}] extract failed: {e}"));
@@ -1530,6 +1545,65 @@ mod tests {
         assert!(
             v.to_lowercase().contains("clangd"),
             "clangd reports itself: {v}"
+        );
+    }
+
+    /// marksman publishes bare executables (#834): a `Raw` payload is written
+    /// byte for byte, its missing parent dirs are created, and it comes out
+    /// executable.
+    #[test]
+    fn a_raw_payload_is_the_binary_and_comes_out_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("marksman/marksman");
+        let script: &[u8] = b"#!/bin/sh\necho marksman-ok\n";
+        extract_raw(script, &target).expect("write the raw binary");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            script,
+            "the payload is written unaltered"
+        );
+        let out = Command::new(&target).output().expect("run the raw binary");
+        assert!(out.status.success(), "the raw binary is executable");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("marksman-ok"));
+    }
+
+    /// End-to-end exercise of the raw path against marksman's real release,
+    /// through the bundled manifest's own URL and pinned digest (#834): proves
+    /// the pin matches what the release serves for this platform and that the
+    /// written file runs. `#[ignore]`d: a 22-44 MB network download,
+    /// platform-gated. Run with `cargo test --bin croft -- --ignored marksman_raw`.
+    #[test]
+    #[ignore = "network: downloads a real marksman release"]
+    fn marksman_raw_binary_downloads_verifies_and_runs() {
+        let registry = crate::lsp::registry::ServerRegistry::with_defaults();
+        let marksman = &registry.for_language(Language::MARKDOWN)[0];
+        let Some(Provision::Binary {
+            targets,
+            sha256,
+            archive,
+            bin,
+            ..
+        }) = &marksman.provision
+        else {
+            panic!("marksman must carry a Binary provision");
+        };
+        assert_eq!(*archive, ArchiveKind::Raw);
+        let (key, url) = target_entry(targets, std::env::consts::OS, std::env::consts::ARCH)
+            .expect("the manifest has a marksman asset for this platform");
+        let bytes = download_capped(url, MAX_BINARY_BYTES).expect("download marksman");
+        digest_verdict(sha256, key, &bytes).expect("the pinned digest matches the release");
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(bin);
+        extract_raw(&bytes, &target).expect("write marksman");
+        let out = Command::new(&target)
+            .arg("--version")
+            .output()
+            .expect("run marksman --version");
+        assert!(out.status.success(), "marksman --version exits 0");
+        let v = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            v.contains("2026-02-08"),
+            "marksman reports its release: {v}"
         );
     }
 
