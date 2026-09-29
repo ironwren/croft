@@ -29050,9 +29050,16 @@ impl App {
     }
 
     /// Append a line to the debug console, capping the backlog so a chatty
-    /// program can't grow it without bound.
+    /// program can't grow it without bound. The line is mirrored to OUTPUT's
+    /// "Debug Console" channel (#867), where it reads at full width and can
+    /// be searched and copied; that channel keeps its own cap.
     fn debug_console_push(&mut self, line: String) {
         const CAP: usize = 1000;
+        crate::output::push(
+            crate::output::CHANNEL_DEBUG_CONSOLE,
+            crate::output::OutputLevel::Info,
+            &line,
+        );
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
             let overflow = self.debug_console.len() - CAP;

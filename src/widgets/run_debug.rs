@@ -57,6 +57,29 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+/// Soft-wrap one console line into rows at most `width` display columns
+/// wide, the way a terminal wraps (#867): whitespace is kept, so a
+/// traceback's indentation survives, a wide glyph never straddles two rows,
+/// and a tab is four spaces. An empty line is one empty row.
+fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for c in line.replace('\t', "    ").chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(c);
+        used += w;
+    }
+    rows.push(row);
+    rows
+}
+
 /// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
 /// collections green, numbers cyan, None/bool orange, everything else (objects)
 /// the neutral name grey.
@@ -391,6 +414,26 @@ impl RunDebugPanel {
         }
     }
 
+    /// The newest `max_rows` rows of the console tail, each line soft-wrapped
+    /// to `width` columns (#867), oldest first so they paint top-down with
+    /// the newest last. Each row says whether its line is a REPL echo
+    /// (`❯ expr`), drawn in the accent colour down all its rows.
+    fn console_rows(&self, width: usize, max_rows: usize) -> Vec<(String, bool)> {
+        let mut rows = Vec::new();
+        for line in self.console_tail.iter().rev() {
+            let echo = line.starts_with('❯');
+            for row in wrap_console_line(line, width).into_iter().rev() {
+                if rows.len() == max_rows {
+                    rows.reverse();
+                    return rows;
+                }
+                rows.push((row, echo));
+            }
+        }
+        rows.reverse();
+        rows
+    }
+
     /// Render the paused-state tree (Variant A / Darcula): a status pill, the
     /// call-stack + variables tree with type-coloured values, then the console
     /// and a REPL bar pinned to the bottom. Records `last_debug_row_y0` /
@@ -423,13 +466,16 @@ impl RunDebugPanel {
 
         // Reserve the bottom for the console + the REPL input area. The input
         // area is 2 rows: a "DEBUG CONSOLE" label and the filled input field.
-        // The console is sized to its actual line count (capped at 6) so the
+        // The console is sized to its actual row count (capped at 6) so the
         // newest line sits directly above the label and output grows UPWARD,
         // like a terminal — never floating at the top of a fixed-height box.
+        // Lines wrap to the panel's width rather than clip at its edge (#867).
         let bottom = inner.y + inner.height;
         let input_h: u16 = 2;
         let console_avail = bottom.saturating_sub(y).saturating_sub(input_h + 2);
-        let console_h: u16 = (self.console_tail.len() as u16).min(6).min(console_avail);
+        let console_w = inner.width.saturating_sub(2);
+        let console_rows = self.console_rows(console_w as usize, console_avail.min(6) as usize);
+        let console_h = console_rows.len() as u16;
         let rows_bottom = bottom.saturating_sub(input_h + console_h);
         let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
@@ -704,23 +750,20 @@ impl RunDebugPanel {
         let label_y = bottom - 2;
 
         // Console: program output + REPL echoes, above the label.
-        if console_h > 0 {
-            let console_y0 = label_y.saturating_sub(console_h);
-            for (i, line) in self
-                .console_tail
-                .iter()
-                .rev()
-                .take(console_h as usize)
-                .rev()
-                .enumerate()
-            {
-                let style = if line.starts_with('❯') {
-                    Style::default().fg(self.theme.ui(DBG_ACCENT))
-                } else {
-                    Style::default().fg(self.theme.ui(DBG_LOC))
-                };
-                put(buf, inner.x + 1, console_y0 + i as u16, right, line, style);
-            }
+        let console_y0 = label_y.saturating_sub(console_h);
+        for (i, (row, echo)) in console_rows.iter().enumerate() {
+            let style = if *echo {
+                Style::default().fg(self.theme.ui(DBG_ACCENT))
+            } else {
+                Style::default().fg(self.theme.ui(DBG_LOC))
+            };
+            buf.set_stringn(
+                inner.x + 1,
+                console_y0 + i as u16,
+                row,
+                console_w as usize,
+                style,
+            );
         }
 
         // "DEBUG CONSOLE" label above the field.
@@ -1088,15 +1131,10 @@ impl Widget for &mut RunDebugPanel {
             next_y = next_y.saturating_add(1);
             let bottom = inner.y + inner.height;
             let avail = bottom.saturating_sub(next_y) as usize;
-            let start = self.console_tail.len().saturating_sub(avail);
             let max_w = inner.width.saturating_sub(2) as usize;
             let line_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
-            for line in &self.console_tail[start..] {
-                if next_y >= bottom {
-                    break;
-                }
-                let shown: String = line.chars().take(max_w).collect();
-                buf.set_string(inner.x + 1, next_y, &shown, line_style);
+            for (row, _) in self.console_rows(max_w, avail) {
+                buf.set_stringn(inner.x + 1, next_y, &row, max_w, line_style);
                 next_y = next_y.saturating_add(1);
             }
         }
@@ -1237,6 +1275,91 @@ mod tests {
             "newest console line must hug the label (row above it):\nlabel-1: {:?}",
             row_text(label_y - 1)
         );
+    }
+
+    /// #867: program output wider than the sidebar was cut at its edge, with
+    /// no wrap and no scroll. A long line now wraps onto the rows above the
+    /// label, every character of it on screen, still anchored to the label.
+    #[test]
+    fn a_long_console_line_wraps_with_all_its_text_visible() {
+        let long = "ValueError: 12345 is not one of the permitted choices \
+                    (alpha, beta, gamma, delta) - END";
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused (exception)");
+        panel.debug_rows = vec![DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: "CALL STACK".into(),
+            },
+        }];
+        panel.console_tail = vec!["short".into(), long.into()];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let cells = |y: u16, from: u16, to: u16| -> String {
+            (from..to).map(|x| buf[(x, y)].symbol()).collect::<String>()
+        };
+        let label_y = (0..area.height)
+            .find(|&y| cells(y, 0, area.width).contains("DEBUG CONSOLE"))
+            .expect("label present");
+        // Text runs from one cell inside the border for the inner width
+        // less a margin: columns 2..28 of a 30-wide panel.
+        let width = 26usize;
+        let rows = long.chars().count().div_ceil(width) as u16;
+        let wrapped: String = (label_y - rows..label_y).map(|y| cells(y, 2, 28)).collect();
+        assert_eq!(wrapped.trim_end(), long, "every character is on screen");
+        assert!(
+            cells(label_y - rows - 1, 0, area.width).contains("short"),
+            "the line before it sits above its first row"
+        );
+    }
+
+    /// #867: the idle panel's retained console wraps the same way.
+    #[test]
+    fn the_retained_console_wraps_too() {
+        let long = "x".repeat(60) + "END";
+        let mut panel = RunDebugPanel::new();
+        panel.session_ended = true;
+        panel.console_tail = vec![long.clone()];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("END"),
+            "the line's tail is on screen:\n{dump}"
+        );
+        assert_eq!(dump.matches('x').count(), 60, "{dump}");
+    }
+
+    /// Wrapping counts display columns: a double-width glyph fills two, and
+    /// never straddles the edge.
+    #[test]
+    fn console_wrapping_measures_display_width() {
+        let wide = "界".repeat(20);
+        let rows = wrap_console_line(&wide, 25);
+        assert_eq!(
+            rows.iter().map(|r| r.chars().count()).collect::<Vec<_>>(),
+            vec![12, 8]
+        );
+        assert_eq!(rows.concat(), wide);
+        assert_eq!(
+            wrap_console_line("\tif x:", 8),
+            vec![String::from("    if x"), String::from(":")],
+            "a tab is four columns and indentation is kept"
+        );
+        assert_eq!(wrap_console_line("", 8), vec![String::new()]);
     }
 
     #[test]

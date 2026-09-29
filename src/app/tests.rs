@@ -51817,6 +51817,53 @@ fn a_switched_to_member_replays_its_queued_stop() {
     app.debug_stop();
 }
 
+/// #867: the Debug Console lived only in the sidebar, cut at its edge.
+/// Program output and REPL results are mirrored, whole, to OUTPUT's
+/// "Debug Console" channel, where they read at full width and can be
+/// searched and copied.
+#[test]
+fn the_debug_console_is_mirrored_to_an_output_channel() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-{}", std::process::id());
+    let printed = format!("{tag} {}", "wide ".repeat(40));
+    let event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"{printed}\n"}}}}"#
+    );
+    app.debug_sessions.push("P", stub_emitting(&[&event]));
+    let mirrored = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| l.text == text)
+    };
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the program's output to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            mirrored(&printed)
+        },
+    );
+
+    let (_, p) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    p.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: format!("describe('{tag}')"),
+        result: format!("'{tag} described'"),
+        success: true,
+    });
+    app.poll_dap();
+    assert!(mirrored(&format!("❯ describe('{tag}')")), "the REPL echo");
+    assert!(mirrored(&format!("'{tag} described'")), "and its result");
+    app.debug_stop();
+}
+
 /// A workspace with two source files and breakpoints set in both (#250).
 fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
