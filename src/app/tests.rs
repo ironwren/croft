@@ -54329,8 +54329,10 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         }
         screen.push('\n');
     }
+    // Look at editor lines only (`N ┃text`): the explorer shows the temp
+    // dir's random name, which can itself contain "v2".
     assert!(
-        !screen.contains("v2"),
+        screen.contains("┃v1") && !screen.contains("┃v2"),
         "only the root commit's text shows:\n{screen}"
     );
 }
@@ -56301,6 +56303,66 @@ fn a_codeql_runs_evaluator_log_opens_raw_or_summarised() {
 
 #[cfg(unix)]
 #[test]
+fn a_codeql_runs_query_log_opens_the_newest_log_in_its_logs_folder() {
+    // #578: VS Code's "Show Query Log". Every run passes `--logdir` so
+    // `codeql` writes its log beside the results; the newest one opens.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let out = App::codeql_results_dir().join("1-q").join("results.csv");
+        seed_codeql_history(
+            tmp.path(),
+            &[("q.ql", 1, RunStatus::Succeeded, out.clone())],
+        );
+        // A run from before croft kept query logs.
+        app.run_command(Command::CodeqlShowQueryLog);
+        assert_eq!(app.status, "q.ql has no query log");
+
+        let logs = crate::codeql_query::query_log_dir(&out);
+        std::fs::create_dir_all(&logs).unwrap();
+        let at = |secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        for (name, secs) in [
+            ("execute-new.log", 20),
+            ("execute-old.log", 10),
+            ("x.txt", 30),
+        ] {
+            let f = std::fs::File::create(logs.join(name)).unwrap();
+            f.set_modified(at(secs)).unwrap();
+        }
+        app.run_command(Command::CodeqlShowQueryLog);
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(logs.join("execute-new.log").as_path())
+        );
+        assert_eq!(
+            Command::from_id("codeql_show_query_log"),
+            Some(Command::CodeqlShowQueryLog)
+        );
+
+        // A real run asks `codeql` for a log in its own folder.
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "import rust\nselect 1");
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlRunQuery);
+        wait_for_codeql(&mut app);
+        let history = crate::codeql_query::History::load(&App::codeql_history_path());
+        let run = &history.entries[history.newest().unwrap()];
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        let logdir = format!(
+            "--logdir={}",
+            crate::codeql_query::query_log_dir(&run.output).display()
+        );
+        assert!(calls.starts_with("query run "), "{calls}");
+        assert!(calls.contains(&logdir), "{calls}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn a_codeql_runs_evaluator_log_viewer_shows_a_folded_predicate_tree() {
     // #578: "Show Evaluator Log (Viewer)" runs `codeql generate log-summary
     // --format=predicates` once, keeps the file beside the log, and shows
@@ -56571,6 +56633,278 @@ fn comparing_codeql_performance_sets_two_runs_predicate_timings_side_by_side() {
         assert_eq!(
             Command::from_id("codeql_compare_performance"),
             Some(Command::CodeqlComparePerformance)
+        );
+    });
+}
+
+#[test]
+fn codeql_results_are_exported_to_a_new_file_only() {
+    // #578: VS Code's "Export Results" copies the newest successful run's
+    // results (a failed run later on is passed over) to a file the user
+    // names, suggesting one in the workspace, and never overwrites.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::codeql_query::RunStatus;
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(Command::CodeqlExportResults);
+        assert_eq!(
+            app.status,
+            "There is no successful CodeQL query run to export"
+        );
+        assert!(app.input_prompt.is_none());
+
+        seed_codeql_history(
+            tmp.path(),
+            &[
+                (
+                    "q.ql",
+                    2,
+                    RunStatus::Succeeded,
+                    App::codeql_results_dir().join("2-q/results.csv"),
+                ),
+                (
+                    "r.ql",
+                    5,
+                    RunStatus::Failed(String::from("x")),
+                    App::codeql_results_dir().join("5-r/results.sarif"),
+                ),
+            ],
+        );
+        app.run_command(Command::CodeqlExportResults);
+        let dest = app.workspace_root().join("q-results.csv");
+        assert_eq!(
+            app.input_prompt.as_ref().expect("the prompt opens").value,
+            dest.display().to_string()
+        );
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            format!("Exported results to {}", dest.display())
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "col0\n1\n");
+
+        std::fs::write(&dest, "mine").unwrap();
+        app.run_command(Command::CodeqlExportResults);
+        app.submit_input_prompt();
+        assert_eq!(
+            app.status,
+            format!(
+                "{} already exists; export the results to a new file",
+                dest.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        // A dangling symlink is refused too, not followed and written.
+        #[cfg(unix)]
+        {
+            let link = app.workspace_root().join("link.csv");
+            let target = app.workspace_root().join("nowhere.csv");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            app.run_command(Command::CodeqlExportResults);
+            app.input_prompt.as_mut().unwrap().value = link.display().to_string();
+            app.submit_input_prompt();
+            assert!(app.status.contains("already exists"), "{}", app.status);
+            assert!(!target.exists(), "the link's target was not created");
+        }
+        // Results gone while the prompt was open: nothing is created at
+        // the destination.
+        let fresh = app.workspace_root().join("fresh.csv");
+        app.run_command(Command::CodeqlExportResults);
+        app.input_prompt.as_mut().unwrap().value = fresh.display().to_string();
+        std::fs::remove_file(App::codeql_results_dir().join("2-q/results.csv")).unwrap();
+        app.submit_input_prompt();
+        assert!(
+            app.status.starts_with("Could not read the results at "),
+            "{}",
+            app.status
+        );
+        assert!(!fresh.exists(), "no file was created for a failed export");
+        assert_eq!(
+            Command::from_id("codeql_export_results"),
+            Some(Command::CodeqlExportResults)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
+    // #578: VS Code's "CodeQL: Run Query Suite" runs the open .qls on the
+    // selected database; a suite only runs through `database analyze`, so
+    // its results are SARIF whatever its queries' kinds.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        // `resolve queries` answers with the suite's queries: one alert
+        // query, listed in a file the test can switch to a table query.
+        let alert = tmp.path().join("Alert.ql");
+        std::fs::write(&alert, "/** @kind problem */ select 1").unwrap();
+        let listed = bin.path().join("resolved.json");
+        std::fs::write(&listed, format!("[\"{}\"]", alert.display())).unwrap();
+        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        std::fs::write(
+            &app.codeql_program,
+            script.replacen(
+                "\n",
+                &format!(
+                    "\n[ \"$1\" = resolve ] && {{ cat '{}'; exit 0; }}\n",
+                    listed.display()
+                ),
+                1,
+            ),
+        )
+        .unwrap();
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert_eq!(app.status, "Open a .qls query suite to run it");
+        assert!(app.codeql_run.is_none());
+
+        let suite = tmp.path().join("s.qls");
+        std::fs::write(&suite, "- queries: .\n").unwrap();
+        app.editor.open(&suite).unwrap();
+        // The CLI reads the saved suite, so unsaved edits are refused.
+        app.editor.dirty = true;
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert_eq!(
+            app.status,
+            "Save s.qls before running it: CodeQL reads it from disk"
+        );
+        assert!(app.codeql_run.is_none());
+        app.editor.dirty = false;
+        app.run_command(Command::CodeqlRunQuerySuite);
+        assert!(
+            app.status.contains("Running s.qls on app"),
+            "{}",
+            app.status
+        );
+        wait_for_codeql(&mut app);
+        let opened = app.editor.path.clone().expect("the results open");
+        assert_eq!(opened.extension().and_then(|e| e.to_str()), Some("sarif"));
+        assert!(
+            app.codeql.history[0].starts_with("\u{2713} s.qls \u{b7} app"),
+            "{:?}",
+            app.codeql.history
+        );
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert!(
+            calls.contains(&format!(
+                "database analyze {} {} --format=sarif-latest ",
+                tmp.path().join("dbs/app").display(),
+                suite.display()
+            )),
+            "{calls}"
+        );
+
+        // A suite selecting a table query is refused before the analysis:
+        // `database analyze` cannot produce its results.
+        let table = tmp.path().join("Table.ql");
+        std::fs::write(&table, "select 1").unwrap();
+        std::fs::write(
+            &listed,
+            format!("[\"{}\",\"{}\"]", alert.display(), table.display()),
+        )
+        .unwrap();
+        app.editor.open(&suite).unwrap();
+        app.run_command(Command::CodeqlRunQuerySuite);
+        wait_for_codeql(&mut app);
+        assert!(
+            app.codeql.history[0].contains("Table.ql"),
+            "the refusal names the table query: {:?}",
+            app.codeql.history
+        );
+
+        // "Run Query on Selected Database" takes a suite too.
+        app.editor.open(&suite).unwrap();
+        app.run_command(Command::CodeqlRunQuery);
+        assert!(
+            app.status.contains("Running s.qls on app"),
+            "{}",
+            app.status
+        );
+        wait_for_codeql(&mut app);
+        assert_eq!(
+            Command::from_id("codeql_run_query_suite"),
+            Some(Command::CodeqlRunQuerySuite)
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn codeql_query_help_is_previewed_as_markdown_or_reported_missing() {
+    // #578: VS Code's "CodeQL: Preview Query Help" renders the open
+    // query's help with `codeql generate query-help` off the UI thread and
+    // shows it in the Markdown preview; with no .ql open it takes the
+    // query of the newest history entry.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::command_palette::Command;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut app = codeql_query_fixture(tmp.path(), "select 1");
+        let wait = |app: &mut App| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.drain_codeql_query_help() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the query help never landed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        app.codeql_program = fake_codeql(bin.path(), "# Q\n\nFinds things.\n", 0, "");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        assert_eq!(app.status, "Rendering the help of q.ql\u{2026}");
+        wait(&mut app);
+        assert_eq!(app.status, "Query help for q.ql");
+        let help = croft_cache_dir().join("codeql/help/q.md");
+        assert_eq!(app.editor.path.as_deref(), Some(help.as_path()));
+        assert!(app.editor.markdown_preview.is_some());
+        let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "generate query-help --format=markdown --output={} {}",
+                help.display(),
+                tmp.path().join("q.ql").display()
+            )
+        );
+
+        // No help beside the query: the CLI writes nothing.
+        seed_codeql_history(
+            tmp.path(),
+            &[(
+                "h.ql",
+                5,
+                crate::codeql_query::RunStatus::Succeeded,
+                App::codeql_results_dir().join("5-h/results.csv"),
+            )],
+        );
+        app.codeql_program = fake_codeql(bin.path(), "", 0, "");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        assert_eq!(app.status, "Rendering the help of h.ql\u{2026}");
+        wait(&mut app);
+        assert_eq!(
+            app.status,
+            "h.ql has no query help (no .qhelp or .md beside it)"
+        );
+
+        app.editor.open(&tmp.path().join("q.ql")).unwrap();
+        app.codeql_program = fake_codeql(bin.path(), "", 2, "ERROR: no help");
+        app.run_command(Command::CodeqlPreviewQueryHelp);
+        wait(&mut app);
+        assert_eq!(app.status, "q.ql has no query help: ERROR: no help");
+        assert_eq!(
+            Command::from_id("codeql_preview_query_help"),
+            Some(Command::CodeqlPreviewQueryHelp)
         );
     });
 }
