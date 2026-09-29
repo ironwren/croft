@@ -65556,3 +65556,102 @@ fn the_tour_caption_panel_stays_out_of_a_frame_too_small_for_it() {
         assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_none());
     });
 }
+
+/// #863 (issue comment): a tour ended by closing croft's terminal left its
+/// `croft-demo-<pid>-<stamp>` folder in the cache, and the next `croft demo`
+/// made its own beside it. Starting the tour now sweeps a marked folder
+/// whose croft is gone, and keeps this croft's own and an unmarked one.
+#[test]
+fn starting_the_tour_sweeps_a_dead_tour_s_scratch_folder() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let demo = croft_cache_dir().join("demo");
+        let make = |name: &str, marked: bool| {
+            let dir = demo.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("README.md"), "# old tour\n").unwrap();
+            if marked {
+                std::fs::write(dir.join(crate::tour::SCRATCH_MARKER), "scratch\n").unwrap();
+            }
+            dir
+        };
+        // A pid above any kernel's pid_max: no such process.
+        let dead = make("croft-demo-2147483647-1", true);
+        let unmarked = make("croft-demo-2147483646-1", false);
+        let mine = make(&format!("croft-demo-{}-1", std::process::id()), true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(app.tour.is_some());
+        assert!(!dead.exists(), "the dead tour's folder is swept");
+        assert!(
+            unmarked.is_dir(),
+            "an unmarked folder is not croft's to delete"
+        );
+        assert!(mine.is_dir(), "this croft's own folder stays");
+        app.finish_tour();
+    });
+}
+
+/// #863: step 1 says Esc leaves the tour at any time and the keys row says
+/// "Esc leave", but with the theme picker a step opened, Esc closed only
+/// the picker. Esc with a modal the tour opened (the palette, Quick Open,
+/// the theme picker) now closes it and leaves the tour.
+#[test]
+fn esc_leaves_the_tour_from_a_picker_the_tour_opened() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let scratch = app.workspace_root().to_path_buf();
+        let theme = app.theme;
+        // Enter through the steps until one has a picker up.
+        let mut presses = 0;
+        while app.context_menu.is_none() && app.tour.is_some() && presses < 20 {
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            presses += 1;
+        }
+        assert!(
+            app.context_menu.is_some(),
+            "fixture: the theme picker is up"
+        );
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.tour.is_none(),
+            "Esc leaves the tour, as its keys row says"
+        );
+        assert!(app.context_menu.is_none(), "and the picker goes with it");
+        assert!(app.command_palette.is_none() && app.file_finder.is_none());
+        assert_eq!(app.theme, theme, "leaving picked no theme");
+        assert_eq!(app.workspace_root(), tmp.path());
+        assert!(!scratch.exists());
+    });
+}
+
+/// #863 negative: a palette the user opens themselves mid-tour is theirs:
+/// Esc closes it and the tour goes on.
+#[test]
+fn esc_in_a_palette_the_user_opened_keeps_the_tour() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(
+            app.command_palette.is_none(),
+            "fixture: step 1 opens no modal"
+        );
+        app.open_command_palette();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.command_palette.is_none());
+        assert!(app.tour.is_some(), "the tour goes on");
+        app.finish_tour();
+    });
+}

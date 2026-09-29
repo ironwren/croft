@@ -2569,6 +2569,9 @@ pub struct TourRun {
     pub tour: crate::tour::Tour,
     pub scratch: PathBuf,
     pub previous_root: PathBuf,
+    /// The current step opened a palette, Quick Open or a picker, whose Esc
+    /// then leaves the tour rather than only closing it (#863).
+    pub step_opened_modal: bool,
 }
 
 /// The live ssh-pane workspace offer (#364): which pane's foreground became
@@ -21386,6 +21389,31 @@ impl App {
             self.handle_shortcuts_modal_key(key);
             return Ok(());
         }
+        // The tour (#377): Esc leaves it at any time, as its first caption
+        // and its keys row say, from a palette, Quick Open or picker its step
+        // opened too (#863). Esc there closed only that, so at the theme
+        // picker a user taking the caption at its word stayed in the tour.
+        // A modal the user opens mid-tour is theirs: its Esc just closes it.
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == KeyEventKind::Press
+            && self.tour.as_ref().is_some_and(|run| run.step_opened_modal)
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.context_menu.is_some())
+        {
+            if self.command_palette.is_some() {
+                self.close_command_palette();
+            }
+            if self.file_finder.is_some() {
+                self.close_file_finder();
+            }
+            if self.context_menu.take().is_some() {
+                self.overlays.activity.mark_dirty();
+            }
+            self.finish_tour();
+            return Ok(());
+        }
         if self.file_finder.is_some() {
             self.handle_file_finder_key(key);
             return Ok(());
@@ -36342,7 +36370,11 @@ impl App {
                 return;
             }
         };
-        let scratch = match crate::tour::create_scratch(&croft_cache_dir().join("demo")) {
+        // A tour ended by closing croft's terminal left its scratch folder
+        // behind (#863): clear those whose croft is gone before adding one.
+        let demo_dir = croft_cache_dir().join("demo");
+        crate::tour::sweep_dead_scratch(&demo_dir, process_is_alive);
+        let scratch = match crate::tour::create_scratch(&demo_dir) {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("The tour could not create its sample project: {e}");
@@ -36356,6 +36388,7 @@ impl App {
             tour,
             scratch,
             previous_root,
+            step_opened_modal: false,
         });
         if let Some(action) = first {
             self.perform_tour_action(action);
@@ -36402,9 +36435,14 @@ impl App {
 
     fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
         use crate::tour::TourAction as A;
-        let Some(scratch) = self.tour.as_ref().map(|r| r.scratch.clone()) else {
+        let Some(run) = self.tour.as_mut() else {
             return;
         };
+        run.step_opened_modal = matches!(
+            action,
+            A::QuickOpen | A::FindFile(_) | A::CommandPalette | A::Palette(_) | A::ThemePicker
+        );
+        let scratch = run.scratch.clone();
         match action {
             A::Open(rel) => {
                 if let Err(e) = self.open_at(&scratch.join(rel), 0, 0) {
