@@ -23900,6 +23900,51 @@ fn sync_markdown_lint_settles_after_a_split_pane_is_edited() {
     assert!(!app.sync_markdown_lint(), "and it stays settled");
 }
 
+/// #851: while rumdl runs for Markdown the built-in lint withdraws what it
+/// published (rumdl reports the same rules, so each would show twice) and
+/// stays quiet; once rumdl is gone it lints every open tab again.
+#[test]
+fn sync_markdown_lint_stands_down_while_rumdl_runs() {
+    use crate::lsp::config::Language;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.md");
+    std::fs::write(&file, "# Title\n\nBody.\n\n# Another\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let has_md025 = |app: &App| {
+        app.merged_diagnostics(&file)
+            .iter()
+            .any(|d| d.message.contains("MD025"))
+    };
+    assert!(app.sync_markdown_lint());
+    assert!(has_md025(&app), "the built-in lint reports MD025");
+
+    app.lsp
+        .as_ref()
+        .expect("a test App has an LSP manager")
+        .set_running_servers_for_test(Language::MARKDOWN, &["marksman", "rumdl"]);
+    assert!(app.sync_markdown_lint(), "standing down is a change");
+    assert!(!has_md025(&app), "withdrawn while rumdl runs");
+    assert!(
+        app.editor
+            .diagnostic_spans_for_test()
+            .iter()
+            .all(|line| line.is_empty()),
+        "and its squiggle is gone from the open tab"
+    );
+    assert!(!app.sync_markdown_lint(), "and it stays quiet");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .set_running_servers_for_test(Language::MARKDOWN, &["marksman"]);
+    assert!(
+        app.sync_markdown_lint(),
+        "with rumdl gone the lint runs again"
+    );
+    assert!(has_md025(&app));
+}
+
 /// Two panes can reach the same `edit_seq` with different text (one edit in
 /// each). Switching which pane is linted must still lint it: the cursor has
 /// to recognise a different buffer, not just a different sequence number.

@@ -8,8 +8,17 @@
 //! rather than the whole rule set, chosen for a very low false-positive
 //! rate: multiple top-level headings, no space after a heading's `#`,
 //! trailing whitespace, and runs of blank lines.
+//!
+//! The bundled rumdl server (#851) implements markdownlint's whole rule set,
+//! these four included, so while it runs this lint stands down. It remains
+//! the fallback where rumdl could not be installed.
 
 use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+
+/// The bundled language server whose rules include every one of these
+/// (#851). While it runs for Markdown, the app withdraws this lint rather
+/// than report each violation twice.
+pub const SUPERSEDED_BY: &str = "rumdl";
 
 /// Lints Markdown `text` and returns one diagnostic per violation, in
 /// document order. `start_line`/`end_line` are 0-based, matching the LSP

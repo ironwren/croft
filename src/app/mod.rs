@@ -8151,14 +8151,22 @@ impl App {
     /// Lints every open `.md` tab and folds the results into the same
     /// diagnostics store a real language server writes to (`lsp_diagnostics`,
     /// keyed by path then by "producer"), under the synthetic server name
-    /// `"Markdown Lint"`. There is no bundled Markdown language server (see
-    /// `src/vscode_extensions.rs`), so this runs independently of `self.lsp`
-    /// and `sync_lsp`'s extension gate, which only covers languages that
-    /// map to a real server. Gated by its own edit-seq cursor
-    /// (`markdown_lint_last_seen`) so an unchanged buffer isn't re-linted
-    /// every tick. Returns whether any editor's overlay or the PROBLEMS
-    /// panel changed, for the caller's redraw decision.
+    /// `"Markdown Lint"`. It needs no language server, so it works the moment
+    /// a file opens and on a box where none could be installed. While rumdl
+    /// (#851) runs, which reports these same rules among its own, it stands
+    /// down instead, so no violation is listed twice. Gated by its own
+    /// edit-seq cursor (`markdown_lint_last_seen`) so an unchanged buffer
+    /// isn't re-linted every tick. Returns whether any editor's overlay or
+    /// the PROBLEMS panel changed, for the caller's redraw decision.
     pub fn sync_markdown_lint(&mut self) -> bool {
+        if self.lsp.as_ref().is_some_and(|lsp| {
+            lsp.language_runs_server(
+                crate::lsp::config::Language::MARKDOWN,
+                crate::markdown_lint::SUPERSEDED_BY,
+            )
+        }) {
+            return self.stand_down_markdown_lint();
+        }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
         // Both collections: `self.editor` is the ACTIVE group's tabs, and a
@@ -8243,6 +8251,45 @@ impl App {
                 changed |= by_server.remove("Markdown Lint").is_some();
                 if by_server.is_empty() {
                     self.lsp_diagnostics.remove(&p);
+                }
+            }
+        }
+        if changed {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
+        changed
+    }
+
+    /// Withdraws every diagnostic the built-in Markdown lint published, for
+    /// while rumdl serves Markdown (#851), and repaints the tabs showing
+    /// those files. Emptying the seen cursor makes the lint run afresh on
+    /// every open tab if rumdl goes away.
+    fn stand_down_markdown_lint(&mut self) -> bool {
+        let linted: Vec<PathBuf> = self
+            .markdown_lint_last_seen
+            .drain()
+            .map(|(path, _)| path)
+            .collect();
+        let mut changed = false;
+        for path in linted {
+            let Some(by_server) = self.lsp_diagnostics.get_mut(&path) else {
+                continue;
+            };
+            if by_server.remove("Markdown Lint").is_none() {
+                continue;
+            }
+            changed = true;
+            if by_server.is_empty() {
+                self.lsp_diagnostics.remove(&path);
+            }
+            let merged = self.merged_diagnostics(&path);
+            if self.editor.path.as_deref() == Some(path.as_path()) {
+                self.editor.apply_diagnostics(path.clone(), merged.clone());
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if group.path.as_deref() == Some(path.as_path()) {
+                    group.apply_diagnostics(path.clone(), merged.clone());
                 }
             }
         }
