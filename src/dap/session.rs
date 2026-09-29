@@ -1044,6 +1044,11 @@ pub struct DapSession {
     /// In-flight `evaluate` requests: request `seq` -> (context, expression), so
     /// the response can be turned into an [`DapEvent::Evaluated`].
     pending_evals: std::collections::HashMap<i64, (String, String)>,
+    /// The `seq` of the `exceptionInfo` request the current exception stop
+    /// sent (#864). Only its reply names what was thrown: a resume, a newer
+    /// stop or the end of the session clears it, so a reply that lands
+    /// after the program moved on is dropped instead of labelling it.
+    exception_info_seq: Option<i64>,
     /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
@@ -1210,6 +1215,7 @@ impl DapSession {
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
+            exception_info_seq: None,
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
             capabilities: Value::Null,
@@ -1403,8 +1409,12 @@ impl DapSession {
                     out.push(DapEvent::InspectionUpdated);
                 }
                 Some("exceptionInfo") => {
-                    if let Some(summary) = exception_summary(&msg) {
-                        out.push(DapEvent::ExceptionInfo { summary });
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if req_seq.is_some() && req_seq == self.exception_info_seq {
+                        self.exception_info_seq = None;
+                        if let Some(summary) = exception_summary(&msg) {
+                            out.push(DapEvent::ExceptionInfo { summary });
+                        }
                     }
                 }
                 Some("scopes") => {
@@ -1550,16 +1560,20 @@ impl DapSession {
                 let _ = self.active().send(stack_trace_request(*thread_id));
                 let _ = self.active().send(threads_request());
                 // "Paused (exception)" alone does not say what was thrown
-                // (#864); the answer arrives as `ExceptionInfo`.
+                // (#864); the answer arrives as `ExceptionInfo`, for this
+                // stop only.
+                self.exception_info_seq = None;
                 if reason == "exception" && self.supports("supportsExceptionInfoRequest") {
-                    let _ = self
+                    self.exception_info_seq = self
                         .active()
-                        .send(thread_request("exceptionInfo", *thread_id));
+                        .send(thread_request("exceptionInfo", *thread_id))
+                        .ok();
                 }
             }
             DapEvent::Continued => {
                 self.phase = SessionPhase::Running;
                 self.current_location = None;
+                self.exception_info_seq = None;
                 self.clear_inspection();
             }
             DapEvent::Terminated => {
@@ -1570,6 +1584,7 @@ impl DapSession {
                 if from_child || self.child.is_none() {
                     self.phase = SessionPhase::Terminated;
                     self.current_location = None;
+                    self.exception_info_seq = None;
                     self.clear_inspection();
                 }
             }
@@ -1690,6 +1705,7 @@ impl DapSession {
         if let Some(tid) = self.stopped_thread {
             let _ = self.active().send(thread_request("continue", tid));
             self.phase = SessionPhase::Running;
+            self.exception_info_seq = None;
         }
     }
 
@@ -1709,6 +1725,8 @@ impl DapSession {
     pub fn step(&mut self, command: &str) {
         if let Some(tid) = self.stopped_thread {
             let _ = self.active().send(thread_request(command, tid));
+            // The stop is over; its exception reply no longer applies (#864).
+            self.exception_info_seq = None;
         }
     }
 
@@ -1724,6 +1742,7 @@ impl DapSession {
         }
         let _ = self.transport.send(req);
         self.phase = SessionPhase::Terminated;
+        self.exception_info_seq = None;
     }
 }
 
@@ -3311,6 +3330,150 @@ while True:
             "{reqs:?}"
         );
         assert!(summaries.is_empty(), "{summaries:?}");
+    }
+
+    /// FAKE_DAP stopping on an exception and advertising `exceptionInfo`,
+    /// with `arms` (Python `elif` arms) in place of its `continue` arm: they
+    /// decide when each held `exceptionInfo` request is answered, through
+    /// `answer(req, name, text)`, and send `marker()`, an output line after
+    /// which every earlier reply has been read.
+    fn held_exception_info_session(arms: &str) -> (tempfile::TempDir, PathBuf, DapSession) {
+        let script = FAKE_DAP
+            .replace(r#""reason": "breakpoint""#, r#""reason": "exception""#)
+            .replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            )
+            .replace(
+                "def stopped():",
+                r#"held = []
+def answer(req, name, text):
+    reply(req, {"exceptionId": name, "description": text})
+def marker():
+    send({"type": "event", "event": "output", "body": {"category": "stdout", "output": "MARKER\n"}})
+def stopped():"#,
+            )
+            .replace("    elif c == \"continue\":\n        reply(req)\n        stopped()\n", arms);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        (tmp, log, session)
+    }
+
+    /// Poll `session` to its exception stop, with the `exceptionInfo` request
+    /// sent, run `then`, and poll to the fake's marker. Returns every
+    /// `ExceptionInfo` the session raised after `then`, in order.
+    fn exception_info_after(
+        session: &mut DapSession,
+        log: &Path,
+        then: impl FnOnce(&mut DapSession),
+    ) -> Vec<String> {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "an exception stop that asks what was thrown",
+            || {
+                session.poll();
+                session.stopped_thread.is_some()
+                    && requests(log)
+                        .iter()
+                        .any(|q| q["command"] == "exceptionInfo")
+            },
+        );
+        then(session);
+        let mut summaries = Vec::new();
+        let mut marked = false;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter's marker",
+            || {
+                for ev in session.poll() {
+                    match ev {
+                        DapEvent::ExceptionInfo { summary } => summaries.push(summary),
+                        DapEvent::Output { text, .. } if text.contains("MARKER") => marked = true,
+                        _ => {}
+                    }
+                }
+                marked
+            },
+        );
+        summaries
+    }
+
+    /// #864: an `exceptionInfo` reply that arrives after the program moved
+    /// on describes a stop that is over, and is dropped: after Continue,
+    /// after a Step, and after the session was ended. The adapter holds the
+    /// reply until that request, so the order is fixed.
+    #[test]
+    fn an_exception_reply_that_arrives_after_the_stop_ended_is_dropped() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let arms = r#"    elif c == "exceptionInfo":
+        held.append(req)
+    elif c in ("continue", "next", "disconnect"):
+        reply(req)
+        for h in held:
+            answer(h, "KeyError", "'x'")
+        marker()
+"#;
+        type Move = fn(&mut DapSession);
+        let moves: [(&str, Move); 3] = [
+            ("continue", DapSession::continue_execution),
+            ("step", |s| s.step("next")),
+            ("disconnect", DapSession::disconnect),
+        ];
+        let late: Vec<(&str, Vec<String>)> = moves
+            .into_iter()
+            .map(|(name, then)| {
+                let (_tmp, log, mut session) = held_exception_info_session(arms);
+                let late = exception_info_after(&mut session, &log, then);
+                session.disconnect();
+                (name, late)
+            })
+            .filter(|(_, late)| !late.is_empty())
+            .collect();
+        assert!(late.is_empty(), "reported after the stop ended: {late:?}");
+    }
+
+    /// #864 guard: a reply for an older stop that lands after a newer
+    /// exception stop's own does not overwrite it; the newer stop keeps its
+    /// summary.
+    #[test]
+    fn an_older_stops_exception_reply_does_not_overwrite_the_newer_ones() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let arms = r#"    elif c == "exceptionInfo":
+        held.append(req)
+        if len(held) == 2:
+            answer(held[1], "ValueError", "new")
+            answer(held[0], "KeyError", "'old'")
+            marker()
+    elif c == "continue":
+        reply(req)
+        stopped()
+"#;
+        let (_tmp, log, mut session) = held_exception_info_session(arms);
+        let seen = exception_info_after(&mut session, &log, DapSession::continue_execution);
+        session.disconnect();
+        assert_eq!(seen, vec![String::from("ValueError: new")]);
     }
 
     #[test]
