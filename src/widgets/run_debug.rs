@@ -1362,6 +1362,44 @@ mod tests {
         assert_eq!(wrap_console_line("", 8), vec![String::new()]);
     }
 
+    /// #867 guard: a line that fits is left alone. One exactly as wide as
+    /// the console is a single row, not a row and an empty one, and a
+    /// zero-width console still ends (a character per row) instead of
+    /// looping.
+    #[test]
+    fn a_console_line_that_fits_is_not_wrapped() {
+        assert_eq!(wrap_console_line("short", 26), vec![String::from("short")]);
+        assert_eq!(
+            wrap_console_line("12345678", 8),
+            vec![String::from("12345678")]
+        );
+        assert_eq!(
+            wrap_console_line("ab", 0),
+            vec![String::from("a"), String::from("b")]
+        );
+    }
+
+    /// #867 guard: wrapping does not grow the paused console past its cap.
+    /// The newest rows are the ones kept, the long line's tail among them,
+    /// and older lines give way first.
+    #[test]
+    fn wrapped_console_rows_keep_the_newest_within_the_cap() {
+        let mut panel = RunDebugPanel::new();
+        panel.console_tail = vec![String::from("older"), "y".repeat(30) + "END"];
+        let rows = panel.console_rows(10, 3);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        // 33 columns at width 10: three full rows of `y`, then `END`.
+        assert_eq!(rows.last().map(|(r, _)| r.as_str()), Some("END"));
+        assert!(!rows.iter().any(|(r, _)| r.contains("older")), "{rows:?}");
+        // A REPL echo keeps its accent on every one of its rows.
+        panel.console_tail = vec![format!("❯ {}", "e".repeat(20))];
+        let rows = panel.console_rows(10, 6);
+        assert!(
+            rows.len() > 1 && rows.iter().all(|(_, echo)| *echo),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn empty_repl_shows_a_ghost_placeholder() {
         let mut panel = RunDebugPanel::new();

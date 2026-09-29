@@ -51864,6 +51864,54 @@ fn the_debug_console_is_mirrored_to_an_output_channel() {
     app.debug_stop();
 }
 
+/// #867 guard: the mirror carries what the console shows and nothing more.
+/// debugpy's `telemetry` banner, which the console drops, stays out of the
+/// channel too, and a printed line lands there once, not once per poll.
+#[test]
+fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-once-{}", std::process::id());
+    let telemetry = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"telemetry","output":"{tag} ptvsd"}}}}"#
+    );
+    let printed = format!(
+        r#"{{"seq":2,"type":"event","event":"output","body":{{"category":"stdout","output":"{tag} printed\n"}}}}"#
+    );
+    app.debug_sessions
+        .push("P", stub_emitting(&[&telemetry, &printed]));
+    let count = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.text == text)
+            .count()
+    };
+    let line = format!("{tag} printed");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the printed line to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            count(&line) > 0
+        },
+    );
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
+    let in_panel = app.debug_console.iter().filter(|l| **l == line).count();
+    app.debug_stop();
+    assert_eq!(count(&line), 1, "once");
+    assert!(
+        !channel
+            .iter()
+            .any(|l| l.text.contains(&format!("{tag} ptvsd"))),
+        "telemetry is not mirrored"
+    );
+    assert_eq!(in_panel, 1, "and the panel keeps its own copy");
+}
+
 /// A workspace with two source files and breakpoints set in both (#250).
 fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
