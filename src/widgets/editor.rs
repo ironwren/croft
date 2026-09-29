@@ -30007,6 +30007,82 @@ mod tests {
     }
 
     #[test]
+    fn a_string_prefix_opens_a_pair_only_in_python_and_only_as_a_prefix() {
+        // #844 guard: `f"` pairs because Python's `f` is part of the
+        // opener. In any other language, or after a word Python does not
+        // take as a prefix, a quote after a word character stays single.
+        for lang in [None, Some(LangKind::Rust), Some(LangKind::JavaScript)] {
+            let mut e = typed(lang, "f");
+            e.insert_char('"');
+            assert_eq!(e.lines[0], "f\"", "{lang:?}");
+        }
+        for word in ["ub", "fu", "bb", "rbf", "print"] {
+            let mut e = typed(Some(LangKind::Python), word);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{word}'"), "{word:?} is no prefix");
+        }
+        let mut e = typed(Some(LangKind::Python), "x = U");
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "x = U''", "a prefix in either case");
+    }
+
+    #[test]
+    fn a_closing_quote_inside_a_string_is_still_typed_over() {
+        // #844 guard: refusing to pair inside a string comes after
+        // type-over, so the quote that closes a string steps over the one
+        // already at the caret instead of adding a second.
+        for (lang, text) in [
+            (Some(LangKind::Python), "s = \"abc|\""),
+            (Some(LangKind::Rust), "let s = \"a \\\" b|\";"),
+            (None, "say \"hi|\""),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}{tail}"), "{lang:?}: {text:?}");
+            assert_eq!(e.cursor_col, head.chars().count() + 1, "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_selection_inside_a_string_is_still_wrapped_in_quotes() {
+        // #844 guard: wrapping a selection is not auto-pairing. A quote
+        // typed over a selection inside a string still surrounds it.
+        let mut e = editor_with("s = \"a word here\"");
+        e.set_language(Some(LangKind::Python));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 7),
+            head: (0, 11),
+        }); // "word"
+        e.cursor_col = 11;
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "s = \"a 'word' here\"");
+    }
+
+    #[test]
+    fn a_docstring_an_edit_removed_no_longer_holds_back_a_pair() {
+        // #844 guard: the string ranges are the highlight pass's after every
+        // edit, never stale. Inside a docstring a quote does not pair; once
+        // its opener is deleted, the same quote on the same line does.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"", "inside the docstring: no pair");
+        e.backspace();
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "doc = ");
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"\"", "no docstring left: the quote pairs");
+    }
+
+    #[test]
     fn typing_a_bracket_with_a_selection_surrounds_it() {
         let mut e = editor_with("abc def");
         e.cursor_row = 0;
