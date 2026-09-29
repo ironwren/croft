@@ -40,10 +40,11 @@ pub struct Cli {
     // not argument ids, so `conflicts_with = "command"` is a runtime assert
     // failure rather than a guard. A plain comment rather than part of the
     // doc below, because clap prints a field's `///` as its long help and
-    // this note is for maintainers, not `croft --help` readers (#853).
+    // this note is for maintainers, not `croft --help` readers (#853). The
+    // flag itself came from #282; the issue number stays here, not in help.
     /// Print the version with build provenance (git hash and build time) and
     /// exit. `--version` prints the plain `x.y.z`; this is the flag to quote
-    /// in a bug report, since two builds can share a version (#282).
+    /// in a bug report, since two builds can share a version.
     ///
     /// It answers before anything else runs, so pairing it with a subcommand
     /// ignores that subcommand, as `--version` does.
@@ -2144,7 +2145,7 @@ mod tests {
             entry.contains("ignores that subcommand"),
             "the user-facing caveat stays: {entry}"
         );
-        for leak in ["clap", "conflicts_with", "assert"] {
+        for leak in ["clap", "conflicts_with", "assert", "(#"] {
             assert!(
                 !entry.contains(leak),
                 "{leak:?} leaked into --build-info's help: {entry}"
@@ -2164,7 +2165,7 @@ mod tests {
         let entry = &help[start..];
         let entry = &entry[..entry.find("--open-file").unwrap_or(entry.len())];
         assert!(entry.contains("build provenance"), "{entry}");
-        for absent in ["subcommand", "clap", "conflicts_with"] {
+        for absent in ["subcommand", "clap", "conflicts_with", "(#"] {
             assert!(
                 !entry.contains(absent),
                 "{absent:?} does not belong in -h's --build-info line: {entry}"
