@@ -298,4 +298,35 @@ mod tests {
             "every language's template lists the same strings"
         );
     }
+
+    /// #849 guard: the keys come from every built-in catalog, the values
+    /// only from `lang`'s own. German's template carries German, never
+    /// another catalog's translation of the same string, and a string only
+    /// another language translates is offered blank.
+    #[test]
+    fn a_template_fills_in_only_its_own_languages_translations() {
+        for (lang, json) in BUILT_IN {
+            let own: HashMap<String, String> = serde_json::from_str(json).unwrap();
+            let t: HashMap<String, String> = serde_json::from_str(&template(lang, &[])).unwrap();
+            for (key, translation) in &own {
+                // A translation spelled like the English is offered blank.
+                let want = if translation == key { "" } else { translation };
+                assert_eq!(
+                    t.get(key).map(String::as_str),
+                    Some(want),
+                    "{lang}'s own {key:?}"
+                );
+            }
+            for (other, json) in BUILT_IN.iter().filter(|(l, _)| l != lang) {
+                let theirs: HashMap<String, String> = serde_json::from_str(json).unwrap();
+                for key in theirs.keys().filter(|k| !own.contains_key(*k)) {
+                    assert_eq!(
+                        t.get(key).map(String::as_str),
+                        Some(""),
+                        "{lang}'s template must offer {other}'s {key:?} blank"
+                    );
+                }
+            }
+        }
+    }
 }
