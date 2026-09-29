@@ -6,7 +6,7 @@
 //! file would. Paragraph text is emitted unwrapped — the editor renders the
 //! lines through a wrapping `Paragraph`, so the preview reflows with the pane.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -741,6 +741,13 @@ fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'st
     out
 }
 
+/// Screen cells `text` takes in the preview, measured the way the painter
+/// advances (#404): a CJK character or an emoji is two, a combining mark
+/// none.
+fn cells(text: &str) -> usize {
+    usize::from(crate::cell_map::CellMap::new(text).width())
+}
+
 struct Renderer<'r> {
     theme: Theme,
     registry: &'r mut LangRegistry,
@@ -776,6 +783,9 @@ struct Renderer<'r> {
     outputs: BlockOutputs,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
+    /// The open table's per-column alignment from its delimiter row
+    /// (`---:`, `:---:`), one entry per column (#861).
+    table_aligns: Vec<Alignment>,
     /// Directory local image paths resolve against (#176); None keeps
     /// every image a placeholder.
     base_dir: Option<std::path::PathBuf>,
@@ -996,14 +1006,18 @@ impl Renderer<'_> {
         let Some(rows) = self.table.take() else {
             return;
         };
+        let aligns = std::mem::take(&mut self.table_aligns);
         if rows.is_empty() {
             return;
         }
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        // Widths in screen cells, not characters (#861): the preview paints
+        // `食費` across four cells, and padding it as two pushed that row's
+        // `│` two columns right of every other row's.
         let mut widths = vec![0usize; cols];
         for row in &rows {
             for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell.chars().count());
+                widths[i] = widths[i].max(cells(cell));
             }
         }
         for (r, row) in rows.iter().enumerate() {
@@ -1023,8 +1037,18 @@ impl Renderer<'_> {
                     ));
                 }
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = width.saturating_sub(cell.chars().count());
-                spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
+                let pad = width.saturating_sub(cells(cell));
+                // The delimiter row's colons place the text in its column;
+                // a centred cell's odd cell of slack goes on the right.
+                let (left, right) = match aligns.get(i) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    Some(Alignment::Left | Alignment::None) | None => (0, pad),
+                };
+                spans.push(Span::styled(
+                    format!("{}{cell}{}", " ".repeat(left), " ".repeat(right)),
+                    style,
+                ));
             }
             self.out.push(Line::from(spans));
             if r == 0 {
@@ -1119,6 +1143,7 @@ pub fn render_markdown_mapped(
         runnables: Vec::new(),
         outputs,
         table: None,
+        table_aligns: Vec::new(),
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
         suppress_inline: false,
@@ -1255,9 +1280,10 @@ pub fn render_markdown_mapped(
                         r.cur.push(Span::styled(format!("({dest_url}) "), style));
                     }
                 }
-                Tag::Table(_) => {
+                Tag::Table(aligns) => {
                     r.ensure_blank();
                     r.table = Some(Vec::new());
+                    r.table_aligns = aligns;
                 }
                 Tag::TableHead => {
                     if let Some(rows) = r.table.as_mut() {
@@ -2285,6 +2311,63 @@ mod tests {
         assert!(
             text.contains("\u{2500}\u{253c}\u{2500}"),
             "a rule must separate the header; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_columns_follow_the_delimiter_row_alignment() {
+        // #861: `---:` right-aligns, `:---:` centres (the odd cell of slack
+        // on the right), and `:---` and `---` stay on the left.
+        let lines = render(
+            "| item | amount | note | kind |\n\
+             | :--- | ---: | :---: | --- |\n\
+             | rent | 1200 | due | x |\n\
+             | tea | 5 | ok, paid | yy |",
+        );
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let row = |first: &str| {
+            rows.iter()
+                .find(|r| r.starts_with(first))
+                .unwrap_or_else(|| panic!("no row starting {first:?} in {rows:#?}"))
+                .clone()
+        };
+        assert_eq!(
+            row("item"),
+            "item \u{2502} amount \u{2502}   note   \u{2502} kind"
+        );
+        assert_eq!(
+            row("rent"),
+            "rent \u{2502}   1200 \u{2502}   due    \u{2502} x   "
+        );
+        assert_eq!(
+            row("tea"),
+            "tea  \u{2502}      5 \u{2502} ok, paid \u{2502} yy  "
+        );
+    }
+
+    #[test]
+    fn a_wide_character_row_keeps_its_separators_in_line() {
+        // #861: `食費` is two characters but four cells; padding by
+        // character count put this row's `│` two columns right of the rest.
+        let lines =
+            render("| category | amount |\n| --- | ---: |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let seams: Vec<(String, usize)> = lines
+            .iter()
+            .map(text_of)
+            .filter_map(|t| {
+                let at = t.find(['\u{2502}', '\u{253c}'])?;
+                Some((t.clone(), cells(&t[..at])))
+            })
+            .collect();
+        assert_eq!(seams.len(), 4, "header, rule and two rows: {seams:#?}");
+        assert!(
+            seams.iter().all(|(_, col)| *col == seams[0].1),
+            "every row's seam must sit on the same screen column: {seams:#?}"
+        );
+        let widths: Vec<usize> = seams.iter().map(|(t, _)| cells(t)).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "every row must end on the same column: {seams:#?}"
         );
     }
 
