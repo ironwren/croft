@@ -2152,6 +2152,60 @@ mod tests {
         }
     }
 
+    /// #853 guard: `-h` shows only a field's first paragraph, so the caveat
+    /// (and anything a maintainer might tuck after it) stays out of the
+    /// short help; `--build-info` there is its one-line summary.
+    #[test]
+    fn build_info_short_help_is_its_summary_alone() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_help()
+            .to_string();
+        let start = help.find("--build-info").expect("--build-info is listed");
+        let entry = &help[start..];
+        let entry = &entry[..entry.find("--open-file").unwrap_or(entry.len())];
+        assert!(entry.contains("build provenance"), "{entry}");
+        for absent in ["subcommand", "clap", "conflicts_with"] {
+            assert!(
+                !entry.contains(absent),
+                "{absent:?} does not belong in -h's --build-info line: {entry}"
+            );
+        }
+    }
+
+    /// #853 guard: moving the note did not just move the leak. No help page,
+    /// the top level or any subcommand's, talks about clap internals.
+    #[test]
+    fn no_help_page_carries_a_note_about_clap_internals() {
+        fn walk(cmd: &mut clap::Command, path: &str) {
+            let help = cmd.render_long_help().to_string();
+            for leak in ["clap", "conflicts_with", "runtime assert"] {
+                assert!(
+                    !help.contains(leak),
+                    "{leak:?} leaked into `{path} --help`: {help}"
+                );
+            }
+            for sub in cmd.get_subcommands_mut() {
+                let path = format!("{path} {}", sub.get_name());
+                walk(sub, &path);
+            }
+        }
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        cmd.build();
+        walk(&mut cmd, "croft");
+    }
+
+    /// #853 guard against over-correcting the caveat into a clap rule:
+    /// `conflicts_with = "command"` names no argument id, so clap would
+    /// panic on it. `--build-info` beside a subcommand keeps parsing, and
+    /// `run` answers `--build-info` first, as the help now says.
+    #[test]
+    fn build_info_beside_a_subcommand_still_parses() {
+        <Cli as clap::CommandFactory>::command().debug_assert();
+        let cli = Cli::try_parse_from(["croft", "--build-info", "demo"]).unwrap();
+        assert!(cli.build_info);
+        assert!(matches!(cli.command, Some(CliCommand::Demo { tour: None })));
+    }
+
     #[test]
     fn file_path_roots_the_workspace_at_its_parent_and_opens_it() {
         let dir = tempfile::tempdir().unwrap();
