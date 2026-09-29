@@ -304,10 +304,21 @@ fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
 /// pytest installed wins, run as `<venv>/bin/python -m pytest` the way VS
 /// Code runs it: `-m` puts the root on `sys.path`, so tests import the
 /// project's own top-level modules, which the `pytest` script alone does
-/// not (#845). Without one, the `pytest` script as before; with no script
-/// anywhere, `python3 -m pytest`, which at least fails with a reason
-/// instead of a spawn error.
+/// not (#845). Without one, `python3 -m pytest` when that `python3` can
+/// import pytest: a `pytest` script on `PATH` may belong to another
+/// interpreter (a uv tool's), which cannot import the project's
+/// dependencies. Then the `pytest` script; with no script anywhere,
+/// `python3 -m pytest`, which at least fails with a reason instead of a
+/// spawn error.
 fn pytest_launch(root: &Path) -> (PathBuf, &'static [&'static str]) {
+    pytest_launch_on(root, std::env::var_os("PATH").as_deref())
+}
+
+/// [`pytest_launch`] against the given `PATH` value.
+fn pytest_launch_on(
+    root: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> (PathBuf, &'static [&'static str]) {
     const MODULE: &[&str] = &["-m", "pytest"];
     for venv in [".venv", "venv"] {
         let bin = root.join(venv).join("bin");
@@ -316,19 +327,64 @@ fn pytest_launch(root: &Path) -> (PathBuf, &'static [&'static str]) {
             return (python, MODULE);
         }
     }
-    match pytest_script() {
-        Some(script) => (script, &[]),
-        None => (PathBuf::from("python3"), MODULE),
+    let python3 = python3_program(path_var);
+    if python_has_pytest(root, &python3) {
+        return (python3, MODULE);
     }
+    match pytest_script(path_var) {
+        Some(script) => (script, &[]),
+        None => (python3, MODULE),
+    }
+}
+
+/// Absolute path to `python3`: `PATH`, then Homebrew's and the usual
+/// local prefix, for the GUI-stripped-PATH reason [`pytest_script`]
+/// gives. Bare `python3` when none is found.
+fn python3_program(path_var: Option<&std::ffi::OsStr>) -> PathBuf {
+    let path_dirs = path_var.map(std::env::split_paths).into_iter().flatten();
+    let fallback = ["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from);
+    path_dirs
+        .chain(fallback)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("python3"))
+}
+
+/// Whether `python` can import pytest when run in `root`, asked once per
+/// root and interpreter for the life of the process: discovery and every
+/// run launch pytest, and the answer only changes when pytest is
+/// installed or removed.
+fn python_has_pytest(root: &Path, python: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static ANSWERS: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), bool>>> = OnceLock::new();
+    let key = (root.to_path_buf(), python.to_path_buf());
+    let answers = ANSWERS.get_or_init(Default::default);
+    if let Some(&known) = answers.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return known;
+    }
+    let has = Command::new(python)
+        .args(["-c", "import pytest"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    answers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, has);
+    has
 }
 
 /// Absolute path to a `pytest` script outside any project venv: `PATH`,
 /// then the usual user/tool install dirs — resolved absolutely like
 /// [`cargo_cmd`] because a GUI-launched croft inherits the stripped
 /// launchd PATH.
-fn pytest_script() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
+fn pytest_script(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
             let candidate = dir.join("pytest");
             if candidate.is_file() {
                 return Some(candidate);
@@ -1319,8 +1375,13 @@ fn discover(root: &Path, tx: &EpochTx) {
             // no tests yet, which lists fine.
             .map(|code| matches!(code, Some(0 | 5)))
         }
+        // `--passWithNoTests`: vitest 1 has no `list` command, reads the
+        // word as a file filter and, finding no file, exits 1 without it.
+        // vitest 2 and later exit 0 with no tests either way, and 1 still
+        // on a file that fails to load. jest's `--listTests` exits 0 with
+        // nothing to list.
         Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &["list"]);
+            let cmd = js_cmd(root, "vitest", &["list", "--passWithNoTests"]);
             run_streaming(tx, cmd, |line| {
                 parse_vitest_list_line(line)
                     .map(not_run)
@@ -2231,5 +2292,154 @@ mod tests {
             "echo tests/test_g.py::test_total\nkill -9 $$",
         );
         assert_eq!(finished(), Some(Some(false)), "killed by a signal");
+    }
+
+    /// A `bin` dir to stand for `PATH`: a `pytest` script, and a `python3`
+    /// that appends each command line it gets to `python3.log` beside
+    /// itself and answers `-c "import pytest"` with `probe_exit`.
+    #[cfg(unix)]
+    fn fake_path_bin(dir: &Path, probe_exit: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let python =
+            format!("echo \"$*\" >> \"$0.log\"\n[ \"$1\" = -c ] && exit {probe_exit}\nexit 0");
+        for (name, text) in [("python3", python.as_str()), ("pytest", "exit 0")] {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{text}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// #845: with no project venv, a `python3` that can import pytest runs
+    /// it as `python3 -m pytest`, ahead of a `pytest` script on PATH that
+    /// may belong to another interpreter (a uv tool's, which cannot import
+    /// the project's dependencies). The probe runs once per root.
+    #[cfg(unix)]
+    #[test]
+    fn without_a_venv_a_python3_that_has_pytest_runs_it_as_a_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = fake_path_bin(tmp.path(), 0);
+        let path = bin.clone().into_os_string();
+        let want = (bin.join("python3"), &["-m", "pytest"][..]);
+        assert_eq!(pytest_launch_on(&root, Some(&path)), want);
+        assert_eq!(pytest_launch_on(&root, Some(&path)), want);
+        let log = std::fs::read_to_string(bin.join("python3.log")).unwrap_or_default();
+        assert_eq!(log, "-c import pytest\n", "probed once");
+    }
+
+    /// #845 guard: a `python3` that cannot import pytest is not used for
+    /// it; the `pytest` script on PATH runs as before.
+    #[cfg(unix)]
+    #[test]
+    fn without_a_venv_a_python3_lacking_pytest_leaves_the_pytest_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = fake_path_bin(tmp.path(), 1);
+        let path = bin.clone().into_os_string();
+        assert_eq!(
+            pytest_launch_on(&root, Some(&path)),
+            (bin.join("pytest"), &[][..])
+        );
+    }
+
+    /// #845 guard: a project venv with pytest still wins over a `python3`
+    /// that has pytest too, and that `python3` is not even asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_venv_with_pytest_wins_without_probing_python3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        fake_venv(&root, ".venv", "exit 0");
+        let bin = fake_path_bin(tmp.path(), 0);
+        let path = bin.clone().into_os_string();
+        assert_eq!(
+            pytest_launch_on(&root, Some(&path)),
+            (root.join(".venv/bin/python"), &["-m", "pytest"][..])
+        );
+        assert!(!bin.join("python3.log").exists(), "python3 was not probed");
+    }
+
+    /// Discover `root` on this thread: the names listed, and what
+    /// `Finished` said.
+    fn discovery_of(root: &Path) -> (Vec<String>, Option<Option<bool>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        discover(root, &etx);
+        let mut cases = Vec::new();
+        let mut finished = None;
+        for (_, r) in rx.try_iter() {
+            match r {
+                TestResponse::Case(c) => cases.push(c.name),
+                TestResponse::Finished { ok } => finished = Some(ok),
+                _ => {}
+            }
+        }
+        (cases, finished)
+    }
+
+    /// A JS project whose `runner` (`vitest` or `jest`) is the stand-in
+    /// script `body` in its `node_modules/.bin`.
+    #[cfg(unix)]
+    fn fake_js_runner(root: &Path, runner: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            format!("{{\"devDependencies\":{{\"{runner}\":\"*\"}}}}"),
+        )
+        .unwrap();
+        let p = bin.join(runner);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #845: a JS project with no test files lists as an empty project, not
+    /// a failed discovery. vitest 2 and later exit 0 from `vitest list`
+    /// then, but vitest 1 has no `list` command: it reads the word as a
+    /// file filter, says "No test files found" and exits 1 unless told
+    /// `--passWithNoTests`. The stand-in behaves as vitest 1.6 does. jest's
+    /// `--listTests` exits 0 with nothing to list (29 and 30 alike).
+    #[cfg(unix)]
+    #[test]
+    fn a_js_project_with_no_test_files_lists_as_empty_not_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_js_runner(
+            tmp.path(),
+            "vitest",
+            "case \" $* \" in *\" --passWithNoTests \"*) exit 0 ;; esac\n\
+             echo 'No test files found, exiting with code 1' >&2\nexit 1",
+        );
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
+        assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
+
+        let tmp = tempfile::tempdir().unwrap();
+        fake_js_runner(tmp.path(), "jest", "exit 0");
+        assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
+        assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
+    }
+
+    /// #845 guard: `--passWithNoTests` only forgives an empty project. A
+    /// vitest listing that errors (a test file that fails to transform)
+    /// still exits 1 with the flag, and stays a failed discovery.
+    #[cfg(unix)]
+    #[test]
+    fn a_vitest_listing_that_errors_is_still_a_failed_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_js_runner(
+            tmp.path(),
+            "vitest",
+            "echo 'Error: Transform failed with 1 error' >&2\nexit 1",
+        );
+        assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(false))));
     }
 }
