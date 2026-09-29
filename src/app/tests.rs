@@ -10805,6 +10805,48 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// #843: Cmd+A has no `Ctrl` form in the editor off macOS (`Ctrl`+`A` is line
+/// start there), so the palette's "Select All" is the keyboard route, from
+/// any pane.
+#[test]
+fn the_palette_selects_the_whole_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "one\ntwo");
+    app.focus_pane(Pane::Tree);
+    assert!(run_from_palette(&mut app, "Select All"));
+    assert!(app.focus == Pane::Editor);
+    assert_eq!(app.editor.selection_text(), "one\ntwo");
+}
+
+/// Guard (#843): `Ctrl`+`A` in the editor is still line start, never select
+/// all: the reason LINUX.md lists Cmd+A as having no `Ctrl` form there.
+#[test]
+fn ctrl_a_in_the_editor_is_line_start_not_select_all() {
+    let mut app = editor_app_with_lines(&["hello world", "next"]);
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 0);
+    assert!(app.editor.selection.is_none());
+}
+
+/// Guard (#843): "Select All" is the same command as #852's (one id, one
+/// title, one chord), so the two branches meet on one row.
+#[test]
+fn select_all_is_one_palette_command() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    assert_eq!(Command::from_id("select_all"), Some(Command::SelectAll));
+    assert_eq!(Command::SelectAll.title(), "Select All");
+    assert_eq!(Command::SelectAll.keybinding_hint(), "Cmd+A");
+    assert_eq!(
+        ALL_COMMANDS
+            .iter()
+            .filter(|c| c.title() == "Select All")
+            .count(),
+        1
+    );
+}
+
 /// Run the Command Palette row titled `title` the way a user does: open the
 /// palette (Cmd+Shift+P), type the title, pick its row, Enter. Returns false,
 /// running nothing, when no row has that title.

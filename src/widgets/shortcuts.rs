@@ -388,7 +388,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+A",
-                description: "Select the entire buffer",
+                description: "Select the entire buffer (in the editor off macOS Ctrl+A is line start: the palette's Select All)",
                 handler: "is_editor_select_all_key",
             },
             ShortcutEntry {

@@ -47492,6 +47492,16 @@ impl App {
                     String::from("Nothing to redo")
                 };
             }
+            // The keyboard route on Linux, where Ctrl+A is line start and a
+            // terminal without Super forwarding never delivers Cmd+A (#852).
+            Cmd::SelectAll => {
+                self.focus_pane(Pane::Editor);
+                self.editor.select_all();
+                self.status = format!(
+                    "Selected {} chars",
+                    self.editor.selection_text().chars().count()
+                );
+            }
             Cmd::CloseEditor => {
                 self.record_closed_tab_at(self.editor.active_index());
                 if self.editor.close_active() {

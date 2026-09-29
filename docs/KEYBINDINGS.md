@@ -135,6 +135,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 | Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
 | Markdown: Run Code Block at Cursor | `Cmd`+`Enter` | Run the runnable fence under the caret in a Markdown source, through the same confirm popup as the chord: the route on a terminal that sends `Ctrl`+`Enter` as a bare `Enter` |
+| Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
@@ -281,7 +282,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
 | `Shift`+`Ctrl`+`Z` / `Shift`+`Cmd`+`Z` | Redo the most recently undone step; a fresh edit after an undo discards the redo branch (also Command Palette "Redo") |
-| `Cmd`+`A` | Select the entire buffer |
+| `Cmd`+`A` | Select the entire buffer (on Linux `Ctrl`+`A` is line start: the Command Palette's "Select All") |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
