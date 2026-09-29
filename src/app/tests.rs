@@ -10805,6 +10805,421 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// #843: LINUX.md promises that off macOS a `Cmd` chord "works as the same
+/// chord with `Ctrl`", except the chords its table lists. This walks every
+/// `is_*_key` predicate over every `Cmd` chord it takes and checks the `Ctrl`
+/// spelling: taken too, unless the table lists the chord, in which case it
+/// must really not be `Ctrl` (the negative half). The table is read from
+/// LINUX.md itself, so a new Super-only chord fails here until it gets a
+/// `Ctrl` form or a row, and a row fails once its chord gains a `Ctrl` form.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
+    use std::collections::BTreeSet;
+    type Pred = fn(KeyEvent) -> bool;
+    macro_rules! preds {
+        ($($p:ident),* $(,)?) => { vec![$((stringify!($p), $p as Pred)),*] };
+    }
+    // The leader asked from the editor and from a focused shell.
+    fn leader_in_editor(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, false, false))
+    }
+    fn leader_in_shell(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
+    }
+    let mut predicates: Vec<(&str, Pred)> = preds![
+        is_terminal_copy_key,
+        is_compare_key,
+        is_search_jump_key,
+        is_editor_find_key,
+        is_terminal_find_key,
+        is_editor_replace_key,
+        is_file_finder_key,
+        is_command_palette_key,
+        is_go_to_symbol_key,
+        is_toggle_line_comment_key,
+        is_toggle_block_comment_key,
+        is_toggle_wrap_key,
+        is_tree_zoxide_jump_key,
+        is_tree_new_file_key,
+        is_tree_new_folder_key,
+        is_tree_rename_key,
+        is_reveal_in_finder_key,
+        is_copy_path_key,
+        is_tree_make_root_key,
+        is_tree_make_parent_root_key,
+        is_explorer_jump_key,
+        is_source_control_jump_key,
+        is_run_debug_jump_key,
+        is_remote_jump_key,
+        is_extensions_jump_key,
+        is_drop_to_local_key,
+        is_run_build_task_key,
+        is_markdown_preview_key,
+        is_run_fence_key,
+        is_sidebar_toggle_key,
+        is_secondary_sidebar_toggle_key,
+        is_minimap_toggle_key,
+        is_terminal_toggle_key,
+        is_terminal_maximize_key,
+        is_quick_select_key,
+        is_copy_mode_key,
+        is_command_history_key,
+        is_terminal_split_key,
+        is_editor_split_key,
+        is_goto_bracket_key,
+        is_select_to_bracket_key,
+        is_navigate_back_key,
+        is_navigate_forward_key,
+        is_transpose_key,
+        is_indentation_to_spaces_key,
+        is_indentation_to_tabs_key,
+        is_trim_final_newlines_key,
+        is_toggle_bookmark_key,
+        is_switch_debug_session_key,
+        is_clear_bookmarks_key,
+        is_next_bookmark_key,
+        is_prev_bookmark_key,
+        is_join_lines_key,
+        is_transform_upper_key,
+        is_transform_lower_key,
+        is_copy_relative_path_key,
+        is_sort_lines_asc_key,
+        is_sort_lines_desc_key,
+        is_trim_trailing_whitespace_key,
+        is_increment_number_key,
+        is_decrement_number_key,
+        is_format_document_key,
+        is_emmet_expand_key,
+        is_quick_fix_key,
+        is_focus_group_left_key,
+        is_focus_group_right_key,
+        is_terminal_focus_key,
+        is_terminal_close_key,
+        is_terminal_cycle_key,
+        is_terminal_cycle_back_key,
+        is_delete_node_key,
+        is_completion_trigger_key,
+        is_save_key,
+        is_editor_copy_key,
+        is_editor_cut_key,
+        is_search_paste_key,
+        is_editor_paste_key,
+        is_clipboard_paste_key,
+        is_editor_select_all_key,
+        is_editor_undo_key,
+        is_editor_redo_key,
+        is_rename_symbol_key,
+        is_change_all_occurrences_key,
+        is_select_next_occurrence_key,
+        is_delete_line_key,
+        is_go_to_definition_key,
+        is_peek_definition_key,
+        is_go_to_references_key,
+        is_run_to_cursor_key,
+        is_peek_references_key,
+        is_go_to_declaration_key,
+        is_go_to_type_definition_key,
+        is_go_to_implementation_key,
+        is_vim_toggle_key,
+        is_editor_line_home_key,
+        is_editor_line_end_key,
+        is_editor_kill_to_eol_key,
+        is_editor_kill_to_bol_key,
+        is_editor_open_line_below_key,
+        is_editor_open_line_above_key,
+        is_close_tab_key,
+    ];
+    predicates.push(("is_cmd_k_leader_key", leader_in_editor));
+    predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
+
+    // Every predicate the key router defines is walked (the scan F1's own
+    // coverage test uses), so a new one cannot slip past unexamined.
+    const APP_SRC: &str = include_str!("mod.rs");
+    let defined: BTreeSet<&str> = APP_SRC
+        .match_indices("\nfn is_")
+        .filter_map(|(i, _)| {
+            let rest = &APP_SRC[i + 4..];
+            let name = &rest[..rest.find('(')?];
+            name.ends_with("_key").then_some(name)
+        })
+        .collect();
+    let walked: BTreeSet<&str> = predicates
+        .iter()
+        .map(|(n, _)| n.split('@').next().unwrap())
+        .collect();
+    assert_eq!(defined, walked, "walk every is_*_key predicate");
+
+    // How a LINUX.md row's chord lacks a `Ctrl` form.
+    #[derive(Clone, Copy)]
+    enum NoCtrl {
+        /// The predicate refuses the `Ctrl` spelling.
+        Refused,
+        /// The predicate would take it, but this one takes it first there.
+        TakenBy(&'static str, Pred),
+        /// croft takes `Ctrl`, but a legacy terminal sends the bare key.
+        LegacySendsBareKey,
+    }
+    struct Row {
+        /// The row's first cell in LINUX.md's table.
+        doc: &'static str,
+        pred: &'static str,
+        /// The chord's key, and its modifiers besides `Cmd` (every
+        /// combination the predicate takes when empty).
+        code: &'static [KeyCode],
+        mods: &'static [KeyModifiers],
+        how: NoCtrl,
+    }
+    let any: &[KeyModifiers] = &[];
+    let rows = [
+        Row {
+            doc: "`Cmd`+`\\` split editor",
+            pred: "is_editor_split_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`\\` / `Cmd`+`Opt`+`\\` go to / select to bracket",
+            pred: "is_goto_bracket_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`\\` / `Cmd`+`Opt`+`\\` go to / select to bracket",
+            pred: "is_select_to_bracket_key",
+            code: &[KeyCode::Char('\\')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Opt`+`←` / `→` focus the left / right editor group",
+            pred: "is_focus_group_left_key",
+            code: &[KeyCode::Left],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Opt`+`←` / `→` focus the left / right editor group",
+            pred: "is_focus_group_right_key",
+            code: &[KeyCode::Right],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`]` / `Cmd`+`[` next / previous terminal",
+            pred: "is_terminal_cycle_key",
+            code: &[KeyCode::Char(']'), KeyCode::Char('}')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`]` / `Cmd`+`[` next / previous terminal",
+            pred: "is_terminal_cycle_back_key",
+            code: &[KeyCode::Char('['), KeyCode::Char('{')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`T` split terminal",
+            pred: "is_terminal_split_key",
+            code: &[KeyCode::Char('t')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd+K` chords typed in the terminal pane",
+            pred: "is_cmd_k_leader_key@shell",
+            code: &[KeyCode::Char('k')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`E` toggle vim mode",
+            pred: "is_vim_toggle_key",
+            code: &[KeyCode::Char('e')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`A` select all, in the editor",
+            pred: "is_editor_select_all_key",
+            code: &[KeyCode::Char('a')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::SHIFT],
+            how: NoCtrl::TakenBy("is_editor_line_home_key", is_editor_line_home_key),
+        },
+        Row {
+            doc: "`Cmd`+`Shift`+`T` focus the terminal",
+            pred: "is_terminal_focus_key",
+            code: &[KeyCode::Char('t')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane",
+            pred: "is_terminal_copy_key",
+            code: &[KeyCode::Char('c')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::ALT],
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane",
+            pred: "is_terminal_close_key",
+            code: &[KeyCode::Char('w')],
+            mods: &[KeyModifiers::NONE, KeyModifiers::ALT],
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`F12` go to implementations",
+            pred: "is_go_to_implementation_key",
+            code: &[KeyCode::F(12)],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Z` jump to a directory with zoxide, in the Explorer",
+            pred: "is_tree_zoxide_jump_key",
+            code: &[KeyCode::Char('z')],
+            mods: any,
+            how: NoCtrl::Refused,
+        },
+        Row {
+            doc: "`Cmd`+`Enter` run the Markdown code block under the caret",
+            pred: "is_run_fence_key",
+            code: &[KeyCode::Enter],
+            mods: any,
+            how: NoCtrl::LegacySendsBareKey,
+        },
+    ];
+
+    // Every key a chord is spelled with, and every modifier set besides Cmd.
+    let mut codes: Vec<KeyCode> = ('a'..='z')
+        .chain('A'..='Z')
+        .chain('0'..='9')
+        .chain("`-=[]\\;',./~!@#$%^&*()_+{}|:\"<>?".chars())
+        .map(KeyCode::Char)
+        .collect();
+    codes.extend([
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Backspace,
+        KeyCode::Delete,
+        KeyCode::Esc,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Insert,
+    ]);
+    codes.extend((1..=12).map(KeyCode::F));
+    let extras = [
+        KeyModifiers::NONE,
+        KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ];
+    let same_key = |a: KeyCode, b: KeyCode| match (a, b) {
+        (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
+        _ => a == b,
+    };
+    let row_for = |pred: &str, code: KeyCode, extra: KeyModifiers| {
+        rows.iter().find(|r| {
+            r.pred == pred
+                && r.code.iter().any(|c| same_key(*c, code))
+                && (r.mods.is_empty() || r.mods.contains(&extra))
+        })
+    };
+    let spell = |k: KeyEvent| format!("{:?}+{:?}", k.modifiers, k.code);
+
+    let mut broken = Vec::new();
+    let mut listed_seen = BTreeSet::new();
+    for (name, pred) in &predicates {
+        for &code in &codes {
+            for extra in extras {
+                let cmd = key(code, KeyModifiers::SUPER | extra);
+                if !pred(cmd) {
+                    continue;
+                }
+                let ctrl = key(code, KeyModifiers::CONTROL | extra);
+                let Some(row) = row_for(name, code, extra) else {
+                    if !pred(ctrl) {
+                        broken.push(format!(
+                            "{name}: takes {} but not {} (give it a Ctrl form, or a LINUX.md row)",
+                            spell(cmd),
+                            spell(ctrl)
+                        ));
+                    }
+                    continue;
+                };
+                listed_seen.insert((row.doc, row.pred));
+                // The negative half: a listed chord really has no Ctrl form.
+                let holds = match row.how {
+                    NoCtrl::Refused => !pred(ctrl),
+                    NoCtrl::TakenBy(_, first) => first(ctrl),
+                    NoCtrl::LegacySendsBareKey => pred(ctrl) && !pred(key(code, extra)),
+                };
+                if !holds {
+                    broken.push(format!(
+                        "{name}: LINUX.md lists {:?} without a Ctrl form, but {} {}",
+                        row.doc,
+                        spell(ctrl),
+                        match row.how {
+                            NoCtrl::Refused => String::from("matches"),
+                            NoCtrl::TakenBy(owner, _) => format!("is not taken first by {owner}"),
+                            NoCtrl::LegacySendsBareKey =>
+                                String::from("is refused, or the bare key matches too"),
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    assert!(broken.is_empty(), "{broken:#?}");
+    for row in &rows {
+        assert!(
+            listed_seen.contains(&(row.doc, row.pred)),
+            "{} does not take the Cmd chord of {:?}",
+            row.pred,
+            row.doc
+        );
+    }
+
+    // LINUX.md's table has exactly these rows, and each palette command its
+    // right-hand column names exists.
+    let doc = include_str!("../../docs/LINUX.md");
+    let table = doc
+        .split("| Chord | Why not `Ctrl` | Without `Super` |")
+        .nth(1)
+        .expect("LINUX.md still has the no-Ctrl table");
+    let cells: Vec<Vec<&str>> = table
+        .lines()
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| l.trim_matches('|').split(" | ").map(str::trim).collect())
+        .collect();
+    let documented: BTreeSet<&str> = cells.iter().map(|c| c[0]).collect();
+    let expected: BTreeSet<&str> = rows.iter().map(|r| r.doc).collect();
+    assert_eq!(documented, expected, "LINUX.md's no-Ctrl table");
+    let titles: BTreeSet<&str> = crate::widgets::command_palette::ALL_COMMANDS
+        .iter()
+        .map(|c| c.title())
+        .collect();
+    for route in cells.iter().map(|c| c[2]) {
+        for quoted in route.split('"').skip(1).step_by(2) {
+            assert!(
+                titles.contains(quoted),
+                "LINUX.md names the palette command {quoted:?}, which does not exist"
+            );
+        }
+    }
+}
+
 /// #843: the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) spells each
 /// chord for Linux: `Cmd` is `Ctrl` there, as LINUX.md says, and a chord
 /// without a `Ctrl` form reads `Super` rather than a `Ctrl` that does
