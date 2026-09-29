@@ -1663,6 +1663,69 @@ mod tests {
         assert_eq!(bare.lines().count(), 3, "{bare}");
     }
 
+    /// #847 guard: a one-point line has one label, and it is not printed
+    /// twice as both the first and the last.
+    #[test]
+    fn a_one_point_line_wears_its_label_once() {
+        let chart = text(&ds("k,v\nonly,5\n"), ChartKind::Line, None, 30, 3);
+        let labels = chart.lines().last().unwrap();
+        assert_eq!(labels.matches("only").count(), 1, "{chart}");
+        assert_eq!(labels.trim(), "only", "{chart}");
+    }
+
+    /// #847 guard: the end labels are clipped by display width, so a wide
+    /// glyph never pushes the row past the chart, at any width down to the
+    /// narrowest chart `text` draws.
+    #[test]
+    fn line_end_labels_measure_wide_glyphs_and_never_overflow() {
+        let d = ds("k,v\n日本語の最初のラベル,1\n中,2\n最後の日本語ラベル,3\n");
+        for cols in 1..=30 {
+            let chart = text(&d, ChartKind::Line, None, cols, 3);
+            let rows: Vec<&str> = chart.lines().collect();
+            assert_eq!(rows.len(), 4, "three chart rows and the labels:\n{chart}");
+            let width = |r: &str| r.chars().map(display_width).sum::<usize>();
+            assert!(
+                width(rows[3]) <= width(rows[0]),
+                "{cols} cols: labels row wider than the chart:\n{chart}"
+            );
+        }
+    }
+
+    /// #847 guard: points are joined within a series, never from one
+    /// series' last point to the next series' first. A low flat series and
+    /// a high flat one leave the rows between them empty.
+    #[test]
+    fn two_series_are_not_joined_to_each_other() {
+        let chart = text(
+            &ds("low,high\n0,10\n0,10\n0,10\n"),
+            ChartKind::Line,
+            None,
+            30,
+            4,
+        );
+        let rows: Vec<&str> = chart.lines().collect();
+        assert_eq!(rows.len(), 4, "{chart}");
+        for middle in &rows[1..3] {
+            assert!(
+                middle
+                    .chars()
+                    .filter(|c| ('\u{2800}'..='\u{28ff}').contains(c))
+                    .all(|c| c == '\u{2800}'),
+                "no segment crosses between the series:\n{chart}"
+            );
+        }
+    }
+
+    /// #847 guard: the end labels belong to the line chart only; a spark
+    /// with `--x` labels is still its single row of blocks.
+    #[test]
+    fn the_spark_gains_no_labels_row() {
+        let d = ds("month,sales\nJan,10\nFeb,30\nMar,20\n");
+        let spark = text(&d, ChartKind::Spark, None, 10, 1);
+        assert_eq!(spark.lines().count(), 1, "{spark}");
+        assert!(!spark.contains("Jan") && !spark.contains("Mar"), "{spark}");
+    }
+
     /// The acceptance budget: 10k rows parse and render as text and SVG well
     /// inside 50 ms of CPU on any machine that can build croft (this is a
     /// generous multiple; the point is the algorithm is linear).
