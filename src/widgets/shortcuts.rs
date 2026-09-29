@@ -148,7 +148,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Opt+Left / Right",
-                description: "Move focus to the left / right editor group while split",
+                description: "Move focus to the left / right editor group while split (also the palette's View: Focus Left / Right Editor Group)",
                 handler: "is_focus_group_left_key is_focus_group_right_key",
             },
             ShortcutEntry {
@@ -923,7 +923,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+[ / Cmd+]",
-                description: "Cycle to the previous / next terminal",
+                description: "Cycle to the previous / next terminal (also the palette's Terminal: Focus Previous / Next Terminal)",
                 handler: "is_terminal_cycle_back_key is_terminal_cycle_key",
             },
             ShortcutEntry {

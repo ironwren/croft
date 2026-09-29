@@ -23,7 +23,7 @@ Per platform:
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split) |
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
-| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column) |
+| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column, or the Command Palette's "View: Focus Left Editor Group" / "View: Focus Right Editor Group") |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer). Add `:236` after the name to land on that line, `:236:7` for a column, or `:236-239` to open with those lines selected. Results are mouse-friendly: click a row to open it, wheel to move the selection, and the same goes for all the quick-pick popups (Command Palette, Go to Symbol, the branch and directory pickers, and the Debug: Attach to Python Process list) |
 | `Ctrl+p` / `Cmd+p`, then `#` | Go to Symbol in Workspace: the query goes to every running language server as a `workspace/symbol` search; Enter opens the picked symbol's file at its definition (also Command Palette "Go to Symbol in Workspace") |
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
@@ -136,6 +136,8 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
 | Markdown: Run Code Block at Cursor | `Cmd`+`Enter` | Run the runnable fence under the caret in a Markdown source, through the same confirm popup as the chord: the route on a terminal that sends `Ctrl`+`Enter` as a bare `Enter` |
 | Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
+| View: Focus Left Editor Group / View: Focus Right Editor Group | `Cmd`+`Opt`+`←` / `Cmd`+`Opt`+`→` | Move focus to the left / right editor group while split: the Linux route, where `Ctrl`+`Alt`+arrows switch desktop workspaces |
+| Terminal: Focus Next Terminal / Terminal: Focus Previous Terminal | `Cmd`+`]` / `Cmd`+`[` | Focus the terminal pane and cycle to the next / previous terminal: the Linux route, where `Ctrl`+`[` is `Esc` |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
@@ -565,7 +567,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+C` / `Ctrl+Shift+c` | Copy the terminal's current selection. On a remote session the text goes to the clipboard of the machine you are typing at, not the remote box's. Inside a program that has asked for mouse tracking a plain drag belongs to that program, so **Shift+drag** is what selects there. A program that has not asked still selects on a plain drag |
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal beside the current one (each has its own PTY, scrollback, selection) |
 | `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when one is left; `Ctrl+J` hides the pane) |
-| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it) |
+| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it). The Command Palette's "Terminal: Focus Next Terminal" / "Terminal: Focus Previous Terminal" do the same from any pane and focus the terminal |
 | Click the `⌄` caret (beside `+`) | Drop the terminal profile menu anchored under the caret: pick a shell (from `/etc/shells` + `$SHELL`) to launch a new pane |
 | `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |

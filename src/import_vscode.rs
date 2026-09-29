@@ -220,6 +220,16 @@ const COMMANDS: &[(&str, &str)] = &[
         "toggle_terminal",
     ),
     ("workbench.action.terminal.new", "new_terminal"),
+    ("workbench.action.terminal.focusNext", "focus_next_terminal"),
+    (
+        "workbench.action.terminal.focusPrevious",
+        "focus_previous_terminal",
+    ),
+    ("workbench.action.focusLeftGroup", "focus_left_editor_group"),
+    (
+        "workbench.action.focusRightGroup",
+        "focus_right_editor_group",
+    ),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
     ("workbench.view.explorer", "show_explorer"),
     ("workbench.view.search", "show_search"),

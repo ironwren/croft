@@ -10805,6 +10805,89 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// #843: Cmd+Opt+←/→ have no `Ctrl` form off macOS (`Ctrl`+`Alt`+arrows
+/// switch desktop workspaces), so the palette carries them, doing what the
+/// chords do, from any pane.
+#[test]
+fn the_palette_focuses_the_left_and_right_editor_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "left");
+    app.split_editor();
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
+    app.focus_pane(Pane::Tree);
+    assert!(run_from_palette(&mut app, "View: Focus Left Editor Group"));
+    assert_eq!(app.editor_layout.active_dfs_index(), 0);
+    assert!(app.focus == Pane::Editor);
+    assert!(run_from_palette(&mut app, "View: Focus Right Editor Group"));
+    assert_eq!(app.editor_layout.active_dfs_index(), 1);
+}
+
+/// #843: Cmd+] / Cmd+[ have no `Ctrl` form (`Ctrl`+`[` is `Esc`), so the
+/// palette carries next / previous terminal. The chords work only in the
+/// terminal pane; the commands also focus it, as VS Code's do.
+#[test]
+fn the_palette_focuses_the_next_and_previous_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Focus Next Terminal"));
+    assert_eq!(app.active_terminal, 1);
+    assert!(app.focus == Pane::Terminal);
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Focus Previous Terminal"
+    ));
+    assert_eq!(app.active_terminal, 0);
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Focus Previous Terminal"
+    ));
+    assert_eq!(app.active_terminal, 2, "it wraps like Cmd+[");
+}
+
+/// Guard (#843): with no split, "View: Focus Left/Right Editor Group" change
+/// nothing, as the chords do: focus stays where it was.
+#[test]
+fn focusing_an_editor_group_without_a_split_changes_nothing() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "only");
+    app.focus_pane(Pane::Tree);
+    for cmd in [
+        Command::FocusLeftEditorGroup,
+        Command::FocusRightEditorGroup,
+    ] {
+        app.run_command(cmd);
+        assert!(app.focus == Pane::Tree, "{cmd:?}");
+        assert!(!app.editor_layout.is_split());
+    }
+}
+
+/// Guard (#843): with one terminal, next / previous stay on it, and they
+/// skip a folded pane as Cmd+] does, never landing on one.
+#[test]
+fn the_terminal_focus_commands_stay_put_alone_and_skip_folded_panes() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::FocusNextTerminal);
+    assert_eq!(app.active_terminal, 0);
+    app.run_command(Command::FocusPreviousTerminal);
+    assert_eq!(app.active_terminal, 0);
+
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.terminals[1].collapsed = true;
+    app.run_command(Command::FocusNextTerminal);
+    assert_eq!(app.active_terminal, 2, "the folded pane is skipped");
+    app.run_command(Command::FocusPreviousTerminal);
+    assert_eq!(app.active_terminal, 0);
+}
+
 /// #843: Cmd+A has no `Ctrl` form in the editor off macOS (`Ctrl`+`A` is line
 /// start there), so the palette's "Select All" is the keyboard route, from
 /// any pane.

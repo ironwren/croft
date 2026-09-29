@@ -47512,6 +47512,10 @@ impl App {
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             Cmd::SplitEditor => self.split_editor(),
+            // The chords' own moves (#843): Cmd+Opt+Left / Right have no
+            // `Ctrl` form off macOS.
+            Cmd::FocusLeftEditorGroup => self.focus_editor_group(true),
+            Cmd::FocusRightEditorGroup => self.focus_editor_group(false),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
             Cmd::SarifNextResult => self.step_sarif_result(true),
@@ -48035,6 +48039,18 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
+            // work in the terminal pane; from the palette the commands bring
+            // it up and focus it first, as VS Code's do.
+            Cmd::FocusNextTerminal | Cmd::FocusPreviousTerminal => {
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                if cmd == Cmd::FocusNextTerminal {
+                    self.cycle_terminal();
+                } else {
+                    self.cycle_terminal_back();
+                }
+            }
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(

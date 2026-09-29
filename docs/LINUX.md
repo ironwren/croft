@@ -21,15 +21,15 @@ A handful of chords have no `Ctrl` form, or one a legacy terminal cannot send, b
 |-------|----------------|-----------------|
 | `Cmd`+`\` split editor | `Ctrl`+`\` is the shell's quit signal | Command Palette "View: Split Editor" |
 | `Cmd`+`Shift`+`\` / `Cmd`+`Opt`+`\` go to / select to bracket | a legacy terminal cannot send `Shift` or `Alt` with `Ctrl`+`\` | Command Palette "Go to Bracket" / "Select to Bracket" |
-| `Cmd`+`Opt`+`←` / `→` focus the left / right editor group | `Ctrl`+`Alt`+arrows switch desktop workspaces | click the group |
-| `Cmd`+`]` / `Cmd`+`[` next / previous terminal | `Ctrl`+`[` is `Esc` | click the pane |
+| `Cmd`+`Opt`+`←` / `→` focus the left / right editor group | `Ctrl`+`Alt`+arrows switch desktop workspaces | Command Palette "View: Focus Left Editor Group" / "View: Focus Right Editor Group" |
+| `Cmd`+`]` / `Cmd`+`[` next / previous terminal | `Ctrl`+`[` is `Esc` | Command Palette "Terminal: Focus Next Terminal" / "Terminal: Focus Previous Terminal" |
 | `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | `Ctrl`+`Shift`+`T` |
 | `Cmd`+`Enter` run the Markdown code block under the caret | `Ctrl`+`Enter` runs it too where the terminal reports it (the kitty keyboard protocol, tmux `extended-keys`), but a legacy terminal sends it as a bare `Enter` | Command Palette "Markdown: Run Code Block at Cursor" |
 | `Cmd`+`A` select all, in the editor | `Ctrl`+`A` is line start there, as in the shell | Command Palette "Select All" |
 | `Cmd`+`E` toggle vim mode | `Ctrl`+`E` is end of line, in the editor as in the shell | Command Palette "Toggle Vim Mode" |
 | `Cmd+K` chords typed in the terminal pane | `Ctrl`+`K` goes to the shell | the ones that act on the active terminal (`R`, `K`, `M`, `D`) work as `Ctrl`+`K` chords from any other pane |
 
-`Cmd` is `Super`, and it reaches croft only over the kitty keyboard protocol: kitty, Ghostty, WezTerm, and Alacritty deliver it natively, so these chords work there. In GNOME Terminal, Konsole, xterm, or tmux, use the right-hand column.
+`Cmd` is `Super`, and it reaches croft only over the kitty keyboard protocol: kitty, Ghostty, WezTerm, and Alacritty deliver it natively, so these chords work there. In GNOME Terminal, Konsole, xterm, or tmux, use the right-hand column, or give its palette command a chord of your own: pick the command in the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) and press the chord, which croft writes to `keybindings.json`.
 
 ## Nerd Font
 
