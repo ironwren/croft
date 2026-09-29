@@ -13,12 +13,18 @@ from tui_demo import Demo  # noqa: E402
 
 
 def main(binary: str, gif: str) -> None:
-    d = Demo(
+    """Record the scenario from `binary` into `gif`."""
+    with Demo(
         binary,
         user_config={"auto_save": False, "theme": "dark"},
         workspace_config={"copy_on_select": True},
         files={"src/main.rs": 'fn main() {\n    println!("hello");\n}\n'},
-    )
+    ) as d:
+        record(d, gif)
+
+
+def record(d: Demo, gif: str) -> None:
+    """The steps: open the editor, flip a bool, set a number, use the workspace."""
     d.start()
     d.snap(1200)
 
