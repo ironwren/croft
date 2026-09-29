@@ -221,6 +221,60 @@ mod tests {
         }
     }
 
+    /// #868 guard: only pdb itself is an attach client. A module that merely
+    /// starts with `pdb`, or pdb with no `-p`, is left in the list.
+    #[test]
+    fn a_module_only_named_like_pdb_is_still_a_target() {
+        for target in [
+            &["python3", "-m", "pdbpp", "-p", "1"][..],
+            &["python3", "-mpdbx", "--pid=1"],
+            &["python3", "-m", "pdb"],
+            &["python3", "-m", "pdb", "-c", "continue"],
+        ] {
+            assert!(!is_pdb_attach_client(&argv(target)), "{target:?}");
+        }
+    }
+
+    /// #868 guard: the refresh that reads argv leaves threads out. A 3.14
+    /// process running several threads is one row, not one per thread.
+    #[test]
+    fn a_threaded_target_is_listed_once() {
+        let Some(python) = python_314() else {
+            eprintln!("skipping: no CPython 3.14+ found");
+            return;
+        };
+        // The marker leads the command line, inside the label's cap.
+        let marker = format!("threaded{}", std::process::id());
+        let script = format!(
+            "{marker} = 1\n\
+             import threading, time\n\
+             for _ in range(3): threading.Thread(target=time.sleep, args=(30,), daemon=True).start()\n\
+             time.sleep(30)\n"
+        );
+        let target = Reap(
+            Command::new(&python)
+                .args(["-c", &script])
+                .spawn()
+                .expect("spawn the target"),
+        );
+        let pid = target.0.id();
+        let listed = || -> Vec<u32> {
+            attachable_python_targets()
+                .into_iter()
+                .filter(|t| t.label.contains(&marker))
+                .map(|t| t.pid)
+                .collect()
+        };
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the threaded python to be listed",
+            || !listed().is_empty(),
+        );
+        // Give the threads time to start, then look again.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(listed(), vec![pid]);
+    }
+
     /// A CPython 3.14+ to run a target under, or None: attaching needs one,
     /// so the listing test skips without it.
     fn python_314() -> Option<PathBuf> {
