@@ -65465,3 +65465,94 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+/// Every cell of a drawn frame, row after row.
+fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+/// #863 regression, drawn through base APIs only: at 80x24 each step of the
+/// tour shows the keys that move it. The caption shared one clamped line
+/// with the progress and the keys, and the keys were cut at every step.
+#[test]
+fn the_tour_keys_show_at_every_step_at_80_columns() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        let mut steps = 0;
+        while app.tour.is_some() && steps < 20 {
+            app.command_palette = None;
+            app.file_finder = None;
+            app.context_menu = None;
+            let screen = screen_text_863(&mut app, 80, 24);
+            assert!(
+                screen.contains("Enter next \u{b7} Esc leave"),
+                "step {}: the keys are cut:\n{screen}",
+                steps + 1
+            );
+            app.advance_tour();
+            steps += 1;
+        }
+    });
+}
+
+/// #863 regression, drawn through base APIs only: the Quick Open step names
+/// this platform's modifier, `Ctrl+P` off macOS, where `Cmd+P` is a key that
+/// does nothing.
+#[test]
+fn the_tour_names_this_platform_s_modifier_on_screen() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        app.advance_tour();
+        app.file_finder = None;
+        let screen = screen_text_863(&mut app, 200, 50);
+        let (want, not) = if cfg!(target_os = "macos") {
+            ("Cmd+P finds", "Ctrl+P finds")
+        } else {
+            ("Ctrl+P finds", "Cmd+P finds")
+        };
+        assert!(
+            screen.contains(want) && !screen.contains(not),
+            "the Quick Open caption names {want:?}:\n{screen}"
+        );
+        app.finish_tour();
+    });
+}
+
+/// #863 negative: the caption panel keeps out of a frame too small to hold
+/// it, and drawing the tour there does not panic.
+#[test]
+fn the_tour_caption_panel_stays_out_of_a_frame_too_small_for_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.start_demo();
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_some());
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 19, 24)).is_none());
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 3)).is_none());
+        for (w, h) in [(20, 4), (19, 24), (80, 3), (12, 2)] {
+            let _ = screen_text_863(&mut app, w, h);
+        }
+        app.finish_tour();
+        assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_none());
+    });
+}

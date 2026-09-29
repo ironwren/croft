@@ -293,6 +293,21 @@ mod tests {
         );
     }
 
+    /// #863 negative: only the exact `{mod}` placeholder is spelled out; a
+    /// caption that names a fixed key (`Ctrl+J` is Ctrl on every platform)
+    /// or braces anything else is shown as written.
+    #[test]
+    fn a_caption_without_the_placeholder_is_left_as_written() {
+        for caption in [
+            "Ctrl+J opens a real terminal inside croft.",
+            "{modifier} and {MOD} are not the placeholder",
+            "",
+        ] {
+            assert_eq!(expand_caption(caption, "Cmd"), caption);
+        }
+        assert_eq!(expand_caption("{mod}{mod}", "Ctrl"), "CtrlCtrl");
+    }
+
     #[test]
     fn the_startup_demo_request_is_taken_once() {
         request_startup_demo();
