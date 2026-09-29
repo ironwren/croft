@@ -681,3 +681,202 @@ fn locale_template_accepts_a_full_locale() {
     assert!(filled > 0, "the built-in German entries seed it");
     assert!(stderr.contains("locales/de.json"), "{stderr}");
 }
+
+/// The real binary on a pty with `HOME` at `dir`, for tests that type raw
+/// terminal bytes at croft and read back what it did. Killed on drop.
+#[cfg(unix)]
+struct PtyCroft {
+    child: std::process::Child,
+    pty: std::fs::File,
+}
+
+#[cfg(unix)]
+impl PtyCroft {
+    fn spawn(dir: &std::path::Path, args: &[&str]) -> Self {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        let (mut master, mut slave) = (0, 0);
+        let ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &ws,
+                )
+            },
+            0
+        );
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("TMUX")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let pty = unsafe { std::fs::File::from_raw_fd(master) };
+        Self { child, pty }
+    }
+
+    /// Everything croft writes during the next `for_`.
+    fn drain(&mut self, for_: std::time::Duration) -> String {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1 << 16];
+        let end = std::time::Instant::now() + for_;
+        while std::time::Instant::now() < end {
+            match self.pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Type `bytes` as the terminal would send them, then let croft act.
+    fn send(&mut self, bytes: &[u8]) -> String {
+        use std::io::Write;
+        self.pty.write_all(bytes).unwrap();
+        self.drain(std::time::Duration::from_millis(700))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyCroft {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// #857: what croft's key reader makes of the bytes tmux sends for
+/// Ctrl+Shift+S. tmux 3.2-3.4 with `extended-keys always` (and any tmux
+/// with `extended-keys-format csi-u` for a program that asked) send
+/// `CSI 83;6u`, the uppercase letter with the Shift flag: that must read as
+/// Ctrl+Shift, the Source Control jump. The negative cases must never gain a
+/// Shift: the legacy control byte (what tmux 3.5+ and plain terminals send
+/// for both Ctrl+S and Ctrl+Shift+S) and an uppercase S reported without the
+/// flag stay Ctrl+S, a save; tmux 3.5's default `CSI 27;6;83~` form is not
+/// read as a plain Ctrl+S either.
+#[cfg(unix)]
+#[test]
+fn croft_keys_reads_tmux_ctrl_shift_s_with_the_shift_and_nothing_else_with_one() {
+    let home = tempfile::tempdir().unwrap();
+    let mut croft = PtyCroft::spawn(home.path(), &["keys"]);
+    let banner = croft.drain(std::time::Duration::from_secs(3));
+    assert!(banner.contains("croft keys"), "no banner: {banner:?}");
+    // Each case is followed by a lone marker key, so the report lines of
+    // one case never run into the next.
+    let cases: [(&str, &[u8]); 4] = [
+        ("tmux CSI u Ctrl+Shift+S", b"\x1b[83;6u"),
+        ("legacy Ctrl+S byte", b"\x13"),
+        ("uppercase S, Ctrl, no Shift flag", b"\x1b[83;5u"),
+        ("tmux 3.5 CSI 27 Ctrl+Shift+S", b"\x1b[27;6;83~"),
+    ];
+    let mut reports = Vec::new();
+    for (i, (name, bytes)) in cases.iter().enumerate() {
+        let mut seen = croft.send(bytes);
+        seen += &croft.send(format!("{i}").as_bytes());
+        let marker = format!("code=Char('{i}')");
+        let lines: Vec<String> = seen
+            .lines()
+            .filter(|l| l.contains("code="))
+            .take_while(|l| !l.contains(&marker))
+            .map(|l| l.split("  code=").nth(1).unwrap_or(l).trim().to_string())
+            .collect();
+        assert!(seen.contains(&marker), "{name}: marker lost in {seen:?}");
+        reports.push((*name, lines));
+    }
+    let [csi_u, legacy, no_flag, csi_27] = reports.try_into().unwrap();
+    assert_eq!(
+        csi_u.1,
+        vec!["Char('S')  modifiers=[CONTROL + SHIFT]  kitty=true"],
+        "{}",
+        csi_u.0
+    );
+    assert_eq!(
+        legacy.1,
+        vec!["Char('s')  modifiers=[CONTROL]  kitty=true"],
+        "{}",
+        legacy.0
+    );
+    assert_eq!(
+        no_flag.1,
+        vec!["Char('S')  modifiers=[CONTROL]  kitty=true"],
+        "{}",
+        no_flag.0
+    );
+    assert!(
+        csi_27
+            .1
+            .iter()
+            .all(|l| !l.ends_with("modifiers=[CONTROL]  kitty=true")),
+        "{}: {:?}",
+        csi_27.0,
+        csi_27.1
+    );
+}
+
+/// #857 end to end on the real binary: with a file edited in the editor, the
+/// bytes tmux sends for Ctrl+Shift+S (`CSI 83;6u`) jump to Source Control
+/// and leave the file unsaved; before the fix they saved it. The legacy
+/// Ctrl+S byte, which carries no Shift, still saves.
+#[cfg(unix)]
+#[test]
+fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let mut croft = PtyCroft::spawn(home.path(), &["a.txt"]);
+    let started = croft.drain(std::time::Duration::from_secs(8));
+    assert!(started.len() > 1000, "croft drew nothing: {started:?}");
+    // Dismiss anything a first launch shows over the editor.
+    croft.send(b"\x1b");
+    croft.send(b"x");
+    croft.send(b"\x13");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xalpha\n",
+        "setup: the typed x lands in a.txt and Ctrl+S saves it"
+    );
+    croft.send(b"y");
+    let drawn = croft.send(b"\x1b[83;6u");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xalpha\n",
+        "Ctrl+Shift+S with the Shift reported must not save"
+    );
+    assert!(
+        drawn.contains("SOURCE CONTROL"),
+        "Ctrl+Shift+S opens Source Control"
+    );
+}

@@ -6738,6 +6738,42 @@ fn ctrl_shift_s_in_the_editor_jumps_to_source_control_without_saving() {
     );
 }
 
+/// #857 negative: the jump needs the Shift *reported*. Where the terminal
+/// (or tmux 3.5+, or tmux with `extended-keys on`) sends no Shift flag,
+/// Ctrl+S and a Ctrl+uppercase-S still save and the side bar stays put,
+/// and without the kitty keyboard protocol even a reported Shift saves.
+#[test]
+fn ctrl_s_without_a_reported_shift_still_saves_and_stays_put() {
+    let cases = [
+        (true, KeyCode::Char('s'), KeyModifiers::CONTROL),
+        (true, KeyCode::Char('S'), KeyModifiers::CONTROL),
+        (
+            false,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+    ];
+    for (kitty, code, mods) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "on disk").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.kitty_keys = kitty;
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        let before = app.sidebar_view;
+        app.editor.insert_str("edited ");
+        app.handle_key(key(code, mods)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim_end(),
+            "edited on disk",
+            "{code:?} {mods:?} kitty={kitty} saves"
+        );
+        assert_eq!(app.sidebar_view, before, "{code:?} {mods:?}: no jump");
+        assert_ne!(app.sidebar_view, SidebarView::SourceControl);
+    }
+}
+
 #[test]
 fn plain_s_is_not_save_key() {
     assert!(!is_save_key(
