@@ -100,6 +100,9 @@ pub enum ListPurpose {
     /// Output: Select Channel… (#852): the OUTPUT channels, `id` the
     /// channel's name.
     OutputChannel,
+    /// Where to add a CodeQL database from (#578): `id` is an index into
+    /// the App's database sources.
+    CodeqlDbSource,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
