@@ -919,10 +919,13 @@ struct LangCapabilitySupport {
     /// Concatenated on-type trigger characters per language (#254);
     /// a missing entry means "not probed yet".
     on_type_triggers: HashMap<Language, String>,
-    /// The servers running for each language, by name (#851): the built-in
-    /// Markdown lint stands down while rumdl runs, and comes back if rumdl
-    /// is given up on after crashing.
-    servers: HashMap<Language, Vec<String>>,
+    /// The servers reporting on each open document, by name (#851): the
+    /// built-in Markdown lint stands down for a file only while rumdl
+    /// reports on it. A document the app never opened here (one shown only
+    /// in a split's other group) has no entry, and a server leaves the
+    /// lists it was on when it is retired from document pulls or given up
+    /// on after crashing.
+    document_servers: HashMap<PathBuf, Vec<String>>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -1647,25 +1650,26 @@ impl LspManager {
             .is_ok_and(|s| s.will_rename.values().any(|w| *w))
     }
 
-    /// Whether the server named `name` is running for `lang` (#851). Read
-    /// synchronously by the app: the built-in Markdown lint stands down
-    /// while rumdl, which covers its rules, runs.
-    pub fn language_runs_server(&self, lang: Language, name: &str) -> bool {
+    /// Whether the server named `name` reports on the open document `path`
+    /// (#851). Read synchronously by the app: the built-in Markdown lint
+    /// stands down for a file rumdl, which covers its rules, reports on.
+    pub fn document_reported_by(&self, path: &Path, name: &str) -> bool {
         self.capability_support.lock().is_ok_and(|s| {
-            s.servers
-                .get(&lang)
+            s.document_servers
+                .get(path)
                 .is_some_and(|names| names.iter().any(|n| n == name))
         })
     }
 
-    /// Test hook: record `names` as the servers running for `lang`, as a
-    /// spawn would, without starting any.
+    /// Test hook: record `names` as the servers reporting on `path`, as an
+    /// open would, without starting any.
     #[cfg(test)]
-    pub fn set_running_servers_for_test(&self, lang: Language, names: &[&str]) {
+    pub fn set_document_servers_for_test(&self, path: &Path, names: &[&str]) {
         if let Ok(mut support) = self.capability_support.lock() {
-            support
-                .servers
-                .insert(lang, names.iter().map(|n| n.to_string()).collect());
+            support.document_servers.insert(
+                path.to_path_buf(),
+                names.iter().map(|n| n.to_string()).collect(),
+            );
         }
     }
 
@@ -2715,10 +2719,16 @@ impl WorkerState {
                     .into_iter()
                     .filter(|m| m.client.try_lock().map_or(true, |c| !c.has_exited()))
                     .collect();
+                // The dead ones report on nothing any more.
                 if let Ok(mut support) = self.capability_support.lock() {
-                    support
-                        .servers
-                        .insert(key.0, alive.iter().map(|m| m.name.clone()).collect());
+                    for (path, doc) in &self.docs {
+                        if (doc.language, doc.project_root.clone()) != key {
+                            continue;
+                        }
+                        if let Some(names) = support.document_servers.get_mut(path) {
+                            names.retain(|n| alive.iter().any(|m| &m.name == n));
+                        }
+                    }
                 }
                 self.restarts.incomplete.remove(&key);
                 self.clients.insert(key, alive);
@@ -2736,6 +2746,13 @@ impl WorkerState {
                     let _ =
                         tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
                             .await;
+                }
+            }
+            if let Ok(mut support) = self.capability_support.lock() {
+                for (path, doc) in &self.docs {
+                    if (doc.language, doc.project_root.clone()) == key {
+                        support.document_servers.remove(path);
+                    }
                 }
             }
             self.docs
@@ -3008,9 +3025,6 @@ impl WorkerState {
                 support
                     .will_rename
                     .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));
-                support
-                    .servers
-                    .insert(lang, spawned.iter().map(|c| c.name.clone()).collect());
             }
             // The first pull (#533). A server that answers workspace
             // diagnostics reports on files no editor has opened, and firing
@@ -3106,16 +3120,30 @@ impl WorkerState {
         }
         // Pull-mode servers report only when asked (#866); ask at once, since
         // nothing is typed yet to debounce.
+        let key: ClientKey = (lang, project_root.clone());
         let pulls = self
             .clients
-            .get(&(lang, project_root.clone()))
-            .map(|cs| document_pull_targets(cs.iter(), &path, &uri))
+            .get(&key)
+            .map(|cs| document_pull_targets(cs.iter(), &path, &uri, &self.capability_support))
             .unwrap_or_default();
         spawn_document_pulls(
             pulls,
             self.diagnostics_tx.clone(),
             std::time::Duration::ZERO,
         );
+        // Who reports on it (#851): every server open on it, less any retired
+        // from document pulls, since those report nothing.
+        let reporting: Vec<String> = self
+            .clients
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|c| !c.document_pull_stalled.load(Ordering::Relaxed))
+            .map(|c| c.name.clone())
+            .collect();
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_servers.insert(path.clone(), reporting);
+        }
         self.docs.insert(
             path,
             DocState {
@@ -3152,7 +3180,7 @@ impl WorkerState {
         let pulls = self
             .clients
             .get(&key)
-            .map(|cs| document_pull_targets(cs.iter(), &path, &uri))
+            .map(|cs| document_pull_targets(cs.iter(), &path, &uri, &self.capability_support))
             .unwrap_or_default();
         spawn_document_pulls(pulls, self.diagnostics_tx.clone(), DOCUMENT_PULL_DEBOUNCE);
     }
@@ -3184,6 +3212,9 @@ impl WorkerState {
         let Some(doc) = self.docs.remove(&path) else {
             return;
         };
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_servers.remove(&path);
+        }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -4371,7 +4402,7 @@ impl WorkerState {
             let pulls = self
                 .clients
                 .get(&key)
-                .map(|cs| document_pull_targets(cs.iter(), path, &uri))
+                .map(|cs| document_pull_targets(cs.iter(), path, &uri, &self.capability_support))
                 .unwrap_or_default();
             spawn_document_pulls(
                 pulls,
@@ -6252,6 +6283,11 @@ struct DocumentPull {
     generation: u64,
     path: PathBuf,
     uri: Url,
+    /// Whether the server also answers the workspace pull, which keeps its
+    /// sets fresh after it is retired from document pulls.
+    reports_per_workspace: bool,
+    /// Where the documents the server reports on are recorded (#851).
+    support: CapabilitySupport,
 }
 
 impl DocumentPull {
@@ -6261,6 +6297,39 @@ impl DocumentPull {
     fn is_current(&self) -> bool {
         let generations = self.generations.lock().unwrap_or_else(|e| e.into_inner());
         generations.get(&self.path) == Some(&self.generation)
+    }
+
+    /// Once a pull expired and retired the server from document pulls: it
+    /// reports on none of its documents any more, so it leaves their
+    /// reporter lists (#851; the built-in Markdown lint comes back where it
+    /// stood down for rumdl), and the sets it pulled for them are withdrawn,
+    /// as nothing will refresh them after an edit. A server that also
+    /// reports per workspace keeps those.
+    fn retire(&self, tx: &std_mpsc::Sender<DiagnosticsUpdate>) {
+        let served: Vec<PathBuf> = self
+            .generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        if let Ok(mut support) = self.support.lock() {
+            for path in &served {
+                if let Some(names) = support.document_servers.get_mut(path) {
+                    names.retain(|n| *n != self.name);
+                }
+            }
+        }
+        if self.reports_per_workspace {
+            return;
+        }
+        for path in served {
+            let _ = tx.send(DiagnosticsUpdate {
+                path,
+                server: self.name.clone(),
+                diagnostics: Vec::new(),
+            });
+        }
     }
 }
 
@@ -6272,6 +6341,7 @@ fn document_pull_targets<'a>(
     clients: impl Iterator<Item = &'a ManagedClient>,
     path: &Path,
     uri: &Url,
+    support: &CapabilitySupport,
 ) -> Vec<DocumentPull> {
     clients
         .filter(|c| c.supports_document_diagnostics)
@@ -6295,6 +6365,8 @@ fn document_pull_targets<'a>(
                 generation,
                 path: path.to_path_buf(),
                 uri: uri.clone(),
+                reports_per_workspace: c.supports_workspace_diagnostics,
+                support: support.clone(),
             }
         })
         .collect()
@@ -6362,6 +6434,7 @@ fn spawn_document_pulls_within(
                         target.name,
                         ceiling.as_secs()
                     ));
+                    target.retire(&tx);
                     return;
                 }
             };
@@ -7792,9 +7865,10 @@ while True:
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("a.md");
         let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
         stub_runtime().block_on(async {
             let (managed, _receipt) = document_pull_client(&python, &root, true).await;
-            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri);
+            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
             assert_eq!(pulls.len(), 1, "a diagnosticProvider server is pulled");
             let (tx, rx) = std_mpsc::channel();
             spawn_document_pulls_within(
@@ -7835,10 +7909,11 @@ while True:
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("a.md");
         let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
         stub_runtime().block_on(async {
             let (managed, receipt) = document_pull_client(&python, &root, true).await;
-            let older = document_pull_targets(std::iter::once(&managed), &file, &uri);
-            let newer = document_pull_targets(std::iter::once(&managed), &file, &uri);
+            let older = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            let newer = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
             let (tx, rx) = std_mpsc::channel();
             let ceiling = std::time::Duration::from_secs(20);
             spawn_document_pulls_within(older, tx.clone(), std::time::Duration::ZERO, ceiling);
@@ -7865,7 +7940,10 @@ while True:
 
     /// #866: a server that lets a document pull go unanswered is retired
     /// from document pulls, as one that stalls a workspace pull is (#533):
-    /// every unanswered request leaks an entry async-lsp can never drain.
+    /// every unanswered request leaks an entry async-lsp can never drain. It
+    /// then reports on nothing: its pulled sets are withdrawn and it leaves
+    /// the file's reporters, so the built-in Markdown lint returns where it
+    /// stood down for rumdl (#851).
     #[test]
     fn an_unanswered_document_pull_retires_the_server() {
         let Some(python) = python_for_stub_server() else {
@@ -7876,10 +7954,16 @@ while True:
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("a.md");
         let uri = Url::from_file_path(&file).expect("a file uri");
+        let support: CapabilitySupport = Arc::default();
         stub_runtime().block_on(async {
             let (managed, _receipt) = document_pull_client(&python, &root, false).await;
-            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri);
-            let (tx, _rx) = std_mpsc::channel();
+            // Opened with another server beside it (#851).
+            support.lock().unwrap().document_servers.insert(
+                file.clone(),
+                vec![String::from("doc-pull"), String::from("other")],
+            );
+            let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
+            let (tx, rx) = std_mpsc::channel();
             spawn_document_pulls_within(
                 pulls,
                 tx,
@@ -7894,8 +7978,26 @@ while True:
             .await;
             assert!(retired.is_ok(), "the unanswered pull retires the server");
             assert!(
-                document_pull_targets(std::iter::once(&managed), &file, &uri).is_empty(),
+                document_pull_targets(std::iter::once(&managed), &file, &uri, &support).is_empty(),
                 "and it is not asked again"
+            );
+            let withdrawn = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(crate::test_budget::spawn_budget(
+                    std::time::Duration::from_secs(5),
+                ))
+            })
+            .await
+            .expect("the waiter")
+            .expect("its pulled set is withdrawn");
+            assert_eq!(
+                (withdrawn.path, withdrawn.server.as_str()),
+                (file.clone(), "doc-pull")
+            );
+            assert!(withdrawn.diagnostics.is_empty());
+            assert_eq!(
+                support.lock().unwrap().document_servers[&file],
+                ["other"],
+                "it no longer counts as reporting on the file, and only it left"
             );
         });
     }

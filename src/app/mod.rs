@@ -8152,23 +8152,19 @@ impl App {
     /// diagnostics store a real language server writes to (`lsp_diagnostics`,
     /// keyed by path then by "producer"), under the synthetic server name
     /// `"Markdown Lint"`. It needs no language server, so it works the moment
-    /// a file opens and on a box where none could be installed. While rumdl
-    /// (#851) runs, which reports these same rules among its own, it stands
-    /// down instead, so no violation is listed twice. Gated by its own
+    /// a file opens and on a box where none could be installed. For a file
+    /// rumdl (#851) reports on, which covers these same rules among its own,
+    /// it stands down instead, so no violation is listed twice; a file rumdl
+    /// does not see (one shown only in a split's other group, which is not
+    /// sent to the language servers, or one rumdl stopped answering for)
+    /// keeps the built-in lint. Gated by its own
     /// edit-seq cursor (`markdown_lint_last_seen`) so an unchanged buffer
     /// isn't re-linted every tick. Returns whether any editor's overlay or
     /// the PROBLEMS panel changed, for the caller's redraw decision.
     pub fn sync_markdown_lint(&mut self) -> bool {
-        if self.lsp.as_ref().is_some_and(|lsp| {
-            lsp.language_runs_server(
-                crate::lsp::config::Language::MARKDOWN,
-                crate::markdown_lint::SUPERSEDED_BY,
-            )
-        }) {
-            return self.stand_down_markdown_lint();
-        }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut to_lint: Vec<(PathBuf, Vec<String>, u64)> = Vec::new();
+        let mut superseded: Vec<PathBuf> = Vec::new();
         // Both collections: `self.editor` is the ACTIVE group's tabs, and a
         // split's other panes live in `editor_layout`. Walking only the
         // active one left a `.md` open in an inactive pane unlinted, and the
@@ -8198,6 +8194,12 @@ impl App {
             if !current.insert(path.clone()) {
                 continue;
             }
+            if self.lsp.as_ref().is_some_and(|lsp| {
+                lsp.document_reported_by(path, crate::markdown_lint::SUPERSEDED_BY)
+            }) {
+                superseded.push(path.clone());
+                continue;
+            }
             // The seq alone cannot tell two panes apart: each counts its own
             // edits, so they can agree while holding different text. The
             // lines last linted are kept too and compared when the seqs
@@ -8213,6 +8215,9 @@ impl App {
             }
         }
         let mut changed = false;
+        for path in superseded {
+            changed |= self.withdraw_markdown_lint(&path);
+        }
         for (path, lines, seq) in to_lint {
             let diags = crate::markdown_lint::lint(&lines.join("\n"));
             let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
@@ -8261,43 +8266,35 @@ impl App {
         changed
     }
 
-    /// Withdraws every diagnostic the built-in Markdown lint published, for
-    /// while rumdl serves Markdown (#851), and repaints the tabs showing
-    /// those files. Emptying the seen cursor makes the lint run afresh on
-    /// every open tab if rumdl goes away.
-    fn stand_down_markdown_lint(&mut self) -> bool {
-        let linted: Vec<PathBuf> = self
-            .markdown_lint_last_seen
-            .drain()
-            .map(|(path, _)| path)
-            .collect();
-        let mut changed = false;
-        for path in linted {
-            let Some(by_server) = self.lsp_diagnostics.get_mut(&path) else {
-                continue;
-            };
-            if by_server.remove("Markdown Lint").is_none() {
-                continue;
-            }
-            changed = true;
-            if by_server.is_empty() {
-                self.lsp_diagnostics.remove(&path);
-            }
-            let merged = self.merged_diagnostics(&path);
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor.apply_diagnostics(path.clone(), merged.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(path.as_path()) {
-                    group.apply_diagnostics(path.clone(), merged.clone());
-                }
+    /// Withdraws what the built-in Markdown lint published for `path`, a
+    /// file rumdl reports on (#851), and repaints the tabs showing it. The
+    /// caller rebuilds PROBLEMS when this returns true. Forgetting the seen
+    /// cursor makes the lint run afresh on the file once rumdl stops
+    /// reporting on it.
+    fn withdraw_markdown_lint(&mut self, path: &Path) -> bool {
+        if self.markdown_lint_last_seen.remove(path).is_none() {
+            return false;
+        }
+        let Some(by_server) = self.lsp_diagnostics.get_mut(path) else {
+            return false;
+        };
+        if by_server.remove("Markdown Lint").is_none() {
+            return false;
+        }
+        if by_server.is_empty() {
+            self.lsp_diagnostics.remove(path);
+        }
+        let merged = self.merged_diagnostics(path);
+        if self.editor.path.as_deref() == Some(path) {
+            self.editor
+                .apply_diagnostics(path.to_path_buf(), merged.clone());
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if group.path.as_deref() == Some(path) {
+                group.apply_diagnostics(path.to_path_buf(), merged.clone());
             }
         }
-        if changed {
-            self.rebuild_problems();
-            self.refresh_problems_badge();
-        }
-        changed
+        true
     }
 
     /// Publish every open SARIF log's results as diagnostics (#577), and

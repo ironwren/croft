@@ -10,13 +10,14 @@
 //! trailing whitespace, and runs of blank lines.
 //!
 //! The bundled rumdl server (#851) implements markdownlint's whole rule set,
-//! these four included, so while it runs this lint stands down. It remains
-//! the fallback where rumdl could not be installed.
+//! these four included, so this lint stands down for each file rumdl reports
+//! on. It remains the fallback where rumdl could not be installed, and for
+//! a file rumdl does not see.
 
 use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
 
 /// The bundled language server whose rules include every one of these
-/// (#851). While it runs for Markdown, the app withdraws this lint rather
+/// (#851). For a file it reports on, the app withdraws this lint rather
 /// than report each violation twice.
 pub const SUPERSEDED_BY: &str = "rumdl";
 
