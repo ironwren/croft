@@ -198,6 +198,10 @@ const SETTINGS: &[SettingMap] = &[
 /// opens a different thing entirely.
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
+    ("workbench.action.files.saveAll", "save_all"),
+    ("explorer.newFile", "new_file"),
+    ("explorer.newFolder", "new_folder"),
+    ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
     ("workbench.action.gotoSymbol", "go_to_symbol"),
     ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
@@ -220,6 +224,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "toggle_terminal",
     ),
     ("workbench.action.terminal.new", "new_terminal"),
+    ("workbench.action.terminal.focus", "focus_terminal"),
+    ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
     ("workbench.view.explorer", "show_explorer"),
     ("workbench.view.search", "show_search"),

@@ -97,6 +97,9 @@ pub enum ListPurpose {
     /// The databases checklist of "Run Query on Multiple Databases"
     /// (#578): `id` is a database's index, or `run`.
     CodeqlMultiDb,
+    /// Output: Select Channel… (#852): the OUTPUT channels, `id` the
+    /// channel's name.
+    OutputChannel,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.

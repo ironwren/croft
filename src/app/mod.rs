@@ -870,6 +870,44 @@ enum BottomPanelTab {
     Captures,
 }
 
+impl BottomPanelTab {
+    /// Every tab, in the strip's left-to-right order (VS Code's panel-group
+    /// order). The strip paints from this list, so a tab cannot be
+    /// clickable without being in it.
+    const ALL: [BottomPanelTab; 5] = [
+        BottomPanelTab::Problems,
+        BottomPanelTab::Output,
+        BottomPanelTab::Terminal,
+        BottomPanelTab::Ports,
+        BottomPanelTab::Captures,
+    ];
+
+    /// The tab's strip label, padded to its click target.
+    fn label(self) -> &'static str {
+        match self {
+            BottomPanelTab::Problems => " PROBLEMS ",
+            BottomPanelTab::Output => " OUTPUT ",
+            BottomPanelTab::Terminal => " TERMINAL ",
+            BottomPanelTab::Ports => " PORTS ",
+            BottomPanelTab::Captures => " CAPTURES ",
+        }
+    }
+
+    /// The palette command that shows this tab (#852). No catch-all: a new
+    /// tab fails to compile until it names one, so no tab ships reachable
+    /// only by a click on the strip.
+    fn show_command(self) -> crate::widgets::command_palette::Command {
+        use crate::widgets::command_palette::Command;
+        match self {
+            BottomPanelTab::Terminal => Command::FocusTerminal,
+            BottomPanelTab::Problems => Command::ShowProblems,
+            BottomPanelTab::Output => Command::ShowOutput,
+            BottomPanelTab::Ports => Command::ShowPorts,
+            BottomPanelTab::Captures => Command::ShowCaptures,
+        }
+    }
+}
+
 /// A transient, click-only notification that a browsable port just appeared in
 /// the terminal. It never captures keystrokes — the terminal owns those — so
 /// the user clicks an action or lets it auto-dismiss. The forward actions only
@@ -17375,13 +17413,7 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = [
-            (BottomPanelTab::Problems, " PROBLEMS "),
-            (BottomPanelTab::Output, " OUTPUT "),
-            (BottomPanelTab::Terminal, " TERMINAL "),
-            (BottomPanelTab::Ports, " PORTS "),
-            (BottomPanelTab::Captures, " CAPTURES "),
-        ];
+        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -17498,6 +17530,31 @@ impl App {
             self.show_terminal = true;
         }
         self.focus_pane(Pane::Terminal);
+    }
+
+    /// Output: Select Channel… (#852): the OUTPUT toolbar's channel dropdown
+    /// as a keyboard picker, opened on the channel shown now. Choosing one
+    /// shows it in the OUTPUT tab.
+    fn open_output_channel_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        // The panel only syncs while painted; a tab never shown yet would
+        // otherwise open the picker on the wrong channel.
+        self.output.sync();
+        let current = self.output.selected_name();
+        let rows: Vec<ListRow> = crate::output::channel_names()
+            .into_iter()
+            .map(|name| ListRow {
+                id: name.clone(),
+                label: name,
+            })
+            .collect();
+        let selected = rows
+            .iter()
+            .position(|r| Some(&r.id) == current.as_ref())
+            .unwrap_or(0);
+        let mut picker = ListPicker::new(ListPurpose::OutputChannel, "Output Channels", rows);
+        picker.selected = selected;
+        self.open_list_picker(picker, "No output channels yet");
     }
 
     /// Split the editor into two side-by-side columns (`Cmd+\`). The new
@@ -21784,10 +21841,8 @@ impl App {
             return Ok(());
         }
         if is_terminal_focus_key(key) {
-            if !self.show_terminal {
-                self.show_terminal = true;
-            }
-            self.focus_pane(Pane::Terminal);
+            // The TERMINAL tab, not whichever panel tab was last up (#852).
+            self.set_bottom_panel_tab(BottomPanelTab::Terminal);
             return Ok(());
         }
         if is_run_build_task_key(key) {
@@ -21834,6 +21889,20 @@ impl App {
         if is_extensions_jump_key(key) {
             self.show_tree = true;
             self.set_sidebar_view(SidebarView::Extensions);
+            return Ok(());
+        }
+        // The bottom panel's tabs (#852), claimed from any pane like the
+        // side bar jumps above.
+        if is_show_problems_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Problems);
+            return Ok(());
+        }
+        if is_show_output_key(key) {
+            self.set_bottom_panel_tab(BottomPanelTab::Output);
+            return Ok(());
+        }
+        if is_save_all_key(key) {
+            self.save_all();
             return Ok(());
         }
         if self.is_remote && is_drop_to_local_key(key) {
@@ -34906,6 +34975,11 @@ impl App {
                     );
                 }
             }
+            ListPurpose::OutputChannel => {
+                self.output.sync();
+                self.output.select_by_name(&row.id);
+                self.set_bottom_panel_tab(BottomPanelTab::Output);
+            }
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
@@ -47448,6 +47522,15 @@ impl App {
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
+            Cmd::SaveAll => self.save_all(),
+            Cmd::NewFile => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::File, target);
+            }
+            Cmd::NewFolder => {
+                let target = self.palette_create_target_dir();
+                self.open_create_prompt(CreateKind::Folder, target);
+            }
             Cmd::Undo => {
                 self.status = if self.editor.undo() {
                     String::from("Undo")
@@ -47461,6 +47544,16 @@ impl App {
                 } else {
                     String::from("Nothing to redo")
                 };
+            }
+            // The keyboard route on Linux, where Ctrl+A is line start and a
+            // terminal without Super forwarding never delivers Cmd+A (#852).
+            Cmd::SelectAll => {
+                self.focus_pane(Pane::Editor);
+                self.editor.select_all();
+                self.status = format!(
+                    "Selected {} chars",
+                    self.editor.selection_text().chars().count()
+                );
             }
             Cmd::CloseEditor => {
                 self.record_closed_tab_at(self.editor.active_index());
@@ -47893,6 +47986,12 @@ impl App {
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
+            Cmd::FocusTerminal => self.set_bottom_panel_tab(BottomPanelTab::Terminal),
+            Cmd::ShowProblems => self.set_bottom_panel_tab(BottomPanelTab::Problems),
+            Cmd::ShowOutput => self.set_bottom_panel_tab(BottomPanelTab::Output),
+            Cmd::OutputSelectChannel => self.open_output_channel_picker(),
+            Cmd::ShowPorts => self.set_bottom_panel_tab(BottomPanelTab::Ports),
+            Cmd::ShowCaptures => self.set_bottom_panel_tab(BottomPanelTab::Captures),
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
@@ -53720,6 +53819,14 @@ impl App {
     /// immediately but skips the editor that currently HAS focus (it has
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
+        let skip_active = !require_delay && self.focus == Pane::Editor;
+        self.sweep_dirty_buffers(require_delay, skip_active)
+    }
+
+    /// Write every dirty buffer the auto-save rules allow, in every split,
+    /// leaving the active tab alone when `skip_active`. Shared by the
+    /// auto-save sweep and File: Save All (#852).
+    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -53740,9 +53847,9 @@ impl App {
             .filter(|p| !self.symbol_path_is_live(p))
             .collect();
         // The tab that still holds focus is not saved by the focus-change
-        // mode: only buffers that LOST focus are written.
-        let keep_focused =
-            (!require_delay && self.focus == Pane::Editor).then(|| self.editor.active_index());
+        // mode: only buffers that LOST focus are written. Save All skips it
+        // too, having just saved it the explicit way.
+        let keep_focused = skip_active.then(|| self.editor.active_index());
         // Collab guests never write shared (workspace) files; the session
         // owner is the single writer (docs/MULTIPLAYER.md, Phase D).
         let guest = self.is_collab_guest();
@@ -53880,6 +53987,61 @@ impl App {
             self.record_history_snapshot_of(&path, seats, described);
         }
         true
+    }
+
+    /// File: Save All (#852, `Cmd+Opt+S` / `Ctrl+Alt+S`): the active tab
+    /// saves exactly as `Cmd+S` would (format on save, hex and sheet edits,
+    /// the overwrite prompt), then every other dirty buffer in every split
+    /// is written by the auto-save rules, which leave a tab that must not
+    /// be written blind (a disk conflict, a lossy encoding, an unresolved
+    /// merge, a hex or sheet edit) to its own `Cmd+S`.
+    fn save_all(&mut self) {
+        let before = self.dirty_tab_count();
+        if before == 0 {
+            self.status = String::from("Save All: nothing to save");
+            return;
+        }
+        if self.editor.dirty {
+            self.save();
+        }
+        let active_status = self.status.clone();
+        self.sweep_dirty_buffers(false, true);
+        // A format-on-save write lands with its formatter reply: it is on
+        // its way, not left behind.
+        let pending = usize::from(self.save_after_format.is_some());
+        let left = self.dirty_tab_count().saturating_sub(pending);
+        self.status = if left == 0 {
+            format!(
+                "Saved {before} editor{}",
+                if before == 1 { "" } else { "s" }
+            )
+        } else if self.editor.dirty && pending == 0 {
+            // The active tab's own refusal names the reason and the key
+            // that consents; a summary would bury it.
+            active_status
+        } else {
+            format!(
+                "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
+                if left == 1 { "" } else { "s" },
+                if left == 1 { "it" } else { "each" }
+            )
+        };
+    }
+
+    /// Tabs with unsaved edits, across the active group and every inactive
+    /// split leaf.
+    fn dirty_tab_count(&self) -> usize {
+        self.editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|tabs| tabs.editors.iter()),
+            )
+            .filter(|e| e.dirty)
+            .count()
     }
 
     fn toggle_auto_save(&mut self) {
@@ -56614,6 +56776,19 @@ impl App {
     fn explorer_create_target_dir(&self) -> PathBuf {
         let node = self.tree.nodes.get(self.tree.selected);
         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root)
+    }
+
+    /// Where the palette's File: New File… / New Folder… create (#852): the
+    /// Explorer selection while the Explorer has focus, as its own chords
+    /// do; otherwise beside the active file, falling back to the selection
+    /// when no file is open.
+    fn palette_create_target_dir(&self) -> PathBuf {
+        if !self.is_explorer_focused()
+            && let Some(dir) = self.editor.path.as_deref().and_then(Path::parent)
+        {
+            return dir.to_path_buf();
+        }
+        self.explorer_create_target_dir()
     }
 
     /// VS Code-style type-to-jump for the Explorer. Each printable
@@ -62747,6 +62922,34 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
+/// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's
+/// "View: Focus Problems" (#852).
+fn is_show_problems_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'm')
+}
+
+/// `Ctrl/Cmd+Shift+U`: show the OUTPUT tab from any pane, VS Code's
+/// "View: Toggle Output" chord (#852).
+fn is_show_output_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'u')
+}
+
+/// `Cmd+Opt+S` / `Ctrl+Alt+S`: File: Save All (#852). VS Code's macOS chord;
+/// its Linux `Ctrl+K S` is croft's Select for Compare. Shift is rejected:
+/// `Cmd+Opt+Shift+S` converts indentation to spaces.
+fn is_save_all_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'s') {
+        return false;
+    }
+    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// The TurnDone status fragment for a turn's notes: the file is named only
 /// when every note landed in the SAME file. "3 comments in b.rs" was a lie
 /// when two of them sat in a.rs (F4 only cycles the active file, so the
@@ -63369,10 +63572,11 @@ fn is_focus_group_right_key(key: KeyEvent) -> bool {
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any
-/// pane, un-hiding it if it was collapsed via Ctrl+J. SUPER-only so the
-/// cross-platform `Ctrl+Shift+T` (split-terminal) chord keeps its
-/// historical meaning - the two chords share the same letter but are
-/// disambiguated by the modifier.
+/// pane, un-hiding it if it was collapsed via Ctrl+J and bringing its
+/// TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (#852).
+/// SUPER-only so the cross-platform `Ctrl+Shift+T` (split-terminal) chord
+/// keeps its historical meaning - the two chords share the same letter but
+/// are disambiguated by the modifier.
 fn is_terminal_focus_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;

@@ -65326,3 +65326,202 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         app.settings_chain
     );
 }
+
+/// #852: every bottom-panel tab is reachable from the keyboard. Each tab
+/// names the palette command that shows it (`show_command` has no
+/// catch-all, so a new tab cannot compile without one, and the strip paints
+/// from `ALL`, so a clickable tab is always in this loop); here each command
+/// must be in the palette and must land on its tab, panel shown and
+/// focused, from a hidden panel on another tab.
+#[test]
+fn every_bottom_panel_tab_is_reachable_from_the_palette() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for tab in BottomPanelTab::ALL {
+        let cmd = tab.show_command();
+        assert!(
+            ALL_COMMANDS.contains(&cmd),
+            "{cmd:?} (shows {tab:?}) is missing from the palette"
+        );
+        app.show_terminal = false;
+        app.focus_pane(Pane::Editor);
+        app.bottom_panel_tab = if tab == BottomPanelTab::Terminal {
+            BottomPanelTab::Problems
+        } else {
+            BottomPanelTab::Terminal
+        };
+        app.run_command(cmd);
+        assert_eq!(app.bottom_panel_tab, tab, "{cmd:?}");
+        assert!(app.show_terminal, "{cmd:?} must reveal the panel");
+        assert!(
+            app.focus == Pane::Terminal,
+            "{cmd:?} must focus the panel so its keys work at once"
+        );
+    }
+}
+
+/// #852: VS Code's `Ctrl/Cmd+Shift+M` and `+U` show PROBLEMS and OUTPUT from
+/// any pane, the live terminal included, and `Cmd+Shift+T` brings the
+/// TERMINAL tab back rather than focusing whichever tab was last up.
+#[test]
+fn panel_tab_chords_switch_between_problems_output_and_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Problems);
+    assert!(app.focus == Pane::Terminal);
+    // From the PROBLEMS view itself.
+    app.handle_key(key(KeyCode::Char('u'), cmd_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring the TERMINAL tab forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+    // From the live shell: the chord is croft's, as the side bar jumps are.
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    // Plain Ctrl+M / Ctrl+U stay the shell's (Enter, kill line).
+    assert!(!is_show_problems_key(key(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL
+    )));
+    // Cmd+Opt+Shift+U is Transform to Uppercase, not OUTPUT.
+    assert!(!is_show_output_key(key(
+        KeyCode::Char('U'),
+        cmd_shift | KeyModifiers::ALT
+    )));
+}
+
+/// #852: Output: Select Channel… is the OUTPUT toolbar's click-only channel
+/// dropdown as a keyboard picker; choosing a row shows that channel.
+#[test]
+fn output_select_channel_picks_a_channel_from_the_keyboard() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses and the picker is narrowed to it.
+    let channel = "Keyboard Reach 852";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.run_command(Command::OutputSelectChannel);
+    let picker = app.list_picker.as_mut().expect("the channel picker opens");
+    assert_eq!(picker.purpose, ListPurpose::OutputChannel);
+    for c in "reach 852".chars() {
+        picker.push_char(c);
+    }
+    assert_eq!(picker.visible_count(), 1);
+    app.confirm_list_picker();
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert!(app.focus == Pane::Terminal);
+    assert_eq!(app.output.selected_name().as_deref(), Some(channel));
+}
+
+/// #852: File: New File… / New Folder… open the Explorer's create prompt
+/// from any pane: beside the active file from the editor, in the Explorer
+/// selection while the Explorer has focus (as its own chords do).
+#[test]
+fn new_file_and_folder_from_the_palette_open_the_create_prompt() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    let mut app = app_with_open_file(tmp.path(), "sub/a.txt", "x");
+    let file_dir = app
+        .editor
+        .path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap();
+    assert!(file_dir.ends_with("sub"));
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &file_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+    app.prompt = None;
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Explorer;
+    app.run_command(Command::NewFolder);
+    let explorer_dir = app.explorer_create_target_dir();
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::Folder),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New Folder… must open the New Folder prompt"),
+    }
+}
+
+/// #852: Select All is on the palette, the route on Linux where `Ctrl+A` is
+/// line start; it selects the active buffer and hands the editor focus.
+#[test]
+fn select_all_from_the_palette_selects_the_active_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "one\ntwo");
+    app.focus_pane(Pane::Tree);
+    app.run_command(crate::widgets::command_palette::Command::SelectAll);
+    assert_eq!(app.editor.selection_text(), "one\ntwo");
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #852: `Ctrl+Alt+S` is File: Save All: every dirty tab reaches disk, not
+/// only the active one, and a second press says there is nothing left.
+#[test]
+fn save_all_writes_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // App::new loads the developer's real prefs: pin every mode that would
+    // save on its own, or defer the write, off.
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.dirty_tab_count(), 2);
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.dirty_tab_count(), 0, "{}", app.status);
+    assert!(std::fs::read_to_string(&a).unwrap().contains('X'));
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.status, "Saved 2 editors");
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(app.status, "Save All: nothing to save");
+    // Shift is Convert Indentation to Spaces; plain Ctrl+S is Save.
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('S'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_save_all_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL
+    )));
+}

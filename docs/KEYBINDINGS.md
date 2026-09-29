@@ -34,6 +34,10 @@ Per platform:
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
 | `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
+| `Ctrl+Shift+m` / `Cmd+Shift+m` | Show the PROBLEMS tab of the bottom panel (VS Code's "View: Focus Problems") |
+| `Ctrl+Shift+u` / `Cmd+Shift+u` | Show the OUTPUT tab; the palette's "Output: Select Channel…" picks its channel from the keyboard. Where the desktop's input method claims `Ctrl+Shift+u` for Unicode entry (IBus), use the palette's "View: Show Output" |
+| `Cmd+Shift+t` | Focus the terminal pane, un-hiding the panel and bringing its TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (also the palette's "Terminal: Focus Terminal") |
+| `Ctrl+Alt+s` / `Cmd+Opt+s` | Save All: the active tab saves as `Cmd+S` does, then every other tab with unsaved edits, in every split. A tab that must not be written blind (changed on disk, an encoding that would lose characters, an unresolved merge, a hex or sheet edit) is left for its own `Cmd+S`, and the status line says how many |
 | Click a pinned row in the Explorer's sticky band | Scrolled deep in a directory, its ancestor rows pin to the top of the tree; clicking one selects that directory and scrolls it to the top (right-click opens its context menu) |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, Extensions, and Testing |
 | Click the settings gear | Open settings → Color Theme picker (Croft Black / Croft Dark Blue / Croft Light, a full VS Code Light Modern-style light theme that recolors the whole session including the host terminal, plus ten editor-inspired dark themes: One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) or Customize Layout |
@@ -134,6 +138,10 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 | Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
+| File: New File… / File: New Folder… | palette only (`Cmd`+`F` / `Cmd`+`Shift`+`N` while the Explorer is focused) | The Explorer's create prompt from any pane: beside the active file, or in the Explorer selection while the Explorer has focus (or no file is open) |
+| Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
+| View: Show Ports / View: Show Captures | palette only | Show the PORTS / CAPTURES tab of the bottom panel and focus it, so its keys (`↑`/`↓`, `⏎`, …) work at once |
+| Output: Select Channel… | palette only | Pick an OUTPUT channel (the toolbar dropdown's list) and show it |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
 
@@ -184,7 +192,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
 | Right-click | Context menu: Cut, Copy, Paste, Rename, Delete, Reveal in Finder (local macOS), and New File / New Folder on empty space |
-| Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`) |
+| Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`, and from any pane via the palette's "File: New File…" / "File: New Folder…") |
 | Click the `⋯` button on the EXPLORER title line | Open the "Views and More Actions" menu: toggle which sub-views stack in the Explorer (Open Editors, Folders, Outline, Timeline, and a language-aware Dependencies view that only appears when the workspace root has a recognized manifest), each with a checkmark when shown. Choices persist across launches |
 | Click a row in OPEN EDITORS | Activate that editor's tab (dirty tabs show a dot, the active tab is highlighted) |
 | Click a commit in TIMELINE | Open that commit's diff for the active file in a read-only editor tab |
@@ -523,7 +531,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | Keys | Action |
 |------|--------|
 | Any key croft does not bind | Forwarded to the shell PTY (arrows, most `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
-| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **F J P Q S V**, and `Ctrl+Shift` + **B C D E F H J L O P R S T V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F L O P R S T V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app, and so does `Ctrl+B` while the terminal pane is focused (#304), which is what lets Claude Code background a running command; `Cmd+B` still reaches croft from anywhere |
+| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **F J P Q S V**, and `Ctrl+Shift` + **B C D E F H J L M O P R S T U V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F L M O P R S T U V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app, and so does `Ctrl+B` while the terminal pane is focused (#304), which is what lets Claude Code background a running command; `Cmd+B` still reaches croft from anywhere |
 | Bare `F5` / `F9` / `F10` / `F11` | Forwarded while the terminal is focused and no debug session is live, so process-compose's `F10` and htop's `F9` work. Modified, they keep their debug meaning everywhere |
 | Mouse drag | Select text, pinned to the scrollback content; drag past an edge to auto-scroll through history. Inside a full-screen app that scrolls by repainting (Claude Code, a pager), the highlight follows its text across the app's own scrolling. Rows covered by the app's chrome (an input box, a floating pill) drop out, while a row with an overlay in its middle keeps both intact ends; the surviving rows stay highlighted, the selection hides entirely only when none remain (copy still yields the whole selection), and it reappears as the text scrolls back. A drag held past an edge forwards wheel ticks, so the app scrolls under the drag |
 | `Shift`+click | Extend the existing selection to the clicked cell instead of starting a new one |
@@ -587,7 +595,7 @@ The panel's layout survives restarts: the pane arrangement, each pane's director
 
 ## Ports
 
-The PORTS tab in the bottom panel group lists the loopback ports croft has noticed this session, from scraping terminal output (`http://localhost:PORT` banners, `listening on :PORT` lines) and a periodic socket poll of the shell's process subtree. A newly announced port also raises a transient, click-only toast in the bottom-right corner.
+The PORTS tab in the bottom panel group (the palette's "View: Show Ports" from the keyboard) lists the loopback ports croft has noticed this session, from scraping terminal output (`http://localhost:PORT` banners, `listening on :PORT` lines) and a periodic socket poll of the shell's process subtree. A newly announced port also raises a transient, click-only toast in the bottom-right corner.
 
 The poll only surfaces ports owned by a pane's own processes, so one outside it (a port a container publishes, say) is found by the terminal scrape; it still drops off the list when it genuinely stops listening. On a remote session, forwarding rides the existing SSH master, with no second connection; on a local session a port is already reachable, so the only action is to open it.
 
@@ -604,7 +612,7 @@ The poll only surfaces ports owned by a pane's own processes, so one outside it 
 
 ## Captures
 
-The CAPTURES tab collects output lines matched by `capture` triggers in `triggers.json` (iTerm2's Capture Output): point a rule at your compiler's error format and every hit funnels into one clickable list, however much output scrolled past.
+The CAPTURES tab (the palette's "View: Show Captures" from the keyboard) collects output lines matched by `capture` triggers in `triggers.json` (iTerm2's Capture Output): point a rule at your compiler's error format and every hit funnels into one clickable list, however much output scrolled past.
 
 With a row selected, `n` (or right-click → "Ask Navigator About This Line", or the palette's "Captures: Ask Navigator About This Line") sends the line, the trigger that caught it, and the redacted pane rows around it to the resident Navigator. When the line carries a `path:line` that resolves to an existing file (relative to the pane's cwd, then the workspace), that file opens first so the reply lands as a comment box there; otherwise the ask anchors on the active file, and with none open it says so.
 
