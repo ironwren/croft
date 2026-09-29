@@ -55402,6 +55402,27 @@ fn a_coverage_run_that_never_ran_keeps_its_reason_in_the_status() {
     );
 }
 
+/// #845 guard: `o` opens the runner's output only from the Testing view
+/// itself. With that view showing a failed discovery but the editor
+/// focused, `o` is a character typed into the buffer, and the bottom
+/// panel stays where it was.
+#[test]
+fn o_typed_in_the_editor_beside_a_failed_discovery_stays_a_character() {
+    let mut app = editor_app_with_lines(&["ab"]);
+    app.set_sidebar_view(SidebarView::Testing);
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Discovering);
+    app.testing.on_finished(Some(false));
+    draw(&mut app, 100, 30);
+    assert!(app.testing.last_output_hint.width > 0);
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_col = 2;
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["abo"]);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
+}
+
 /// A workspace with one source file and a SARIF log pointing into it.
 fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();

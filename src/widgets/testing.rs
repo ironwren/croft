@@ -1572,4 +1572,50 @@ mod tests {
             "gone: no test ran (0.1 s)"
         );
     }
+
+    /// #845 guard: a red run whose failure is a row in the tree explains
+    /// itself, so it gets no "see OUTPUT" pointer and the tree keeps the
+    /// row under the summary. Only an unexplained failure points away.
+    #[test]
+    fn a_red_run_with_its_failure_in_the_tree_gets_no_output_pointer() {
+        let area = Rect::new(0, 0, 32, 10);
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Failed,
+        });
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let screen: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!p.failed_unexplained());
+        assert!(!screen.contains("OUTPUT"), "{screen:?}");
+        assert_eq!(p.last_output_hint, Rect::default());
+        assert_eq!(p.first_row_y, 3, "the tree starts under the summary");
+        assert!(p.take_failed_run(), "it is still a red run");
+    }
+
+    /// #845 guard: in a panel too narrow for the whole pointer, the text and
+    /// its click area are clipped together, short of the watch glyphs, so a
+    /// click on the header's glyphs never lands on it.
+    #[test]
+    fn a_narrow_panel_clips_the_output_pointer_and_its_click_area_together() {
+        let area = Rect::new(0, 0, 16, 8);
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Discovering);
+        p.on_finished(Some(false));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let hint = p.last_output_hint;
+        let drawn: String = (hint.x..hint.x + hint.width)
+            .map(|x| buf[(x, hint.y)].symbol())
+            .collect();
+        assert_eq!(drawn, "see OUTPUT");
+        assert!(hint.x + hint.width < p.last_watch_all.x, "{hint:?}");
+        assert_eq!(buf[(hint.x + hint.width, hint.y)].symbol(), " ");
+    }
 }
