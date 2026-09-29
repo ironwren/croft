@@ -9614,30 +9614,41 @@ while True:
     /// notifications travel one ordered stream, so a server that has seen
     /// didClose has seen every didSave that was sent before it.
     fn saves_seen_by(capabilities: &str) -> String {
+        saves_seen_by_each(&[capabilities]).remove(0)
+    }
+
+    /// [`saves_seen_by`] for several servers on the one document, each a
+    /// [`FAKE_LSP_RECORDER`] advertising its own `capabilities`, in order;
+    /// one method log per server.
+    fn saves_seen_by_each(capabilities: &[&str]) -> Vec<String> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().canonicalize().expect("canonicalize");
         let file = root.join("demo.py");
         std::fs::write(&file, "x = 1\n").expect("write demo");
-        let script = root.join("fake_lsp.py");
-        std::fs::write(
-            &script,
-            format!("CAPABILITIES = {capabilities}\n{FAKE_LSP_RECORDER}"),
-        )
-        .expect("write fake server");
-        let log = root.join("methods.log");
-
         let mut registry = ServerRegistry::new();
-        registry.register(
-            Language::PYTHON,
-            ServerConfig {
-                name: "fake-recorder",
-                command: "python3".into(),
-                args: vec![script.display().to_string(), log.display().to_string()],
-                language: Language::PYTHON,
-                initialization_options: None,
-                provision: None,
-            },
-        );
+        let mut logs = Vec::new();
+        for (i, caps) in capabilities.iter().enumerate() {
+            let script = root.join(format!("fake_lsp_{i}.py"));
+            std::fs::write(
+                &script,
+                format!("CAPABILITIES = {caps}\n{FAKE_LSP_RECORDER}"),
+            )
+            .expect("write fake server");
+            let log = root.join(format!("methods_{i}.log"));
+            registry.register(
+                Language::PYTHON,
+                ServerConfig {
+                    // Named apart, so no server stands in for another.
+                    name: Box::leak(format!("fake-recorder-{i}").into_boxed_str()),
+                    command: "python3".into(),
+                    args: vec![script.display().to_string(), log.display().to_string()],
+                    language: Language::PYTHON,
+                    initialization_options: None,
+                    provision: None,
+                },
+            );
+            logs.push(log);
+        }
         let (diag_tx, _diag_rx) = std_mpsc::channel();
         let (prog_tx, _prog_rx) = std_mpsc::channel();
         let mut state = WorkerState {
@@ -9664,20 +9675,26 @@ while True:
 
         crate::test_budget::await_spawned(
             Duration::from_millis(500),
-            "the fake server to receive didClose",
+            "every fake server to receive didClose",
             || {
-                std::fs::read_to_string(&log)
-                    .unwrap_or_default()
-                    .contains("textDocument/didClose")
+                logs.iter().all(|log| {
+                    std::fs::read_to_string(log)
+                        .unwrap_or_default()
+                        .contains("textDocument/didClose")
+                })
             },
         );
         runtime.handle().clone().block_on(state.shutdown_all());
-        let methods = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            methods.contains("textDocument/didOpen"),
-            "sanity: the fake server must have received didOpen; got: {methods:?}"
-        );
-        methods
+        logs.iter()
+            .map(|log| {
+                let methods = std::fs::read_to_string(log).unwrap_or_default();
+                assert!(
+                    methods.contains("textDocument/didOpen"),
+                    "sanity: the fake server must have received didOpen; got: {methods:?}"
+                );
+                methods
+            })
+            .collect()
     }
 
     /// Issue #37: rust-analyzer re-runs its check-on-save (`cargo check`, the
@@ -9740,6 +9757,65 @@ while True:
                 .lines()
                 .any(|l| l == r#"textDocument/didSave "x = 2\n""#),
             "includeText must put the saved buffer in didSave; server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: servers sharing a document are each answered by their
+    /// own capability, from the one save: the one that asked for the text
+    /// gets it, the one that asked for a bare save gets no text, and the one
+    /// that asked for nothing gets nothing.
+    #[test]
+    fn save_doc_answers_each_server_on_a_document_by_its_own_capability() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert!(saves(&logs[2]).is_empty(), "{:?}", logs[2]);
+    }
+
+    /// #854 guard: the fix does not reach a server that picked the older
+    /// `textDocumentSync: <kind>` number. That form predates `save`, and such
+    /// a server is still told about saves, without the text, as VS Code,
+    /// Neovim and Helix tell it.
+    #[test]
+    fn save_doc_still_sends_a_bare_save_to_a_server_with_the_old_sync_kind() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(r#"{"textDocumentSync": 2}"#);
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
+        );
+    }
+
+    /// #854 guard: `includeText: false` asks for a bare save, never the text.
+    #[test]
+    fn save_doc_sends_no_text_when_include_text_is_false() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let methods = saves_seen_by(
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {"includeText": False}}}"#,
+        );
+        assert!(
+            methods.lines().any(|l| l == "textDocument/didSave null"),
+            "server received: {methods:?}"
         );
     }
 
