@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use super::remote_attach::{PyVersion, is_python_process};
 
@@ -34,12 +34,23 @@ pub struct PyTarget {
 
 /// Enumerate attachable CPython processes, newest-looking first by pid.
 ///
-/// Skips croft's own process, anything that is not a CPython interpreter, any
+/// Skips croft's own process, anything that is not a CPython interpreter, a
+/// `-m pdb -p` attach client (croft's own, from an earlier attach), any
 /// process whose interpreter version cannot be resolved, and any interpreter
 /// older than 3.14.
 pub fn attachable_python_targets() -> Vec<PyTarget> {
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    // The plain `refresh_processes` reads no argv, so every row's command
+    // line was empty (#868). Threads are left out: on Linux each would be
+    // listed as a process of its own, one row per thread.
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
     let self_pid = std::process::id();
 
     let mut targets: Vec<PyTarget> = sys
@@ -56,6 +67,9 @@ pub fn attachable_python_targets() -> Vec<PyTarget> {
                 return None;
             }
             let exe = exe?;
+            if is_pdb_attach_client(proc_.cmd()) {
+                return None;
+            }
             let version = interpreter_version(exe)?;
             if !version.supports_remote_attach() {
                 return None;
@@ -96,6 +110,35 @@ fn summarize_cmd(cmd: &[OsString]) -> String {
     } else {
         joined
     }
+}
+
+/// Whether `cmd` is a `python -m pdb -p <pid>` attach client, the process an
+/// earlier attach left running (#868). It is a debugger, not a program to
+/// debug, and listing it beside its target offered to attach to itself.
+fn is_pdb_attach_client(cmd: &[OsString]) -> bool {
+    let args: Vec<_> = cmd.iter().map(|a| a.to_string_lossy()).collect();
+    let Some(module_at) = args.iter().enumerate().find_map(|(i, a)| match a.as_ref() {
+        "-mpdb" => Some(i + 1),
+        "-m" if args.get(i + 1).is_some_and(|m| m == "pdb") => Some(i + 2),
+        _ => None,
+    }) else {
+        return false;
+    };
+    // pdb's own options, up to the script it debugs: a `-p` after that is
+    // the script's argument, and `python -m pdb app.py` is a real target.
+    let mut rest = args[module_at..].iter();
+    while let Some(a) = rest.next() {
+        match a.as_ref() {
+            "-p" | "--pid" => return true,
+            a if a.starts_with("--pid=") => return true,
+            "-c" | "--command" => {
+                rest.next();
+            }
+            a if a.starts_with('-') => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Build the picker row label: pid, interpreter version, then the command line.
@@ -150,5 +193,97 @@ mod tests {
     #[test]
     fn summarize_empty_argv_is_empty() {
         assert_eq!(summarize_cmd(&[]), "");
+    }
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    /// #868: an attach client (croft's `python -m pdb -p <pid>`) is not a
+    /// target; a program merely run under pdb, or taking a `-p` of its own,
+    /// still is.
+    #[test]
+    fn a_pdb_attach_client_is_not_offered_as_a_target() {
+        for client in [
+            &["/usr/bin/python3.14", "-m", "pdb", "-p", "4321"][..],
+            &["python3", "-mpdb", "--pid=4321"],
+            &["python3", "-m", "pdb", "-c", "continue", "--pid", "9"],
+        ] {
+            assert!(is_pdb_attach_client(&argv(client)), "{client:?}");
+        }
+        for target in [
+            &["python3", "-m", "pdb", "app.py", "-p", "80"][..],
+            &["python3", "serve.py", "-p", "8000"],
+            &["python3", "-m", "http.server", "-p"],
+            &["python3"],
+        ] {
+            assert!(!is_pdb_attach_client(&argv(target)), "{target:?}");
+        }
+    }
+
+    /// A CPython 3.14+ to run a target under, or None: attaching needs one,
+    /// so the listing test skips without it.
+    fn python_314() -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = ["python3.14", "python3.15", "python3"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(home).join(".croft/debug-venv/bin/python"));
+        }
+        if let Ok(out) = Command::new("uv").args(["python", "find", "3.14"]).output() {
+            let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !found.is_empty() {
+                candidates.push(PathBuf::from(found));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|p| interpreter_version(p).is_some_and(|v| v.supports_remote_attach()))
+    }
+
+    /// Kills the spawned target however the test ends.
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// #868: every row read `PID n · Python 3.14.7 ·` with nothing after,
+    /// because the process refresh never read argv. A real 3.14 process is
+    /// listed with its command line.
+    #[test]
+    fn a_listed_target_shows_its_command_line() {
+        let Some(python) = python_314() else {
+            eprintln!("skipping: no CPython 3.14+ found");
+            return;
+        };
+        let target = Reap(
+            Command::new(&python)
+                .args(["-c", "import time; time.sleep(30)"])
+                .spawn()
+                .expect("spawn the target"),
+        );
+        let pid = target.0.id();
+        let mut label = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the sleeping python to be listed",
+            || {
+                label = attachable_python_targets()
+                    .into_iter()
+                    .find(|t| t.pid == pid)
+                    .map(|t| t.label);
+                label.is_some()
+            },
+        );
+        let label = label.unwrap();
+        assert!(
+            label.contains("-c import time"),
+            "the row names the command line: {label}"
+        );
     }
 }

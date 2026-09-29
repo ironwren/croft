@@ -118,7 +118,7 @@ src/
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers)
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
-│   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
+│   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo (argv included, for the picker row; `-m pdb -p` attach clients left out, #868) plus a per-candidate `--version` probe
 │   └── reaper.rs             sweeps orphaned vscode-js-debug processes (server plus its detached watchdog) left by a crash or force-quit; kills only `~/.croft/js-debug` scripts reparented to pid 1, so a live session is never touched
 ├── testing/              Test Runner: a background worker runs the project's test tool off the render loop (cargo/pytest/vitest/jest/go/codeql, picked by `registry::runner_for`) and streams parsed cases into the Testing panel
 │   ├── mod.rs           shared NO_RUNNER_STATUS, `suite_pattern` (anchors a suite as `parse::` so cargo's substring filter and the panel's marking cannot sweep `parse_utils::b`), and `regex_escape` (shared by the JS `-t` argv builders and the locator; test titles are arbitrary strings)
