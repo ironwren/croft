@@ -65,6 +65,9 @@ pub enum DapEvent {
         /// so a watch row can render `<not available>` instead of the error.
         success: bool,
     },
+    /// What an `exception` stop threw (#864), from the `exceptionInfo`
+    /// response: `ModuleNotFoundError: No module named 'requests'`.
+    ExceptionInfo { summary: String },
 }
 
 /// Why an adapter refused `launch`/`attach`: DAP puts the full text in
@@ -195,7 +198,8 @@ pub fn initialize_request() -> Value {
 /// adapter is spawned and the `launch` shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterKind {
-    /// debugpy (CPython 3.14+), launches the `.py` source directly.
+    /// debugpy (the adapter on croft's CPython 3.14+ venv), launches the `.py`
+    /// source directly under the project's own interpreter.
     Debugpy,
     /// lldb-dap, launches a compiled binary (Rust / C / C++).
     LldbDap,
@@ -511,8 +515,8 @@ pub fn set_exception_breakpoints_request(filters: &[String]) -> Value {
     })
 }
 
-/// Build a thread-scoped execution request (`continue` / `next` / `stepIn` /
-/// `stepOut`).
+/// Build a thread-scoped request (`continue` / `next` / `stepIn` /
+/// `stepOut`, and `exceptionInfo`, which takes the same `threadId`).
 pub fn thread_request(command: &str, thread_id: i64) -> Value {
     json!({
         "type": "request",
@@ -575,6 +579,40 @@ pub fn parse_evaluate_result(response: &Value) -> Option<String> {
         .get("result")?
         .as_str()
         .map(str::to_string)
+}
+
+/// One line naming what an `exceptionInfo` response says was thrown (#864):
+/// `exceptionId: description`, with only the description's first line (an
+/// adapter may append the stack) and without repeating an id the
+/// description already opens with. None when the response names nothing.
+pub fn exception_summary(response: &Value) -> Option<String> {
+    let body = response.get("body")?;
+    let text = |pointer: &str| {
+        body.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    };
+    // debugpy pads the id with "(note: full exception trace is shown but
+    // execution is paused at: …)" when the stop is outside user code.
+    let id = text("/exceptionId")
+        .split("(note:")
+        .next()
+        .unwrap_or("")
+        .trim();
+    let description = [text("/description"), text("/details/message")]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .and_then(|s| s.lines().next())
+        .unwrap_or("")
+        .trim();
+    match (id.is_empty(), description.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(id.to_string()),
+        (true, false) => Some(description.to_string()),
+        (false, false) if description.starts_with(id) => Some(description.to_string()),
+        (false, false) => Some(format!("{id}: {description}")),
+    }
 }
 
 /// Build a `scopes` request for one stack frame (locals / globals containers).
@@ -1364,6 +1402,11 @@ impl DapSession {
                     self.threads = parse_threads(&msg);
                     out.push(DapEvent::InspectionUpdated);
                 }
+                Some("exceptionInfo") => {
+                    if let Some(summary) = exception_summary(&msg) {
+                        out.push(DapEvent::ExceptionInfo { summary });
+                    }
+                }
                 Some("scopes") => {
                     self.scopes = parse_scopes(&msg);
                     let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
@@ -1493,7 +1536,7 @@ impl DapSession {
                 let _ = t.send(configuration_done_request());
                 self.phase = SessionPhase::Running;
             }
-            DapEvent::Stopped { thread_id, .. } => {
+            DapEvent::Stopped { thread_id, reason } => {
                 // Run to Cursor's breakpoint lives for one stop, whichever
                 // breakpoint or step produced it.
                 if let Some((path, _)) = self.run_to.take() {
@@ -1506,6 +1549,13 @@ impl DapSession {
                 self.clear_inspection();
                 let _ = self.active().send(stack_trace_request(*thread_id));
                 let _ = self.active().send(threads_request());
+                // "Paused (exception)" alone does not say what was thrown
+                // (#864); the answer arrives as `ExceptionInfo`.
+                if reason == "exception" && self.supports("supportsExceptionInfoRequest") {
+                    let _ = self
+                        .active()
+                        .send(thread_request("exceptionInfo", *thread_id));
+                }
             }
             DapEvent::Continued => {
                 self.phase = SessionPhase::Running;
@@ -1526,7 +1576,8 @@ impl DapSession {
             DapEvent::Output { .. } => {}
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
-            | DapEvent::Evaluated { .. } => {}
+            | DapEvent::Evaluated { .. }
+            | DapEvent::ExceptionInfo { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -2622,6 +2673,51 @@ while True:
         assert_eq!(parse_evaluate_result(&json!({"body": {}})), None);
     }
 
+    /// #864: what an exception stop threw, on one line.
+    #[test]
+    fn exception_summary_names_the_type_and_message() {
+        let debugpy = json!({ "body": {
+            "exceptionId": "ModuleNotFoundError",
+            "description": "No module named 'requests'",
+            "breakMode": "unhandled",
+            "details": { "message": "No module named 'requests'", "stackTrace": "..." }
+        }});
+        assert_eq!(
+            exception_summary(&debugpy).as_deref(),
+            Some("ModuleNotFoundError: No module named 'requests'")
+        );
+        // What a real debugpy sends for an uncaught exception it pauses on
+        // outside the user's own frames: the note is not part of the name.
+        let noted = json!({ "body": {
+            "exceptionId": "ValueError       (note: full exception trace is shown but \
+                            execution is paused at: _run_module_as_main)",
+            "description": "boom 42"
+        }});
+        assert_eq!(
+            exception_summary(&noted).as_deref(),
+            Some("ValueError: boom 42")
+        );
+        // A description that already names the type, followed by the stack
+        // (js-debug's shape), is not prefixed twice or run onto one line.
+        let js = json!({ "body": {
+            "exceptionId": "Error",
+            "description": "Error: boom\n    at main (/w/app.js:3:9)"
+        }});
+        assert_eq!(exception_summary(&js).as_deref(), Some("Error: boom"));
+        let only_details = json!({ "body": {
+            "exceptionId": "panic",
+            "details": { "message": "index out of range" }
+        }});
+        assert_eq!(
+            exception_summary(&only_details).as_deref(),
+            Some("panic: index out of range")
+        );
+        let only_id = json!({ "body": { "exceptionId": "KeyError", "description": "" } });
+        assert_eq!(exception_summary(&only_id).as_deref(), Some("KeyError"));
+        assert_eq!(exception_summary(&json!({ "body": {} })), None);
+        assert_eq!(exception_summary(&json!({ "success": false })), None);
+    }
+
     #[test]
     fn reverse_request_response_references_request_seq() {
         let r = reverse_request_response(42, "runInTerminal", false);
@@ -3042,6 +3138,67 @@ while True:
         assert_eq!(
             session.data_breakpoints,
             vec![(String::from("var:total"), String::from("total"))]
+        );
+        session.disconnect();
+    }
+
+    /// #864 against a fake adapter: an `exception` stop asks the adapter
+    /// what was thrown, and the answer comes back as one event.
+    #[test]
+    fn an_exception_stop_reports_what_was_thrown() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let script = FAKE_DAP
+            .replace(r#""reason": "breakpoint""#, r#""reason": "exception""#)
+            .replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsExceptionInfoRequest": True"#,
+            )
+            .replace(
+                "    elif c == \"disconnect\":",
+                r#"    elif c == "exceptionInfo":
+        reply(req, {"exceptionId": "ModuleNotFoundError",
+                    "description": "No module named 'requests'", "breakMode": "unhandled"})
+    elif c == "disconnect":"#,
+            );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let mut summary = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the fake adapter to answer exceptionInfo",
+            || {
+                for ev in session.poll() {
+                    if let DapEvent::ExceptionInfo { summary: s } = ev {
+                        summary = Some(s);
+                    }
+                }
+                summary.is_some()
+            },
+        );
+        let asked = requests(&log)
+            .into_iter()
+            .find(|q| q["command"] == "exceptionInfo")
+            .expect("exceptionInfo was requested");
+        assert_eq!(asked["arguments"]["threadId"], 1);
+        assert_eq!(
+            summary.as_deref(),
+            Some("ModuleNotFoundError: No module named 'requests'")
         );
         session.disconnect();
     }

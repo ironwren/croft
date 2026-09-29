@@ -4,8 +4,10 @@
 //! installing debugpy into the user's interpreter: PEP 668 marks the uv-managed
 //! CPython externally-managed (pip refuses), and polluting the user's Python
 //! would be wrong regardless. Mirrors the `~/.croft/servers` LSP store. The venv
-//! is built from CPython 3.14+ (`uv venv -p 3.14`) — the only line croft's
-//! debugger supports (PEP 768), with no fallback to older interpreters.
+//! is built from CPython 3.14+ (`uv venv -p 3.14`), with no fallback to older
+//! interpreters; it hosts the debugpy adapter, while a launched program runs
+//! under the project's own interpreter (#864). The 3.14 floor on the program
+//! itself is attach's (PEP 768), not launch's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,8 +34,9 @@ pub fn debug_venv_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".croft").join("debug-venv"))
 }
 
-/// The venv's interpreter, used both to run `-m debugpy.adapter` and as the
-/// debuggee interpreter.
+/// The venv's interpreter, which runs `-m debugpy.adapter` only. The program
+/// being debugged runs under the project's own interpreter (#864): debugpy
+/// injects itself there, so neither debugpy nor 3.14 is required of it.
 pub fn debug_venv_python() -> Option<PathBuf> {
     Some(debug_venv_dir()?.join("bin").join("python"))
 }

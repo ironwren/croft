@@ -446,7 +446,7 @@ Opens as a rendered preview (shapes, text via system fonts, embedded images). `F
 
 Real breakpoint debugging over the Debug Adapter Protocol. Adapters by language:
 
-* **Python** — the verified adapter (debugpy, CPython 3.14+). croft provisions a private `~/.croft/debug-venv` with debugpy on first use, with no fallback to older interpreters.
+* **Python** — the verified adapter (debugpy). croft provisions a private `~/.croft/debug-venv` (CPython 3.14+) with debugpy on first use to host the adapter only. The program runs under the project's own interpreter, the one Run uses: the nearest `.venv` / `venv` / `.env` inside the workspace, else `python3`, so its installed packages import; a launch.json `python` overrides it. It needs no debugpy and no 3.14. When the program stops on an exception, the Run and Debug panel and the status line name the exception type and message.
 * **JavaScript / TypeScript** — under Node via **vscode-js-debug**, the same engine VS Code, Zed and nvim use. croft auto-downloads the pinned `js-debug` server to `~/.croft/js-debug` on first use and talks to it over TCP, spawning the parent + child sessions js-debug requires. `node` must be on `PATH`, and TypeScript binds through source maps.
 * **Rust / C / C++** — `lldb-dap` (binary built on launch; breakpoint binding additionally needs a permitted macOS `debugserver`). The adapter is resolved from the Xcode Command Line Tools on macOS or from `PATH` elsewhere, matching the versioned names LLVM ships (`lldb-dap`, `lldb-dap-18`, legacy `lldb-vscode`); on Linux install it with the LLVM package (e.g. `apt install lldb`).
 

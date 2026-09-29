@@ -28689,6 +28689,12 @@ impl App {
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
                 }
+                // What the exception stop threw (#864): the panel's pill and
+                // the status line, which has the width the pill lacks.
+                DapEvent::ExceptionInfo { summary } => {
+                    self.run_debug.feedback = Some(format!("Paused (exception): {summary}"));
+                    self.status = format!("Paused on exception: {summary}");
+                }
                 DapEvent::BreakpointsUpdated => {
                     // Mirror the adapter's unverified set into the editor so the
                     // gutter can hollow out inert breakpoints, and warn once if
@@ -30029,11 +30035,13 @@ impl App {
                     Ok(py) => {
                         let adapter_args =
                             vec![String::from("-m"), String::from("debugpy.adapter")];
+                        let program_py =
+                            config_project_python(&rc, &cwd, &self.active_workspace_root());
                         crate::dap::session::DapSession::launch_with(
                             &py.to_string_lossy(),
                             &adapter_args,
                             &cwd,
-                            configs::debugpy_request(&rc, &py),
+                            configs::debugpy_request(&rc, &program_py),
                             breakpoints,
                         )
                     }
@@ -30232,12 +30240,15 @@ impl App {
             .owning_root(&path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
+        // The debug venv hosts only the adapter; the program runs under
+        // the interpreter Run would use, so its packages import (#864).
+        let program_py = project_python_for(path.parent().unwrap_or(&debug_root), &debug_root);
         match crate::dap::session::DapSession::launch(
             &py_str,
             &adapter_args,
             &debug_root,
             &path,
-            &py,
+            &program_py,
             breakpoints,
             false,
         ) {
@@ -54966,9 +54977,7 @@ impl App {
         let lines = tab.lines.clone();
         let root = self.roots.primary().to_path_buf();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let python = find_python_venv(&dir, &root)
-            .map(|(py, _)| py)
-            .unwrap_or_else(|| project_python(&root));
+        let python = project_python_for(&dir, &root);
         self.live_run_sent.insert(path.clone(), lines.clone());
         if let Some(runner) = &self.live_run_runner {
             runner.submit(crate::live_run::Job {
@@ -65056,6 +65065,33 @@ fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, Pat
             _ => return None,
         }
     }
+}
+
+/// The interpreter that runs Python code in `dir`: the nearest venv up to
+/// `workspace_root` ([`find_python_venv`]), else [`project_python`]. Live
+/// Run and the debugger's program both use it, so a script debugs against
+/// the same installed packages it runs with (#864).
+fn project_python_for(dir: &Path, workspace_root: &Path) -> PathBuf {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .unwrap_or_else(|| project_python(workspace_root))
+}
+
+/// The interpreter a launch.json Python config's program runs under when
+/// the config names none (#864): resolved from the program's directory,
+/// or from `cwd` for a `module` launch, never croft's own debug venv.
+fn config_project_python(
+    rc: &crate::dap::configs::ResolvedConfig,
+    cwd: &Path,
+    workspace_root: &Path,
+) -> PathBuf {
+    let dir = rc
+        .program
+        .as_deref()
+        .map(|p| crate::dap::configs::absolute_in(p, cwd))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    project_python_for(&dir, workspace_root)
 }
 
 const TERMINAL_ADD_LABEL: &str = " + ";

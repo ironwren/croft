@@ -20755,6 +20755,91 @@ fn run_spec_does_not_walk_above_workspace_root() {
     );
 }
 
+/// #864: F5 on a script ran it under croft's private debug venv, where the
+/// project's packages are missing, so `import requests` stopped the run on
+/// line 1. The program runs under the interpreter Run picks: the nearest
+/// venv inside the workspace, else python3.
+#[test]
+fn a_debugged_script_runs_under_the_interpreter_run_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pkg = root.join("src").join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let file = pkg.join("main.py");
+    std::fs::write(&file, b"import requests\n").unwrap();
+
+    let bare = super::project_python_for(&pkg, root);
+    assert_eq!(
+        bare.file_name().and_then(|n| n.to_str()),
+        Some("python3"),
+        "no venv: python3, got {}",
+        bare.display()
+    );
+    assert!(!bare.to_string_lossy().contains("debug-venv"));
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(super::project_python_for(&pkg, root), venv);
+    let req =
+        crate::dap::session::launch_request(&file, &super::project_python_for(&pkg, root), false);
+    assert_eq!(
+        req["arguments"]["python"][0],
+        &*venv.to_string_lossy(),
+        "the launch names the project's venv"
+    );
+    // The same interpreter Run spawns for this file.
+    let spec = App::run_spec_for(&file, root).unwrap();
+    assert_eq!(spec.program, venv.to_string_lossy());
+}
+
+/// #864 for launch.json: a Python config that names no interpreter runs
+/// under the venv nearest its program (or its cwd, for a `module`), and one
+/// that names its own keeps it.
+#[test]
+fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let python_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let req = debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root));
+        req["arguments"]["python"].clone()
+    };
+    let program = r#"[{"name":"P","type":"python","program":"${workspaceFolder}/app/main.py"}]"#;
+
+    let fallback = python_of(program);
+    let fallback = fallback[0].as_str().unwrap();
+    assert!(
+        fallback.ends_with("python3") && !fallback.contains("debug-venv"),
+        "no venv: python3, got {fallback}"
+    );
+
+    let venv = make_venv(root, ".venv");
+    assert_eq!(python_of(program)[0], &*venv.to_string_lossy());
+
+    // A module launch has no program path: its cwd's venv is the one.
+    let svc = root.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    let svc_venv = make_venv(&svc, "venv");
+    assert_eq!(
+        python_of(r#"[{"name":"M","type":"python","module":"svc.main","cwd":"svc"}]"#)[0],
+        &*svc_venv.to_string_lossy()
+    );
+
+    assert_eq!(
+        python_of(
+            r#"[{"name":"E","type":"python","program":"app/main.py","python":"/opt/py/bin/python3.9"}]"#
+        ),
+        "/opt/py/bin/python3.9",
+        "an explicit python wins"
+    );
+}
+
 #[test]
 fn run_active_file_with_no_open_file_records_feedback_and_does_not_spawn_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -65063,6 +65148,80 @@ fn a_launch_json_python_config_passes_args_and_env_file() {
         app.run_debug.feedback
     );
     assert_eq!(who.as_deref(), Some("'croft'"));
+}
+
+/// #864 against a real debugpy: F5 on a script importing a module only the
+/// project's `.venv` has stopped with "Paused (exception)" on line 1, since
+/// the program ran under croft's debug venv. It now reaches its breakpoint
+/// with the module's value, and the exception it raises next is named.
+/// Needs `~/.croft/debug-venv` and a `python3` with `venv`.
+#[test]
+#[ignore = "requires ~/.croft/debug-venv (uv + debugpy)"]
+fn f5_debugs_a_script_against_the_project_venv_and_names_its_exception() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(root.join(".venv"))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let site = std::process::Command::new(root.join(".venv/bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    let site = PathBuf::from(String::from_utf8(site.stdout).unwrap().trim());
+    std::fs::write(site.join("croftdep.py"), "VALUE = 42\n").unwrap();
+    let file = root.join("main.py");
+    std::fs::write(
+        &file,
+        "import croftdep\nvalue = croftdep.VALUE\nraise ValueError(f\"boom {value}\")\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor
+        .breakpoints
+        .entry(file.clone())
+        .or_default()
+        .insert(3);
+    app.debug_start_or_continue();
+    let value = debug_until_local(&mut app, "value", 90);
+    assert_eq!(
+        value.as_deref(),
+        Some("42"),
+        "status {:?}, feedback {:?}",
+        app.status,
+        app.run_debug.feedback
+    );
+    app.debug_start_or_continue();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline
+        && !app
+            .run_debug
+            .feedback
+            .as_deref()
+            .is_some_and(|f| f.contains("ValueError"))
+    {
+        app.poll_dap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): ValueError: boom 42"),
+        "status {status:?}"
+    );
+    assert!(status.contains("ValueError: boom 42"), "{status}");
 }
 
 /// #250, against a real lldb-dap: a Rust binary that needs a CLI argument
