@@ -110,15 +110,15 @@ Per platform:
 
 ### Customize Layout
 
-Click the **⛶** icon at the top-right of the editor (or the welcome screen), or the settings gear → **Customize Layout**. The popup mirrors VS Code's title-bar layout controls and stays open while you flip several toggles:
+Click the **⛶** icon at the top-right of the editor (or the welcome screen), or the settings gear → **Customize Layout**, or run **View: Customize Layout…** from the Command Palette. The popup mirrors VS Code's title-bar layout controls and stays open while you flip several toggles. Every row is also a palette command (VS Code's names), so a bar hidden with a click comes back from the keyboard; the palette query "layout" lists them all:
 
 | Group | Options |
 |-------|---------|
-| Visibility | Activity Bar, Primary Side Bar (`Cmd`/`Ctrl`+`B` — but bare `Ctrl`+`B` goes to the app while the terminal pane is focused, so Claude Code's backgrounding works; `Cmd`+`B` always reaches croft), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar, Minimap (`Opt`+`Cmd`/`Ctrl`+`M`) |
+| Visibility | Activity Bar (**View: Toggle Activity Bar Visibility**), Primary Side Bar (`Cmd`/`Ctrl`+`B` — but bare `Ctrl`+`B` goes to the app while the terminal pane is focused, so Claude Code's backgrounding works; `Cmd`+`B` always reaches croft), Secondary Side Bar (`Opt`+`Cmd`/`Ctrl`+`B`), Panel (`Ctrl`+`J`), Status Bar (**View: Toggle Status Bar Visibility**), Minimap (`Opt`+`Cmd`/`Ctrl`+`M`) |
 | Auto-Hide Side Bar | Off by default. On, the primary side bar collapses when focus moves to the editor or a terminal (also on the palette as **View: Toggle Auto-Hide Side Bar**). A reveal you asked for - `Cmd`/`Ctrl`+`B`, the activity bar, this row - is exempt from the next collapse. See [LAYOUT.md](LAYOUT.md#auto-hide-side-bar) for everything that holds it open. |
-| Primary Side Bar Position | Left / Right (moves the activity bar with it) |
-| Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar) |
-| Quick Input Position | Top / Center (where Command Palette / Go to File appears) |
+| Primary Side Bar Position | Left / Right (moves the activity bar with it); **View: Toggle Primary Side Bar Position** swaps it |
+| Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar); **View: Set Panel Alignment…** picks one from the keyboard |
+| Quick Input Position | Top / Center (where Command Palette / Go to File appears); **View: Set Quick Input Position…** picks one from the keyboard |
 | Zen Mode | `Cmd`/`Ctrl`+`K` `Z` |
 
 Every choice except the side-bar / panel visibility persists across launches in `~/.config/croft/config.json`.
@@ -196,6 +196,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Click the Explorer root-folder icons | New File, New Folder, Refresh Explorer, and Collapse Folders, right-aligned on the root folder row and shown only while the Explorer is focused, mirroring VS Code's workspace-folder actions (New File / New Folder also on `Cmd+F` / `Cmd+Shift+N`, and from any pane via the palette's "File: New File…" / "File: New Folder…") |
 | Click the `⋯` button on the EXPLORER title line | Open the "Views and More Actions" menu: toggle which sub-views stack in the Explorer (Open Editors, Folders, Outline, Timeline, and a language-aware Dependencies view that only appears when the workspace root has a recognized manifest), each with a checkmark when shown. Choices persist across launches |
 | Click a row in OPEN EDITORS | Activate that editor's tab (dirty tabs show a dot, the active tab is highlighted) |
+| Click the Save All icon on the OPEN EDITORS header | Save All (as `Ctrl+Alt+S` / `Cmd+Opt+S`), VS Code's Open Editors action; shown while the section is expanded |
 | Click a commit in TIMELINE | Open that commit's diff for the active file in a read-only editor tab |
 | Click a local snapshot in TIMELINE | croft snapshots every save into local history; the TIMELINE lists those snapshots alongside git commits. Click one to diff it against the working file |
 | Command Palette: `Local History: Restore Snapshot` | Write the snapshot shown in the open TIMELINE diff back over the working file |

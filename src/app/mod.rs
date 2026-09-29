@@ -245,6 +245,17 @@ pub(crate) enum PanelAlignment {
     Justify,
 }
 
+impl PanelAlignment {
+    /// Every alignment with its picker id and label, in the Customize
+    /// Layout popup's order (View: Set Panel Alignment…, #852).
+    const OPTIONS: [(PanelAlignment, &'static str, &'static str); 4] = [
+        (PanelAlignment::Left, "left", "Left"),
+        (PanelAlignment::Center, "center", "Center"),
+        (PanelAlignment::Right, "right", "Right"),
+        (PanelAlignment::Justify, "justify", "Justify"),
+    ];
+}
+
 /// Where the quick input (command palette / Go to File) anchors vertically.
 /// VS Code's "Quick Input Position". Persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -253,6 +264,15 @@ pub(crate) enum QuickInputPosition {
     #[default]
     Top,
     Center,
+}
+
+impl QuickInputPosition {
+    /// Both positions with their picker id and label, in the Customize
+    /// Layout popup's order (View: Set Quick Input Position…, #852).
+    const OPTIONS: [(QuickInputPosition, &'static str, &'static str); 2] = [
+        (QuickInputPosition::Top, "top", "Top"),
+        (QuickInputPosition::Center, "center", "Center"),
+    ];
 }
 
 /// One in-flight `textDocument/selectionRange` request (#254): the
@@ -7747,7 +7767,8 @@ impl App {
     /// Count of open editors with unsaved edits, across the active group and any
     /// split groups, deduped by path (a file open in two splits is one unsaved
     /// file; each dirty path-less buffer counts once). Drives the Explorer
-    /// activity badge, mirroring VS Code.
+    /// activity badge, mirroring VS Code, and Save All's "Saved N editors"
+    /// (#852).
     fn unsaved_count(&self) -> usize {
         let mut paths: std::collections::HashSet<&std::path::Path> =
             std::collections::HashSet::new();
@@ -8956,6 +8977,9 @@ impl App {
                 }
                 if rect_contains(t.header_views_btn, col, row) {
                     return Some("Views and More Actions");
+                }
+                if self.open_editors.hit_save_all(col, row) {
+                    return Some("Save All");
                 }
             }
             SidebarView::Remote => {
@@ -12021,6 +12045,107 @@ impl App {
         });
     }
 
+    /// Show or hide the activity bar. The Customize Layout row and the
+    /// palette's View: Toggle Activity Bar Visibility (#852) both land here.
+    fn toggle_activity_bar(&mut self) {
+        self.activity_bar_visible = !self.activity_bar_visible;
+        // The bar is a structural auto-hide suppression, and unlike Zen
+        // it flips here on its own. A pending collapse armed against the
+        // old chrome would otherwise sit armed while `allowed()` declines
+        // for it, then fire on the first idle tick after the bar comes
+        // back, with no focus move of the user's own.
+        //
+        // Cancel the collapse. And when the bar goes AWAY, drop the pin
+        // too — for the reason `toggle_side_bar` already refuses to bank
+        // one in that state: no collapse can fire while the bar is
+        // hidden, so a pin held across that period is unconsumable, and
+        // it silently eats the first real collapse after the bar
+        // returns. Those two sites disagreed about the same question
+        // until this line; the bank-time answer is the right one.
+        //
+        // Revealing the bar leaves any pin alone: a pin banked while the
+        // bar is visible belongs to a reveal that can still be honoured.
+        self.sidebar_dwell.disarm();
+        if !self.activity_bar_visible {
+            self.sidebar_pinned_open = false;
+        }
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Show or hide the status bar: the Customize Layout row and View:
+    /// Toggle Status Bar Visibility (#852).
+    fn toggle_status_bar(&mut self) {
+        self.status_bar_visible = !self.status_bar_visible;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// Dock the primary side bar (and the activity bar with it) to `pos`:
+    /// the Customize Layout radio rows and View: Toggle Primary Side Bar
+    /// Position (#852).
+    fn set_side_bar_position(&mut self, pos: SideBarPosition) {
+        self.side_bar_position = pos;
+        self.persist_layout();
+        self.after_chrome_visibility_change();
+    }
+
+    /// The bottom panel's alignment: the Customize Layout radio rows and
+    /// View: Set Panel Alignment… (#852).
+    fn set_panel_alignment(&mut self, al: PanelAlignment) {
+        self.panel_alignment = al;
+        self.persist_layout();
+    }
+
+    /// Where the quick input anchors: the Customize Layout radio rows and
+    /// View: Set Quick Input Position… (#852).
+    fn set_quick_input_position(&mut self, pos: QuickInputPosition) {
+        self.quick_input_position = pos;
+        self.persist_layout();
+    }
+
+    /// View: Set Panel Alignment… (#852): the popup's Panel Alignment radio
+    /// group as a keyboard picker, opened on the current alignment.
+    fn open_panel_alignment_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = PanelAlignment::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::PanelAlignment, "Panel Alignment", rows);
+        picker.selected = PanelAlignment::OPTIONS
+            .iter()
+            .position(|(al, ..)| *al == self.panel_alignment)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No panel alignments");
+    }
+
+    /// View: Set Quick Input Position… (#852): the popup's Quick Input
+    /// Position radio group as a keyboard picker, opened on the current one.
+    fn open_quick_input_position_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows = QuickInputPosition::OPTIONS
+            .iter()
+            .map(|(_, id, label)| ListRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        let mut picker = ListPicker::new(
+            ListPurpose::QuickInputPosition,
+            "Quick Input Position",
+            rows,
+        );
+        picker.selected = QuickInputPosition::OPTIONS
+            .iter()
+            .position(|(pos, ..)| *pos == self.quick_input_position)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "No quick input positions");
+    }
+
     /// Hide the activity bar's inline images when the bar is collapsed so the
     /// OSC-1337 icons don't ghost over the editor; arm a re-emit when shown.
     fn after_chrome_visibility_change(&mut self) {
@@ -12355,6 +12480,7 @@ impl App {
     /// their hit-test rects are zeroed so a stale click can't reach them.
     fn render_explorer_sections(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.open_editors.last_area = Rect::default();
+        self.open_editors.save_all_btn = Rect::default();
         self.outline.last_area = Rect::default();
         self.timeline.last_area = Rect::default();
         self.dependencies.last_area = Rect::default();
@@ -35058,6 +35184,22 @@ impl App {
                 self.output.select_by_name(&row.id);
                 self.set_bottom_panel_tab(BottomPanelTab::Output);
             }
+            ListPurpose::PanelAlignment => {
+                if let Some((al, ..)) = PanelAlignment::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_panel_alignment(*al);
+                }
+            }
+            ListPurpose::QuickInputPosition => {
+                if let Some((pos, ..)) = QuickInputPosition::OPTIONS
+                    .iter()
+                    .find(|(_, id, _)| *id == row.id)
+                {
+                    self.set_quick_input_position(*pos);
+                }
+            }
             ListPurpose::Settings => {
                 match row.id.as_str() {
                     "toggle:format_on_save" => self.toggle_format_on_save(),
@@ -48099,6 +48241,19 @@ impl App {
                 }
             }
             Cmd::OutputSelectChannel => self.open_output_channel_picker(),
+            // The Customize Layout popup's rows (#852), through the same
+            // setters its clicks use.
+            Cmd::ToggleActivityBar => self.toggle_activity_bar(),
+            Cmd::ToggleStatusBar => self.toggle_status_bar(),
+            Cmd::ToggleSideBarPosition => {
+                self.set_side_bar_position(match self.side_bar_position {
+                    SideBarPosition::Left => SideBarPosition::Right,
+                    SideBarPosition::Right => SideBarPosition::Left,
+                })
+            }
+            Cmd::SetPanelAlignment => self.open_panel_alignment_picker(),
+            Cmd::SetQuickInputPosition => self.open_quick_input_position_picker(),
+            Cmd::CustomizeLayout => self.open_customize_layout_menu(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
@@ -51951,6 +52106,10 @@ impl App {
                     if rect_contains(self.open_editors.last_scrollbar, m.column, m.row) {
                         self.open_editors.scroll_to_bar_y(m.row);
                         self.open_editors_scrollbar_drag = true;
+                    } else if self.open_editors.hit_save_all(m.column, m.row) {
+                        // VS Code's Save All on the section header (#852),
+                        // checked first: the header row holds the button.
+                        self.save_all();
                     } else if self.open_editors.hit_header(m.column, m.row) {
                         self.open_editors.toggle_collapse();
                     } else if let Some(idx) = self.open_editors.row_at(m.row)
@@ -54092,7 +54251,7 @@ impl App {
     /// be written blind (a disk conflict, a lossy encoding, an unresolved
     /// merge, a hex or sheet edit) to its own `Cmd+S`.
     fn save_all(&mut self) {
-        let before = self.dirty_tab_count();
+        let before = self.unsaved_count();
         if before == 0 {
             self.status = String::from("Save All: nothing to save");
             return;
@@ -54105,7 +54264,7 @@ impl App {
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
         let pending = usize::from(self.save_after_format.is_some());
-        let left = self.dirty_tab_count().saturating_sub(pending);
+        let left = self.unsaved_count().saturating_sub(pending);
         self.status = if left == 0 {
             format!(
                 "Saved {before} editor{}",
@@ -54122,22 +54281,6 @@ impl App {
                 if left == 1 { "it" } else { "each" }
             )
         };
-    }
-
-    /// Tabs with unsaved edits, across the active group and every inactive
-    /// split leaf.
-    fn dirty_tab_count(&self) -> usize {
-        self.editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
-                    .flat_map(|tabs| tabs.editors.iter()),
-            )
-            .filter(|e| e.dirty)
-            .count()
     }
 
     fn toggle_auto_save(&mut self) {
@@ -57174,29 +57317,7 @@ impl App {
             MenuAction::ToggleExplorerView(view) => self.toggle_explorer_view(view),
             MenuAction::OpenCustomizeLayout => self.open_customize_layout_menu(),
             MenuAction::ToggleActivityBar => {
-                self.activity_bar_visible = !self.activity_bar_visible;
-                // The bar is a structural auto-hide suppression, and unlike Zen
-                // it flips here on its own. A pending collapse armed against the
-                // old chrome would otherwise sit armed while `allowed()` declines
-                // for it, then fire on the first idle tick after the bar comes
-                // back, with no focus move of the user's own.
-                //
-                // Cancel the collapse. And when the bar goes AWAY, drop the pin
-                // too — for the reason `toggle_side_bar` already refuses to bank
-                // one in that state: no collapse can fire while the bar is
-                // hidden, so a pin held across that period is unconsumable, and
-                // it silently eats the first real collapse after the bar
-                // returns. Those two sites disagreed about the same question
-                // until this line; the bank-time answer is the right one.
-                //
-                // Revealing the bar leaves any pin alone: a pin banked while the
-                // bar is visible belongs to a reveal that can still be honoured.
-                self.sidebar_dwell.disarm();
-                if !self.activity_bar_visible {
-                    self.sidebar_pinned_open = false;
-                }
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_activity_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleActivityBar);
             }
             MenuAction::ToggleSideBar => {
@@ -57217,25 +57338,19 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::TogglePanel);
             }
             MenuAction::ToggleStatusBar => {
-                self.status_bar_visible = !self.status_bar_visible;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.toggle_status_bar();
                 self.open_customize_layout_menu_on(&MenuAction::ToggleStatusBar);
             }
             MenuAction::SetSideBarPosition(pos) => {
-                self.side_bar_position = pos;
-                self.persist_layout();
-                self.after_chrome_visibility_change();
+                self.set_side_bar_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetSideBarPosition(pos));
             }
             MenuAction::SetPanelAlignment(al) => {
-                self.panel_alignment = al;
-                self.persist_layout();
+                self.set_panel_alignment(al);
                 self.open_customize_layout_menu_on(&MenuAction::SetPanelAlignment(al));
             }
             MenuAction::SetQuickInputPosition(pos) => {
-                self.quick_input_position = pos;
-                self.persist_layout();
+                self.set_quick_input_position(pos);
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),

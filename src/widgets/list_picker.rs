@@ -103,6 +103,11 @@ pub enum ListPurpose {
     /// Where to add a CodeQL database from (#578): `id` is an index into
     /// the App's database sources.
     CodeqlDbSource,
+    /// View: Set Panel Alignment… (#852): `id` is `left`, `center`,
+    /// `right` or `justify`.
+    PanelAlignment,
+    /// View: Set Quick Input Position… (#852): `id` is `top` or `center`.
+    QuickInputPosition,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
