@@ -66193,3 +66193,569 @@ fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles
     );
     assert!(app.editor.dirty);
 }
+
+// #852 (comment 3): the editor-tab actions (the tab menu's Close Others,
+// Close to the Right, Close Saved, Close All, Pin / Unpin and Keep Open) are
+// palette commands under VS Code's names, so they can be searched, bound in
+// keybindings.json, and run on Linux without Super.
+
+/// An app with `names` open as kept (non-preview) tabs in one group, the
+/// last one active and focused. Auto-save is off so an edited tab stays
+/// dirty.
+fn tabs_app_852(names: &[&str]) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    for name in names {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+/// A group's tabs by file name, in strip order.
+fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
+    tabs.editors
+        .iter()
+        .map(|e| {
+            e.path
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Runs `query` from the palette as a user does: `Cmd+Shift+P`, type it,
+/// Enter. Returns the title of the row Enter ran, `None` when none matched.
+fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let ran = app
+        .command_palette
+        .as_ref()
+        .and_then(|p| p.selected_item())
+        .map(|item| item.title().to_string());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    ran
+}
+
+/// The palette's rows for `query`, then Esc.
+fn palette_rows_852(app: &mut App, query: &str) -> Vec<String> {
+    open_palette_852(app);
+    type_keys_852(app, query);
+    let rows = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.results.iter().map(|i| i.title().to_string()).collect())
+        .unwrap_or_default();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    rows
+}
+
+/// Makes the active tab dirty the way a user does, by typing into it.
+fn type_into_active_tab_852(app: &mut App) {
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.dirty,
+        "fixture: the active tab has unsaved edits"
+    );
+}
+
+/// #852 (comment 3): View: Close Other Editors in Group, typed into the
+/// palette, closes every other tab and keeps the active one, as the tab
+/// menu's Close Others does. Before, the palette had no such command.
+#[test]
+fn palette_close_other_editors_keeps_only_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.status, "Closed 3 other tabs");
+}
+
+/// #852 (comment 3): View: Close Editors to the Right in Group closes the
+/// tabs right of the active one and keeps it active.
+#[test]
+fn palette_close_editors_to_the_right_closes_only_the_tabs_right_of_the_active_one() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.editor.select(1);
+    let ran = run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["a.rs", "b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert_eq!(app.editor.active_index(), 1, "b.rs stays active");
+    assert_eq!(app.status, "Closed 2 tabs to the right");
+}
+
+/// #852 (comment 3): View: Close Saved Editors in Group closes the saved
+/// tabs and keeps the one with unsaved edits, unwritten.
+#[test]
+fn palette_close_saved_editors_closes_the_saved_tabs_and_keeps_the_dirty_one() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.editor.select(1);
+    type_into_active_tab_852(&mut app);
+    let ran = run_in_palette_852(&mut app, "View: Close Saved Editors in Group");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs"],
+        "the palette ran {ran:?}"
+    );
+    assert!(app.editor.dirty, "the unsaved edit is kept");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("b.rs")).unwrap(),
+        "x\n",
+        "and not written"
+    );
+    assert_eq!(app.status, "Closed 2 saved tabs");
+}
+
+/// #852 (comment 3): View: Close All Editors closes every tab.
+#[test]
+fn palette_close_all_editors_closes_every_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Close All Editors");
+    assert!(
+        app.editor.is_blank_initial(),
+        "the palette ran {ran:?}; tabs left: {:?}",
+        tab_names_852(&app.editor)
+    );
+    assert_eq!(app.status, "Closed 3 tabs");
+}
+
+/// #852 (comment 3): View: Pin Editor pins the active tab (it moves to the
+/// pinned block on the left) and View: Unpin Editor unpins it.
+#[test]
+fn palette_pin_editor_and_unpin_editor_pin_and_unpin_the_active_tab() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    let ran = run_in_palette_852(&mut app, "View: Pin Editor");
+    assert!(app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "a.rs", "b.rs"],
+        "a pinned tab moves leftmost"
+    );
+    assert_eq!(app.status, "Pinned tab");
+    let ran = run_in_palette_852(&mut app, "View: Unpin Editor");
+    assert!(!app.editor.pinned, "the palette ran {ran:?}");
+    assert_eq!(
+        app.editor.path.as_deref().and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("c.rs"))
+    );
+    assert_eq!(app.status, "Unpinned tab");
+}
+
+/// #852 (comment 3): as in VS Code, the palette offers Pin Editor on an
+/// unpinned tab and Unpin Editor on a pinned one, never the one that would
+/// do nothing.
+#[test]
+fn the_palette_offers_pin_editor_or_unpin_editor_by_the_active_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Pin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Unpin Editor"),
+        "an unpinned tab has nothing to unpin: {rows:?}"
+    );
+    let idx = app.editor.active_index();
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(idx), tmp.path().to_path_buf());
+    assert!(app.editor.pinned, "fixture: the tab menu pinned it");
+    let rows = palette_rows_852(&mut app, "pin editor");
+    assert!(rows.iter().any(|t| t == "View: Unpin Editor"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|t| t == "View: Pin Editor"),
+        "a pinned tab is already pinned: {rows:?}"
+    );
+}
+
+/// #852 (comment 3): View: Keep Editor keeps the preview tab open, as the
+/// tab menu's Keep Open does.
+#[test]
+fn palette_keep_editor_keeps_the_preview_tab_open() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    assert!(app.editor.preview, "fixture: p.rs is the preview tab");
+    let ran = run_in_palette_852(&mut app, "View: Keep Editor");
+    assert!(!app.editor.preview, "the palette ran {ran:?}");
+    assert_eq!(app.status, "Kept tab open");
+}
+
+/// #852 (comment 3, its GIF): the tab menu's words work in the palette too.
+/// "keep open" found no command at all; it now runs View: Keep Editor.
+#[test]
+fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs"]);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    let ran = run_in_palette_852(&mut app, "keep open");
+    assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
+    assert!(!app.editor.preview, "the preview tab is kept");
+}
+
+/// #852 (comment 3): the tab commands bind from keybindings.json like any
+/// palette command, which gives Close Others (no chord of its own) and Pin
+/// a key on Linux without Super.
+#[test]
+fn keybindings_json_chords_run_pin_editor_and_close_other_editors() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+o", "command": "close_other_editors" }
+        ]"#,
+    );
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.editor.pinned, "ctrl+alt+p pins the active c.rs");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    app.editor.select(2);
+    app.handle_key(key(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["c.rs", "b.rs"],
+        "ctrl+alt+o closes the others, the pinned tab surviving as in the tab menu"
+    );
+}
+
+/// #852 (comment 3): the Keyboard Shortcuts editor lists each tab command
+/// with the chord croft has for it, like every other palette command.
+#[test]
+fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_keyboard_shortcuts();
+    let picker = app.list_picker.as_ref().expect("the editor opens");
+    for (id, title, chord) in [
+        (
+            "close_other_editors",
+            "View: Close Other Editors in Group",
+            "\u{2014}",
+        ),
+        (
+            "close_editors_to_the_right",
+            "View: Close Editors to the Right in Group",
+            "Cmd+K →",
+        ),
+        (
+            "close_saved_editors",
+            "View: Close Saved Editors in Group",
+            "Cmd+K U",
+        ),
+        ("close_all_editors", "View: Close All Editors", "Cmd+K W"),
+        ("pin_editor", "View: Pin Editor", "Cmd+K P"),
+        ("unpin_editor", "View: Unpin Editor", "Cmd+K P"),
+        ("keep_editor", "View: Keep Editor", "Cmd+K Shift+P"),
+    ] {
+        let row = picker
+            .rows
+            .iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap_or_else(|| panic!("no Keyboard Shortcuts row for {id}"));
+        assert_eq!(row.label, format!("{title}  \u{00b7}  {chord}"));
+    }
+}
+
+/// A split whose right (active) group is `[b.rs (pinned), c.rs, p.rs
+/// (preview), d.rs (unsaved), e.rs]` with `active` selected, beside a left
+/// group `[a.rs, b.rs]`.
+fn split_tabs_app_852(active: &str) -> (App, tempfile::TempDir) {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs"]);
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "fixture: two groups");
+    for name in ["c.rs", "d.rs", "e.rs"] {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.editor.toggle_pin(0);
+    app.editor.select(1);
+    let p = tmp.path().join("p.rs");
+    std::fs::write(&p, "x\n").unwrap();
+    app.editor.open_preview(&p).unwrap();
+    app.editor.select(3);
+    type_into_active_tab_852(&mut app);
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["b.rs", "c.rs", "p.rs", "d.rs", "e.rs"],
+        "fixture"
+    );
+    let idx = tab_names_852(&app.editor)
+        .iter()
+        .position(|n| n == active)
+        .unwrap();
+    app.editor.select(idx);
+    app.status.clear();
+    (app, tmp)
+}
+
+/// Every group's tabs as (name, pinned, preview, dirty), the active group
+/// first, then the active index, whether the layout is split, the status
+/// line and the reopen stack (by file name: each fixture has its own
+/// directory).
+type TabsSnapshot852 = (
+    Vec<Vec<(String, bool, bool, bool)>>,
+    usize,
+    bool,
+    String,
+    Vec<String>,
+);
+
+fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
+    let group = |tabs: &crate::widgets::editor::EditorTabs| {
+        tab_names_852(tabs)
+            .into_iter()
+            .zip(&tabs.editors)
+            .map(|(n, e)| (n, e.pinned, e.preview, e.dirty))
+            .collect::<Vec<_>>()
+    };
+    let mut groups = vec![group(&app.editor)];
+    groups.extend(app.editor_layout.inactive_groups().into_iter().map(group));
+    (
+        groups,
+        app.editor.active_index(),
+        app.editor_layout.is_split(),
+        app.status.clone(),
+        app.closed_tabs
+            .iter()
+            .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// #852 (comment 3) guard: each close / pin / keep row of the tab menu
+/// names the palette command that does its job on the active tab, and the
+/// command leaves every group's tabs, the status line and the reopen stack
+/// exactly as a click on the row does, whether the tab is plain, pinned or
+/// a preview, beside an unsaved tab and another split group.
+#[test]
+fn every_tab_menu_close_pin_and_keep_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::Command;
+    fn command_id(label: &str, action: &MenuAction) -> Option<&'static str> {
+        match action {
+            MenuAction::CloseOtherTabs(_) => Some("close_other_editors"),
+            MenuAction::CloseTabsToRight(_) => Some("close_editors_to_the_right"),
+            MenuAction::CloseSavedTabs => Some("close_saved_editors"),
+            MenuAction::CloseAllTabs => Some("close_all_editors"),
+            MenuAction::KeepTabOpen(_) => Some("keep_editor"),
+            MenuAction::ToggleTabPin(_) if label == "Pin" => Some("pin_editor"),
+            MenuAction::ToggleTabPin(_) => Some("unpin_editor"),
+            _ => None,
+        }
+    }
+    let mut covered: Vec<&str> = Vec::new();
+    for active in ["c.rs", "b.rs", "p.rs"] {
+        let (app, _tmp) = split_tabs_app_852(active);
+        let idx = app.editor.active_index();
+        let path = app.editor.tab_path(idx);
+        let items = build_tab_context_menu_items(
+            idx,
+            app.editor.tab_count(),
+            app.editor_layout.is_split(),
+            path.as_deref(),
+            false,
+            app.editor.is_preview(idx),
+            app.editor.is_pinned(idx),
+        );
+        for (label, action) in items.into_iter().filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        }) {
+            let Some(id) = command_id(&label, &action) else {
+                continue;
+            };
+            let cmd = Command::from_id(id).unwrap_or_else(|| {
+                panic!("the tab menu's {label:?} (on {active}) has no palette command {id:?}")
+            });
+            let (mut by_click, tmp_click) = split_tabs_app_852(active);
+            let (mut by_palette, _tmp_palette) = split_tabs_app_852(active);
+            by_click.dispatch_menu_action(action.clone(), tmp_click.path().to_path_buf());
+            by_palette.run_command(cmd);
+            assert_eq!(
+                tabs_snapshot_852(&by_palette),
+                tabs_snapshot_852(&by_click),
+                "{cmd:?} on {active} must do what the tab menu's {label:?} does"
+            );
+            covered.push(id);
+        }
+    }
+    for id in [
+        "close_other_editors",
+        "close_editors_to_the_right",
+        "close_saved_editors",
+        "close_all_editors",
+        "pin_editor",
+        "unpin_editor",
+        "keep_editor",
+    ] {
+        assert!(
+            covered.contains(&id),
+            "{id} was never compared: {covered:?}"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: Close Other Editors in Group keeps the active
+/// tab and every pinned tab, as the tab menu's Close Others does, and the
+/// tabs it closes go on the reopen stack.
+#[test]
+fn palette_close_other_editors_keeps_the_active_and_the_pinned_tabs() {
+    let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(0), tmp.path().to_path_buf());
+    app.editor.select(2);
+    run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "c.rs"]);
+    assert!(app.editor.editors[0].pinned, "the pinned a.rs survives");
+    assert_eq!(app.editor.active_index(), 1, "c.rs stays active");
+    let reopen: Vec<String> = app
+        .closed_tabs
+        .iter()
+        .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(reopen, ["b.rs", "d.rs"]);
+    assert_eq!(app.status, "Closed 2 other tabs");
+}
+
+/// #852 (comment 3) negative: Close Editors to the Right on the last tab
+/// closes nothing and says so, rather than touching the tabs to its left.
+#[test]
+fn palette_close_editors_to_the_right_on_the_last_tab_closes_nothing() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.editor.active_index(), 2);
+    assert!(app.closed_tabs.is_empty(), "nothing to reopen");
+    assert_eq!(app.status, "No tabs to the right to close");
+}
+
+/// #852 (comment 3) negative: the group-scoped tab commands act on the
+/// focused split only. The other split's tabs, including its copy of a file
+/// the command closes here, stay exactly as they were.
+#[test]
+fn palette_tab_commands_leave_the_other_split_alone() {
+    for (title, active) in [
+        ("View: Close Other Editors in Group", "c.rs"),
+        ("View: Close Editors to the Right in Group", "c.rs"),
+        ("View: Close Saved Editors in Group", "c.rs"),
+        ("View: Pin Editor", "c.rs"),
+        ("View: Unpin Editor", "b.rs"),
+        ("View: Keep Editor", "p.rs"),
+    ] {
+        let (mut app, _tmp) = split_tabs_app_852(active);
+        let before = tabs_snapshot_852(&app);
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        let after = tabs_snapshot_852(&app);
+        assert!(after.2, "{title}: still split");
+        assert_ne!(after.0[0], before.0[0], "{title} changed the focused group");
+        assert_eq!(
+            after.0[1..],
+            before.0[1..],
+            "{title} must leave the other split alone"
+        );
+    }
+}
+
+/// #852 (comment 3) negative: with no file open, Pin, Unpin and Keep only
+/// say so. The welcome screen's placeholder is not pinned (Cmd+K P used to
+/// pin it) and Close Others / Close to the Right have nothing to close.
+#[test]
+fn tab_commands_with_no_editor_open_only_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{ "key": "ctrl+alt+u", "command": "unpin_editor" }]"#);
+    assert!(app.editor.is_blank_initial(), "fixture: the welcome screen");
+    for (title, status) in [
+        ("View: Pin Editor", "No editor is open"),
+        ("View: Keep Editor", "No editor is open"),
+        (
+            "View: Close Other Editors in Group",
+            "No other tabs to close",
+        ),
+        (
+            "View: Close Editors to the Right in Group",
+            "No tabs to the right to close",
+        ),
+    ] {
+        let ran = run_in_palette_852(&mut app, title);
+        assert_eq!(ran.as_deref(), Some(title));
+        assert_eq!(app.status, status, "{title}");
+        assert!(app.editor.is_blank_initial(), "{title}");
+        assert!(!app.editor.pinned, "{title}");
+    }
+    app.handle_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.status, "No editor is open", "a key bound to Unpin");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.pinned, "Cmd+K P pins no placeholder");
+    assert_eq!(app.status, "No editor is open");
+}
+
+/// #852 (comment 3) negative: Pin Editor and Unpin Editor are not toggles.
+/// Bound to their own keys, each leaves a tab already in its state alone,
+/// as VS Code's `when` clauses do; Keep Editor on a kept tab changes nothing.
+#[test]
+fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+            { "key": "ctrl+alt+p", "command": "pin_editor" },
+            { "key": "ctrl+alt+u", "command": "unpin_editor" },
+            { "key": "ctrl+alt+k", "command": "keep_editor" }
+        ]"#,
+    );
+    let press = |app: &mut App, c: char| {
+        app.handle_key(key(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .unwrap();
+    };
+    press(&mut app, 'u');
+    assert!(!app.editor.pinned, "Unpin does not pin");
+    assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(app.status, "Tab is not pinned");
+    press(&mut app, 'p');
+    assert!(app.editor.pinned);
+    press(&mut app, 'p');
+    assert!(app.editor.pinned, "a second Pin does not unpin");
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already pinned");
+    press(&mut app, 'k');
+    assert!(
+        !app.editor.preview && app.editor.pinned,
+        "Keep changes nothing"
+    );
+    assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
+    assert_eq!(app.status, "Tab is already kept open");
+}

@@ -2361,6 +2361,63 @@ mod tests {
         assert!(!palette.results.contains(&builtin(Command::ToggleZenMode)));
     }
 
+    /// #852 (comment 3): each editor-tab action is in the palette under
+    /// VS Code's title, as the top row for that title, showing the chord
+    /// croft has for it (Close Others has none: the tab menu's ⌥⌘T is not a
+    /// chord croft binds).
+    #[test]
+    fn the_editor_tab_commands_are_found_under_their_vscode_titles() {
+        let mut palette = CommandPalette::new();
+        for (title, chord) in [
+            ("View: Close Other Editors in Group", ""),
+            ("View: Close Editors to the Right in Group", "Cmd+K →"),
+            ("View: Close Saved Editors in Group", "Cmd+K U"),
+            ("View: Close All Editors", "Cmd+K W"),
+            ("View: Pin Editor", "Cmd+K P"),
+            ("View: Unpin Editor", "Cmd+K P"),
+            ("View: Keep Editor", "Cmd+K Shift+P"),
+        ] {
+            palette.set_query(title);
+            let top = palette.results.first();
+            assert_eq!(
+                top.map(PaletteItem::title),
+                Some(title),
+                "the palette's top row for {title:?}"
+            );
+            assert_eq!(
+                top.map(PaletteItem::keybinding_hint),
+                Some(chord),
+                "{title:?}"
+            );
+        }
+    }
+
+    /// #852 (comment 3): the tab menu's own labels find the same commands,
+    /// so a query in the menu's words ("keep open") is not a dead end.
+    #[test]
+    fn the_tab_menu_labels_find_the_editor_tab_commands() {
+        let mut palette = CommandPalette::new();
+        for (label, title) in [
+            ("close others", "View: Close Other Editors in Group"),
+            (
+                "close to the right",
+                "View: Close Editors to the Right in Group",
+            ),
+            ("close saved", "View: Close Saved Editors in Group"),
+            ("close all", "View: Close All Editors"),
+            ("pin", "View: Pin Editor"),
+            ("unpin", "View: Unpin Editor"),
+            ("keep open", "View: Keep Editor"),
+        ] {
+            palette.set_query(label);
+            let titles: Vec<&str> = palette.results.iter().map(PaletteItem::title).collect();
+            assert!(
+                titles.contains(&title),
+                "{label:?} must find {title:?}; it found {titles:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_command_has_a_nonempty_title() {
         for cmd in ALL_COMMANDS {
