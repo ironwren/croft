@@ -59,6 +59,10 @@ pub struct SearchHit {
     pub line_no: usize,
     /// The matched line, with surrounding whitespace trimmed and length capped.
     pub line_text: String,
+    /// How many times the query matches on this line, counted as Replace All
+    /// replaces them. The header counts these, as VS Code does, not lines
+    /// (#860).
+    pub matches: usize,
 }
 
 /// Mode toggles that drive `search_workspace`. Mirror VS Code's three
@@ -174,6 +178,8 @@ struct HitSink<'a> {
     path: PathBuf,
     batch: &'a mut Vec<SearchHit>,
     cancel: Option<Arc<AtomicBool>>,
+    /// The search's own matcher, to count each line's occurrences.
+    matcher: &'a RegexMatcher,
 }
 
 impl<'a> Sink for HitSink<'a> {
@@ -202,6 +208,9 @@ impl<'a> Sink for HitSink<'a> {
             path: self.path.clone(),
             line_no,
             line_text: cut,
+            // A listed line is at least one result, even one whose bytes
+            // are not UTF-8 and so cannot be counted.
+            matches: count_in_line(stripped, self.matcher).max(1),
         });
         Ok(true)
     }
@@ -310,6 +319,7 @@ pub fn search_workspace_streaming_filtered<F>(
                     path: path.to_path_buf(),
                     batch: &mut batch,
                     cancel: Some(cancel.clone()),
+                    matcher: &matcher,
                 };
                 let mut searcher = build_searcher();
                 let _ = searcher.search_path(&matcher, path, &mut sink);
@@ -692,6 +702,7 @@ pub fn collect_matches_in_text(
         path: path.to_path_buf(),
         batch: out,
         cancel: None,
+        matcher: &matcher,
     };
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
@@ -797,6 +808,13 @@ fn replace_in_line(
     }
     out.push_str(&line[last..]);
     (out, count)
+}
+
+/// How many matches ONE line holds, by exactly the rule `replace_in_line`
+/// replaces them with, so the Search header's result count and the Replace
+/// All confirmation always agree (#860).
+fn count_in_line(line: &str, matcher: &RegexMatcher) -> usize {
+    replace_in_line(line, matcher, None, "", SearchOpts::default()).1
 }
 
 /// `replacement` with each numbered capture reference braced (`$1_old` to
@@ -1366,6 +1384,13 @@ impl SearchPanel {
         }
     }
 
+    /// Expand the Replace row if it is collapsed and focus it: VS Code's
+    /// Replace in Files (#860). Unlike the chevron, it never collapses.
+    pub fn open_replace(&mut self) {
+        self.replace_open = true;
+        self.focus_field(SearchField::Replace);
+    }
+
     /// Toggle the include/exclude detail rows. Collapsing while one holds
     /// focus returns focus to the Query field.
     pub fn toggle_details(&mut self) {
@@ -1424,17 +1449,18 @@ impl SearchPanel {
                 "Toggle Replace"
             });
         }
+        // The keyboard route rides the label, as in VS Code (#860).
         if self.ellipsis_at(col, row) {
-            return Some("Toggle Search Details");
+            return Some("Toggle Search Details (Alt+D)");
         }
         if self.replace_all_at(col, row) {
             return Some("Replace All");
         }
         if let Some(toggle) = self.toggle_at(col, row) {
             return Some(match toggle {
-                SearchToggle::CaseSensitive => "Match Case",
-                SearchToggle::WholeWord => "Match Whole Word",
-                SearchToggle::UseRegex => "Use Regular Expression",
+                SearchToggle::CaseSensitive => "Match Case (Alt+C)",
+                SearchToggle::WholeWord => "Match Whole Word (Alt+W)",
+                SearchToggle::UseRegex => "Use Regular Expression (Alt+R)",
             });
         }
         None
@@ -1664,6 +1690,27 @@ impl SearchPanel {
         self.hits.get(self.selected)
     }
 
+    /// Flip one of the three mode toggles (`Aa` / `ab` / `.*`), from a click
+    /// or `Alt+C` / `Alt+W` / `Alt+R` (#860). Returns the new state.
+    pub fn toggle_opt(&mut self, toggle: SearchToggle) -> bool {
+        let flag = match toggle {
+            SearchToggle::CaseSensitive => &mut self.opts.case_sensitive,
+            SearchToggle::WholeWord => &mut self.opts.whole_word,
+            SearchToggle::UseRegex => &mut self.opts.use_regex,
+        };
+        *flag = !*flag;
+        *flag
+    }
+
+    /// `(results, files)` for the header: every occurrence counts, two on
+    /// one line being two results, as in VS Code and the Replace All
+    /// confirmation (#860).
+    pub fn result_counts(&self) -> (usize, usize) {
+        let results = self.hits.iter().map(|h| h.matches).sum();
+        let files = self.hits.iter().map(|h| &h.path).collect::<HashSet<_>>();
+        (results, files.len())
+    }
+
     /// Map a click row to a hit index, if any. Hits sit below the input
     /// cluster; the exact first row depends on which optional rows (Replace,
     /// include/exclude) are expanded, captured in `results_start_offset`.
@@ -1683,7 +1730,8 @@ impl SearchPanel {
     }
 }
 
-/// Identifies which of the three search-mode toggles a click landed on.
+/// Identifies which of the three search-mode toggles a click landed on, or
+/// an `Alt` key named (#860).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchToggle {
     CaseSensitive,
@@ -2191,8 +2239,12 @@ impl Widget for &mut SearchPanel {
         // Record where results begin so scrolling / click mapping stay aligned.
         self.results_start_offset = results_start_y.saturating_sub(inner.y);
         if caption_y < inner.y + inner.height && !self.query.trim().is_empty() {
-            let count = self.hits.len();
-            let header = format!("{count} match{}", if count == 1 { "" } else { "es" });
+            let (results, files) = self.result_counts();
+            let header = format!(
+                "{results} result{} in {files} file{}",
+                if results == 1 { "" } else { "s" },
+                if files == 1 { "" } else { "s" }
+            );
             let caption = Line::from(Span::styled(
                 header,
                 Style::default()
@@ -3343,14 +3395,17 @@ mod tests {
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let y = panel.toggle_y;
-        assert_eq!(panel.tooltip_at(panel.toggle_case_x, y), Some("Match Case"));
+        assert_eq!(
+            panel.tooltip_at(panel.toggle_case_x, y),
+            Some("Match Case (Alt+C)")
+        );
         assert_eq!(
             panel.tooltip_at(panel.toggle_word_x, y),
-            Some("Match Whole Word")
+            Some("Match Whole Word (Alt+W)")
         );
         assert_eq!(
             panel.tooltip_at(panel.toggle_regex_x, y),
-            Some("Use Regular Expression")
+            Some("Use Regular Expression (Alt+R)")
         );
         assert_eq!(
             panel.tooltip_at(panel.refresh_x, panel.refresh_y),
@@ -3393,6 +3448,7 @@ mod tests {
                 path: tmp.path().join("a.txt"),
                 line_no: i + 1,
                 line_text: format!("line {i}"),
+                matches: 1,
             })
             .collect();
         panel
@@ -3472,6 +3528,7 @@ mod tests {
                 path: tmp.path().join("a.txt"),
                 line_no: i + 1,
                 line_text: format!("line {i}"),
+                matches: 1,
             })
             .collect();
         panel.hits.extend(extra);
@@ -4224,5 +4281,47 @@ mod tests {
         };
         assert!(line_may_match("ERROR here", "error", ci), "case folds");
         assert!(!line_may_match("ERROR here", "warning", ci));
+    }
+
+    /// #860: two matches on one line are two results. The header counted hit
+    /// LINES ("3 matches") while the Replace All confirmation counted
+    /// occurrences ("Replace 4 occurrence(s) across 2 file(s)").
+    #[test]
+    fn the_header_counts_occurrences_as_replace_all_does() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.txt"), "foo foo\nfoo\n");
+        write(&tmp.path().join("b.txt"), "foo\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.query = "foo".into();
+        panel.run_query();
+        assert_eq!(panel.hits.len(), 3, "one hit per matching line");
+        assert_eq!(panel.result_counts(), (4, 2));
+        assert_eq!(panel.count_replacements(&HashSet::new()), (4, 2));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("4 results in 2 files"), "{text}");
+        // An unsaved buffer is searched in memory and counts the same way,
+        // whole word included (`foobar` is not a match, as in Replace All).
+        let mut out = Vec::new();
+        let whole_word = SearchOpts {
+            whole_word: true,
+            ..SearchOpts::default()
+        };
+        collect_matches_in_text(
+            Path::new("c.txt"),
+            "foo foobar foo",
+            "foo",
+            whole_word,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].matches, 2);
     }
 }
