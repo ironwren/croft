@@ -65525,3 +65525,157 @@ fn save_all_writes_every_dirty_tab() {
         KeyModifiers::CONTROL
     )));
 }
+
+/// #852 regression, driven by keys alone: from the editor with the panel
+/// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
+/// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel
+/// shown and focused.
+#[test]
+fn panel_tab_chords_reach_problems_output_and_terminal_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.show_terminal = false;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Problems,
+        "Ctrl+Shift+M must show PROBLEMS"
+    );
+    assert!(app.show_terminal, "Ctrl+Shift+M must reveal the panel");
+    assert!(app.focus == Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Output,
+        "Ctrl+Shift+U must show OUTPUT"
+    );
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring TERMINAL forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
+/// tab to disk, the inactive one included, not only the active tab.
+#[test]
+fn ctrl_alt_s_writes_the_inactive_dirty_tab_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "the inactive tab a.txt must reach disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+}
+
+/// #852 negative: Save All writes only what auto save may write blind. An
+/// inactive tab whose file changed on disk keeps the external text, stays
+/// dirty and is reported, while the other dirty tab still saves.
+#[test]
+fn save_all_never_overwrites_an_external_change_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    std::fs::write(&a, "external change wins\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "external change wins\n",
+        "Save All must not write over a file changed on disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.dirty_tab_count(), 1, "the conflicted tab stays dirty");
+    assert!(
+        app.status.contains("1 editor still unsaved"),
+        "the leftover tab is reported, not a clean \"Saved\": {:?}",
+        app.status
+    );
+}
+
+/// #852 negative: plain `Ctrl+S` is still File: Save, not Save All; the
+/// inactive dirty tab stays unsaved on disk.
+#[test]
+fn plain_ctrl_s_still_saves_only_the_active_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
+    assert_eq!(app.dirty_tab_count(), 1);
+}
+
+/// #852 boundary: with no file open, File: New File… from the editor has
+/// no "beside the active file" and falls back to the Explorer's target.
+#[test]
+fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.focus_pane(Pane::Editor);
+    let explorer_dir = app.explorer_create_target_dir();
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
+}
