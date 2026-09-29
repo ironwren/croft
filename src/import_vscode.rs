@@ -210,6 +210,19 @@ const COMMANDS: &[(&str, &str)] = &[
         "workbench.action.reopenClosedEditor",
         "reopen_closed_editor",
     ),
+    ("workbench.action.closeOtherEditors", "close_other_editors"),
+    (
+        "workbench.action.closeEditorsToTheRight",
+        "close_editors_to_the_right",
+    ),
+    (
+        "workbench.action.closeUnmodifiedEditors",
+        "close_saved_editors",
+    ),
+    ("workbench.action.closeAllEditors", "close_all_editors"),
+    ("workbench.action.pinEditor", "pin_editor"),
+    ("workbench.action.unpinEditor", "unpin_editor"),
+    ("workbench.action.keepEditor", "keep_editor"),
     ("workbench.action.splitEditor", "split_editor"),
     (
         "workbench.action.toggleSidebarVisibility",

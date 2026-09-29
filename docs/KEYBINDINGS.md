@@ -65,11 +65,11 @@ Per platform:
 | (box focused) type / `Backspace` / `←` `→` | Edit the box's reply draft (the buffer is untouched) |
 | (box focused) `Enter` | Send the reply to the navigator (a comment-only turn) |
 | (box focused) `Esc` | Leave the box; the keyboard returns to the buffer |
-| `Cmd+K` `→` | Close the editor tabs to the right of the active one |
+| `Cmd+K` `→` | Close the editor tabs to the right of the active one (also the palette's "View: Close Editors to the Right in Group") |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
-| `Cmd+K` `W` | Close all editor tabs |
-| `Cmd+K` `U` | Close all saved (non-dirty) editor tabs, keeping unsaved ones |
+| `Cmd+K` `W` | Close all editor tabs, in every split (also the palette's "View: Close All Editors") |
+| `Cmd+K` `U` | Close all saved (non-dirty) editor tabs of the focused group, keeping unsaved ones (also the palette's "View: Close Saved Editors in Group") |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
@@ -78,8 +78,8 @@ Per platform:
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv, a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test. When the last run of that test FAILED and named a place in your own code, croft sets a temporary breakpoint at the assertion first, so the session stops where it broke without you finding the line; that breakpoint is removed when the session ends, and a breakpoint you set yourself on the same line is left alone |
-| `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests) |
-| `Cmd+K` `Shift+P` | Keep the active preview tab open (promote the italic preview to a real tab; moved off `Cmd+K` `Enter`, which now runs tests) |
+| `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests; also the palette's "View: Pin Editor" / "View: Unpin Editor") |
+| `Cmd+K` `Shift+P` | Keep the active preview tab open (promote the italic preview to a real tab; moved off `Cmd+K` `Enter`, which now runs tests; also the palette's "View: Keep Editor") |
 | `Cmd+K` `H` | Show incoming calls: a picker of everyone calling the symbol at the caret (LSP call hierarchy, one level per invocation; pick a caller and invoke again to walk up) |
 | `Cmd+K` `Shift+H` | Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition |
 | `Cmd+K` `Shift+U` | Show supertypes: the classes, traits or interfaces the type at the caret extends or implements (LSP type hierarchy; clangd, gopls, jdtls and others) |
@@ -142,6 +142,10 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
 | View: Show Ports / View: Show Captures | palette only | Show the PORTS / CAPTURES tab of the bottom panel and focus it, so its keys (`↑`/`↓`, `⏎`, …) work at once |
 | Output: Select Channel… | palette only | Pick an OUTPUT channel (the toolbar dropdown's list) and show it |
+| View: Close Other Editors in Group | palette only | The tab menu's **Close Others** on the active tab: every other tab of the focused group closes, pinned tabs excepted; other splits are untouched. Bind it in `keybindings.json` for a key (the menu's `⌥⌘T` is iTerm2's New Tab, which croft leaves alone) |
+| View: Close Editors to the Right in Group / View: Close Saved Editors in Group / View: Close All Editors | `Cmd`+`K` `→` / `Cmd`+`K` `U` / `Cmd`+`K` `W` | The tab menu's **Close to the Right**, **Close Saved** and **Close All**, on the active tab, exactly as the menu does them (Close All empties every split) |
+| View: Pin Editor / View: Unpin Editor | `Cmd`+`K` `P` | The tab menu's **Pin** / **Unpin** on the active tab. As in VS Code, the palette lists only the one that applies; bound in `keybindings.json`, each leaves a tab already in its state alone |
+| View: Keep Editor | `Cmd`+`K` `Shift`+`P` | The tab menu's **Keep Open**: the italic preview tab stays when the next file opens (the palette also finds it as "keep open") |
 
 **Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
 
