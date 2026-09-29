@@ -249,6 +249,17 @@ pub enum Command {
     ToggleSecondarySideBar,
     ToggleZenMode,
     ToggleTerminal,
+    /// The Customize Layout popup's rows as commands (#852), VS Code's
+    /// names: the bars' visibility, the side bar's side, and pickers for
+    /// the panel alignment and the quick input position. `LAYOUT_COMMANDS`
+    /// lists them with the popup's other rows so "layout" finds them all.
+    ToggleActivityBar,
+    ToggleStatusBar,
+    ToggleSideBarPosition,
+    SetPanelAlignment,
+    SetQuickInputPosition,
+    /// View: Customize Layout… (#852): the popup itself.
+    CustomizeLayout,
     /// Terminal: Focus Terminal (#852): the TERMINAL tab, shown and focused.
     /// With the `Show*` commands below, one command per bottom-panel tab
     /// (`BottomPanelTab::show_command` pairs them).
@@ -628,6 +639,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleSecondarySideBar,
     Command::ToggleZenMode,
     Command::ToggleTerminal,
+    Command::ToggleActivityBar,
+    Command::ToggleStatusBar,
+    Command::ToggleSideBarPosition,
+    Command::SetPanelAlignment,
+    Command::SetQuickInputPosition,
+    Command::CustomizeLayout,
     Command::FocusTerminal,
     Command::ShowProblems,
     Command::ShowOutput,
@@ -736,6 +753,25 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleProactiveNavigator,
     Command::NextComment,
     Command::IgnoreComment,
+];
+
+/// The Customize Layout popup as palette commands (#852): the popup itself,
+/// then one command per row group in the popup's order. VS Code's titles
+/// mostly don't say "layout", so the palette also matches these on that
+/// word, and the query "layout" lists everything the popup can change.
+pub const LAYOUT_COMMANDS: &[Command] = &[
+    Command::CustomizeLayout,
+    Command::ToggleActivityBar,
+    Command::ToggleSideBar,
+    Command::ToggleSecondarySideBar,
+    Command::ToggleTerminal,
+    Command::ToggleStatusBar,
+    Command::ToggleMinimap,
+    Command::ToggleAutoHideSideBar,
+    Command::ToggleSideBarPosition,
+    Command::SetPanelAlignment,
+    Command::SetQuickInputPosition,
+    Command::ToggleZenMode,
 ];
 
 impl Command {
@@ -963,6 +999,12 @@ impl Command {
             Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
             Command::ToggleZenMode => "View: Toggle Zen Mode",
             Command::ToggleTerminal => "View: Toggle Terminal",
+            Command::ToggleActivityBar => "View: Toggle Activity Bar Visibility",
+            Command::ToggleStatusBar => "View: Toggle Status Bar Visibility",
+            Command::ToggleSideBarPosition => "View: Toggle Primary Side Bar Position",
+            Command::SetPanelAlignment => "View: Set Panel Alignment…",
+            Command::SetQuickInputPosition => "View: Set Quick Input Position…",
+            Command::CustomizeLayout => "View: Customize Layout…",
             Command::FocusTerminal => "Terminal: Focus Terminal",
             Command::ShowProblems => "View: Show Problems",
             Command::ShowOutput => "View: Show Output",
@@ -1305,6 +1347,12 @@ impl Command {
             Command::ToggleSecondarySideBar => "Cmd+Opt+B",
             Command::ToggleZenMode => "Cmd+K Z",
             Command::ToggleTerminal => "Ctrl+J",
+            Command::ToggleActivityBar => "",
+            Command::ToggleStatusBar => "",
+            Command::ToggleSideBarPosition => "",
+            Command::SetPanelAlignment => "",
+            Command::SetQuickInputPosition => "",
+            Command::CustomizeLayout => "",
             Command::FocusTerminal => "Cmd+Shift+T",
             Command::ShowProblems => "Cmd+Shift+M",
             Command::ShowOutput => "Cmd+Shift+U",
@@ -1648,6 +1696,12 @@ impl Command {
             Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
             Command::ToggleZenMode => "toggle_zen_mode",
             Command::ToggleTerminal => "toggle_terminal",
+            Command::ToggleActivityBar => "toggle_activity_bar",
+            Command::ToggleStatusBar => "toggle_status_bar",
+            Command::ToggleSideBarPosition => "toggle_side_bar_position",
+            Command::SetPanelAlignment => "set_panel_alignment",
+            Command::SetQuickInputPosition => "set_quick_input_position",
+            Command::CustomizeLayout => "customize_layout",
             Command::FocusTerminal => "focus_terminal",
             Command::ShowProblems => "show_problems",
             Command::ShowOutput => "show_output",
@@ -1756,6 +1810,17 @@ impl Command {
             Command::RunTask => "run_task",
             Command::RunBuildTask => "run_build_task",
             Command::RerunLastTask => "rerun_last_task",
+        }
+    }
+
+    /// An extra word the palette matches this command on, beyond its
+    /// title: "layout" for the Customize Layout commands (#852), whose
+    /// VS Code names mostly don't say it. Empty for the rest.
+    pub fn keyword(self) -> &'static str {
+        if LAYOUT_COMMANDS.contains(&self) {
+            "layout"
+        } else {
+            ""
         }
     }
 
@@ -1979,7 +2044,17 @@ impl CommandPalette {
                 let local = (shown != title_lower)
                     .then(|| fuzzy_score(&needle, &shown, 0))
                     .flatten();
-                english.max(local).map(|score| (score, idx, item))
+                // A search word the title lacks, e.g. "layout" (#852).
+                let keyword = match &item {
+                    PaletteItem::Builtin(c) if !c.keyword().is_empty() => {
+                        fuzzy_score(&needle, c.keyword(), 0)
+                    }
+                    _ => None,
+                };
+                english
+                    .max(local)
+                    .max(keyword)
+                    .map(|score| (score, idx, item))
             })
             .collect();
         // Higher score first; equal scores keep declaration order.
@@ -2263,6 +2338,27 @@ mod tests {
         palette.select_next();
         palette.push_char('s');
         assert_eq!(palette.selected, 0);
+    }
+
+    /// #852 negative: the "layout" search word reaches the Customize Layout
+    /// commands only; an unrelated command whose title lacks the word is not
+    /// pulled in, and a title query still ranks by the title alone.
+    #[test]
+    fn the_layout_keyword_finds_only_the_layout_commands() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("layout");
+        for c in LAYOUT_COMMANDS {
+            assert!(palette.results.contains(&builtin(*c)), "{c:?}");
+        }
+        for c in [Command::SaveAll, Command::ShowProblems, Command::SaveFile] {
+            assert!(!palette.results.contains(&builtin(c)), "{c:?}");
+        }
+        palette.set_query("status bar");
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::ToggleStatusBar))
+        );
+        assert!(!palette.results.contains(&builtin(Command::ToggleZenMode)));
     }
 
     #[test]

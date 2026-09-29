@@ -65564,13 +65564,13 @@ fn save_all_writes_every_dirty_tab() {
     app.editor.open_pinned(&b).unwrap();
     app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(app.dirty_tab_count(), 2);
+    assert_eq!(app.unsaved_count(), 2);
     app.handle_key(key(
         KeyCode::Char('s'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     ))
     .unwrap();
-    assert_eq!(app.dirty_tab_count(), 0, "{}", app.status);
+    assert_eq!(app.unsaved_count(), 0, "{}", app.status);
     assert!(std::fs::read_to_string(&a).unwrap().contains('X'));
     assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
     assert_eq!(app.status, "Saved 2 editors");
@@ -65685,7 +65685,7 @@ fn save_all_never_overwrites_an_external_change_on_disk() {
         "Save All must not write over a file changed on disk"
     );
     assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
-    assert_eq!(app.dirty_tab_count(), 1, "the conflicted tab stays dirty");
+    assert_eq!(app.unsaved_count(), 1, "the conflicted tab stays dirty");
     assert!(
         app.status.contains("1 editor still unsaved"),
         "the leftover tab is reported, not a clean \"Saved\": {:?}",
@@ -65717,7 +65717,7 @@ fn plain_ctrl_s_still_saves_only_the_active_tab() {
         .unwrap();
     assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
-    assert_eq!(app.dirty_tab_count(), 1);
+    assert_eq!(app.unsaved_count(), 1);
 }
 
 /// #852 boundary: with no file open, File: New File… from the editor has
@@ -65739,4 +65739,457 @@ fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
         }) => assert_eq!(target_dir, &explorer_dir),
         _ => panic!("File: New File… must open the New File prompt"),
     }
+}
+
+/// Types `text` into whatever overlay has the keyboard, one key at a time.
+fn type_keys_852(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+/// Opens the Command Palette with `Cmd+Shift+P`, as a user would.
+fn open_palette_852(app: &mut App) {
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.command_palette.is_some(),
+        "Cmd+Shift+P opens the palette"
+    );
+}
+
+/// #852 (comment 2): the Customize Layout popup opens from the keyboard.
+/// Typing its name in the palette and pressing Enter shows the popup with
+/// its rows, where before the palette said "No commands match".
+#[test]
+fn typing_customize_layout_in_the_palette_opens_the_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "customize layout");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("View: Customize Layout… opens the Customize Layout popup");
+    assert!(
+        menu.items.iter().any(|e| matches!(
+            e,
+            MenuEntry::Item {
+                action: MenuAction::ToggleStatusBar,
+                ..
+            }
+        )),
+        "the popup is the Customize Layout one"
+    );
+}
+
+/// #852 (comment 2): the palette query "layout" finds the layout commands,
+/// so a bar hidden with a click can be brought back from the keyboard.
+#[test]
+fn palette_query_layout_lists_the_customize_layout_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "layout");
+    let titles: Vec<String> = app
+        .command_palette
+        .as_ref()
+        .unwrap()
+        .results
+        .iter()
+        .map(|r| r.title().to_string())
+        .collect();
+    for want in [
+        "View: Customize Layout…",
+        "View: Toggle Activity Bar Visibility",
+        "View: Toggle Status Bar Visibility",
+        "View: Toggle Primary Side Bar Position",
+        "View: Set Panel Alignment…",
+        "View: Set Quick Input Position…",
+    ] {
+        assert!(
+            titles.iter().any(|t| t == want),
+            "\"layout\" must find {want:?}; got {titles:?}"
+        );
+    }
+}
+
+/// #852 (comment 2): Activity Bar, Status Bar and Primary Side Bar Position
+/// toggle from the palette, typed and run with Enter.
+#[test]
+fn palette_toggles_the_activity_bar_status_bar_and_side_bar_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.activity_bar_visible = true;
+    app.status_bar_visible = true;
+    app.side_bar_position = SideBarPosition::Left;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle status bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.status_bar_visible, "the status bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle activity bar visibility");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.activity_bar_visible, "the activity bar hides");
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "toggle primary side bar position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.side_bar_position, SideBarPosition::Right);
+}
+
+/// #852 (comment 2): Panel Alignment and Quick Input Position are set from
+/// the palette through a picker of their options.
+#[test]
+fn palette_sets_panel_alignment_and_quick_input_position_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Center;
+    app.quick_input_position = QuickInputPosition::Top;
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set panel alignment");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the alignment picker opens");
+    type_keys_852(&mut app, "justify");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.panel_alignment, PanelAlignment::Justify);
+    open_palette_852(&mut app);
+    type_keys_852(&mut app, "set quick input position");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_some(), "the position picker opens");
+    type_keys_852(&mut app, "center");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.quick_input_position, QuickInputPosition::Center);
+}
+
+/// Renders `app` at `w`x`h` and returns the frame's buffer.
+fn render_buffer_852(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let backend = ratatui::backend::TestBackend::new(w, h);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// #852 (comment 1): the OPEN EDITORS header carries VS Code's Save All
+/// action; clicking it writes every dirty tab and leaves the section as it
+/// was (the click is the button's, not the header's collapse toggle).
+#[test]
+fn clicking_save_all_on_the_open_editors_header_saves_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = false;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    let save_all_x = (hdr.x..hdr.x + hdr.width)
+        .find(|&x| buf[(x, hdr.y)].symbol() == "\u{eb49}")
+        .expect("the OPEN EDITORS header paints a Save All (codicon save-all) action");
+    left_click(&mut app, save_all_x, hdr.y);
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "Save All writes the inactive tab"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(
+        !app.open_editors.collapsed,
+        "the button's click does not also collapse the section"
+    );
+}
+
+/// #852: a file dirty in two splits is one unsaved file, as the Explorer's
+/// unsaved badge counts it, so Save All does not report it twice.
+#[test]
+fn save_all_counts_a_file_dirty_in_two_splits_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.focus_editor_group(true);
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    let dirty_buffers = app
+        .editor
+        .editors
+        .iter()
+        .chain(
+            app.editor_layout
+                .inactive_groups()
+                .into_iter()
+                .flat_map(|g| g.editors.iter()),
+        )
+        .filter(|e| e.dirty && e.path.as_deref() == Some(a.as_path()))
+        .count();
+    assert_eq!(dirty_buffers, 2, "fixture: a.txt is dirty in both splits");
+    assert_eq!(app.unsaved_count(), 1, "one file, counted once");
+}
+
+/// #852: a file with a symbol tab is one file on disk; Save All writes it
+/// once and says "Saved 1 editor", not 2.
+#[test]
+fn save_all_reports_a_file_with_a_symbol_tab_as_one_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_symbol_tab_on_b(&tmp);
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.sync_symbol_views();
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::NONE))
+        .unwrap();
+    app.sync_symbol_views();
+    assert!(
+        app.editor.editors.iter().all(|e| e.dirty),
+        "fixture: both tabs hold the edit"
+    );
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn a() {\n    1\n}\nfn b() {\n    27\n}"
+    );
+    assert_eq!(app.status, "Saved 1 editor");
+}
+
+/// #852 guard: no Customize Layout row ships mouse-only. Every row names
+/// the palette command that reaches it (a new row fails here until it has
+/// one), the command is in the palette and found by "layout", and running
+/// it (choosing the row's option where it opens a picker) lands on the
+/// state the row's click sets, from a state where that option is not yet
+/// the active one.
+#[test]
+fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
+    fn command_for(action: &MenuAction) -> Option<Command> {
+        match action {
+            MenuAction::ToggleActivityBar => Some(Command::ToggleActivityBar),
+            MenuAction::ToggleSideBar => Some(Command::ToggleSideBar),
+            MenuAction::ToggleSecondarySideBar => Some(Command::ToggleSecondarySideBar),
+            MenuAction::TogglePanel => Some(Command::ToggleTerminal),
+            MenuAction::ToggleStatusBar => Some(Command::ToggleStatusBar),
+            MenuAction::ToggleMinimap => Some(Command::ToggleMinimap),
+            MenuAction::ToggleAutoHideSideBar => Some(Command::ToggleAutoHideSideBar),
+            MenuAction::SetSideBarPosition(_) => Some(Command::ToggleSideBarPosition),
+            MenuAction::SetPanelAlignment(_) => Some(Command::SetPanelAlignment),
+            MenuAction::SetQuickInputPosition(_) => Some(Command::SetQuickInputPosition),
+            MenuAction::ToggleZenMode => Some(Command::ToggleZenMode),
+            _ => None,
+        }
+    }
+    // A radio row's setting moved off the row's option first.
+    fn off_option(app: &mut App, action: &MenuAction) {
+        match *action {
+            MenuAction::SetSideBarPosition(p) => {
+                app.side_bar_position = if p == SideBarPosition::Left {
+                    SideBarPosition::Right
+                } else {
+                    SideBarPosition::Left
+                };
+            }
+            MenuAction::SetPanelAlignment(al) => {
+                app.panel_alignment = if al == PanelAlignment::Left {
+                    PanelAlignment::Center
+                } else {
+                    PanelAlignment::Left
+                };
+            }
+            MenuAction::SetQuickInputPosition(p) => {
+                app.quick_input_position = if p == QuickInputPosition::Top {
+                    QuickInputPosition::Center
+                } else {
+                    QuickInputPosition::Top
+                };
+            }
+            _ => {}
+        }
+    }
+    let snapshot = |app: &App| {
+        (
+            app.activity_bar_visible,
+            app.show_tree,
+            app.secondary_side_bar_visible,
+            app.show_terminal,
+            app.status_bar_visible,
+            app.minimap_visible,
+            app.sidebar_auto_hide,
+            app.side_bar_position,
+            app.panel_alignment,
+            app.quick_input_position,
+            app.zen_mode,
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rows: Vec<(String, MenuAction)> = App::new(tmp.path().to_path_buf())
+        .unwrap()
+        .customize_layout_items()
+        .into_iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, action } => Some((label, action)),
+            _ => None,
+        })
+        .collect();
+    assert!(rows.len() >= 12, "the popup's rows: {rows:?}");
+    for (label, action) in rows {
+        let cmd = command_for(&action)
+            .unwrap_or_else(|| panic!("Customize Layout row {label:?} has no palette command"));
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?} is not in the palette");
+        assert!(
+            LAYOUT_COMMANDS.contains(&cmd),
+            "{cmd:?} is not found by the query \"layout\""
+        );
+        let mut by_click = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut by_palette = App::new(tmp.path().to_path_buf()).unwrap();
+        off_option(&mut by_click, &action);
+        off_option(&mut by_palette, &action);
+        assert_eq!(snapshot(&by_click), snapshot(&by_palette), "fixture");
+        by_click.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+        by_palette.run_command(cmd);
+        if let Some(picker) = by_palette.list_picker.as_mut() {
+            let option = label.trim_start_matches('\u{2713}').trim().to_lowercase();
+            for c in option.chars() {
+                picker.push_char(c);
+            }
+            assert_eq!(picker.visible_count(), 1, "{cmd:?} offers {option:?}");
+            by_palette.confirm_list_picker();
+        }
+        assert_eq!(
+            snapshot(&by_palette),
+            snapshot(&by_click),
+            "{cmd:?} must do what the row {label:?} does"
+        );
+    }
+}
+
+/// #852 negative: the palette's layout commands change the layout and
+/// nothing else; the Customize Layout popup's re-open is the click route's
+/// (it keeps the popup up between clicks) and must not pop over the editor
+/// after a palette command.
+#[test]
+fn palette_layout_commands_leave_the_customize_layout_popup_closed() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+        assert!(
+            app.context_menu.is_none(),
+            "{cmd:?} must not open the Customize Layout popup"
+        );
+    }
+    // Twice is a round trip: every toggle is back where it started.
+    let fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    for cmd in [
+        Command::ToggleActivityBar,
+        Command::ToggleStatusBar,
+        Command::ToggleSideBarPosition,
+    ] {
+        app.run_command(cmd);
+    }
+    assert_eq!(app.activity_bar_visible, fresh.activity_bar_visible);
+    assert_eq!(app.status_bar_visible, fresh.status_bar_visible);
+    assert_eq!(app.side_bar_position, fresh.side_bar_position);
+}
+
+/// #852 negative: the alignment picker opens on the current alignment and
+/// Esc leaves it unchanged; only a chosen row changes it.
+#[test]
+fn dismissing_the_panel_alignment_picker_keeps_the_alignment() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.panel_alignment = PanelAlignment::Right;
+    app.run_command(Command::SetPanelAlignment);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("right"),
+        "the picker opens on the current alignment"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.panel_alignment, PanelAlignment::Right);
+}
+
+/// #852 negative: a collapsed OPEN EDITORS hides its Save All action, as
+/// VS Code hides a collapsed view's actions, and a click on the header
+/// title still just toggles the section and saves nothing.
+#[test]
+fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.explorer_views = Default::default();
+    app.explorer_views.toggle(ExplorerView::OpenEditors);
+    app.open_editors.collapsed = true;
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    let buf = render_buffer_852(&mut app, 120, 40);
+    let hdr = app.open_editors.last_area;
+    assert!(hdr.height > 0, "OPEN EDITORS is on screen");
+    assert!(
+        !(hdr.x..hdr.x + hdr.width).any(|x| buf[(x, hdr.y)].symbol() == "\u{eb49}"),
+        "a collapsed section paints no Save All"
+    );
+    assert_eq!(app.open_editors.save_all_btn, Rect::default());
+    // The rightmost header cells, where the button sits when expanded.
+    left_click(&mut app, hdr.x + hdr.width - 2, hdr.y);
+    assert!(!app.open_editors.collapsed, "the header click expands it");
+    let _ = render_buffer_852(&mut app, 120, 40);
+    left_click(&mut app, hdr.x + 3, hdr.y);
+    assert!(app.open_editors.collapsed, "the title click collapses it");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "aaa",
+        "no header click saved anything"
+    );
+    assert!(app.editor.dirty);
 }

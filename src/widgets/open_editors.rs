@@ -51,6 +51,10 @@ pub struct OpenEditorsPanel {
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
+    /// Hit-test rect of the header's Save All action (#852), VS Code's
+    /// Open Editors toolbar button. `Rect::default()` while the section is
+    /// collapsed (VS Code hides a collapsed view's actions) or too narrow.
+    pub save_all_btn: Rect,
     last_header_row: u16,
     last_header_x: u16,
     last_header_w: u16,
@@ -73,6 +77,7 @@ impl OpenEditorsPanel {
             hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
+            save_all_btn: Rect::default(),
             last_header_row: 0,
             last_header_x: 0,
             last_header_w: 0,
@@ -157,6 +162,12 @@ impl OpenEditorsPanel {
             && x < self.last_header_x.saturating_add(self.last_header_w)
     }
 
+    /// Whether `(x, y)` is on the header's Save All action (#852).
+    pub fn hit_save_all(&self, x: u16, y: u16) -> bool {
+        let b = self.save_all_btn;
+        b.width > 0 && y == b.y && x >= b.x && x < b.x.saturating_add(b.width)
+    }
+
     pub fn row_at(&self, y: u16) -> Option<usize> {
         if self.collapsed || self.visible_rows == 0 || y < self.first_row_y {
             return None;
@@ -190,6 +201,7 @@ impl Widget for &mut OpenEditorsPanel {
         block.render(area, buf);
         self.last_area = area;
         self.last_scrollbar = Rect::default();
+        self.save_all_btn = Rect::default();
         self.visible_rows = 0;
         if inner.height == 0 || inner.width == 0 {
             return;
@@ -230,6 +242,33 @@ impl Widget for &mut OpenEditorsPanel {
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
         self.last_header_w = inner.width;
+
+        // VS Code's Save All action (#852), right-aligned on the header with
+        // a one-cell pad, as the Explorer's root-row toolbar sits. Only while
+        // expanded (VS Code hides a collapsed view's actions) and only where
+        // it clears the title: "▸ OPEN EDITORS" is 14 cells.
+        const TITLE_W: u16 = 14;
+        const PAD: u16 = 1;
+        // Title, a two-cell gap, then the glyph and its pad.
+        if !self.collapsed && inner.width > TITLE_W + 2 + PAD {
+            let x = inner.x + inner.width - PAD - 1;
+            let rect = Rect {
+                x,
+                y: header_y,
+                width: 1 + PAD,
+                height: 1,
+            };
+            let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+            crate::widgets::header_pill::render(
+                buf,
+                x,
+                header_y,
+                crate::widgets::header_pill::SAVE_ALL_GLYPH,
+                self.theme,
+                hovered,
+            );
+            self.save_all_btn = rect;
+        }
 
         if self.collapsed || inner.height < 2 {
             return;
@@ -403,6 +442,28 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// #852 negative: the header's Save All sits right-aligned while
+    /// expanded, and a header too narrow to clear the title paints none
+    /// rather than overprinting "OPEN EDITORS".
+    #[test]
+    fn save_all_action_needs_room_beside_the_title() {
+        let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
+        p.set_items(vec![item("a.rs", true, true)]);
+        let text = rendered_text(&mut p, 18, 4);
+        assert!(!text.contains('\u{eb49}'), "{text:?}");
+        assert!(text.contains("OPEN EDITORS"));
+        assert_eq!(p.save_all_btn, Rect::default());
+        let text = rendered_text(&mut p, 30, 4);
+        assert!(
+            text.lines().next().unwrap().contains('\u{eb49}'),
+            "{text:?}"
+        );
+        assert!(p.hit_save_all(28, 0));
+        assert!(!p.hit_save_all(5, 0), "the title is not the button");
+        assert!(!p.hit_save_all(28, 1), "nor is the row below it");
     }
 
     #[test]

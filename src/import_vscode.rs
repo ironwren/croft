@@ -227,6 +227,19 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.terminal.focus", "focus_terminal"),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
+    (
+        "workbench.action.toggleActivityBarVisibility",
+        "toggle_activity_bar",
+    ),
+    (
+        "workbench.action.toggleStatusbarVisibility",
+        "toggle_status_bar",
+    ),
+    (
+        "workbench.action.toggleSidebarPosition",
+        "toggle_side_bar_position",
+    ),
+    ("workbench.action.customizeLayout", "customize_layout"),
     ("workbench.view.explorer", "show_explorer"),
     ("workbench.view.search", "show_search"),
     ("workbench.view.scm", "show_source_control"),
