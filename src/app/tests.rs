@@ -11595,6 +11595,91 @@ fn ctrl_enter_is_not_the_fence_chord_on_macos() {
     assert!(is_run_fence_key(key(KeyCode::Enter, KeyModifiers::SUPER)));
 }
 
+/// #843 on the path the issue took: on desktop Linux, `Ctrl`+`K` `B` with the
+/// caret in the editor opens Testing and leaves the line alone. Before the
+/// fix `Ctrl`+`K` killed the rest of the line and `b` was typed in its place.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_b_opens_testing_and_leaves_the_line_off_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "DATA = Path(\"data\")");
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "DATA = Path(\"data\")",
+        "nothing killed, nothing typed"
+    );
+    assert_eq!(app.sidebar_view, SidebarView::Testing);
+}
+
+/// Guard (#843): a `Ctrl`+`K` that leads, then a key that completes no chord,
+/// drops the leader and the key keeps its meaning: `!` is typed where the
+/// caret was, and nothing is killed.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_then_a_key_that_completes_no_chord_types_it_and_kills_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "keep this");
+    app.editor.cursor_col = 4;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+    assert_eq!(app.editor.lines[0], "keep! this");
+}
+
+/// Guard (#843): the shell keeps `Ctrl`+`K` only while it has the keyboard.
+/// With the bottom panel on PROBLEMS the focused panel is not a shell, so
+/// `Ctrl`+`K` leads there as in any other pane.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_k_leads_from_the_panel_while_it_shows_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some());
+}
+
+/// Guard (#843): only the bare `Ctrl`+`K` leads. `Ctrl`+`Shift`+`K` is still
+/// Delete Line, and `Ctrl`+`Alt`+`K` arms nothing.
+#[test]
+fn ctrl_shift_k_still_deletes_the_line_and_ctrl_alt_k_never_leads() {
+    let mut app = editor_app_with_lines(&["one", "two"]);
+    app.handle_key(key(
+        KeyCode::Char('K'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+    assert_eq!(app.editor.lines, ["two"]);
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.cmd_k_leader.is_none());
+}
+
+/// Guard (#843): the palette's "Kill to End of Line" at the end of a line
+/// kills nothing and never joins the next line up, as `Ctrl`+`K` did not.
+#[test]
+fn kill_to_end_of_line_at_the_end_of_a_line_changes_nothing() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["hello", "next"]);
+    app.editor.cursor_col = 5;
+    app.status.clear();
+    app.run_command(Command::KillToEndOfLine);
+    assert_eq!(app.editor.lines, ["hello", "next"]);
+    assert!(app.status.is_empty(), "{}", app.status);
+}
+
 #[test]
 fn cmd_k_then_s_selects_active_file_for_compare() {
     let tmp = tempfile::tempdir().unwrap();
