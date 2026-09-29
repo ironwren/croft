@@ -733,20 +733,20 @@ impl Verb {
 }
 
 /// The absolute path `target` names, resolved against `cwd` and checked
-/// before any croft is asked to open it. Checked here rather than at the
-/// server so the message names the path the USER typed, resolved against the
-/// cwd they typed it in.
+/// before any croft is asked to open it, and whether this call created it.
+/// Checked here rather than at the server so the message names the path the
+/// USER typed, resolved against the cwd they typed it in.
 ///
 /// A missing file is refused for `view`. For `edit` it is created empty when
 /// its directory exists, as `vim new.py` or `code --wait new.py` start one,
 /// so `EDITOR="croft edit --wait"` works for tools that name a file they
 /// have not written yet (#848). A missing directory is still an error: an
 /// editor creates a file, not the folders above it.
-fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<(PathBuf, bool)> {
     let v = verb.name();
     let path = resolve(cwd, target);
     if path.exists() {
-        return Ok(path);
+        return Ok((path, false));
     }
     if verb == Verb::View {
         anyhow::bail!("croft {v}: no such file: {}", path.display());
@@ -764,10 +764,10 @@ fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<PathB
         .create_new(true)
         .open(&path)
     {
-        Ok(_) => Ok(path),
+        Ok(_) => Ok((path, true)),
         // Something else created it since the check: open what is there
         // rather than truncate it.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok((path, false)),
         Err(e) => anyhow::bail!("croft {v}: cannot create {}: {e}", path.display()),
     }
 }
@@ -800,19 +800,33 @@ pub fn run(
         );
     }
 
-    let path = if target == "-" {
+    let (path, created) = if target == "-" {
         let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
             anyhow::bail!("croft {v} -: nothing arrived on stdin");
         }
-        stage_stdin(cache_dir, &buf, as_hint)?
+        (stage_stdin(cache_dir, &buf, as_hint)?, false)
     } else {
         // After the socket check, so `croft edit` run outside croft leaves
         // no empty file behind.
         resolve_target(verb, &std::env::current_dir()?, Path::new(target))?
     };
 
-    match send(&socket, &ViewRequest::new(&path)) {
+    let opened = open_in_croft(v, &socket, &path);
+    // Nor does one whose croft cannot open it: a stale socket (the croft
+    // that set it has exited) or a refusal takes back the empty file created
+    // just above. Only while it is still empty, and never a file that was
+    // already there (#848).
+    if opened.is_err() && created && std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+        let _ = std::fs::remove_file(&path);
+    }
+    opened
+}
+
+/// Ask the croft listening on `socket` to open `path`, naming the command
+/// `v` in every refusal.
+fn open_in_croft(v: &str, socket: &Path, path: &Path) -> anyhow::Result<()> {
+    match send(socket, &ViewRequest::new(path)) {
         Ok(ViewReply::Ok) => Ok(()),
         Ok(ViewReply::Err { message }) => anyhow::bail!("croft {v}: {message}"),
         Err(e)
@@ -896,8 +910,9 @@ mod tests {
     #[test]
     fn edit_creates_a_missing_file_in_an_existing_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let path = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
         assert_eq!(path, dir.path().join("TODO.md"));
+        assert!(created, "this call made it");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"",
@@ -906,7 +921,8 @@ mod tests {
 
         // An existing file is opened as it is, never truncated.
         std::fs::write(&path, "keep me").unwrap();
-        resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        let (_, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        assert!(!created, "an existing file is not this call's to take back");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
     }
 
@@ -943,7 +959,7 @@ mod tests {
         std::fs::write(dir.path().join("here.pdf"), "x").unwrap();
         assert_eq!(
             resolve_target(Verb::View, dir.path(), Path::new("here.pdf")).unwrap(),
-            dir.path().join("here.pdf")
+            (dir.path().join("here.pdf"), false)
         );
     }
 
