@@ -52108,6 +52108,158 @@ fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
     assert_eq!(in_panel, 1, "and the panel keeps its own copy");
 }
 
+/// A stand-in debug adapter (#864) that stops on an exception as soon as it
+/// is configured, advertising `exceptionInfo`. With `answer_at_once` it
+/// answers that request as it comes; otherwise it holds the answer until
+/// `continue`, then prints `MARKER`, after which the late answer has been
+/// read.
+fn exception_stop_adapter(dir: &Path, answer_at_once: bool) -> crate::dap::session::DapSession {
+    let script = format!(
+        r#"
+import json, sys
+AT_ONCE = {at_once}
+seq = [1000]
+held = []
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+def answer(req):
+    reply(req, {{"exceptionId": "KeyError", "description": "'x'"}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req, {{"supportsExceptionInfoRequest": True}})
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        send({{"type": "event", "event": "stopped", "body": {{"reason": "exception", "threadId": 1}}}})
+    elif c == "exceptionInfo":
+        if AT_ONCE:
+            answer(req)
+        else:
+            held.append(req)
+    elif c == "continue":
+        reply(req)
+        for h in held:
+            answer(h)
+        send({{"type": "event", "event": "output", "body": {{"category": "stdout", "output": "MARKER\n"}}}})
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        at_once = if answer_at_once { "True" } else { "False" }
+    );
+    let path = dir.join("fake_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+/// #864: an `exceptionInfo` answer that arrives after Continue describes a
+/// stop that is over. It must not put "Paused on exception" on the status
+/// line of a program that is running again.
+#[test]
+fn an_exception_answer_after_continue_does_not_say_paused() {
+    use crate::dap::session::SessionPhase;
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), false));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception stop",
+        || {
+            app.poll_dap();
+            app.debug_sessions
+                .focused()
+                .is_some_and(|s| s.phase == SessionPhase::Stopped)
+        },
+    );
+    app.debug_start_or_continue();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the late answer and the marker after it",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l == "MARKER")
+        },
+    );
+    let status = app.status.clone();
+    let feedback = app.run_debug.feedback.clone().unwrap_or_default();
+    app.debug_stop();
+    assert!(!status.contains("Paused"), "status: {status}");
+    assert!(!feedback.contains("KeyError"), "feedback: {feedback}");
+}
+
+/// #864 guard: an answer that arrives while the program is still stopped
+/// names the exception, on the status line and in the panel.
+#[test]
+fn an_exception_answer_while_stopped_names_the_exception() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", exception_stop_adapter(tmp.path(), true));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the exception to be named",
+        || {
+            app.poll_dap();
+            app.status.contains("KeyError")
+        },
+    );
+    let feedback = app.run_debug.feedback.clone();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(status, "Paused on exception: KeyError: 'x'");
+    assert_eq!(
+        feedback.as_deref(),
+        Some("Paused (exception): KeyError: 'x'")
+    );
+}
+
 /// A workspace with two source files and breakpoints set in both (#250).
 fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
