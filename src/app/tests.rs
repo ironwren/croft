@@ -55663,29 +55663,82 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_lower(&term);
+        assert!(screen.contains(" codeql "), "the pane's frame:\n{screen}");
         for section in [
             "language",
-            "databases",
             "queries",
             "variant analysis",
             "query history",
-            "ast viewer",
-            "method modeling",
+            "tools",
         ] {
             assert!(
                 screen.contains(section),
                 "section {section:?} listed:\n{screen}"
             );
         }
-        // The Databases welcome offers VS Code's four ways to add one.
-        for action in [
-            "from a folder",
-            "from an archive",
-            "from a url",
-            "from github",
+        // Without a database the first-run card stands in for the Databases
+        // section: its button offers the four ways to add one in a picker.
+        for text in [
+            "query your code for bugs",
+            "+  add database",
+            "from a folder, archive,",
+            "try quick query",
+            "ast · log · model",
         ] {
-            assert!(screen.contains(action), "{action:?} offered:\n{screen}");
+            assert!(screen.contains(text), "{text:?} shown:\n{screen}");
         }
+    });
+}
+
+#[test]
+fn codeql_add_database_button_offers_the_four_sources_in_a_picker() {
+    // #578: the first-run card's one button opens a picker of the places a
+    // database comes from; each row asks for the source as its old side-bar
+    // link did.
+    use crate::widgets::codeql::{Action, Hit};
+    use crate::widgets::input_prompt::{CodeqlDbSource, InputPurpose};
+    use crate::widgets::list_picker::ListPurpose;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.focus = Pane::Tree;
+        app.codeql.select_action(Action::AddDatabase);
+        assert_eq!(
+            app.codeql.selected_hit(),
+            Some(Hit::Action(Action::AddDatabase))
+        );
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let picker = app.list_picker.as_ref().expect("the sources picker");
+        assert_eq!(picker.purpose, ListPurpose::CodeqlDbSource);
+        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "From a folder",
+                "From an archive",
+                "From a URL (as a zip file)",
+                "From GitHub"
+            ]
+        );
+        for c in "GitHub".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.list_picker.is_none());
+        let prompt = app.input_prompt.as_ref().expect("the GitHub prompt");
+        assert_eq!(
+            prompt.purpose,
+            InputPurpose::CodeqlDatabase {
+                source: CodeqlDbSource::Github
+            }
+        );
+        assert_eq!(prompt.title, "Add CodeQL Database from GitHub");
     });
 }
 
@@ -60640,6 +60693,8 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         app.focus = Pane::Tree;
         app.codeql.language = Some(6);
         app.codeql.collapsed.insert(Section::Databases);
+        // An empty Queries section starts folded: unfold it for its row.
+        app.codeql.toggle(Section::Queries);
         let row = app
             .codeql
             .lines()
@@ -63912,7 +63967,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
     // #578: VS Code's Variant Analysis Repositories view: a controller
     // repository, then lists, repositories and owners to run against.
     use crate::codeql_variant::{Item, Selection, VariantConfig};
-    use crate::widgets::codeql::{Action, Line};
+    use crate::widgets::codeql::{Action, Line, Section};
     use crate::widgets::command_palette::Command;
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
@@ -63933,7 +63988,10 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
         };
         let saved = || VariantConfig::load(&App::codeql_variant_path()).unwrap();
 
-        // The welcome row asks for the controller and refuses a bad one.
+        // The welcome row asks for the controller and refuses a bad one. The
+        // empty section starts folded to its header's "set up".
+        assert!(app.codeql.folded(Section::VariantAnalysis));
+        app.codeql.toggle(Section::VariantAnalysis);
         app.codeql.select_action(Action::SetUpControllerRepository);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -64677,6 +64735,9 @@ esac
             app.status
         );
 
+        // The empty section starts folded; unfold it to reach its row.
+        app.codeql
+            .toggle(crate::widgets::codeql::Section::VariantAnalysis);
         app.codeql
             .select_action(crate::widgets::codeql::Action::SetUpControllerRepository);
         press(&mut app, KeyCode::Char('l'));
@@ -65638,4 +65699,158 @@ fn search_commands_run_from_the_palette_reveal_the_side_bar() {
     app.run_command(Command::ReplaceInFiles);
     assert!(app.search.replace_open);
     assert_eq!(app.search.field, SearchField::Replace);
+}
+
+/// #852 regression, driven by keys alone: from the editor with the panel
+/// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
+/// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel
+/// shown and focused.
+#[test]
+fn panel_tab_chords_reach_problems_output_and_terminal_by_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let cmd_shift = KeyModifiers::SUPER | KeyModifiers::SHIFT;
+    app.show_terminal = false;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('M'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Problems,
+        "Ctrl+Shift+M must show PROBLEMS"
+    );
+    assert!(app.show_terminal, "Ctrl+Shift+M must reveal the panel");
+    assert!(app.focus == Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('U'), ctrl_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Output,
+        "Ctrl+Shift+U must show OUTPUT"
+    );
+    app.handle_key(key(KeyCode::Char('T'), cmd_shift)).unwrap();
+    assert_eq!(
+        app.bottom_panel_tab,
+        BottomPanelTab::Terminal,
+        "Cmd+Shift+T must bring TERMINAL forward"
+    );
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
+/// tab to disk, the inactive one included, not only the active tab.
+#[test]
+fn ctrl_alt_s_writes_the_inactive_dirty_tab_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&a).unwrap().contains('X'),
+        "the inactive tab a.txt must reach disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+}
+
+/// #852 negative: Save All writes only what auto save may write blind. An
+/// inactive tab whose file changed on disk keeps the external text, stays
+/// dirty and is reported, while the other dirty tab still saves.
+#[test]
+fn save_all_never_overwrites_an_external_change_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    std::fs::write(&a, "external change wins\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "external change wins\n",
+        "Save All must not write over a file changed on disk"
+    );
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(app.dirty_tab_count(), 1, "the conflicted tab stays dirty");
+    assert!(
+        app.status.contains("1 editor still unsaved"),
+        "the leftover tab is reported, not a clean \"Saved\": {:?}",
+        app.status
+    );
+}
+
+/// #852 negative: plain `Ctrl+S` is still File: Save, not Save All; the
+/// inactive dirty tab stays unsaved on disk.
+#[test]
+fn plain_ctrl_s_still_saves_only_the_active_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(std::fs::read_to_string(&b).unwrap().contains('Y'));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
+    assert_eq!(app.dirty_tab_count(), 1);
+}
+
+/// #852 boundary: with no file open, File: New File… from the editor has
+/// no "beside the active file" and falls back to the Explorer's target.
+#[test]
+fn palette_new_file_with_no_file_open_uses_the_explorer_target() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.path.is_none());
+    app.focus_pane(Pane::Editor);
+    let explorer_dir = app.explorer_create_target_dir();
+    app.run_command(Command::NewFile);
+    match app.prompt.as_ref() {
+        Some(Prompt {
+            kind: PromptKind::Create(CreateKind::File),
+            target_dir,
+            ..
+        }) => assert_eq!(target_dir, &explorer_dir),
+        _ => panic!("File: New File… must open the New File prompt"),
+    }
 }
