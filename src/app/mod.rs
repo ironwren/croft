@@ -47986,12 +47986,21 @@ impl App {
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
-            Cmd::FocusTerminal => self.set_bottom_panel_tab(BottomPanelTab::Terminal),
-            Cmd::ShowProblems => self.set_bottom_panel_tab(BottomPanelTab::Problems),
-            Cmd::ShowOutput => self.set_bottom_panel_tab(BottomPanelTab::Output),
+            // Each tab names the command that shows it, so the palette reads
+            // the tab from there rather than keeping a second mapping.
+            Cmd::FocusTerminal
+            | Cmd::ShowProblems
+            | Cmd::ShowOutput
+            | Cmd::ShowPorts
+            | Cmd::ShowCaptures => {
+                if let Some(tab) = BottomPanelTab::ALL
+                    .into_iter()
+                    .find(|tab| tab.show_command() == cmd)
+                {
+                    self.set_bottom_panel_tab(tab);
+                }
+            }
             Cmd::OutputSelectChannel => self.open_output_channel_picker(),
-            Cmd::ShowPorts => self.set_bottom_panel_tab(BottomPanelTab::Ports),
-            Cmd::ShowCaptures => self.set_bottom_panel_tab(BottomPanelTab::Captures),
             Cmd::ToggleMinimap => self.toggle_minimap(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
