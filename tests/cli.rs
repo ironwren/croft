@@ -634,6 +634,34 @@ fn edit_outside_croft_names_itself_and_creates_nothing() {
     assert!(!tmp.path().join("new.txt").exists());
 }
 
+/// #848 guard: a new file's folder must exist. `croft edit` into a missing
+/// one is refused before any croft is asked to open it, and creates neither
+/// the file nor the folders above it.
+#[test]
+fn edit_refuses_a_missing_folder_without_bothering_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "no/such/TODO.md"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.starts_with("croft edit: ") && stderr.contains("no such directory"),
+        "stderr must name the command and the reason, was: {stderr}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no croft was asked to open anything"
+    );
+    assert!(!tmp.path().join("no").exists(), "no folders were created");
+}
+
 /// #682 end to end: croft over a pty with an image protocol on (iTerm2's,
 /// forced) must not stream images on every keystroke. Before the fix, 20
 /// keystrokes in a file cost about 175 KB of escape output (the minimap and

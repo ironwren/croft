@@ -947,6 +947,38 @@ mod tests {
         );
     }
 
+    /// #848 guard: `croft edit newdir/` names a folder, not a file. The
+    /// trailing slash must not be read as a new file called `newdir`.
+    #[test]
+    fn edit_never_turns_a_path_ending_in_a_slash_into_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::Edit, dir.path(), Path::new("newdir/"));
+        assert!(err.is_err(), "{err:?}");
+        assert!(
+            !dir.path().join("newdir").exists(),
+            "neither a file nor a folder was created"
+        );
+    }
+
+    /// #848 guard: only `edit` creates. The refusal wording stays `view`'s
+    /// own, and a missing folder is refused as a missing file, not created.
+    #[test]
+    fn view_never_creates_even_where_edit_would() {
+        let dir = tempfile::tempdir().unwrap();
+        for target in ["new.md", "no/such/new.md"] {
+            let err = resolve_target(Verb::View, dir.path(), Path::new(target))
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("croft view: no such file"), "{err}");
+            assert!(!err.contains("edit"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+    }
+
     #[test]
     fn a_tilde_is_a_filename_here_because_the_shell_already_had_its_turn() {
         // Every shell croft spawns expands `~` before exec, so one arriving
