@@ -52064,6 +52064,101 @@ fn a_switched_to_member_replays_its_queued_stop() {
     app.debug_stop();
 }
 
+/// #867: the Debug Console lived only in the sidebar, cut at its edge.
+/// Program output and REPL results are mirrored, whole, to OUTPUT's
+/// "Debug Console" channel, where they read at full width and can be
+/// searched and copied.
+#[test]
+fn the_debug_console_is_mirrored_to_an_output_channel() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-{}", std::process::id());
+    let printed = format!("{tag} {}", "wide ".repeat(40));
+    let event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"{printed}\n"}}}}"#
+    );
+    app.debug_sessions.push("P", stub_emitting(&[&event]));
+    let mirrored = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| l.text == text)
+    };
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the program's output to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            mirrored(&printed)
+        },
+    );
+
+    let (_, p) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    p.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: format!("describe('{tag}')"),
+        result: format!("'{tag} described'"),
+        success: true,
+    });
+    app.poll_dap();
+    assert!(mirrored(&format!("❯ describe('{tag}')")), "the REPL echo");
+    assert!(mirrored(&format!("'{tag} described'")), "and its result");
+    app.debug_stop();
+}
+
+/// #867 guard: the mirror carries what the console shows and nothing more.
+/// debugpy's `telemetry` banner, which the console drops, stays out of the
+/// channel too, and a printed line lands there once, not once per poll.
+#[test]
+fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let tag = format!("mirror-once-{}", std::process::id());
+    let telemetry = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"telemetry","output":"{tag} ptvsd"}}}}"#
+    );
+    let printed = format!(
+        r#"{{"seq":2,"type":"event","event":"output","body":{{"category":"stdout","output":"{tag} printed\n"}}}}"#
+    );
+    app.debug_sessions
+        .push("P", stub_emitting(&[&telemetry, &printed]));
+    let count = |text: &str| {
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.text == text)
+            .count()
+    };
+    let line = format!("{tag} printed");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the printed line to reach the Debug Console channel",
+        || {
+            app.poll_dap();
+            count(&line) > 0
+        },
+    );
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
+    let in_panel = app.debug_console.iter().filter(|l| **l == line).count();
+    app.debug_stop();
+    assert_eq!(count(&line), 1, "once");
+    assert!(
+        !channel
+            .iter()
+            .any(|l| l.text.contains(&format!("{tag} ptvsd"))),
+        "telemetry is not mirrored"
+    );
+    assert_eq!(in_panel, 1, "and the panel keeps its own copy");
+}
+
 /// A stand-in debug adapter (#864) that stops on an exception as soon as it
 /// is configured, advertising `exceptionInfo`. With `answer_at_once` it
 /// answers that request as it comes; otherwise it holds the answer until
@@ -52534,6 +52629,101 @@ fn stop_all_false_leaves_the_siblings_running() {
     poll_until_shrinks(&mut app, 2);
     assert_eq!(app.debug_sessions.names(), vec!["B"]);
     app.debug_stop();
+}
+
+/// #867: the issue's recording shows "Debug session ended" in the panel
+/// while the status bar still read "Debugging out.p… · F10 step over ·
+/// Shift+F5 stop". A session that ends on its own says so on the status
+/// line as well.
+#[test]
+fn a_session_ending_on_its_own_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(
+        app.run_debug.feedback.as_deref(),
+        Some("Debug session ended")
+    );
+    assert_eq!(app.status, "Debug session ended");
+}
+
+/// #867: the run that never reached its breakpoint says that on the
+/// status line too, as the panel does.
+#[test]
+fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .breakpoints
+        .entry(tmp.path().join("out.py"))
+        .or_default()
+        .insert(1);
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert_eq!(app.status, "Program exited without hitting a breakpoint");
+}
+
+/// #867 guard: the end message is written once, when the session ends. A
+/// status set after that (the user's next action) survives later polls.
+#[test]
+fn a_status_set_after_the_debug_session_ended_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    app.status = String::from("Saved out.py");
+    for _ in 0..5 {
+        app.poll_dap();
+    }
+    assert_eq!(app.status, "Saved out.py");
+}
+
+/// #867 guard: a postDebugTask reports after the end, so its message is
+/// the one left on the status line, not the end message.
+#[test]
+fn a_post_debug_task_message_outlives_the_end_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug_post_tasks = vec![String::from("missing")];
+    poll_until_shrinks(&mut app, 1);
+    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(
+        app.status
+            .starts_with("postDebugTask \"missing\" not found"),
+        "{}",
+        app.status
+    );
+}
+
+/// #867 guard: when the focused member of a `stopAll` compound ends, the
+/// status keeps saying why the rest stopped rather than the plain end
+/// message.
+#[test]
+fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.push("B", stub_member(false));
+    app.debug_sessions.focus(0);
+    app.debug_stop_all = true;
+
+    poll_until_shrinks(&mut app, 2);
+    assert!(
+        app.debug_sessions.is_empty(),
+        "{:?}",
+        app.debug_sessions.names()
+    );
+    assert_eq!(
+        app.status,
+        "A ended — stopAll stopped the rest of the compound"
+    );
 }
 
 /// A compound that is REFUSED (here, it names a configuration no

@@ -1065,7 +1065,7 @@ Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) s
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output, and a `❯` REPL prompt. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867), and a `❯` REPL prompt. Every console line is also mirrored to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
@@ -1268,7 +1268,7 @@ The tree-sitter outline provider. It extracts the OUTLINE panel's symbol tree �
 
 ### src/output.rs
 
-The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named channels — one per language server, plus Debug Adapter, Git, Server Provisioning and Navigator (the resident AI pair programmer's commentary) — each a capped ring buffer of levelled lines.
+The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named channels — one per language server, plus Debug Adapter, Debug Console (the Run and Debug console mirrored at full width), Git, Server Provisioning and Navigator (the resident AI pair programmer's commentary) — each a capped ring buffer of levelled lines.
 
 **Producers push here and mirror to disk.** Code across the codebase writes to the bus while also mirroring to the on-disk `lsp.log`. A generation counter lets the widget re-pull only when something actually changed.
 

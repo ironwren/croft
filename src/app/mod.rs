@@ -28886,7 +28886,8 @@ impl App {
                 }
                 // `stopAll: true` (#567): the siblings go too, and the rest
                 // of this arm reports the ended run as for a lone session.
-                if self.debug_stop_all && !self.debug_sessions.is_empty() {
+                let stopped_all = self.debug_stop_all && !self.debug_sessions.is_empty();
+                if stopped_all {
                     self.debug_stop();
                     self.status =
                         format!("{ended_name} ended — stopAll stopped the rest of the compound");
@@ -28912,9 +28913,16 @@ impl App {
                         self.run_debug.feedback_is_error = true;
                     }
                     None => {
-                        self.run_debug.feedback = Some(
-                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string(),
-                        );
+                        let msg =
+                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string();
+                        // The status bar still read "Debugging x — F5
+                        // continue · F10 step over" after the end (#867).
+                        // stopAll's own explanation above is left standing,
+                        // and a postDebugTask below may report over this.
+                        if !stopped_all {
+                            self.status = msg.clone();
+                        }
+                        self.run_debug.feedback = Some(msg);
                         self.run_debug.feedback_is_error = false;
                     }
                 }
@@ -29159,9 +29167,16 @@ impl App {
     }
 
     /// Append a line to the debug console, capping the backlog so a chatty
-    /// program can't grow it without bound.
+    /// program can't grow it without bound. The line is mirrored to OUTPUT's
+    /// "Debug Console" channel (#867), where it reads at full width and can
+    /// be searched and copied; that channel keeps its own cap.
     fn debug_console_push(&mut self, line: String) {
         const CAP: usize = 1000;
+        crate::output::push(
+            crate::output::CHANNEL_DEBUG_CONSOLE,
+            crate::output::OutputLevel::Info,
+            &line,
+        );
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
             let overflow = self.debug_console.len() - CAP;
