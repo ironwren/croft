@@ -1848,7 +1848,7 @@ impl PaletteItem {
 
     /// The right-aligned keybinding hint. Extension commands have none (they are
     /// palette-only), so they show a blank hint.
-    pub fn keybinding_hint(&self) -> &str {
+    pub fn keybinding_hint(&self) -> &'static str {
         match self {
             PaletteItem::Builtin(c) => c.keybinding_hint(),
             PaletteItem::Extension(_) => "",
@@ -2196,7 +2196,8 @@ pub fn render_command_palette(
             Span::styled(prefix.to_string(), row_style),
             Span::styled(title.to_string(), row_style),
             Span::styled(" ".repeat(pad), row_style),
-            Span::styled(hint.into_owned(), hint_style),
+            // Borrowed as written unless the platform respells it.
+            Span::styled(hint, hint_style),
         ];
         lines.push(Line::from(spans));
     }
