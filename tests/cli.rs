@@ -726,10 +726,13 @@ impl PtyCroft {
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
+        // A child that cannot take the pty as its controlling terminal
+        // fails to spawn here, rather than running detached from it.
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
-                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -743,32 +746,45 @@ impl PtyCroft {
         Self { child, pty }
     }
 
-    /// Everything croft writes during the next `for_`.
-    fn drain(&mut self, for_: std::time::Duration) -> String {
+    /// What croft writes until `done` holds, checked on everything read so
+    /// far after every read, or until `limit` (a bound for a slow machine,
+    /// not a wait: a passing run returns as soon as `done` does). The end of
+    /// the terminal (croft exited) stops the read; any other read error
+    /// fails the test rather than passing for the end.
+    fn read_until(
+        &mut self,
+        limit: std::time::Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
         use std::io::Read;
-        let mut out = Vec::new();
+        let mut out = String::new();
         let mut buf = [0u8; 1 << 16];
-        let end = std::time::Instant::now() + for_;
-        while std::time::Instant::now() < end {
+        let end = std::time::Instant::now() + limit;
+        while !done(&out) && std::time::Instant::now() < end {
             match self.pty.read(&mut buf) {
                 Ok(0) => break,
-                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Ok(k) => out.push_str(&String::from_utf8_lossy(&buf[..k])),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(10))
                 }
-                Err(_) => break,
+                // Linux reports the slave side closing as EIO.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading croft's terminal: {e}"),
             }
         }
-        String::from_utf8_lossy(&out).into_owned()
+        out
     }
 
-    /// Type `bytes` as the terminal would send them, then let croft act.
-    fn send(&mut self, bytes: &[u8]) -> String {
+    /// Type `bytes` as the terminal would send them.
+    fn send(&mut self, bytes: &[u8]) {
         use std::io::Write;
         self.pty.write_all(bytes).unwrap();
-        self.drain(std::time::Duration::from_millis(700))
     }
 }
+
+/// How long a PTY test waits for croft to show what it is waiting for.
+#[cfg(unix)]
+const PTY_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[cfg(unix)]
 impl Drop for PtyCroft {
@@ -792,7 +808,7 @@ impl Drop for PtyCroft {
 fn croft_keys_reads_tmux_ctrl_shift_s_with_the_shift_and_nothing_else_with_one() {
     let home = tempfile::tempdir().unwrap();
     let mut croft = PtyCroft::spawn(home.path(), &["keys"]);
-    let banner = croft.drain(std::time::Duration::from_secs(3));
+    let banner = croft.read_until(PTY_LIMIT, |out| out.contains("croft keys"));
     assert!(banner.contains("croft keys"), "no banner: {banner:?}");
     // Each case is followed by a lone marker key, so the report lines of
     // one case never run into the next.
@@ -804,9 +820,10 @@ fn croft_keys_reads_tmux_ctrl_shift_s_with_the_shift_and_nothing_else_with_one()
     ];
     let mut reports = Vec::new();
     for (i, (name, bytes)) in cases.iter().enumerate() {
-        let mut seen = croft.send(bytes);
-        seen += &croft.send(format!("{i}").as_bytes());
         let marker = format!("code=Char('{i}')");
+        croft.send(bytes);
+        croft.send(format!("{i}").as_bytes());
+        let seen = croft.read_until(PTY_LIMIT, |out| out.contains(&marker));
         let lines: Vec<String> = seen
             .lines()
             .filter(|l| l.contains("code="))
@@ -857,19 +874,31 @@ fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
     let file = home.path().join("a.txt");
     std::fs::write(&file, "alpha\n").unwrap();
     let mut croft = PtyCroft::spawn(home.path(), &["a.txt"]);
-    let started = croft.drain(std::time::Duration::from_secs(8));
-    assert!(started.len() > 1000, "croft drew nothing: {started:?}");
-    // Dismiss anything a first launch shows over the editor.
+    let saved = |want: &str| std::fs::read_to_string(&file).unwrap() == want;
+    let started = croft.read_until(PTY_LIMIT, |out| out.contains("alpha"));
+    assert!(
+        started.contains("alpha"),
+        "croft never drew a.txt: {started:?}"
+    );
+    // Dismiss anything a first launch shows over the editor. A terminal
+    // reads ESC as Escape only when nothing follows it at once (ESC then
+    // `x` is Alt+x), so this one pause is the protocol's, not a guess at
+    // how long croft takes.
     croft.send(b"\x1b");
+    croft.read_until(std::time::Duration::from_millis(300), |_| false);
     croft.send(b"x");
     croft.send(b"\x13");
+    croft.read_until(PTY_LIMIT, |_| saved("xalpha\n"));
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "xalpha\n",
         "setup: the typed x lands in a.txt and Ctrl+S saves it"
     );
     croft.send(b"y");
-    let drawn = croft.send(b"\x1b[83;6u");
+    croft.send(b"\x1b[83;6u");
+    // Source Control on screen means the chord has been handled, so a save
+    // it made would be on disk by now.
+    let drawn = croft.read_until(PTY_LIMIT, |out| out.contains("SOURCE CONTROL"));
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "xalpha\n",
