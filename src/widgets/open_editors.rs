@@ -218,13 +218,18 @@ impl Widget for &mut OpenEditorsPanel {
             crate::icons::CHEVRON_OPEN
         };
         let header_y = inner.y;
+        let chevron = format!("{chevron} ");
+        const TITLE: &str = "OPEN EDITORS";
+        // The header's own text, measured in cells, so the Save All action
+        // below clears it whatever the chevron glyph or title become.
+        let title_w = {
+            use unicode_width::UnicodeWidthStr;
+            u16::try_from(chevron.width() + TITLE.width()).unwrap_or(u16::MAX)
+        };
         Paragraph::new(Line::from(vec![
+            Span::styled(chevron, Style::default().fg(self.theme.ui(COLOR_DIM))),
             Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
-            ),
-            Span::styled(
-                "OPEN EDITORS",
+                TITLE,
                 Style::default()
                     .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
@@ -246,11 +251,10 @@ impl Widget for &mut OpenEditorsPanel {
         // VS Code's Save All action (#852), right-aligned on the header with
         // a one-cell pad, as the Explorer's root-row toolbar sits. Only while
         // expanded (VS Code hides a collapsed view's actions) and only where
-        // it clears the title: "▸ OPEN EDITORS" is 14 cells.
-        const TITLE_W: u16 = 14;
+        // it clears the title.
         const PAD: u16 = 1;
         // Title, a two-cell gap, then the glyph and its pad.
-        if !self.collapsed && inner.width > TITLE_W + 2 + PAD {
+        if !self.collapsed && inner.width > title_w.saturating_add(2 + PAD) {
             let x = inner.x + inner.width - PAD - 1;
             let rect = Rect {
                 x,
@@ -464,6 +468,44 @@ mod tests {
         assert!(p.hit_save_all(28, 0));
         assert!(!p.hit_save_all(5, 0), "the title is not the button");
         assert!(!p.hit_save_all(28, 1), "nor is the row below it");
+    }
+
+    /// #852 review guard: at every header width the Save All glyph either
+    /// stays off or sits at least two cells clear of the title's last cell,
+    /// and it shows from the first width with room for both.
+    #[test]
+    fn save_all_clears_the_title_at_every_width() {
+        let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
+        p.set_items(vec![item("a.rs", true, true)]);
+        let title: Vec<char> = "OPEN EDITORS".chars().collect();
+        let mut first_shown = None;
+        for width in 4..48 {
+            let text = rendered_text(&mut p, width, 3);
+            let header: Vec<char> = text.lines().next().unwrap().chars().collect();
+            let title_end = header
+                .windows(title.len())
+                .position(|w| w == title.as_slice())
+                .map(|at| at + title.len());
+            match (title_end, header.iter().position(|&c| c == '\u{eb49}')) {
+                (Some(end), Some(at)) => {
+                    assert!(
+                        at >= end + 2,
+                        "width {width}: glyph at {at}, title ends at {end}"
+                    );
+                    first_shown.get_or_insert(width);
+                }
+                (_, None) => assert_eq!(p.save_all_btn, Rect::default(), "width {width}"),
+                (None, Some(_)) => panic!("width {width}: a glyph with no full title: {text:?}"),
+            }
+        }
+        let shown = first_shown.expect("Save All shows once there is room");
+        assert!(
+            rendered_text(&mut p, shown - 1, 3)
+                .find('\u{eb49}')
+                .is_none()
+        );
+        assert!(shown >= 18, "never squeezed in beside the title: {shown}");
     }
 
     #[test]
