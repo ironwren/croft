@@ -1013,11 +1013,16 @@ impl Renderer<'_> {
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
         // Widths in screen cells, not characters (#861): the preview paints
         // `食費` across four cells, and padding it as two pushed that row's
-        // `│` two columns right of every other row's.
+        // `│` two columns right of every other row's. Each cell is measured
+        // once, for both its column's width and its own padding.
+        let cell_widths: Vec<Vec<usize>> = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cells(cell)).collect())
+            .collect();
         let mut widths = vec![0usize; cols];
-        for row in &rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cells(cell));
+        for row in &cell_widths {
+            for (i, w) in row.iter().enumerate() {
+                widths[i] = widths[i].max(*w);
             }
         }
         for (r, row) in rows.iter().enumerate() {
@@ -1037,7 +1042,8 @@ impl Renderer<'_> {
                     ));
                 }
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = width.saturating_sub(cells(cell));
+                let used = cell_widths[r].get(i).copied().unwrap_or(0);
+                let pad = width.saturating_sub(used);
                 // The delimiter row's colons place the text in its column;
                 // a centred cell's odd cell of slack goes on the right.
                 let (left, right) = match aligns.get(i) {
