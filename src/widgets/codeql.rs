@@ -980,6 +980,11 @@ impl CodeqlPanel {
         let mut x = HISTORY_CHIP_X;
         for chip in history_chips(i) {
             let w = chip.label.chars().count() as u16 + 2;
+            // Too wide for a line of its own: `lay_out_chips` would drop
+            // it, so it never claims a row that paints empty.
+            if HISTORY_CHIP_X + w > limit {
+                continue;
+            }
             if x > HISTORY_CHIP_X && x + w > limit {
                 x = HISTORY_CHIP_X;
             }
@@ -1861,25 +1866,21 @@ impl CodeqlPanel {
     }
 
     /// Paint query history entry `i`: its status glyph, its name cut to
-    /// fit, and the count and duration columns, right-aligned and as wide
-    /// as their widest entry so every row lines up.
-    fn paint_history(&self, buf: &mut Buffer, row: Rect, i: usize, p: &Palette) {
+    /// fit, and the count and duration columns, right-aligned in the
+    /// widths the frame measured so every row lines up.
+    fn paint_history(
+        &self,
+        buf: &mut Buffer,
+        row: Rect,
+        i: usize,
+        (count_w, dur_w): (u16, u16),
+        p: &Palette,
+    ) {
         use crate::codeql_query::RunStatus;
         let Some(h) = self.history.get(i) else {
             return;
         };
         let end = row.x + row.width.saturating_sub(1);
-        let widest = |f: fn(&HistoryRow) -> String| {
-            self.history
-                .iter()
-                .map(|r| f(r).chars().count() as u16)
-                .max()
-                .unwrap_or(0)
-        };
-        let (count_w, dur_w) = (
-            widest(HistoryRow::count_text),
-            widest(HistoryRow::duration_text),
-        );
         let (glyph, glyph_fg, name_fg, dur_fg) = match h.status {
             RunStatus::Succeeded => ("✓", p.added, p.fg, p.dim),
             RunStatus::Failed(_) => ("✗", p.deleted, p.fg, p.dim),
@@ -2184,6 +2185,19 @@ impl Widget for &mut CodeqlPanel {
             self.scroll = self.selected + 1 - rows;
         }
         let focused_row = self.focused.then_some(self.selected);
+        // The count and duration columns are as wide as their widest entry,
+        // measured once a frame rather than once a row.
+        let widest = |f: fn(&HistoryRow) -> String| {
+            self.history
+                .iter()
+                .map(|r| f(r).chars().count() as u16)
+                .max()
+                .unwrap_or(0)
+        };
+        let columns = (
+            widest(HistoryRow::count_text),
+            widest(HistoryRow::duration_text),
+        );
         for (r, line) in lines.iter().enumerate().skip(self.scroll).take(rows) {
             let y = inner.y + (r - self.scroll) as u16;
             let row = Rect::new(inner.x, y, inner.width, 1);
@@ -2217,7 +2231,7 @@ impl Widget for &mut CodeqlPanel {
                 Line::Card(card) => self.paint_card(buf, row, card, &p),
                 Line::Button(a, part) => self.paint_button(buf, row, *a, *part, &p),
                 Line::DbCard(card) => self.paint_db_card(buf, row, *card, &p),
-                Line::History(i) => self.paint_history(buf, row, *i, &p),
+                Line::History(i) => self.paint_history(buf, row, *i, columns, &p),
                 Line::HistoryDetail(i, detail) => self.paint_detail(buf, row, *i, *detail, &p),
                 Line::Running(part) => self.paint_running(buf, row, *part, &p),
             }
@@ -3055,6 +3069,26 @@ mod tests {
         assert_eq!(p.selected_history(), Some(1));
         p.set_running(Some(("b.ql".into(), 1)));
         assert_eq!(p.selected_history(), Some(1));
+    }
+
+    #[test]
+    fn a_narrow_row_never_lists_a_chip_line_it_cannot_paint() {
+        use crate::codeql_query::RunStatus;
+        let mut p = CodeqlPanel::new();
+        p.history = vec![hist("UnsafeDeref", RunStatus::Succeeded, Some(17), 4)];
+        for w in [12, 14, 16, 18, 22, 36] {
+            let _ = draw_w(&mut p, w);
+            p.select_history(0);
+            if !p.is_expanded(0) {
+                p.toggle_history(0);
+            }
+            let _ = draw_w(&mut p, w);
+            for line in p.lines() {
+                if matches!(line, Line::HistoryDetail(_, Detail::Chips(_))) {
+                    assert!(!p.chips_on(&line).is_empty(), "an empty chip row at {w}");
+                }
+            }
+        }
     }
 
     #[test]

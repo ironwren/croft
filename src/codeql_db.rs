@@ -151,13 +151,15 @@ pub fn folder_size(dir: &Path) -> Option<u64> {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
+            // `file_type` describes the entry itself: a link is neither a
+            // folder to walk (it could loop) nor a file to count.
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if kind.is_dir() {
                 stack.push(entry.path());
-            } else if meta.is_file() {
-                total += meta.len();
+            } else if kind.is_file() {
+                total += entry.metadata().map_or(0, |m| m.len());
             }
         }
     }
@@ -396,6 +398,23 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_size_counts_files_and_skips_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("db");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), [0u8; 100]).unwrap();
+        std::fs::write(dir.join("sub/b.bin"), [0u8; 20]).unwrap();
+        let big = tmp.path().join("big.bin");
+        std::fs::write(&big, [0u8; 5000]).unwrap();
+        std::os::unix::fs::symlink(&big, dir.join("to-file")).unwrap();
+        // A link back up would loop if followed.
+        std::os::unix::fs::symlink(&dir, dir.join("sub/loop")).unwrap();
+        assert_eq!(folder_size(&dir), Some(120));
+        assert_eq!(folder_size(&big), None, "not a folder");
+    }
 
     fn make_db(root: &Path, name: &str, lang: &str) -> PathBuf {
         let dir = root.join(name);
