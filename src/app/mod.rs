@@ -2873,6 +2873,13 @@ pub struct App {
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
     timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// Background folder-size scans for the CodeQL database card (#578): a
+    /// large database is many files, so the walk stays off the input path.
+    codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
+    codeql_size_tx: std::sync::mpsc::Sender<(PathBuf, Option<u64>)>,
+    /// Databases whose size scan is in flight, so a refresh does not start
+    /// a second walk of the same folder.
+    codeql_size_pending: std::collections::HashSet<PathBuf>,
     /// The file the TIMELINE has been fetched (or is being fetched) for, so the
     /// fetch fires exactly once per active-file change.
     timeline_fetched: Option<PathBuf>,
@@ -5284,6 +5291,7 @@ impl App {
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
+        let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_check_tx, project_check_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
@@ -5417,6 +5425,9 @@ impl App {
             settings_provenance: merged_settings.provenance,
             timeline_rx,
             timeline_tx,
+            codeql_size_rx,
+            codeql_size_tx,
+            codeql_size_pending: std::collections::HashSet::new(),
             history_done_rx,
             history_done_tx,
             project_check_rx,
@@ -10703,6 +10714,17 @@ impl App {
                  set it to always in Problems: Whole-Project Check Auto-Run",
             );
             changed = true;
+        }
+        // A CodeQL database's folder size landed; drop one for a database
+        // removed while it was being summed.
+        while let Ok((path, size)) = self.codeql_size_rx.try_recv() {
+            self.codeql_size_pending.remove(&path);
+            if let Some(size) = size
+                && self.codeql.databases.iter().any(|db| db.path == path)
+            {
+                self.codeql.db_sizes.insert(path, size);
+                changed = true;
+            }
         }
         // Drain any TIMELINE replies; ignore one for a since-closed file.
         while let Ok((path, entries)) = self.timeline_rx.try_recv() {
@@ -28318,19 +28340,25 @@ impl App {
     /// Mirror the saved database list into the side bar.
     fn refresh_codeql_databases(&mut self) {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
-        // The card shows each folder's size: summed once per database here,
-        // as the list loads or changes, rather than while painting.
-        let mut sizes = std::mem::take(&mut self.codeql.db_sizes);
-        self.codeql.db_sizes = store
-            .databases
-            .iter()
-            .filter_map(|db| {
-                let size = sizes
-                    .remove(&db.path)
-                    .or_else(|| crate::codeql_db::folder_size(&db.path))?;
-                Some((db.path.clone(), size))
-            })
-            .collect();
+        // The card shows each folder's size: summed once per database on a
+        // worker as the list loads or changes, never while painting or on
+        // the key that opened the list. Known sizes stay until it reports.
+        self.codeql
+            .db_sizes
+            .retain(|path, _| store.databases.iter().any(|db| &db.path == path));
+        for db in &store.databases {
+            if self.codeql.db_sizes.contains_key(&db.path)
+                || !self.codeql_size_pending.insert(db.path.clone())
+            {
+                continue;
+            }
+            let tx = self.codeql_size_tx.clone();
+            let path = db.path.clone();
+            std::thread::spawn(move || {
+                let size = crate::codeql_db::folder_size(&path);
+                let _ = tx.send((path, size));
+            });
+        }
         self.codeql.databases = store.databases;
         self.codeql.current_db = store.current;
         self.codeql.db_sort = store.sort_by;

@@ -55940,6 +55940,39 @@ fn codeql_database_card_picker_switches_the_current_database() {
 }
 
 #[test]
+fn codeql_database_sizes_are_summed_off_the_input_path() {
+    // #578: the card's folder size is walked on a worker, so adding or
+    // listing a large database never stalls a key; the size lands on a tick
+    // and a cached one is not walked again.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let db = make_codeql_db(tmp.path(), "flask-db", "python");
+        std::fs::write(db.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        app.submit_codeql_database(
+            crate::widgets::input_prompt::CodeqlDbSource::Folder,
+            &db.display().to_string(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.codeql.db_sizes.contains_key(&db) && std::time::Instant::now() < deadline {
+            app.sync_explorer_panels();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let size = *app.codeql.db_sizes.get(&db).expect("the size landed");
+        assert!(size >= 4096, "{size}");
+        assert!(app.codeql_size_pending.is_empty());
+        app.refresh_codeql_databases();
+        assert!(
+            app.codeql_size_pending.is_empty(),
+            "a cached size is not walked again"
+        );
+        assert_eq!(app.codeql.db_sizes.get(&db), Some(&size));
+    });
+}
+
+#[test]
 fn codeql_history_export_chip_reaches_the_export_prompt() {
     // #578: Space expands a history row into its details and action chips;
     // a click on Export asks where to copy that run's results.
