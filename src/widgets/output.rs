@@ -489,37 +489,54 @@ impl OutputPanel {
 
     fn render_dropdown(&mut self, body: Rect, buf: &mut Buffer, accent: Color) {
         let n = self.channels.len() as u16;
-        // The box's border takes a row above and below the list and a
-        // column either side, so the names sit inside it rather than on it
-        // (#846). A body too short for both border rows and a name gets the
-        // bare list instead.
-        let pad = u16::from(body.height >= 3);
-        let h = n.saturating_add(2 * pad).min(body.height);
-        let rows = h - 2 * pad;
-        // One extra column carries the scrollbar when the list overflows,
-        // so the longest channel name is never overpainted by the track.
-        let overflow = n > rows;
-        let w = self
+        let longest = self
             .channels
             .iter()
             .map(|c| c.chars().count() as u16 + 2)
             .max()
-            .unwrap_or(8)
-            .saturating_add(2 * pad + overflow as u16)
-            .min(body.width.saturating_sub(1));
-        let area = Rect {
-            x: body.x + 1,
-            y: body.y,
-            width: w,
-            height: h,
+            .unwrap_or(8);
+        // The box's border takes a row above and below the list and a
+        // column either side, so the names sit inside it rather than on it
+        // (#846). `pad` is the border's width: 1, or 0 for the bare list.
+        let place = |pad: u16| {
+            let h = n.saturating_add(2 * pad).min(body.height);
+            let rows = h.saturating_sub(2 * pad);
+            // One extra column carries the scrollbar when the list
+            // overflows, so the longest channel name is never overpainted
+            // by the track.
+            let overflow = n > rows;
+            let w = longest
+                .saturating_add(2 * pad + overflow as u16)
+                .min(body.width.saturating_sub(1));
+            let area = Rect {
+                x: body.x + 1,
+                y: body.y,
+                width: w,
+                height: h,
+            };
+            let list = Rect {
+                x: area.x + pad,
+                y: area.y + pad,
+                width: w.saturating_sub(2 * pad),
+                height: rows,
+            };
+            (area, list, rows, overflow)
         };
-        let list = Rect {
-            x: area.x + pad,
-            y: area.y + pad,
-            width: w.saturating_sub(2 * pad),
-            height: rows,
+        // A row holds a space, at least one character of its name and a
+        // space, beside the scrollbar when there is one.
+        let holds_a_name =
+            |list: Rect, overflow: bool| list.width.saturating_sub(overflow as u16) >= 3;
+        // A body too short for both border rows and a name, or too narrow
+        // for a name inside the border, gets the bare list instead. One too
+        // narrow even for that gets no dropdown, rather than a box with
+        // nothing in it.
+        let bordered = body.height >= 3 && {
+            let (_, list, _, overflow) = place(1);
+            holds_a_name(list, overflow)
         };
-        if list.width == 0 {
+        let pad = u16::from(bordered);
+        let (area, list, rows, overflow) = place(pad);
+        if !holds_a_name(list, overflow) {
             return;
         }
         // Clamp the window so the last page is always full; the wheel
@@ -691,18 +708,21 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         (&mut p).render(area, &mut buf);
-        let cells = |y: u16, xs: std::ops::RangeInclusive<u16>| -> String {
-            xs.map(|x| buf[(x, y)].symbol()).collect()
-        };
         // The box: the widest name plus a space either side, plus the
         // border, from the column after the body's edge, under the toolbar.
         let (left, right, top, bottom) = (1, 15, 1, 5);
-        assert_eq!(cells(top, left..=right), format!("╭{}╮", "─".repeat(13)));
-        assert_eq!(cells(bottom, left..=right), format!("╰{}╯", "─".repeat(13)));
+        assert_eq!(
+            cells(&buf, top, left..=right),
+            format!("╭{}╮", "─".repeat(13))
+        );
+        assert_eq!(
+            cells(&buf, bottom, left..=right),
+            format!("╰{}╯", "─".repeat(13))
+        );
         for (i, name) in ["Git", "ruff", "Test Runner"].iter().enumerate() {
             let y = top + 1 + i as u16;
             assert_eq!(
-                cells(y, left..=right),
+                cells(&buf, y, left..=right),
                 format!("│ {name:<12}│"),
                 "row {y}: the name inside the border, no log text around it"
             );
@@ -794,6 +814,59 @@ mod tests {
                 r.x > left && r.x + r.width < right,
                 "{r:?} inside the border"
             );
+        }
+    }
+
+    /// #846 review: a body too narrow for a name inside the border (a space,
+    /// one character and a space between its sides) drops the border rather
+    /// than drawing a box with nothing in it: each row shows the start of
+    /// its name, and its click target is that row.
+    #[test]
+    fn a_dropdown_too_narrow_for_its_border_shows_its_names_without_it() {
+        for w in [4u16, 5] {
+            let mut p = OutputPanel::new();
+            p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
+            p.dropdown_open = true;
+            let buf = render_buf(&mut p, w, 10);
+            for (i, name) in ["Git", "ruff", "Test Runner"].iter().enumerate() {
+                let y = 1 + i as u16;
+                let row = cells(&buf, y, 1..=w - 1);
+                assert!(
+                    !row.contains(['╭', '╮', '╰', '╯', '│', '─']),
+                    "width {w}, row {y} carries no border: {row:?}"
+                );
+                assert_eq!(
+                    row.trim(),
+                    &name[..usize::from(w) - 3],
+                    "width {w}, row {y}: the start of {name}"
+                );
+            }
+            let targets: Vec<(u16, usize)> =
+                p.dropdown_items.iter().map(|&(r, i)| (r.y, i)).collect();
+            assert_eq!(targets, vec![(1, 0), (2, 1), (3, 2)], "width {w}");
+            assert!(p.dropdown_items.iter().all(|&(r, _)| r.width >= 3));
+        }
+    }
+
+    /// #846 review guard: a body with no room for even one character of a
+    /// name draws no dropdown at all, and offers no click target.
+    #[test]
+    fn a_dropdown_with_no_room_for_a_name_is_not_drawn() {
+        for w in [1u16, 2, 3] {
+            let mut p = OutputPanel::new();
+            p.channels = vec!["Git".into(), "ruff".into()];
+            let closed = render_buf(&mut p, w, 10);
+            p.dropdown_open = true;
+            let open = render_buf(&mut p, w, 10);
+            // Below the toolbar, whose chevron says the dropdown is open.
+            for y in 1..10 {
+                assert_eq!(
+                    cells(&open, y, 0..=w - 1),
+                    cells(&closed, y, 0..=w - 1),
+                    "width {w}, row {y}: nothing drawn"
+                );
+            }
+            assert!(p.dropdown_items.is_empty(), "width {w}");
         }
     }
 
