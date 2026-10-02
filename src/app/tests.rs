@@ -20846,6 +20846,57 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     );
 }
 
+/// #864 review: a config naming both `module` and `program` launches the
+/// module (debugpy refuses a request naming both, so the program is dropped),
+/// so its interpreter comes from its `cwd`, never from beside the program
+/// the request no longer carries. A program launch still uses the venv
+/// beside its program.
+#[test]
+fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
+    use crate::dap::configs::{SubstCtx, debugpy_request, parse_launch_json, resolve};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+    };
+    let request_of = |json: &str| {
+        let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
+        let rc = resolve(&cfg, &ctx).unwrap();
+        let cwd = rc.cwd.clone().unwrap_or_else(|| root.to_path_buf());
+        let adapter = Path::new("/home/u/.croft/debug-venv/bin/python");
+        debugpy_request(&rc, &super::config_project_python(&rc, &cwd, root, adapter))
+    };
+    let root_venv = make_venv(root, ".venv");
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools_venv = make_venv(&tools, ".venv");
+
+    let both = request_of(
+        r#"[{"name":"T","type":"python","module":"pytest","program":"tools/helper.py"}]"#,
+    );
+    assert_eq!(
+        both["arguments"]["module"], "pytest",
+        "the module is launched"
+    );
+    assert!(
+        both["arguments"].get("program").is_none(),
+        "the program is dropped"
+    );
+    assert_eq!(
+        both["arguments"]["python"][0],
+        &*root_venv.to_string_lossy(),
+        "the module runs under its cwd's venv, not the dropped program's"
+    );
+
+    let program = request_of(r#"[{"name":"P","type":"python","program":"tools/helper.py"}]"#);
+    assert_eq!(
+        program["arguments"]["python"][0],
+        &*tools_venv.to_string_lossy(),
+        "a program launch keeps the venv beside its program"
+    );
+}
+
 /// #864 guard: the debuggee's interpreter is looked up no higher than the
 /// workspace root, as Run's is. A venv in the folder above the workspace
 /// belongs to some other project and is not picked up.

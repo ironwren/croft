@@ -65336,9 +65336,10 @@ fn config_project_python(
     workspace_root: &Path,
     adapter_python: &Path,
 ) -> PathBuf {
-    let dir = rc
-        .program
-        .as_deref()
+    // A `module` launch drops `program` from the request (debugpy refuses
+    // both), so the program's directory says nothing about what runs.
+    let program = rc.program.as_deref().filter(|_| rc.module.is_none());
+    let dir = program
         .map(|p| crate::dap::configs::absolute_in(p, cwd))
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| cwd.to_path_buf());

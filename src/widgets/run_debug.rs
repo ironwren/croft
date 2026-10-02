@@ -61,23 +61,42 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
 /// wide, the way a terminal wraps (#867): whitespace is kept, so a
 /// traceback's indentation survives, a wide glyph never straddles two rows,
 /// and a tab is four spaces. An empty line is one empty row.
-fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
+///
+/// Only the last `keep` rows are returned, oldest first, and only they are
+/// built: a row that scrolls out of the kept tail lends its buffer to the
+/// next, so a program printing one enormous line costs a scan of it per
+/// frame but never a string per row (#867 review).
+fn wrap_console_line_tail(line: &str, width: usize, keep: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
+    if keep == 0 {
+        return Vec::new();
+    }
     let width = width.max(1);
-    let mut rows = Vec::new();
+    let mut rows: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut row = String::new();
     let mut used = 0;
-    for c in line.replace('\t', "    ").chars() {
+    for c in line.chars() {
+        // A tab is four spaces.
+        let (c, n) = if c == '\t' { (' ', 4) } else { (c, 1) };
         let w = c.width().unwrap_or(0);
-        if used + w > width && !row.is_empty() {
-            rows.push(std::mem::take(&mut row));
-            used = 0;
+        for _ in 0..n {
+            if used + w > width && !row.is_empty() {
+                rows.push_back(std::mem::take(&mut row));
+                // With the row in progress, `keep` rows are kept: once the
+                // finished ones reach `keep`, the oldest one's buffer becomes
+                // the next row instead of a fresh allocation.
+                if rows.len() >= keep {
+                    row = rows.pop_front().unwrap_or_default();
+                    row.clear();
+                }
+                used = 0;
+            }
+            row.push(c);
+            used += w;
         }
-        row.push(c);
-        used += w;
     }
-    rows.push(row);
-    rows
+    rows.push_back(row);
+    rows.into()
 }
 
 /// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
@@ -422,7 +441,8 @@ impl RunDebugPanel {
         let mut rows = Vec::new();
         for line in self.console_tail.iter().rev() {
             let echo = line.starts_with('❯');
-            for row in wrap_console_line(line, width).into_iter().rev() {
+            let keep = max_rows.saturating_sub(rows.len());
+            for row in wrap_console_line_tail(line, width, keep).into_iter().rev() {
                 if rows.len() == max_rows {
                     rows.reverse();
                     return rows;
@@ -1146,6 +1166,11 @@ impl Widget for &mut RunDebugPanel {
 mod tests {
     use super::*;
 
+    /// Every row of `line` wrapped to `width`.
+    fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
+        wrap_console_line_tail(line, width, usize::MAX)
+    }
+
     #[test]
     fn paused_state_renders_call_stack_and_variables_and_maps_clicks() {
         let mut panel = RunDebugPanel::new();
@@ -1227,6 +1252,48 @@ mod tests {
         assert_eq!(panel.debug_row_at(y0), Some(0));
         assert_eq!(panel.debug_row_at(y0 + 1), Some(1));
         assert_eq!(panel.debug_row_at(y0.saturating_sub(1)), None);
+    }
+
+    /// #867 review: only the rows the console shows are built. Wrapping
+    /// just a line's last `keep` rows gives exactly the tail of wrapping the
+    /// whole line, for tabs, wide glyphs, an empty line and any `keep`.
+    #[test]
+    fn wrapping_a_lines_tail_matches_the_tail_of_wrapping_it_whole() {
+        let wide = "界".repeat(9) + "x";
+        let lines = [
+            String::new(),
+            String::from("short"),
+            String::from("\tif x:\n"),
+            "y".repeat(30) + "END",
+            wide,
+            format!("\t{}\t{}", "a".repeat(17), "界b".repeat(7)),
+        ];
+        for line in &lines {
+            for width in [0, 1, 3, 8, 25] {
+                let whole = wrap_console_line(line, width);
+                for keep in 0..=whole.len() + 2 {
+                    let tail = &whole[whole.len().saturating_sub(keep)..];
+                    assert_eq!(
+                        wrap_console_line_tail(line, width, keep),
+                        tail,
+                        "{line:?} at {width} keeping {keep}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #867 review guard: a single enormous line still shows its last rows,
+    /// and only those are built, however long the line is.
+    #[test]
+    fn a_huge_console_line_shows_its_last_rows() {
+        let mut panel = RunDebugPanel::default();
+        let huge = "a".repeat(2_000_000) + "THE END";
+        panel.console_tail = vec![String::from("before"), huge];
+        let rows = panel.console_rows(10, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].0, "THE END");
+        assert_eq!(rows[1].0, "a".repeat(10));
     }
 
     #[test]
