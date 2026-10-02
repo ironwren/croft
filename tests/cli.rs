@@ -682,6 +682,63 @@ fn locale_template_accepts_a_full_locale() {
     assert!(stderr.contains("locales/de.json"), "{stderr}");
 }
 
+/// The text a Rust string literal's body (between its quotes) spells: one
+/// pass over its escapes (`\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`,
+/// `\xNN`, `\u{...}`), as the compiler reads them.
+fn unescape_rust_literal(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                out.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+            }
+            Some('u') => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// #849 review: the scan reads translated strings out of Rust literals, so
+/// it has to spell every escape a literal can hold the way the compiler
+/// does, or a string with a newline or tab would be looked up by the wrong
+/// key.
+#[test]
+fn unescape_rust_literal_reads_every_rust_escape() {
+    for (body, text) in [
+        (r"plain", "plain"),
+        (r#"a \"quoted\" word"#, "a \"quoted\" word"),
+        (r"back\\slash", "back\\slash"),
+        (r"line\nbreak", "line\nbreak"),
+        (r"tab\there", "tab\there"),
+        (r"cr\r", "cr\r"),
+        (r"nul\0", "nul\0"),
+        (r"it\'s", "it's"),
+        (r"hex\x41", "hexA"),
+        (r"\u{2026}\u{1F600}", "\u{2026}\u{1F600}"),
+        (
+            r"\\n stays a backslash and an n",
+            "\\n stays a backslash and an n",
+        ),
+    ] {
+        assert_eq!(unescape_rust_literal(body), text, "{body}");
+    }
+}
+
 /// Every string literal croft hands to `tr` at runtime, read from its own
 /// sources, with the file each came from: `tr("…")` calls, and context-menu
 /// labels, which `ContextMenu::localize` runs through `tr` wholesale. Test
@@ -699,15 +756,6 @@ fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
     .iter()
     .map(|p| regex::Regex::new(p).unwrap())
     .collect();
-    let unescape = |s: &str| {
-        let unicode = regex::Regex::new(r"\\u\{([0-9a-fA-F]+)\}").unwrap();
-        let s = unicode.replace_all(s, |c: &regex::Captures| {
-            char::from_u32(u32::from_str_radix(&c[1], 16).unwrap())
-                .unwrap()
-                .to_string()
-        });
-        s.replace("\\\"", "\"").replace("\\\\", "\\")
-    };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut dirs = vec![root.clone()];
     let mut found = std::collections::BTreeMap::new();
@@ -729,7 +777,7 @@ fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
             for re in &patterns {
                 for caps in re.captures_iter(text) {
                     for m in caps.iter().skip(1).flatten() {
-                        found.insert(unescape(m.as_str()), file.clone());
+                        found.insert(unescape_rust_literal(m.as_str()), file.clone());
                     }
                 }
             }
