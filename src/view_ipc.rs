@@ -732,8 +732,18 @@ impl Verb {
     }
 }
 
+/// Which file a `croft edit` call created: its device and inode. A call
+/// that cannot open the file takes back only this one, never a file
+/// something else has put at the same path since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Created {
+    dev: u64,
+    ino: u64,
+}
+
 /// The absolute path `target` names, resolved against `cwd` and checked
-/// before any croft is asked to open it, and whether this call created it.
+/// before any croft is asked to open it, and the file this call created
+/// there, if it created one.
 /// Checked here rather than at the server so the message names the path the
 /// USER typed, resolved against the cwd they typed it in.
 ///
@@ -742,11 +752,16 @@ impl Verb {
 /// so `EDITOR="croft edit --wait"` works for tools that name a file they
 /// have not written yet (#848). A missing directory is still an error: an
 /// editor creates a file, not the folders above it.
-fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<(PathBuf, bool)> {
+fn resolve_target(
+    verb: Verb,
+    cwd: &Path,
+    target: &Path,
+) -> anyhow::Result<(PathBuf, Option<Created>)> {
+    use std::os::unix::fs::MetadataExt;
     let v = verb.name();
     let path = resolve(cwd, target);
     if path.exists() {
-        return Ok((path, false));
+        return Ok((path, None));
     }
     if verb == Verb::View {
         anyhow::bail!("croft {v}: no such file: {}", path.display());
@@ -764,10 +779,18 @@ fn resolve_target(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<(Path
         .create_new(true)
         .open(&path)
     {
-        Ok(_) => Ok((path, true)),
+        // Read from the handle, so it names the file this call made. Without
+        // it nothing can be shown to be ours, and nothing is taken back.
+        Ok(file) => {
+            let created = file.metadata().ok().map(|m| Created {
+                dev: m.dev(),
+                ino: m.ino(),
+            });
+            Ok((path, created))
+        }
         // Something else created it since the check: open what is there
         // rather than truncate it.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok((path, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok((path, None)),
         Err(e) => anyhow::bail!("croft {v}: cannot create {}: {e}", path.display()),
     }
 }
@@ -805,7 +828,7 @@ pub fn run(
         if buf.is_empty() {
             anyhow::bail!("croft {v} -: nothing arrived on stdin");
         }
-        (stage_stdin(cache_dir, &buf, as_hint)?, false)
+        (stage_stdin(cache_dir, &buf, as_hint)?, None)
     } else {
         // After the socket check, so `croft edit` run outside croft leaves
         // no empty file behind.
@@ -815,12 +838,25 @@ pub fn run(
     let opened = open_in_croft(v, &socket, &path);
     // Nor does one whose croft cannot open it: a stale socket (the croft
     // that set it has exited) or a refusal takes back the empty file created
-    // just above. Only while it is still empty, and never a file that was
-    // already there (#848).
-    if opened.is_err() && created && std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
-        let _ = std::fs::remove_file(&path);
+    // just above, and never a file that was already there (#848).
+    if opened.is_err()
+        && let Some(created) = created
+    {
+        take_back(&path, created);
     }
     opened
+}
+
+/// Remove the file `created` names from `path`: only while that same file
+/// is still there and still empty. Compared by device and inode, not by
+/// path, and without following a link put in its place.
+fn take_back(path: &Path, created: Created) {
+    use std::os::unix::fs::MetadataExt;
+    let ours = std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.dev() == created.dev && m.ino() == created.ino && m.len() == 0);
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Ask the croft listening on `socket` to open `path`, naming the command
@@ -912,7 +948,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
         assert_eq!(path, dir.path().join("TODO.md"));
-        assert!(created, "this call made it");
+        assert!(created.is_some(), "this call made it");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"",
@@ -922,8 +958,46 @@ mod tests {
         // An existing file is opened as it is, never truncated.
         std::fs::write(&path, "keep me").unwrap();
         let (_, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
-        assert!(!created, "an existing file is not this call's to take back");
+        assert_eq!(
+            created, None,
+            "an existing file is not this call's to take back"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    /// #848 review: a `croft edit` whose croft cannot open the file takes
+    /// back the empty file it created. Only that one: an empty file another
+    /// process has put at the same path since is left alone.
+    #[test]
+    fn only_the_file_this_call_created_is_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        let created = created.expect("this call made it");
+        // Made while the first exists, so it cannot reuse its inode.
+        let other = dir.path().join("other.md");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        take_back(&path, created);
+        assert!(
+            path.exists(),
+            "an empty file this call did not create stays"
+        );
+    }
+
+    /// #848 guard: the empty file this call created, still in place, is
+    /// taken back; one it created but that has since been written to, or a
+    /// file that was already there, is not.
+    #[test]
+    fn the_created_file_is_taken_back_while_it_is_still_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("new.md")).unwrap();
+        take_back(&path, created.unwrap());
+        assert!(!path.exists(), "the empty file this call made is gone");
+
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("kept.md")).unwrap();
+        std::fs::write(&path, "written since").unwrap();
+        take_back(&path, created.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "written since");
     }
 
     /// #848: an editor creates a file, not the folders above it, and the
@@ -959,7 +1033,7 @@ mod tests {
         std::fs::write(dir.path().join("here.pdf"), "x").unwrap();
         assert_eq!(
             resolve_target(Verb::View, dir.path(), Path::new("here.pdf")).unwrap(),
-            (dir.path().join("here.pdf"), false)
+            (dir.path().join("here.pdf"), None)
         );
     }
 
