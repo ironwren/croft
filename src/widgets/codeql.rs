@@ -1841,11 +1841,17 @@ impl CodeqlPanel {
                 if db.added > 0 {
                     parts.push(short_age(now().saturating_sub(db.added)));
                 }
+                // Whole parts only: a narrow card drops the age, then the
+                // size, rather than cutting "3d ago" to "3d a".
+                let room = right.saturating_sub(left + 5) as usize;
+                while parts.len() > 1 && parts.join(" \u{b7} ").chars().count() > room {
+                    parts.pop();
+                }
                 buf.set_stringn(
                     left + 4,
                     row.y,
                     parts.join(" \u{b7} "),
-                    right.saturating_sub(left + 5) as usize,
+                    room,
                     Style::default().fg(p.dim),
                 );
             }
@@ -2907,6 +2913,18 @@ mod tests {
         let (mx, my) = find(&buf, "Rust · 214 MB · 2h ago").expect("the meta row");
         assert_eq!((mx, my), (6, y + 1));
         assert_eq!(buf[(mx, my)].fg, p.palette().dim);
+        // Too long for the card: the age goes whole, never cut to "3d a".
+        p.databases[1].added = now() - 3 * 86400 - 30;
+        p.db_sizes.insert("/x/flask".into(), 900 * 1024);
+        p.current_db = Some(1);
+        let buf = draw_w(&mut p, 30);
+        let (_, fy) = find(&buf, "◆ flask").expect("the name row");
+        let meta = row(&buf, fy + 1);
+        assert!(meta.contains("Python · 900 KB "), "{meta}");
+        assert!(!meta.contains("3d"), "{meta}");
+        p.current_db = Some(0);
+        let buf = draw(&mut p);
+        let (_, y) = find(&buf, "◆ croft-core").expect("the name row");
         // Too narrow for the keys at 32 columns: the chips keep their
         // labels; wider, the keys show.
         let (cx, cy) = find(&buf, "▶ Run").expect("the Run chip");
