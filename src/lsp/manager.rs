@@ -3214,8 +3214,24 @@ impl WorkerState {
                     .collect(),
                 None => return,
             };
+        // The text is cloned only for a server that asks for it while another
+        // still waits after it; the last one gets the buffer itself.
+        let mut wanting = arcs
+            .iter()
+            .filter(|(_, _, notify)| *notify == SaveNotify::WithText)
+            .count();
+        let mut text = Some(text);
         for (name, client_arc, notify) in arcs {
-            let text = (notify == SaveNotify::WithText).then(|| text.clone());
+            let text = if notify == SaveNotify::WithText {
+                wanting -= 1;
+                if wanting == 0 {
+                    text.take()
+                } else {
+                    text.clone()
+                }
+            } else {
+                None
+            };
             let mut client = client_arc.lock().await;
             if let Err(e) = client.did_save(uri.clone(), text) {
                 log_file::log(&format!("lsp[{name}] did_save failed: {e}"));
@@ -10324,8 +10340,11 @@ while True:
             state.close_doc(file.clone()).await;
         });
 
+        // Up to three python3 servers start, initialize and see the document
+        // open, save and close: a base as wide as the other spawn waits,
+        // which costs nothing once every log shows didClose.
         crate::test_budget::await_spawned(
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             "every fake server to receive didClose",
             || {
                 logs.iter().all(|log| {
@@ -10435,6 +10454,31 @@ while True:
         assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
         assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
         assert!(saves(&logs[2]).is_empty(), "{:?}", logs[2]);
+    }
+
+    /// #854 review guard: the saved text reaches every server that asks for
+    /// it, not just the last one, which is handed the buffer itself while
+    /// the ones before it get a copy.
+    #[test]
+    fn every_server_that_asks_for_the_text_gets_it() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let logs = saves_seen_by_each(&[
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 2, "save": {}}}"#,
+            r#"{"textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": True}}}"#,
+        ]);
+        let saves = |log: &str| -> Vec<String> {
+            log.lines()
+                .filter(|l| l.starts_with("textDocument/didSave"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(saves(&logs[0]), vec![r#"textDocument/didSave "x = 2\n""#]);
+        assert_eq!(saves(&logs[1]), vec!["textDocument/didSave null"]);
+        assert_eq!(saves(&logs[2]), vec![r#"textDocument/didSave "x = 2\n""#]);
     }
 
     /// #854 guard: the fix does not reach a server that picked the older
