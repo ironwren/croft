@@ -138,6 +138,32 @@ pub fn language_label(id: &str) -> Option<&'static str> {
     Some(crate::widgets::codeql::LANGUAGES[i])
 }
 
+/// The bytes of every file under `dir`, links not followed; `None` when
+/// it is not a folder.
+pub fn folder_size(dir: &Path) -> Option<u64> {
+    if !std::fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Some(total)
+}
+
 /// Where a database keeps the source it was extracted from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbSource {

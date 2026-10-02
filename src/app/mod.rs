@@ -18087,6 +18087,10 @@ impl App {
                 SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
                 SidebarView::CodeQL => {
                     self.codeql.focused = self.focus == Pane::Tree;
+                    let running = self.codeql_run.as_ref().map(|(_, since)| {
+                        (self.codeql_run_name.clone(), since.elapsed().as_secs())
+                    });
+                    self.codeql.set_running(running);
                     frame.render_widget(&mut self.codeql, usable_area)
                 }
             }
@@ -23409,11 +23413,15 @@ impl App {
 
     /// CodeQL view keys: arrows move between headers and actions, Enter or
     /// Space folds a section or runs an action, Esc returns to the Explorer.
-    /// On a database row, Delete removes it, F2 renames it, `e` shows its
-    /// folder in the Explorer, `u` upgrades it and `w` adds its source to
-    /// the workspace. On a query history row, Delete removes it, F2
-    /// renames it, `v` opens its query, `t` the query's text as it ran and
-    /// `o` its results directory. `s`
+    /// On the database card, Enter picks the current database, and Delete
+    /// removes it, F2 renames it, `e` shows its folder in the Explorer, `u`
+    /// upgrades it and `w` adds its source to the workspace; in the
+    /// Databases section `r` runs the open query, `q` opens Quick Query and
+    /// `a` views the AST, as the card's chips do. On a query history row,
+    /// Space or Right expands its details and Left folds them, Delete
+    /// removes it, F2 renames it, `v` opens its query, `t` the query's text
+    /// as it ran, `o` its results directory, `c` compares its results, `x`
+    /// exports them and `l` shows its query log. `s`
     /// steps the query history's sort order within that section and the
     /// databases' anywhere else. `n` creates a query, in the selected pack
     /// when there is one. `r` on a pack or one of its queries runs every
@@ -23434,12 +23442,42 @@ impl App {
         let run = self.codeql.selected_history();
         let va_item = self.codeql.selected_variant_item();
         let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
+        let in_db = self.codeql.selected_section() == Some(Section::Databases);
         match key.code {
             KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
             KeyCode::Esc if self.codeql_run.is_some() => self.cancel_codeql_run(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),
+            KeyCode::Char(' ') | KeyCode::Right if run.is_some() => {
+                if let Some(i) = run {
+                    self.codeql.toggle_history(i);
+                }
+            }
+            KeyCode::Left if run.is_some_and(|i| self.codeql.is_expanded(i)) => {
+                if let Some(i) = run {
+                    self.codeql.toggle_history(i);
+                }
+            }
+            KeyCode::Char(c @ ('r' | 'q' | 'a')) if in_db => {
+                let chip = crate::widgets::codeql::DB_CHIPS
+                    .iter()
+                    .find(|chip| chip.key == Some(c));
+                if let Some(chip) = chip {
+                    self.activate_codeql(Hit::Action(chip.action));
+                }
+            }
+            KeyCode::Char('c') if run.is_some() => {
+                if let Some(i) = run {
+                    self.compare_codeql_results(i);
+                }
+            }
+            KeyCode::Char('x') if run.is_some() => self.prompt_export_codeql_results(),
+            KeyCode::Char('l') if run.is_some() => {
+                if let Some(i) = run {
+                    self.show_codeql_query_log(i);
+                }
+            }
             KeyCode::Char(' ') if matches!(va_item, Some(Item::List(_))) => {
                 if let Some(Item::List(i)) = va_item {
                     self.codeql.toggle_variant_list(i);
@@ -23549,6 +23587,29 @@ impl App {
             .collect();
         self.open_list_picker(
             ListPicker::new(ListPurpose::CodeqlDbSource, "Add CodeQL Database", rows),
+            "",
+        );
+    }
+
+    /// The databases, under the side bar's language, in a picker whose
+    /// choice becomes the current one (#578): the database card's switch.
+    fn open_codeql_database_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = self
+            .codeql
+            .database_choices()
+            .into_iter()
+            .map(|(i, label)| ListRow {
+                id: i.to_string(),
+                label,
+            })
+            .collect();
+        if rows.is_empty() {
+            self.status = String::from("No CodeQL databases in this language");
+            return;
+        }
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::CodeqlDatabase, "Select CodeQL Database", rows),
             "",
         );
     }
@@ -23663,6 +23724,17 @@ impl App {
                 }
             }
             Hit::Action(Action::AddDatabase) => self.open_codeql_database_sources(),
+            Hit::Action(Action::PickDatabase) => self.open_codeql_database_picker(),
+            Hit::Action(Action::RunOpenQuery) => {
+                self.run_command(crate::widgets::command_palette::Command::CodeqlRunQuery)
+            }
+            Hit::Action(Action::CompareHistory(i)) => self.compare_codeql_results(i),
+            Hit::Action(Action::ExportHistory(i)) => {
+                // The export prompt takes the selected entry.
+                self.codeql.select_history(i);
+                self.prompt_export_codeql_results();
+            }
+            Hit::Action(Action::HistoryLog(i)) => self.show_codeql_query_log(i),
             Hit::Action(Action::QuickQuery) => {
                 self.run_command(crate::widgets::command_palette::Command::CodeqlQuickQuery)
             }
@@ -24514,11 +24586,10 @@ impl App {
             _ => format!("Removed CodeQL database {name}"),
         };
         self.refresh_codeql_databases();
-        // Stay in the list: on the row that took its place, else the one
-        // above, never on the welcome text below it.
-        let n = self.codeql.databases.len();
-        if n > 0 {
-            self.codeql.select_database(i.min(n - 1));
+        // Stay on the database card while there is one, never on the
+        // welcome text below it.
+        if !self.codeql.databases.is_empty() {
+            self.codeql.select_database_card();
         }
         if self.codeql.selected_hit().is_none() {
             self.codeql.move_selection(false);
@@ -24585,21 +24656,17 @@ impl App {
             Err(e) => format!("Could not save the CodeQL database list: {e}"),
         };
         self.refresh_codeql_databases();
-        if let Some(i) = store.position(path) {
-            self.codeql.select_database(i);
+        if store.position(path).is_some() {
+            self.codeql.select_database_card();
         }
     }
 
     /// Step the databases to the next sort order (name, language, date
-    /// added), keeping the selection on the same database.
+    /// added), keeping the selection on the database card.
     fn sort_codeql_databases(&mut self) {
         let store_path = Self::codeql_db_store_path();
         let mut store = crate::codeql_db::DatabaseStore::load(&store_path);
-        let selected = self
-            .codeql
-            .selected_database()
-            .and_then(|i| store.databases.get(i))
-            .map(|d| d.path.clone());
+        let on_card = self.codeql.selected_database().is_some();
         let by = store
             .sort_by
             .map_or(crate::codeql_db::DbSort::Name, |b| b.next());
@@ -24609,8 +24676,8 @@ impl App {
             Err(e) => format!("Could not save the CodeQL database list: {e}"),
         };
         self.refresh_codeql_databases();
-        if let Some(i) = selected.and_then(|p| store.position(&p)) {
-            self.codeql.select_database(i);
+        if on_card {
+            self.codeql.select_database_card();
         }
     }
 
@@ -25052,8 +25119,18 @@ impl App {
     /// Mirror the saved query history into the side bar.
     fn refresh_codeql_history(&mut self) {
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
-        self.codeql.history = history.entries.iter().map(|e| e.label()).collect();
+        self.codeql.history = history
+            .entries
+            .iter()
+            .map(crate::widgets::codeql::HistoryRow::new)
+            .collect();
         self.codeql.history_sort = history.sort_by;
+        // An expanded entry that went folds away with it.
+        if let Some(out) = &self.codeql.expanded
+            && !self.codeql.history.iter().any(|r| &r.output == out)
+        {
+            self.codeql.expanded = None;
+        }
     }
 
     /// The query history entry the palette commands act on: the selected
@@ -28241,6 +28318,19 @@ impl App {
     /// Mirror the saved database list into the side bar.
     fn refresh_codeql_databases(&mut self) {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
+        // The card shows each folder's size: summed once per database here,
+        // as the list loads or changes, rather than while painting.
+        let mut sizes = std::mem::take(&mut self.codeql.db_sizes);
+        self.codeql.db_sizes = store
+            .databases
+            .iter()
+            .filter_map(|db| {
+                let size = sizes
+                    .remove(&db.path)
+                    .or_else(|| crate::codeql_db::folder_size(&db.path))?;
+                Some((db.path.clone(), size))
+            })
+            .collect();
         self.codeql.databases = store.databases;
         self.codeql.current_db = store.current;
         self.codeql.db_sort = store.sort_by;
@@ -34798,6 +34888,13 @@ impl App {
             ListPurpose::CodeqlDbSource => {
                 if let Some((action, _)) = CODEQL_DB_SOURCES.get(index) {
                     self.activate_codeql(crate::widgets::codeql::Hit::Action(*action));
+                }
+            }
+            ListPurpose::CodeqlDatabase => {
+                if let Ok(i) = row.id.parse::<usize>() {
+                    self.activate_codeql(crate::widgets::codeql::Hit::Action(
+                        crate::widgets::codeql::Action::SelectDatabase(i),
+                    ));
                 }
             }
             ListPurpose::CodeqlMultiDb => self.choose_codeql_multi_db(&row.id, selected),
