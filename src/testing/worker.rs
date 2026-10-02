@@ -301,7 +301,7 @@ fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
 
 /// How to launch pytest for a workspace: a program, and the arguments that
 /// come before pytest's own. A project venv (`.venv/`, then `venv/`) with
-/// pytest installed wins, run as `<venv>/bin/python -m pytest` the way VS
+/// pytest installed (its `pytest` script, or a python that imports it) wins, run as `<venv>/bin/python -m pytest` the way VS
 /// Code runs it: `-m` puts the root on `sys.path`, so tests import the
 /// project's own top-level modules, which the `pytest` script alone does
 /// not (#845). Without one, `python3 -m pytest` when that `python3` can
@@ -323,7 +323,10 @@ fn pytest_launch_on(
     for venv in [".venv", "venv"] {
         let bin = root.join(venv).join("bin");
         let python = bin.join("python");
-        if python.is_file() && bin.join("pytest").is_file() {
+        // `-m pytest` needs the module: the console script says it is
+        // installed without a process, and without the script the venv's
+        // python is asked.
+        if python.is_file() && (bin.join("pytest").is_file() || python_has_pytest(root, &python)) {
             return (python, MODULE);
         }
     }
@@ -2344,6 +2347,77 @@ mod tests {
         assert_eq!(
             pytest_launch_on(&root, Some(&path)),
             (bin.join("pytest"), &[][..])
+        );
+    }
+
+    /// A stand-in project venv with no `pytest` script: `bin/python` logs
+    /// each command line to `bin/python.log` and answers `-c "import
+    /// pytest"` with `probe_exit`.
+    #[cfg(unix)]
+    fn scriptless_venv(root: &Path, probe_exit: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let python = bin.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"$0.log\"\n[ \"$1\" = -c ] && exit {probe_exit}\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        python
+    }
+
+    /// #845 review: `python -m pytest` needs the module, not the console
+    /// script, so a venv whose python imports pytest is where pytest lives
+    /// even with no `bin/pytest` beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_venv_whose_python_imports_pytest_runs_it_without_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let python = scriptless_venv(&root, 0);
+        let bin = fake_path_bin(tmp.path(), 0);
+        let path = bin.clone().into_os_string();
+        assert_eq!(
+            pytest_launch_on(&root, Some(&path)),
+            (python, &["-m", "pytest"][..])
+        );
+        assert!(!bin.join("python3.log").exists(), "python3 was not probed");
+    }
+
+    /// #845 review guard: the probe is the fallback, not the rule. A venv
+    /// with the script is used without asking its python, and a venv whose
+    /// python cannot import pytest (and has no script) is passed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_venv_is_probed_only_without_the_script_and_skipped_when_it_lacks_pytest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_script = tmp.path().join("a");
+        let python = scriptless_venv(&with_script, 0);
+        let script = python.with_file_name("pytest");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(pytest_launch_on(&with_script, None).0, python);
+        assert!(
+            !python.with_file_name("python.log").exists(),
+            "a venv with the script is not probed"
+        );
+
+        let lacking = tmp.path().join("b");
+        let python = scriptless_venv(&lacking, 1);
+        let bin = fake_path_bin(tmp.path(), 0);
+        let path = bin.clone().into_os_string();
+        assert_eq!(
+            pytest_launch_on(&lacking, Some(&path)),
+            (bin.join("python3"), &["-m", "pytest"][..]),
+            "a venv without pytest is not where it lives"
+        );
+        assert_eq!(
+            std::fs::read_to_string(python.with_file_name("python.log")).unwrap(),
+            "-c import pytest\n",
+            "its python was asked once"
         );
     }
 
