@@ -2131,6 +2131,46 @@ mod tests {
         assert!(!Cli::try_parse_from(["croft"]).unwrap().build_info);
     }
 
+    /// `--build-info`'s entry in rendered `help`, from its flag to the line
+    /// that opens the next option (`-x, --flag` or `--flag`), or to the end.
+    fn build_info_entry(help: &str) -> &str {
+        let start = help.find("--build-info").expect("--build-info is listed");
+        let entry = &help[start..];
+        let mut end = entry.find('\n').map_or(entry.len(), |i| i + 1);
+        for line in entry[end..].split_inclusive('\n') {
+            if line.trim_start().starts_with('-') {
+                break;
+            }
+            end += line.len();
+        }
+        &entry[..end]
+    }
+
+    /// #853 review: the entry ends where the next option starts, whichever
+    /// option that is, so reordering or renaming the flags around
+    /// `--build-info` neither breaks these tests nor lets them read past it.
+    #[test]
+    fn the_build_info_entry_ends_at_whichever_option_follows_it() {
+        let help = "Options:\n      --build-info\n          Print build provenance and exit.\n\n          Ignores that subcommand.\n\n      --zzz <WHAT>\n          Talks about clap internals.\n";
+        let entry = build_info_entry(help);
+        assert!(entry.contains("Ignores that subcommand."), "{entry:?}");
+        assert!(!entry.contains("--zzz"), "{entry:?}");
+        assert!(!entry.contains("clap"), "{entry:?}");
+        // The last option runs to the end of the page.
+        let last = "Options:\n  -V, --version  Print version\n      --build-info  Print build provenance\n";
+        assert_eq!(
+            build_info_entry(last),
+            "--build-info  Print build provenance\n"
+        );
+        // -h's one-line form, and a short flag opening the next entry.
+        let short =
+            "      --build-info  Print build provenance and exit\n  -o, --open-file <F>  Open F\n";
+        assert_eq!(
+            build_info_entry(short),
+            "--build-info  Print build provenance and exit\n"
+        );
+    }
+
     /// #853: clap prints a field's whole `///` doc as its long help, so a
     /// maintainer's note about clap left there shipped in `croft --help`.
     #[test]
@@ -2138,9 +2178,7 @@ mod tests {
         let help = <Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
-        let start = help.find("--build-info").expect("--build-info is listed");
-        let entry = &help[start..];
-        let entry = &entry[..entry.find("--open-file").unwrap_or(entry.len())];
+        let entry = build_info_entry(&help);
         assert!(
             entry.contains("ignores that subcommand"),
             "the user-facing caveat stays: {entry}"
@@ -2161,9 +2199,7 @@ mod tests {
         let help = <Cli as clap::CommandFactory>::command()
             .render_help()
             .to_string();
-        let start = help.find("--build-info").expect("--build-info is listed");
-        let entry = &help[start..];
-        let entry = &entry[..entry.find("--open-file").unwrap_or(entry.len())];
+        let entry = build_info_entry(&help);
         assert!(entry.contains("build provenance"), "{entry}");
         for absent in ["subcommand", "clap", "conflicts_with", "(#"] {
             assert!(
