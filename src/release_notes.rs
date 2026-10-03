@@ -84,8 +84,11 @@ pub fn unreleased() -> bool {
 /// changes past its version's release says so, since the notes below are
 /// not that release's.
 pub fn heading(unreleased: bool, version: &str) -> String {
-    let _ = unreleased;
-    format!("IN THIS RELEASE (v{version})")
+    if unreleased {
+        format!("IN THIS BUILD (v{version}+)")
+    } else {
+        format!("IN THIS RELEASE (v{version})")
+    }
 }
 
 /// Parse the baked notes: one highlight per line, `feature:` or `fix:` first.

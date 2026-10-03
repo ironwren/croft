@@ -29,16 +29,62 @@ pub fn has_highlight(text: &str) -> bool {
 }
 
 /// The pending fragments in `dir/unreleased`, in file-name order, the README
-/// left out.
+/// left out. Only `.md` files are notes, and never a dot-file: an editor's
+/// backup or lock file, or a stray text file beside them, is not.
 pub fn fragments(dir: &Path) -> Vec<PathBuf> {
-    let _ = dir;
-    Vec::new()
+    let Ok(entries) = std::fs::read_dir(dir.join("unreleased")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n != UNRELEASED_README && !n.starts_with('.'))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// The notes a build at `version` carries, read from `dir`
 /// (`src/release_notes`).
+///
+/// The pending fragments when there are any: they are the changes this build
+/// has on top of its version's release, and the release's own notes would
+/// describe a binary without them. They are joined in file-name order, each
+/// ending in a newline, exactly as `scripts/release.py cut` later writes them
+/// into the next version's notes. With none pending, `dir/<version>.md`.
+///
+/// An error rather than an empty card when the notes chosen say nothing or
+/// do not exist, so a binary always describes itself.
 pub fn baked(dir: &Path, version: &str) -> Result<Baked, String> {
-    let _ = fragments(dir);
+    let pending = fragments(dir);
+    if !pending.is_empty() {
+        let mut text = String::new();
+        for path in &pending {
+            let note = std::fs::read_to_string(path)
+                .map_err(|e| format!("{} could not be read ({e}).", path.display()))?;
+            if !has_highlight(&note) {
+                return Err(format!(
+                    "{} carries no highlights (blank, or nothing but headings). \
+                     Write one per line, each prefixed `feature:` or `fix:`.",
+                    path.display()
+                ));
+            }
+            text.push_str(&note);
+            if !note.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        return Ok(Baked {
+            text,
+            unreleased: true,
+        });
+    }
     let path = dir.join(format!("{version}.md"));
     match std::fs::read_to_string(&path) {
         Ok(text) if has_highlight(&text) => Ok(Baked {
@@ -51,9 +97,12 @@ pub fn baked(dir: &Path, version: &str) -> Result<Baked, String> {
             path.display()
         )),
         Err(e) => Err(format!(
-            "{} could not be read ({e}). Every version needs a notes file, so \
-             the welcome panel always describes the binary it is in.",
-            path.display()
+            "{} could not be read ({e}), and no release notes are pending in \
+             {}. A build describes itself: a change that ships adds its notes \
+             to src/release_notes/unreleased/<name>.md, and a release's are \
+             written when the version is cut.",
+            path.display(),
+            dir.join("unreleased").display()
         )),
     }
 }
