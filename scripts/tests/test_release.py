@@ -305,6 +305,24 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertIn("860-width.md carries no highlights", joined(errors))
 
+    def test_a_git_failure_is_one_error_line_not_a_traceback(self):
+        """A base the clone does not have (a shallow checkout, a mistyped
+        ref) made git fail inside the gate, and CI showed a Python
+        traceback. It is one `::error::` line naming the git command, and
+        a non-zero exit (Copilot, #1159)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            out = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "release.py"), "check", "no-such-ref", "HEAD"],
+                cwd=repo.path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+            self.assertNotIn("Traceback", out.stdout + out.stderr)
+            self.assertIn("::error::git diff", out.stdout + out.stderr)
+
     def test_a_stacked_prs_fragments_both_count(self):
         """GitHub tests a PR stacked on another as both merged into main, so
         the gate sees two fragments. The old gate allowed one notes file per
