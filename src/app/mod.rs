@@ -65441,14 +65441,27 @@ fn with_python_note(lead: String, note: Option<&str>) -> String {
 
 /// The interpreter a debugpy `launch` request runs its program under: its
 /// `python` (a path, or a command line whose first word is one) or legacy
-/// `pythonPath`.
-fn launch_request_python(request: &serde_json::Value, _adapter_dir: &Path) -> Option<PathBuf> {
+/// `pythonPath`. A relative path with a folder in it is found where debugpy
+/// starts it, so the version check runs the same file (#864 review): the
+/// request's `cwd`, else the folder of a `program`, else `adapter_dir`, the
+/// folder the adapter runs in. A bare name is left to PATH, as debugpy
+/// leaves it.
+fn launch_request_python(request: &serde_json::Value, adapter_dir: &Path) -> Option<PathBuf> {
     let args = &request["arguments"];
     let python = args.get("python").or_else(|| args.get("pythonPath"))?;
-    python
+    let python = PathBuf::from(python.as_str().or_else(|| python.get(0)?.as_str())?);
+    if python.is_absolute() || python.components().count() < 2 {
+        return Some(python);
+    }
+    let program_dir = args["program"]
         .as_str()
-        .or_else(|| python.get(0)?.as_str())
-        .map(PathBuf::from)
+        .and_then(|p| Path::new(p).parent())
+        .filter(|dir| !dir.as_os_str().is_empty());
+    let launch_dir = match args["cwd"].as_str() {
+        Some(cwd) => adapter_dir.join(cwd),
+        None => program_dir.map_or_else(|| adapter_dir.to_path_buf(), |d| adapter_dir.join(d)),
+    };
+    Some(launch_dir.join(python))
 }
 
 /// The interpreter a launch.json Python config's program runs under when
