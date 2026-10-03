@@ -14598,10 +14598,12 @@ impl App {
 
             let row_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)));
 
-            // Header row: "> IN THIS RELEASE (vX.Y.Z)". The leading chevron
-            // echoes the cr<>ft wordmark's bracket. The highlights below are
-            // hand-curated data baked into this build (see
-            // `crate::release_notes`), so the heading names the exact version.
+            // Header row: "> IN THIS RELEASE (vX.Y.Z)", or "> IN THIS BUILD
+            // (vX.Y.Z+)" for a build carrying changes past that release. The
+            // leading chevron echoes the cr<>ft wordmark's bracket. The
+            // highlights below are hand-curated data baked into this build
+            // (see `crate::release_notes`), so the heading names the exact
+            // version.
             let header_y = inner_y;
             frame.buffer_mut().set_string(
                 inner_x,
@@ -14614,7 +14616,10 @@ impl App {
             frame.buffer_mut().set_string(
                 inner_x + 2,
                 header_y,
-                format!("IN THIS RELEASE (v{})", env!("CARGO_PKG_VERSION")),
+                crate::release_notes::heading(
+                    crate::release_notes::unreleased(),
+                    env!("CARGO_PKG_VERSION"),
+                ),
                 Style::default()
                     .fg(self.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD),

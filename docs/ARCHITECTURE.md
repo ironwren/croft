@@ -59,7 +59,7 @@ src/
 ├── provenance.rs         which SEAT wrote each line (`Seat` plus a per-buffer line map) for the gutter overlay and inline blame; the invariant is that a line croft did not watch being written is Unknown, never guessed
 ├── prefs.rs              durable user preferences (theme, layout chrome, format-on-save, auto-save) at `~/.config/croft/config.json` behind the "Preferences: Open Settings" hub; `host_accents` rules drive per-host terminal pane dressing
 ├── quick_select.rs       WezTerm-style quick-select pure core for the terminal pane (Ctrl+Shift+Space): a priority-ordered pattern set matched over soft-wrap-stitched logical lines, with home-row labels
-├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, baked in by `build.rs` — no git log, no network, and a missing file is a build error
+├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/` for a build past its release (headed "IN THIS BUILD"), baked in by `build.rs` through `release_notes/select.rs` — no git log, no network, and a build with neither is a build error
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
@@ -1057,9 +1057,11 @@ The remote vetted index at `extensions.croft.software`. It fetches `index.json` 
 
 ### release_notes.rs
 
-Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) shown on the welcome panel. The text is DATA: one file per version in `src/release_notes/<version>.md`, baked in by `build.rs` and parsed once. No git log, no network.
+Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) shown on the welcome panel. The text is DATA: one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/`, baked in by `build.rs` and parsed once. No git log, no network.
 
-**One file per version.** A single shared const sat on every open pull request's rebase path. A missing file for the current version is a BUILD error, so a binary always describes itself.
+**Fragments in pull requests, versions after merge.** A pull request writes its highlights to `src/release_notes/unreleased/<name>.md` and never changes `version`; `.github/workflows/version-bump.yml` runs `scripts/release.py cut` on main after each merge, folding the pending fragments into the next version's file and bumping the version once. A single shared const, and then a version bump in every pull request, sat on every open pull request's conflict path.
+
+**Which notes a build carries.** `release_notes/select.rs`, which `build.rs` includes by path and the tests compile as `release_notes::select`, picks the pending fragments when there are any, headed "IN THIS BUILD (vX.Y.Z+)" (`heading`, `unreleased`), and this version's file otherwise. A build with neither is a BUILD error, so a binary always describes itself.
 
 **The card is sized before the logo.** `welcome_card_inner_width` is the one wrap width shared by the height measure and the paint pass, and the logo yields down to its 4-row minimum before the card may clip. The logo-first order kept a full-height logo above a note clipped mid-sentence in height-starved windows.
 
