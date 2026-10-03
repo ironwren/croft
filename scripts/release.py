@@ -191,7 +191,8 @@ def check(base: str, head: str, cwd=None) -> list[str]:
 
     A change that ships must add at least one fragment that says something.
     Whether or not anything ships, the version and every released version's
-    notes stay as they are: `cut` writes both after merge.
+    notes stay as they are (`cut` writes both after merge), and a note
+    pending on main stays, saying something.
     """
     changed = git("diff", "--no-renames", "--name-status", base, head, cwd=cwd).splitlines()
     status = {}
@@ -216,6 +217,30 @@ def check(base: str, head: str, cwd=None) -> list[str]:
             f"{UNRELEASED_DIR}/<name>.md instead."
         )
 
+    # Whether or not anything ships: a note pending on main is the next
+    # release's, so a PR may edit it but not delete it, and an edit must
+    # leave it saying something, or the cut after merge stops on it. A note
+    # moved to another name, its text unchanged, is a rename, not a loss.
+    def is_fragment(p: str) -> bool:
+        return bool(FRAGMENT.match(p)) and Path(p).name != README
+
+    added = [p for p, code in sorted(status.items()) if code == "A" and is_fragment(p)]
+    added_texts = {git("show", f"{head}:{p}", cwd=cwd) for p in added}
+    for path, code in sorted(status.items()):
+        if not is_fragment(path):
+            continue
+        if code == "D" and git("show", f"{base}:{path}", cwd=cwd) not in added_texts:
+            errors.append(
+                f"::error file={path}::This PR deletes {path}, a note waiting for the next "
+                "release, which would then leave it out. Keep it; to change what it says, "
+                "edit it."
+            )
+        elif code == "M" and not has_highlight(git("show", f"{head}:{path}", cwd=cwd)):
+            errors.append(
+                f"::error file={path}::{path} carries no highlights (blank, or nothing but "
+                "headings). Write one per line, each prefixed 'feature:' or 'fix:'."
+            )
+
     shipped = []
     for path in sorted(status):
         if not SHIPPED.match(path) or NOT_SHIPPED.match(path):
@@ -231,11 +256,6 @@ def check(base: str, head: str, cwd=None) -> list[str]:
     for path in shipped:
         print(f"  {path}")
 
-    added = [
-        p
-        for p, code in sorted(status.items())
-        if code == "A" and FRAGMENT.match(p) and Path(p).name != README
-    ]
     if not added:
         errors.append(
             f"::error::This PR changes shipped files but adds no release notes. Add "

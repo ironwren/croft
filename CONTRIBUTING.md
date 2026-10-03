@@ -211,7 +211,8 @@ beside the code they cover and a change confined to them produces a
 byte-identical binary. Anything that filter is unsure about counts as shipped,
 so an unexpected request for notes is the failure it prefers over a waived one.
 Fixing a typo in a pending fragment changes no code and owes no fragment of its
-own.
+own. A fragment pending on main may be edited, or moved to another name, but
+not deleted: the next release would leave it out.
 
 Why fragments: notes in one shared file put every open PR on the others'
 rebase path (#399), and then a version bump in every PR put every open PR in
@@ -225,9 +226,10 @@ On every push to main, `.github/workflows/version-bump.yml` runs
 into `src/release_notes/<next>.md`, removes the fragments, bumps `version` in
 `Cargo.toml` and croft's entry in `Cargo.lock`, and pushes one
 `chore: release <next>` commit. A merge that shipped nothing leaves no fragment
-and releases nothing. Runs are serialized, so two merges close together never
-take the same number, and merges that land while one run is going are released
-together by the next. A run whose push loses the race to a merge cuts again on
+and releases nothing. Runs are serialized and queued, so two merges close
+together never take the same number, a release asked for by hand waits its
+turn rather than being replaced, and merges that land while one run is going
+are released together by the next. A run whose push loses the race to a merge cuts again on
 the new main. A version's notes, once written, describe that release and are
 never edited.
 

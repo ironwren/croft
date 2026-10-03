@@ -15,10 +15,10 @@
 #
 # The shape is code-graph-rag's version bump: a deploy key pushes past main's
 # pull-request rule (the ruleset lets deploy keys bypass it, and a push with
-# the workflow token could not), and the commit message keeps the job from
-# answering its own push. Two things are added. Runs are serialized, so two
-# merges close together never compute the same number. A push that loses a
-# race with a merge is redone on the new main rather than dropped.
+# the workflow token could not). Two things are added. Runs are serialized
+# and queued, so two merges close together never compute the same number. A
+# push that loses a race with a merge is redone on the new main rather than
+# dropped.
 #
 # A merge that shipped nothing leaves no fragment, and the job then commits
 # nothing. Merges that land while a run is still going are released together
@@ -47,18 +47,22 @@ permissions:
   contents: read
 
 # One run at a time, and never cancelled: a cancelled run could stop between
-# its commit and its push. A queued run that a newer one replaces loses
-# nothing, because every run releases whatever is pending when it starts.
+# its commit and its push. Every queued run waits its turn (`queue: max`):
+# by default a group keeps one pending run and a newer one replaces it, and
+# a minor or major release asked for by hand would have been replaced by
+# the next merge's patch run.
 concurrency:
   group: version-bump
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
     name: fold the notes and bump the version
     # The job's own commit triggers this workflow again (a deploy-key push
-    # does, unlike a workflow-token push); that run has nothing to do.
-    if: "${{ !startsWith(github.event.head_commit.message, 'chore: release ') }}"
+    # does, unlike a workflow-token push). That run finds nothing pending and
+    # pushes nothing, so it needs no skip; a skip by commit message would
+    # also skip a merged PR whose title began the same way.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
