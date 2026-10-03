@@ -1732,8 +1732,23 @@ impl SearchPanel {
     /// confirmation (#860).
     pub fn result_counts(&self) -> (usize, usize) {
         let results = self.hits.iter().map(|h| h.matches).sum();
-        let files = self.hits.iter().map(|h| &h.path).collect::<HashSet<_>>();
-        (results, files.len())
+        // Drawn on every render, so a path is hashed once per run of hits
+        // rather than once per hit: a file's hits arrive together, and one
+        // whose hits come in more than one run still counts once.
+        let files = self
+            .hits
+            .first()
+            .into_iter()
+            .chain(
+                self.hits
+                    .windows(2)
+                    .filter(|w| w[0].path != w[1].path)
+                    .map(|w| &w[1]),
+            )
+            .map(|h| &h.path)
+            .collect::<HashSet<_>>()
+            .len();
+        (results, files)
     }
 
     /// Map a click row to a hit index, if any. Hits sit below the input
@@ -4387,6 +4402,30 @@ mod tests {
         ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
         let text = buffer_to_string(&buf);
         assert!(text.contains("4 results in 2 files"), "{text}");
+    }
+
+    /// #860 review guard: the header hashes a path once per run of hits,
+    /// but a file whose hits are not side by side still counts as one file,
+    /// and every hit's results still count.
+    #[test]
+    fn a_file_whose_hits_are_apart_still_counts_once() {
+        let mut panel = SearchPanel::new(PathBuf::from("/w"));
+        let hit = |path: &str, line_no: usize, matches: usize| SearchHit {
+            path: PathBuf::from(path),
+            line_no,
+            line_text: String::from("foo"),
+            matches,
+        };
+        panel.hits = vec![
+            hit("/w/a.txt", 1, 2),
+            hit("/w/a.txt", 2, 1),
+            hit("/w/b.txt", 1, 1),
+            hit("/w/a.txt", 9, 1),
+            hit("/w/c.txt", 3, 3),
+        ];
+        assert_eq!(panel.result_counts(), (8, 3));
+        panel.hits.clear();
+        assert_eq!(panel.result_counts(), (0, 0), "no hits, no files");
     }
 
     /// #860 negative: one occurrence in one file is singular on both
