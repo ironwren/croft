@@ -1691,6 +1691,52 @@ mod tests {
         }
     }
 
+    /// Review finding: a label is data from the CSV, so an ESC or BEL in it
+    /// reached the terminal as a command, under the bars and now under the
+    /// line's ends too.
+    #[test]
+    fn labels_reach_the_terminal_without_control_characters() {
+        let line = "k,v\n\u{1b}[2Jfirst,1\nlast\u{7},2\n";
+        let bars = "k,v\n\u{1b}]0;x\u{7}a,1\nb\u{1b}[31m,2\n";
+        for (input, kind, shown) in [
+            (line, ChartKind::Line, ["[2Jfirst", "last"]),
+            (bars, ChartKind::Bar, ["]0;xa", "b[31m"]),
+        ] {
+            let chart = text(&ds(input), kind, None, 40, 4);
+            assert!(
+                !chart.chars().any(|c| c.is_control() && c != '\n'),
+                "{kind:?} wrote a control character: {chart:?}"
+            );
+            let labels = chart.lines().last().unwrap();
+            assert!(
+                shown.iter().all(|s| labels.contains(s)),
+                "{kind:?} keeps the rest of each label: {chart:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_labels_are_drawn_as_written_and_a_tab_as_a_space() {
+        // Short enough for a bar's six cells at this width.
+        let input = "k,v\ncafé№,1\nend\t½,2\n";
+        for kind in [ChartKind::Line, ChartKind::Bar] {
+            let chart = text(&ds(input), kind, None, 40, 4);
+            let rows: Vec<&str> = chart.lines().collect();
+            let labels = rows.last().unwrap();
+            assert!(
+                labels.contains("café№") && labels.contains("end ½"),
+                "{kind:?}: a TAB is a space, every other character kept: {chart}"
+            );
+            if kind == ChartKind::Line {
+                assert_eq!(
+                    labels.chars().count(),
+                    rows[0].chars().count(),
+                    "the labels row is as wide as the chart:\n{chart}"
+                );
+            }
+        }
+    }
+
     /// #847 guard: points are joined within a series, never from one
     /// series' last point to the next series' first. A low flat series and
     /// a high flat one leave the rows between them empty.
