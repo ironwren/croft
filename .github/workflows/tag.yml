@@ -31,36 +31,39 @@ jobs:
     name: tag the merged version
     runs-on: ubuntu-latest
     permissions:
-      # Create the tag ref.
+      # Read Cargo.toml at the merge commit and create the tag ref.
       contents: write
       # Dispatch release.yml. A tag created with github.token does not fire
       # `push: tags` workflows (GitHub suppresses token-triggered runs to
       # avoid recursion), but workflow_dispatch is exempt from that rule.
       actions: write
+    # No checkout and no action: with this token, the job runs only the
+    # runner's own `gh`, every REST call pinned to an API version, so nothing
+    # it executes can change without a diff here. scripts/check_tag_workflow.py
+    # holds it to that.
     steps:
-      - uses: actions/checkout@v7
-        with:
-          # The tag is created through the API with GH_TOKEN, so the
-          # checkout token is not needed after the fetch.
-          persist-credentials: false
-
       - name: Create v<version> on this commit and start the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml | head -n1)"
+          api() { gh api -H "X-GitHub-Api-Version: 2026-03-10" "$@"; }
+          version="$(api -H "Accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$GITHUB_SHA" \
+            | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1)"
           if [ -z "$version" ]; then
             echo "::error file=Cargo.toml::could not read the package version"
             exit 1
           fi
           tag="v$version"
-          if existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
+          if existing="$(api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
             echo "::notice::$tag already exists ($existing); this merge did not bump the version, so there is no new release to tag."
             exit 0
           fi
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+          api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null
           echo "Tagged $GITHUB_SHA as $tag"
-          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"
-          echo "Started release.yml for $tag"
+          # API version 2026-03-10 answers a dispatch with the run it created.
+          run="$(api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" \
+            -f ref="$tag" --jq .html_url)"
+          echo "Started release.yml for $tag: $run"
