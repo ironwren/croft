@@ -1,8 +1,9 @@
 # Unreleased release notes
 
 A pull request that changes what ships adds one file here, named for the
-change, for example `862-hot-exit.md`. It holds the change's highlights, one
-per line, each prefixed `feature:` or `fix:`:
+change and starting with its issue number, for example `862-hot-exit.md`. It
+holds the change's highlights, one per line, each prefixed `feature:` or
+`fix:`:
 
 ```text
 feature: Unsaved edits survive a kill and come back on the next launch.

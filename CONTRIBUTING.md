@@ -180,10 +180,11 @@ branch really current with main", which is not visible in a diff.
 
 A PR that changes anything compiled into the binary (`src/`, `assets/`,
 `build.rs`, `Cargo.toml`, `Cargo.lock`) adds one file to
-`src/release_notes/unreleased/`, named for the change, for example
-`862-hot-exit.md`. It holds the change's highlights, one per line, each
-prefixed `feature:` or `fix:`, which selects the card's glyph and tint. Blank
-lines and `#` headings are ignored:
+`src/release_notes/unreleased/`, named for the change and starting with its
+issue number so no two PRs pick the same name, for example `862-hot-exit.md`.
+It holds the change's highlights, one per line, each prefixed `feature:` or
+`fix:`, which selects the card's glyph and tint. Blank lines and `#` headings
+are ignored:
 
 ```text
 feature: Cmd+F now searches a rendered colour log.
@@ -214,8 +215,8 @@ own.
 
 Why fragments: notes in one shared file put every open PR on the others'
 rebase path (#399), and then a version bump in every PR put every open PR in
-conflict on one line of `Cargo.toml` whenever any of them merged. Each PR's
-notes in a file only it names never conflict.
+conflict on the version lines of `Cargo.toml` and `Cargo.lock` whenever any of
+them merged. Each PR's notes in a file only it names never conflict.
 
 ### Releases are cut after merge
 
@@ -226,8 +227,9 @@ into `src/release_notes/<next>.md`, removes the fragments, bumps `version` in
 `chore: release <next>` commit. A merge that shipped nothing leaves no fragment
 and releases nothing. Runs are serialized, so two merges close together never
 take the same number, and merges that land while one run is going are released
-together by the next. A version's notes, once written, describe that release
-and are never edited.
+together by the next. A run whose push loses the race to a merge cuts again on
+the new main. A version's notes, once written, describe that release and are
+never edited.
 
 The workflow pushes past main's pull-request rule with a deploy key, as
 code-graph-rag's version bump does: a deploy key with **write** access, whose
