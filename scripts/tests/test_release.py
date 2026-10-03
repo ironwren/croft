@@ -263,6 +263,48 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertEqual(errors, [])
 
+    def test_deleting_a_pending_fragment_fails(self):
+        """A note on main waits for the next release; a PR that deletes it,
+        even one that ships nothing, would have that release leave it out
+        without a word (Greptile, #1159)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/860-width.md", "fix: Width.\n")
+            repo.commit()
+            repo.branch()
+            repo.remove("src/release_notes/unreleased/860-width.md")
+            repo.write("docs/GUIDE.md", "A better guide.\n")
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("deletes src/release_notes/unreleased/860-width.md", joined(errors))
+
+    def test_renaming_a_pending_fragment_passes(self):
+        """The guard: a note moved to another name, its text unchanged, is
+        still released."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/width.md", "fix: Width.\n")
+            repo.commit()
+            repo.branch()
+            repo.remove("src/release_notes/unreleased/width.md")
+            repo.write("src/release_notes/unreleased/860-width.md", "fix: Width.\n")
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertEqual(errors, [])
+
+    def test_editing_a_pending_fragment_to_say_nothing_fails(self):
+        """An edit that leaves a pending note without a highlight would stop
+        the cut on main after merge, so the PR fails instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/860-width.md", "fix: Width.\n")
+            repo.commit()
+            repo.branch()
+            repo.write("src/release_notes/unreleased/860-width.md", "# Width\n")
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("860-width.md carries no highlights", joined(errors))
+
     def test_a_stacked_prs_fragments_both_count(self):
         """GitHub tests a PR stacked on another as both merged into main, so
         the gate sees two fragments. The old gate allowed one notes file per
@@ -407,6 +449,40 @@ def step_script(workflow: Path, name: str) -> str:
 def with_scripts(repo: Repo):
     for name in SCRIPTS:
         repo.write(f"scripts/{name}", (ROOT / "scripts" / name).read_text())
+
+
+class VersionBumpShape(unittest.TestCase):
+    """What the version-bump workflow's YAML says about when it runs, read
+    from the file: GitHub, not a step, acts on these keys."""
+
+    def block(self, key: str) -> list[str]:
+        """The lines of the top-level `key:` block."""
+        lines = VERSION_BUMP.read_text().splitlines()
+        start = lines.index(f"{key}:")
+        body = []
+        for line in lines[start + 1 :]:
+            if line and not line.startswith((" ", "#")):
+                break
+            body.append(line.strip())
+        return body
+
+    def test_queued_runs_wait_their_turn(self):
+        """A concurrency group keeps one pending run by default, and a newer
+        run replaces it: a minor or major release asked for by hand, queued
+        behind a running release, was replaced by the next merge's patch run
+        and its notes went out as a patch (Greptile, #1159). `queue: max`
+        keeps every queued run."""
+        concurrency = self.block("concurrency")
+        self.assertIn("queue: max", concurrency)
+        self.assertIn("cancel-in-progress: false", concurrency)
+
+    def test_no_commit_message_keeps_a_push_from_releasing(self):
+        """The job skipped any push whose head commit message began
+        "chore: release ", which a merged PR's title can do, leaving its
+        notes pending (Greptile, #1159). The job's own release commit needs
+        no skip: its run finds nothing pending and pushes nothing (see
+        `test_the_version_bump_step_with_nothing_pending_pushes_nothing`)."""
+        self.assertNotIn("head_commit", VERSION_BUMP.read_text())
 
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("git"), "needs bash and git")
