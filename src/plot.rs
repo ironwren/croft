@@ -705,7 +705,11 @@ fn display_width(c: char) -> usize {
 fn clip_to_width(s: &str, budget: usize) -> (String, usize) {
     let mut short = String::new();
     let mut width = 0;
-    for c in s.chars() {
+    // A label is data: a control character in it (ESC, BEL) would reach
+    // the terminal as a command, so it is dropped. TAB becomes a space, as
+    // in a saved terminal transcript, so the words it parts stay apart.
+    let shown = s.chars().map(|c| if c == '\t' { ' ' } else { c });
+    for c in shown.filter(|c| !c.is_control()) {
         let cw = display_width(c);
         if width + cw > budget {
             break;
