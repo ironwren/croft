@@ -273,6 +273,18 @@ def check(base: str, head: str, cwd=None) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    try:
+        return run_command(argv)
+    except subprocess.CalledProcessError as err:
+        # A ref the clone lacks (a shallow checkout, a mistyped base): one
+        # line CI shows as an error, not a traceback.
+        command = " ".join(err.cmd)
+        why = (err.stderr or "").strip().splitlines()
+        print(f"::error::{command} failed: {why[0] if why else f'exit {err.returncode}'}")
+        return 1
+
+
+def run_command(argv: list[str]) -> int:
     if len(argv) == 3 and argv[0] == "check":
         errors = check(argv[1], argv[2])
         for error in errors:
