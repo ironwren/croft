@@ -103,6 +103,9 @@ pub enum ListPurpose {
     /// Where to add a CodeQL database from (#578): `id` is an index into
     /// the App's database sources.
     CodeqlDbSource,
+    /// The CodeQL database to make the current one (#578): `id` is its
+    /// index in the database list.
+    CodeqlDatabase,
     /// View: Set Panel Alignment… (#852): `id` is `left`, `center`,
     /// `right` or `justify`.
     PanelAlignment,
