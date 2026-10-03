@@ -30285,7 +30285,7 @@ impl App {
                         // Whichever interpreter runs the program, the
                         // config's own included (#864).
                         if rc.request == RequestKind::Launch {
-                            match launch_request_python(&request)
+                            match launch_request_python(&request, &cwd)
                                 .as_deref()
                                 .map_or(Ok(None), debuggee_python_note)
                             {
@@ -65442,7 +65442,7 @@ fn with_python_note(lead: String, note: Option<&str>) -> String {
 /// The interpreter a debugpy `launch` request runs its program under: its
 /// `python` (a path, or a command line whose first word is one) or legacy
 /// `pythonPath`.
-fn launch_request_python(request: &serde_json::Value) -> Option<PathBuf> {
+fn launch_request_python(request: &serde_json::Value, _adapter_dir: &Path) -> Option<PathBuf> {
     let args = &request["arguments"];
     let python = args.get("python").or_else(|| args.get("pythonPath"))?;
     python

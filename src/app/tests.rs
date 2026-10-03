@@ -21007,8 +21007,9 @@ fn a_debuggee_debugpy_cannot_run_under_is_refused() {
 #[test]
 fn a_launch_requests_own_interpreter_is_the_one_checked() {
     use serde_json::json;
-    let python =
-        |args: serde_json::Value| super::launch_request_python(&json!({ "arguments": args }));
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
     assert_eq!(
         python(json!({ "python": "/opt/py/bin/python3.9" })),
         Some(PathBuf::from("/opt/py/bin/python3.9"))
@@ -21022,6 +21023,55 @@ fn a_launch_requests_own_interpreter_is_the_one_checked() {
         Some(PathBuf::from("/legacy/python"))
     );
     assert_eq!(python(json!({ "program": "a.py" })), None);
+}
+
+/// #864 review: a relative interpreter in launch.json is found where
+/// debugpy starts it: the request's `cwd`, else a program's folder, else
+/// the folder the adapter runs in. The version check used to run it from
+/// croft's own folder, which can hold a different file of that name.
+#[test]
+fn a_relative_launch_python_is_checked_where_debugpy_runs_it() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": ".venv/bin/python", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/work/proj/api/.venv/bin/python")),
+        "from the request's cwd"
+    );
+    assert_eq!(
+        python(json!({
+            "python": ["venv/bin/python", "-X", "dev"],
+            "program": "/work/proj/tools/run.py"
+        })),
+        Some(PathBuf::from("/work/proj/tools/venv/bin/python")),
+        "from the program's folder when the request names no cwd"
+    );
+    assert_eq!(
+        python(json!({ "python": "./py/bin/python", "module": "pytest" })),
+        Some(PathBuf::from("/work/proj/py/bin/python")),
+        "from the adapter's folder for a module launch"
+    );
+}
+
+/// #864 review guard: only a relative path with a folder in it moves. A
+/// bare name is a PATH lookup for debugpy too, and an absolute path is
+/// already where it is.
+#[test]
+fn a_bare_or_absolute_launch_python_is_checked_as_written() {
+    use serde_json::json;
+    let python = |args: serde_json::Value| {
+        super::launch_request_python(&json!({ "arguments": args }), Path::new("/work/proj"))
+    };
+    assert_eq!(
+        python(json!({ "python": "python3", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("python3"))
+    );
+    assert_eq!(
+        python(json!({ "python": "/opt/py/bin/python3.12", "cwd": "/work/proj/api" })),
+        Some(PathBuf::from("/opt/py/bin/python3.12"))
+    );
 }
 
 /// #864, through F5: a project venv debugpy cannot run under is refused
