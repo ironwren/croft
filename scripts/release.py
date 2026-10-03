@@ -49,7 +49,9 @@ PACKAGE = "croft-software"
 SHIPPED = re.compile(r"^(src/|assets/|build\.rs$|Cargo\.toml$|Cargo\.lock$)")
 NOT_SHIPPED = re.compile(r"^(src/app/tests\.rs$|tests/|src/release_notes/unreleased/)")
 RELEASED_NOTES = re.compile(r"^src/release_notes/[0-9]+\.[0-9]+\.[0-9]+\.md$")
-FRAGMENT = re.compile(r"^src/release_notes/unreleased/[^/]+\.md$")
+# A dot-file (an editor's `.#name.md` lock file) is never a note, here, in
+# `fragment_paths` or in the build's `select::fragments`.
+FRAGMENT = re.compile(r"^src/release_notes/unreleased/[^/.][^/]*\.md$")
 
 
 class ReleaseError(Exception):
@@ -123,11 +125,19 @@ def set_lock_version(lock_text: str, new: str) -> str:
 
 
 def fragment_paths(root: Path) -> list[Path]:
-    """Pending fragments, in file-name order so a cut is reproducible."""
+    """Pending fragments, in file-name order so a cut is reproducible.
+
+    pathlib's glob matches dot-files, so they are left out by name: an
+    editor's `.#name.md` lock file is not a note.
+    """
     unreleased = Path(root) / UNRELEASED_DIR
     if not unreleased.is_dir():
         return []
-    return sorted(p for p in unreleased.glob("*.md") if p.name != README and p.is_file())
+    return sorted(
+        p
+        for p in unreleased.glob("*.md")
+        if p.name != README and not p.name.startswith(".") and p.is_file()
+    )
 
 
 def cut(root, kind: str = "patch") -> str | None:

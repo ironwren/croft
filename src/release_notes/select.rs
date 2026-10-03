@@ -130,12 +130,14 @@ mod tests {
         assert!(!baked.unreleased);
     }
 
-    /// Only `.md` files are notes: an editor's backup or a stray `.txt` in
-    /// the directory is not baked into the card.
+    /// Only `.md` files are notes, and never a dot-file: an editor's backup
+    /// or lock file, or a stray `.txt`, in the directory is not baked into
+    /// the card. `scripts/release.py` skips the same files.
     #[test]
     fn only_markdown_files_are_fragments() {
         let dir = notes_dir();
         pend(&dir, "847-plot.md~", "fix: A backup.\n");
+        pend(&dir, ".#847-plot.md", "fix: A lock file.\n");
         pend(&dir, "notes.txt", "fix: A text file.\n");
         let baked = baked(dir.path(), "0.2.11").unwrap();
         assert_eq!(baked.text, "fix: The last release.\n");

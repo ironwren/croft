@@ -214,6 +214,18 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertIn("src/release_notes/unreleased/", joined(errors))
 
+    def test_a_hidden_file_is_not_a_fragment(self):
+        """The build and the cut skip dot-files (an editor's `.#name.md` lock
+        file), so the gate must not count one as the PR's notes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.write("src/release_notes/unreleased/.860-width.md", "fix: Width.\n")
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("adds no release notes", joined(errors))
+
     def test_a_docs_only_change_needs_no_fragment(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repo(Path(tmp))
@@ -318,6 +330,15 @@ class Cut(unittest.TestCase):
                 repo.commit()
                 self.assertEqual(repo.cut(kind), expected, (current, kind))
                 self.assertTrue(repo.exists(f"src/release_notes/{expected}.md"))
+
+    def test_hidden_files_are_not_folded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/.#847-plot.md", "fix: A lock file.\n")
+            repo.write("src/release_notes/unreleased/848-edit.md", "fix: Edit.\n")
+            repo.commit()
+            self.assertEqual(repo.cut(), "0.2.12")
+            self.assertEqual(repo.read("src/release_notes/0.2.12.md"), "fix: Edit.\n")
 
     def test_nothing_pending_releases_nothing(self):
         """A merge that shipped nothing (docs, CI, tests) leaves no fragment,
