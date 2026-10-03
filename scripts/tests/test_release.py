@@ -453,9 +453,13 @@ class Workflows(unittest.TestCase):
             out = self.gate(repo)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
-    def bump(self, tmp: Path, pending: dict[str, str]):
+    def bump(self, tmp: Path, pending: dict[str, str], racing: dict[str, str] | None = None):
         """Run the version-bump step in a clone of a bare `origin` whose main
-        holds `pending` fragments. Returns the result and origin's path."""
+        holds `pending` fragments. Returns the result and origin's path.
+
+        With `racing`, another merge adding those fragments lands on origin's
+        main after the step has cut and committed: origin refuses the step's
+        first push, as GitHub refuses a push that is not a fast-forward."""
         (tmp / "seed").mkdir()
         seed = Repo(tmp / "seed")
         with_scripts(seed)
@@ -464,6 +468,26 @@ class Workflows(unittest.TestCase):
         seed.commit()
         origin = tmp / "origin.git"
         run(tmp, "git", "clone", "-q", "--bare", str(seed.path), str(origin))
+        if racing:
+            for name, text in racing.items():
+                seed.write(f"src/release_notes/unreleased/{name}", text)
+            seed.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 4"))
+            run(seed.path, "git", "add", "-A")
+            run(seed.path, "git", "commit", "-q", "-m", "the racing merge")
+            run(seed.path, "git", "push", "-q", str(origin), "main:refs/heads/racing")
+            # The hook runs in git's push quarantine, where ref updates are
+            # refused; the racing commit is already in origin's own store.
+            hook = origin / "hooks" / "pre-receive"
+            hook.write_text(
+                "#!/bin/sh\n"
+                "[ -e raced ] && exit 0\n"
+                "touch raced\n"
+                "env -u GIT_QUARANTINE_PATH -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \\\n"
+                "  git update-ref refs/heads/main refs/heads/racing\n"
+                "echo 'main moved on' >&2\n"
+                "exit 1\n"
+            )
+            hook.chmod(0o755)
         work = tmp / "work"
         run(tmp, "git", "clone", "-q", str(origin), str(work))
         summary = tmp / "summary.md"
@@ -486,6 +510,29 @@ class Workflows(unittest.TestCase):
             self.assertEqual(log[1], "t|c", "one commit on top of what was there")
             self.assertEqual(run(origin, "git", "show", "main:src/release_notes/0.2.12.md"), "fix: Plot.\n")
             self.assertIn('version = "0.2.12"', run(origin, "git", "show", "main:Cargo.toml"))
+            files = run(origin, "git", "ls-tree", "-r", "--name-only", "main", "src/release_notes/unreleased")
+            self.assertEqual(files.split(), ["src/release_notes/unreleased/README.md"])
+
+    def test_a_merge_that_lands_before_the_push_is_released_with_it(self):
+        """Two merges close together: the second lands on main while the run
+        for the first is between its cut and its push. The push is refused,
+        and the step cuts again on the new main, so one release holds both
+        merges' notes. A run that pushed once and gave up would fail here and
+        leave the first merge's notes for whichever run came next."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out, origin = self.bump(
+                Path(tmp),
+                {"847-plot.md": "fix: Plot.\n"},
+                racing={"862-hot-exit.md": "feature: Hot exit.\n"},
+            )
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("main moved while releasing 0.2.12", out.stdout)
+            log = run(origin, "git", "log", "--format=%an|%s", "-2", "main").splitlines()
+            self.assertEqual(log, ["github-actions[bot]|chore: release 0.2.12", "t|the racing merge"])
+            self.assertEqual(
+                run(origin, "git", "show", "main:src/release_notes/0.2.12.md"),
+                "fix: Plot.\nfeature: Hot exit.\n",
+            )
             files = run(origin, "git", "ls-tree", "-r", "--name-only", "main", "src/release_notes/unreleased")
             self.assertEqual(files.split(), ["src/release_notes/unreleased/README.md"])
 
