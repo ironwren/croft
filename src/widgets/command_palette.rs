@@ -305,6 +305,7 @@ pub enum Command {
     AttachPythonProcess,
     ColorTheme,
     KeyboardShortcuts,
+    UpdateCroft,
     OpenSettings,
     OpenSettingsJson,
     OpenWorkspaceSettingsJson,
@@ -679,6 +680,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RerunLastTask,
     Command::ColorTheme,
     Command::KeyboardShortcuts,
+    Command::UpdateCroft,
     Command::OpenSettings,
     Command::OpenSettingsJson,
     Command::OpenWorkspaceSettingsJson,
@@ -1015,6 +1017,7 @@ impl Command {
             Command::RerunLastTask => "Tasks: Rerun Last Task",
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
+            Command::UpdateCroft => "Help: Update croft (Relaunch or Rebuild)",
             Command::OpenSettings => "Preferences: Open Settings",
             Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
             Command::OpenWorkspaceSettingsJson => "Preferences: Open Workspace Settings (JSON)",
@@ -1322,6 +1325,7 @@ impl Command {
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
             Command::KeyboardShortcuts => "F1",
+            Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
             Command::SelectDebugConfig => "",
             Command::AddDebugConfig => "",
@@ -1698,6 +1702,7 @@ impl Command {
             Command::AttachPythonProcess => "attach_python_process",
             Command::ColorTheme => "color_theme",
             Command::KeyboardShortcuts => "keyboard_shortcuts",
+            Command::UpdateCroft => "update_croft",
             Command::OpenSettings => "open_settings",
             Command::OpenSettingsJson => "open_settings_json",
             Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
@@ -2263,6 +2268,21 @@ mod tests {
         palette.set_query("quick fix");
         assert_eq!(palette.results.first(), Some(&builtin(Command::QuickFix)));
         assert_eq!(Command::QuickFix.keybinding_hint(), "Cmd+.");
+    }
+
+    /// #865: the palette names chords in its macOS spelling, `Cmd` where
+    /// macOS has Cmd, as the other Cmd hints do, so the updater reads
+    /// `Cmd+Shift+F9` here; the status bar picks each platform's own.
+    #[test]
+    fn update_croft_is_reachable_and_shows_its_chord_in_the_palettes_spelling() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("update croft");
+        assert!(
+            palette.results.contains(&builtin(Command::UpdateCroft)),
+            "{:?}",
+            palette.results
+        );
+        assert_eq!(Command::UpdateCroft.keybinding_hint(), "Cmd+Shift+F9");
     }
 
     #[test]
