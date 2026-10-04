@@ -134,6 +134,9 @@ pub struct RepoRow {
 /// Most message rows the box shows before it scrolls.
 pub const MESSAGE_MAX_ROWS: usize = 6;
 
+/// Change-list rows a growing commit message never takes over.
+const MESSAGE_LIST_MIN_ROWS: u16 = 2;
+
 pub struct SourceControlPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -1235,12 +1238,20 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         let line_count = self.message.split('\n').count();
+        // Below the box: gap, Commit button, gap, the feedback line when
+        // there is one, the separator and a couple of change-list rows. A
+        // long message gives up rows (and scrolls) before any of those do;
+        // a short panel still gets a one-line box.
+        let feedback_rows = if self.commit_feedback.is_some() { 2 } else { 0 };
+        let below = 1 + 3 + 1 + feedback_rows + 1 + MESSAGE_LIST_MIN_ROWS;
+        let left = inner.y + inner.height - y;
         let input_box = Rect {
             x: inner.x,
             y,
             width: inner.width,
             height: (line_count.clamp(1, MESSAGE_MAX_ROWS) as u16 + 2)
-                .min(inner.y + inner.height - y),
+                .min(left.saturating_sub(below).max(3))
+                .min(left),
         };
         self.last_input_area = input_box;
         let input_border_style = if self.focused {
@@ -3274,12 +3285,16 @@ mod tests {
     }
 
     fn render_rows(p: &mut SourceControlPanel) -> Vec<String> {
+        render_rows_in(p, 30)
+    }
+
+    fn render_rows_in(p: &mut SourceControlPanel, height: u16) -> Vec<String> {
         use ratatui::buffer::Buffer;
         let area = Rect {
             x: 0,
             y: 0,
             width: 40,
-            height: 30,
+            height,
         };
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(p, area, &mut buf);
@@ -3332,6 +3347,47 @@ mod tests {
         assert!(!rows.iter().any(|r| r.contains("line1 ")), "{rows:#?}");
         let (_, caret_y) = p.cursor_screen_pos().unwrap();
         assert_eq!(caret_y, input.y + input.height - 2);
+    }
+
+    fn long_message_panel(lines: usize) -> SourceControlPanel {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        let text: Vec<String> = (1..=lines).map(|n| format!("line{n}")).collect();
+        p.insert_str(&text.join("\n"));
+        p
+    }
+
+    /// A tall message in a short panel shrinks its box instead of pushing
+    /// the Commit button off the bottom.
+    #[test]
+    fn a_long_message_leaves_room_for_the_commit_button() {
+        let mut p = long_message_panel(5);
+        let rows = render_rows_in(&mut p, 16);
+        let button = p.last_button_area;
+        assert_eq!(button.height, 3, "{rows:#?}");
+        assert!(button.y + button.height <= 16, "{button:?}");
+        assert!(
+            rows[(button.y + 1) as usize].contains("Commit"),
+            "{rows:#?}"
+        );
+        let input = p.last_input_area;
+        assert!(input.y + input.height < button.y, "{input:?} {button:?}");
+        let (_, caret_y) = p.cursor_screen_pos().unwrap();
+        assert!(rows[caret_y as usize].contains("line5"), "{rows:#?}");
+    }
+
+    /// ...and leaves rows for the change list, so files can still be staged.
+    #[test]
+    fn a_long_message_leaves_room_for_the_change_list() {
+        let mut p = long_message_panel(6);
+        let rows = render_rows_in(&mut p, 20);
+        assert!(
+            p.last_list_area.height >= 2,
+            "{:?} {rows:#?}",
+            p.last_list_area
+        );
+        assert!(p.last_list_area.y + p.last_list_area.height <= 20);
     }
 
     /// Up and Down move the caret between message lines, keeping its
