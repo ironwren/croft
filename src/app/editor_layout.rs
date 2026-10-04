@@ -130,7 +130,7 @@ pub fn leaf_rects(node: &LayoutNode, area: Rect, min: u16) -> Vec<Rect> {
 /// rounding for an exact tiling), then raise any child below `min` to `min` by
 /// taking cells from the largest sibling. When `total` can't seat every child
 /// at `min` (a degenerate tiny pane), the floor drops to an even share, so the
-/// lengths always sum to exactly `total`.
+/// lengths always sum to exactly `total` (debug builds assert it).
 fn apportion(total: u16, weights: &[u16], min: u16) -> Vec<u16> {
     let n = weights.len();
     if n == 0 {
@@ -181,6 +181,11 @@ fn apportion(total: u16, weights: &[u16], min: u16) -> Vec<u16> {
             None => break,
         }
     }
+    // Donors only give down to `min_i` (never below 0) and the floor was
+    // lowered to what `total` holds, so nothing is negative and the tiling
+    // is exact.
+    debug_assert!(alloc.iter().all(|&a| a >= 0), "{alloc:?}");
+    debug_assert_eq!(alloc.iter().sum::<i64>(), total_i, "{alloc:?}");
     alloc.into_iter().map(|a| a.max(0) as u16).collect()
 }
 
