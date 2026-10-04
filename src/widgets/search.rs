@@ -1756,8 +1756,9 @@ struct FieldArgs<'a> {
     reserve_right: u16,
 }
 
-/// A glob box's caption, naming any entry that doesn't compile in red so a
-/// typo can't silently change what the search covers (#1251).
+/// A glob box's caption. An entry that doesn't compile replaces the label
+/// with its name in red, right above the box, so a typo can't silently
+/// change what the search covers (#1251).
 fn draw_glob_caption(
     buf: &mut Buffer,
     (x, y, right): (u16, u16, u16),
@@ -1774,7 +1775,7 @@ fn draw_glob_caption(
     buf.set_stringn(
         x,
         y,
-        format!("{label} \u{00b7} invalid: {}", bad.join(", ")),
+        format!("invalid glob: {}", bad.join(", ")),
         right.saturating_sub(x) as usize + 1,
         Style::default().fg(theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
     );
@@ -3717,10 +3718,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            text.contains("files to include \u{00b7} invalid: *.{ts"),
-            "{text}"
-        );
+        assert!(text.contains("invalid glob: *.{ts"), "{text}");
         assert!(text.contains("files to exclude\u{20}"), "{text}");
     }
 
