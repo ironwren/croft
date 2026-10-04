@@ -12610,6 +12610,186 @@ fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
     assert_eq!(remote_head, local_head);
 }
 
+/// Run git in `dir` and return its trimmed stdout ("" on failure).
+fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A committed repo whose `main` tracks `<remote>/main` in a bare repo, for
+/// each named remote, then a local branch `topic` with one more commit and
+/// no upstream (#1245).
+fn unpublished_topic_repo(remotes: &[&str]) -> (tempfile::TempDir, Vec<tempfile::TempDir>) {
+    let tmp = make_committed_repo();
+    let bares: Vec<_> = remotes
+        .iter()
+        .map(|name| {
+            let bare = tempfile::tempdir().unwrap();
+            git_stdout(bare.path(), &["init", "-q", "--bare"]);
+            git_stdout(
+                tmp.path(),
+                &["remote", "add", name, bare.path().to_str().unwrap()],
+            );
+            git_stdout(tmp.path(), &["push", "-q", "-u", name, "main"]);
+            bare
+        })
+        .collect();
+    git_stdout(tmp.path(), &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"two\n").unwrap();
+    git_stdout(tmp.path(), &["commit", "-qam", "two"]);
+    (tmp, bares)
+}
+
+/// Push on a branch nobody has published runs `push -u origin topic`
+/// instead of failing with "has no upstream branch".
+#[test]
+fn push_on_a_branch_with_no_upstream_publishes_it() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert!(
+        app.status.contains("published topic to origin"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// Commit & Push on an unpublished branch commits, then publishes.
+#[test]
+fn commit_and_push_on_a_branch_with_no_upstream_publishes_it() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    std::fs::write(tmp.path().join("seed.txt"), b"three\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("three");
+    app.commit_and_push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_eq!(
+        git_stdout(tmp.path(), &["log", "-1", "--format=%s"]),
+        "three"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// Sync on an unpublished branch has nothing to pull: it publishes instead
+/// of failing on the pull's "no tracking information".
+#[test]
+fn sync_on_a_branch_with_no_upstream_publishes_without_pulling() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_eq!(app.status, "Synced");
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic"
+    );
+    assert_eq!(
+        git_stdout(bares[0].path(), &["rev-parse", "topic"]),
+        git_stdout(tmp.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+/// With two remotes and no `origin`, publishing would be a guess: Push says
+/// so and neither remote gets the branch.
+#[test]
+fn push_with_several_remotes_and_no_origin_does_not_guess() {
+    let (tmp, bares) = unpublished_topic_repo(&["alpha", "beta"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert!(app.status.contains("remote.pushDefault"), "{}", app.status);
+    for bare in &bares {
+        assert_eq!(git_stdout(bare.path(), &["branch", "--list", "topic"]), "");
+    }
+    assert_eq!(
+        git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        ""
+    );
+}
+
+/// A repo with no remote at all has nowhere to publish to.
+#[test]
+fn push_with_no_remote_says_there_is_nowhere_to_publish() {
+    let (tmp, _) = unpublished_topic_repo(&[]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.push_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert!(app.status.contains("no remote"), "{}", app.status);
+}
+
+/// A branch that already tracks one still pulls on Sync: the new-branch
+/// path must not skip the pull for it.
+#[test]
+fn sync_on_a_tracked_branch_still_pulls_first() {
+    let (tmp, bares) = unpublished_topic_repo(&["origin"]);
+    git_stdout(tmp.path(), &["checkout", "-q", "main"]);
+    let other = tempfile::tempdir().unwrap();
+    git_stdout(
+        other.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            bares[0].path().to_str().unwrap(),
+            ".",
+        ],
+    );
+    git_stdout(other.path(), &["config", "user.email", "a@b"]);
+    git_stdout(other.path(), &["config", "user.name", "a"]);
+    std::fs::write(other.path().join("theirs.txt"), b"theirs\n").unwrap();
+    git_stdout(other.path(), &["add", "theirs.txt"]);
+    git_stdout(other.path(), &["commit", "-qm", "theirs"]);
+    git_stdout(other.path(), &["push", "-q", "origin", "main"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status, "Synced",
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert!(tmp.path().join("theirs.txt").exists());
+    assert_eq!(
+        git_stdout(bares[0].path(), &["branch", "--list", "topic"]),
+        ""
+    );
+}
+
 /// Opening a config file must not reload the active tab in place: it held
 /// unsaved edits to another file, which were silently discarded.
 #[test]
