@@ -38452,6 +38452,103 @@ fn linked_editing_set_clears_when_the_caret_leaves_and_mirrors_through_handle_ke
     assert_eq!(app.editor.lines[0], "<titles>tx</titles>");
 }
 
+fn linked_ts_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("app.ts"),
+        "import { add } from \"./math\";\nconsole.log(add(1, 2));\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("app.ts")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    app
+}
+
+/// One UI wake: the caret has idled past the debounce and the tick runs.
+/// A request it sends is answered `null`, as vtsls does outside a tag
+/// pair, and drained. Returns the id of that request.
+fn linked_wake(app: &mut App) -> Option<u64> {
+    let sent = linked_tick_only(app);
+    if let Some(id) = sent {
+        answer_linked(app, id, Vec::new());
+    }
+    app.drain_lsp_linked_editing();
+    sent
+}
+
+/// The tick alone, the answer left to the caller.
+fn linked_tick_only(app: &mut App) -> Option<u64> {
+    let before = app.linked_request.as_ref().map(|r| r.0);
+    app.linked_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    app.tick_linked_editing();
+    app.linked_request
+        .as_ref()
+        .map(|r| r.0)
+        .filter(|id| Some(*id) != before)
+}
+
+fn answer_linked(app: &App, id: u64, ranges: Vec<(u32, u32, u32, u32)>) {
+    let path = app.editor.path.clone().unwrap();
+    app.lsp.as_ref().unwrap().push_linked_editing_for_test(
+        crate::lsp::manager::LinkedEditingResult {
+            request_id: id,
+            path,
+            ranges,
+        },
+    );
+}
+
+/// A `null` linkedEditingRange answer (anything outside a tag pair) was
+/// asked again on every UI wake while the caret stayed put: about 45
+/// requests per keypress and 11k a session against vtsls (#1299).
+#[test]
+fn a_null_linked_editing_answer_is_not_asked_again_at_the_same_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = linked_ts_app(tmp.path());
+    app.tick_linked_editing(); // observes the caret
+    let sent: Vec<u64> = (0..100).filter_map(|_| linked_wake(&mut app)).collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "one request for an unmoved caret over 100 wakes, not {}",
+        sent.len()
+    );
+}
+
+/// Moving the caret or editing is a new position, asked once more; a
+/// non-empty answer there still installs its ranges.
+#[test]
+fn a_moved_caret_or_an_edit_asks_once_more_and_ranges_still_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = linked_ts_app(tmp.path());
+    app.tick_linked_editing();
+    assert!(linked_wake(&mut app).is_some());
+
+    app.editor.cursor_col = 8;
+    app.tick_linked_editing();
+    let moved: Vec<u64> = (0..20).filter_map(|_| linked_wake(&mut app)).collect();
+    assert_eq!(
+        moved.len(),
+        1,
+        "the moved caret asks exactly once: {moved:?}"
+    );
+
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_linked_editing();
+    let id = linked_tick_only(&mut app).expect("an edit asks again");
+    answer_linked(&app, id, vec![(1, 0, 1, 7), (1, 9, 1, 16)]);
+    app.drain_lsp_linked_editing();
+    assert!(app.editor.has_linked_ranges(), "a real answer installs");
+    let more: Vec<u64> = (0..20).filter_map(|_| linked_wake(&mut app)).collect();
+    assert!(
+        more.is_empty(),
+        "inside the installed set nothing is asked: {more:?}"
+    );
+}
+
 #[test]
 fn fold_all_regions_command_works_with_no_language_server_attached() {
     // #254's fallback criterion: region folding must work when no LSP

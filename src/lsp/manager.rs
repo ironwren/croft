@@ -949,6 +949,10 @@ pub struct LspManager {
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
     linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
+    /// Test hook: a sender into `linked_editing_rx`, so app tests can
+    /// answer a linkedEditingRange request without a server.
+    #[cfg(test)]
+    linked_editing_test_tx: std_mpsc::Sender<LinkedEditingResult>,
     selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
@@ -1010,6 +1014,8 @@ impl LspManager {
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
         let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let linked_editing_test_tx = linked_editing_tx.clone();
         let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
         let (calls_tx, calls_rx) = std_mpsc::channel();
         let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
@@ -1106,6 +1112,8 @@ impl LspManager {
             ref_rx,
             doc_highlights_rx,
             linked_editing_rx,
+            #[cfg(test)]
+            linked_editing_test_tx,
             selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
@@ -1577,6 +1585,12 @@ impl LspManager {
 
     pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
         self.linked_editing_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver `result` as if a server had answered.
+    #[cfg(test)]
+    pub fn push_linked_editing_for_test(&self, result: LinkedEditingResult) {
+        let _ = self.linked_editing_test_tx.send(result);
     }
 
     pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
