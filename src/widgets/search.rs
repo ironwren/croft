@@ -57,7 +57,8 @@ pub struct SearchHit {
     pub path: PathBuf,
     /// 1-indexed line number, the way humans / editors talk about lines.
     pub line_no: usize,
-    /// The matched line, with surrounding whitespace trimmed and length capped.
+    /// The matched line, length capped, without its line break or any
+    /// indent before the first match trimmed.
     pub line_text: String,
 }
 
@@ -172,6 +173,7 @@ impl PathFilter {
 
 struct HitSink<'a> {
     path: PathBuf,
+    matcher: &'a RegexMatcher,
     batch: &'a mut Vec<SearchHit>,
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -191,7 +193,15 @@ impl<'a> Sink for HitSink<'a> {
         let line_no = mat.line_number().unwrap_or(0) as usize;
         let line_str = std::str::from_utf8(mat.bytes()).unwrap_or("");
         let stripped = line_str.trim_end_matches(['\r', '\n']);
-        let trimmed = stripped.trim_start();
+        // The indent is trimmed only up to where the first match starts: a
+        // match that begins in it (a query starting with whitespace) would
+        // otherwise lose its highlight in the preview.
+        let indent = stripped.len() - stripped.trim_start().len();
+        let start = grep_matcher::Matcher::find(self.matcher, stripped.as_bytes())
+            .ok()
+            .flatten()
+            .map_or(indent, |m| m.start().min(indent));
+        let trimmed = stripped.get(start..).unwrap_or(stripped.trim_start());
         let cut = if trimmed.chars().count() > MAX_LINE_LEN {
             // Cut plainly, no trailing ellipsis marker (no ellipsis anywhere).
             trimmed.chars().take(MAX_LINE_LEN).collect()
@@ -315,6 +325,7 @@ pub fn search_workspace_streaming_filtered<F>(
             {
                 let mut sink = HitSink {
                     path: path.to_path_buf(),
+                    matcher: &matcher,
                     batch: &mut batch,
                     cancel: Some(cancel.clone()),
                 };
@@ -697,6 +708,7 @@ pub fn collect_matches_in_text(
     };
     let mut sink = HitSink {
         path: path.to_path_buf(),
+        matcher: &matcher,
         batch: out,
         cancel: None,
     };
@@ -2428,6 +2440,82 @@ mod tests {
         assert_eq!(out[0].line_text, "Hello World");
         assert_eq!(out[1].line_no, 3);
         assert_eq!(out[1].line_text, "HELLO again");
+    }
+
+    fn highlighted(hit: &SearchHit, query: &str, opts: SearchOpts) -> Vec<String> {
+        split_for_highlight(&hit.line_text, as_typed(query), opts)
+            .into_iter()
+            .filter(|(_, m)| *m)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn a_match_starting_in_the_indent_keeps_its_highlight() {
+        // The preview trimmed the indent a whitespace query matched in, so
+        // the result row showed no highlight at all.
+        for (content, query) in [
+            ("\tleading word\n", "\tleading"),
+            ("    spaced out\n", "  spaced"),
+            ("x\n      \n", "   "),
+        ] {
+            let mut out = Vec::new();
+            collect_matches_in_text(
+                Path::new("a.txt"),
+                content,
+                query,
+                SearchOpts::default(),
+                &mut out,
+            );
+            assert_eq!(out.len(), 1, "{query:?}");
+            assert_eq!(
+                highlighted(&out[0], query, SearchOpts::default()).first(),
+                Some(&as_typed(query).to_string()),
+                "{query:?} in {:?}",
+                out[0].line_text
+            );
+        }
+    }
+
+    #[test]
+    fn a_regex_match_starting_in_the_indent_keeps_its_highlight() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "    foo()\n",
+            r"^\s+foo",
+            opts,
+            &mut out,
+        );
+        assert_eq!(highlighted(&out[0], r"^\s+foo", opts), ["    foo"]);
+    }
+
+    #[test]
+    fn the_indent_is_still_trimmed_when_the_match_starts_after_it() {
+        // Negative: a match past the indent keeps the compact preview.
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "        let x = 1;\n\t\tx  y\n",
+            "x",
+            SearchOpts::default(),
+            &mut out,
+        );
+        assert_eq!(out[0].line_text, "let x = 1;");
+        assert_eq!(out[1].line_text, "x  y");
+        let mut out = Vec::new();
+        collect_matches_in_text(
+            Path::new("a.txt"),
+            "\tif a  b {\n",
+            "  b",
+            SearchOpts::default(),
+            &mut out,
+        );
+        assert_eq!(out[0].line_text, "if a  b {");
     }
 
     #[test]
