@@ -36791,6 +36791,145 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     );
 }
 
+/// #1244: `gone.txt` deleted on one branch and modified on the other, mid
+/// `git merge feature`. `deleted_on_feature` picks which side deleted it.
+fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.join("gone.txt"), "x\ny\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    if deleted_on_feature {
+        git(&["rm", "-q", "gone.txt"]);
+        git(&["commit", "-qm", "delete"]);
+    } else {
+        std::fs::write(tmp.join("gone.txt"), "x\ny-feature\n").unwrap();
+        git(&["commit", "-aqm", "edit"]);
+    }
+    git(&["checkout", "-q", "main"]);
+    if deleted_on_feature {
+        std::fs::write(tmp.join("gone.txt"), "x\ny-main\n").unwrap();
+        git(&["commit", "-aqm", "edit"]);
+    } else {
+        git(&["rm", "-q", "gone.txt"]);
+        git(&["commit", "-qm", "delete"]);
+    }
+    let merge = git(&["merge", "feature"]);
+    assert!(!merge.status.success(), "modify/delete must conflict");
+}
+
+fn git_out(tmp: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn open_modify_delete(tmp: &std::path::Path, deleted_on_feature: bool) -> App {
+    modify_delete_repo(tmp, deleted_on_feature);
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry_named(&mut app, "gone.txt");
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some(), "{}", app.status);
+    app
+}
+
+fn wait_for_conflicted_entry_named(app: &mut App, name: &str) -> usize {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let mut found = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "the git worker to report the conflicted entry",
+        || {
+            let _ = app.drain_git_responses();
+            found = app.source_control.entries.iter().position(|e| {
+                e.kind == crate::git::ChangeKind::Conflicted && e.path.ends_with(name)
+            });
+            found.is_some()
+        },
+    );
+    found.unwrap()
+}
+
+#[test]
+fn taking_the_incoming_deletion_removes_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    app.complete_merge();
+    assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+    assert_eq!(
+        git_out(tmp.path(), &["status", "--porcelain", "gone.txt"]),
+        "D  gone.txt\n"
+    );
+    assert!(app.status.contains("removed gone.txt"), "{}", app.status);
+    assert!(
+        app.editor
+            .find_any_tab_with_path(&tmp.path().join("gone.txt"))
+            .is_none(),
+        "the tab for the removed file closes"
+    );
+}
+
+#[test]
+fn taking_the_current_deletion_removes_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), false);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
+    app.complete_merge();
+    assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+}
+
+#[test]
+fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
+    // Negative: the side that kept the file still wins as before.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
+    app.complete_merge();
+    assert_eq!(git_out(tmp.path(), &["show", ":gone.txt"]), "x\ny-main\n");
+    assert_eq!(git_out(tmp.path(), &["ls-files", "-u", "gone.txt"]), "");
+    assert!(tmp.path().join("gone.txt").exists());
+}
+
+#[test]
+fn the_deleted_side_says_so_in_its_pane_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_modify_delete(tmp.path(), true);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    let text: String = (a.y..a.y + a.height)
+        .map(|y| {
+            (a.x..a.x + a.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("INCOMING (theirs): deleted"), "{text}");
+    assert!(text.contains("CURRENT (yours)") && !text.contains("CURRENT (yours): deleted"));
+}
+
 #[test]
 fn merge_editor_accepts_toggles_and_manual_edits_update_the_counter() {
     let tmp = tempfile::tempdir().unwrap();

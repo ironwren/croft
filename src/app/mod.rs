@@ -13697,6 +13697,28 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
+        // A modify/delete conflict resolved to the deleting side leaves an
+        // empty Result: the resolution is "no file", so remove it from the
+        // index and the disk, as `git rm` would (#1244).
+        if self
+            .editor
+            .merge
+            .as_ref()
+            .is_some_and(|mv| mv.deleted.is_some())
+            && self.editor.lines.iter().all(|l| l.is_empty())
+        {
+            let rel = self.repo_rel(&path);
+            let root = self.scm_root();
+            match crate::git::remove_path(&root, &rel) {
+                Ok(()) => {
+                    self.close_tabs_with_path_everywhere(&path);
+                    self.refresh_source_control();
+                    self.status = format!("Merge complete: removed {rel}");
+                }
+                Err(e) => self.status = format!("Remove failed: {e}"),
+            }
+            return;
+        }
         if self.editor.dirty {
             self.save();
         }
@@ -13740,18 +13762,29 @@ impl App {
         let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
         let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
         let theirs = crate::git::read_file_at_stage(&canon_root, &rel, 3).map(to_lines);
+        let mut deleted = None;
         let sides = match (ours, theirs) {
             // Neither stage exists: the path is not unmerged in git at
             // all — fall through to marker synthesis below.
             (Err(_), Err(_)) => None,
             // Unmerged: a missing single stage is a deleted side (DU/UD)
-            // and a missing base is added-by-both (AA) — both mean "that
-            // side is empty", not an error.
+            // and a missing base is added-by-both (AA). Both read as an
+            // empty side; a deleted one is also remembered, so taking it
+            // removes the file rather than staging an empty one (#1244).
             (o, t) => {
-                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
-                    .map(&to_lines)
-                    .unwrap_or_default();
-                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
+                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1).map(&to_lines);
+                if base.is_ok() {
+                    deleted = match (&o, &t) {
+                        (Err(_), Ok(_)) => Some(crate::merge_editor::CheckSide::Current),
+                        (Ok(_), Err(_)) => Some(crate::merge_editor::CheckSide::Incoming),
+                        _ => None,
+                    };
+                }
+                Some((
+                    base.unwrap_or_default(),
+                    o.unwrap_or_default(),
+                    t.unwrap_or_default(),
+                ))
             }
         };
         let built = match sides {
@@ -13767,6 +13800,7 @@ impl App {
             self.status = format!("{rel} has no merge conflicts");
             return false;
         };
+        mv.deleted = deleted;
         if let Err(e) = self.editor.open_pinned(path) {
             self.status = format!("Open failed: {e}");
             return false;

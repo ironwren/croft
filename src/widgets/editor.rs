@@ -977,7 +977,11 @@ fn render_merge_panes(
     };
     let mut panes: Vec<Pane> = Vec::new();
     panes.push(Pane {
-        title: "CURRENT (yours)",
+        title: if mv.deleted == Some(CheckSide::Current) {
+            "CURRENT (yours): deleted"
+        } else {
+            "CURRENT (yours)"
+        },
         lines: &mv.ours,
         scroll: mv.ours_scroll,
         side: Some(CheckSide::Current),
@@ -1007,7 +1011,11 @@ fn render_merge_panes(
         });
     }
     panes.push(Pane {
-        title: "INCOMING (theirs)",
+        title: if mv.deleted == Some(CheckSide::Incoming) {
+            "INCOMING (theirs): deleted"
+        } else {
+            "INCOMING (theirs)"
+        },
         lines: &mv.theirs,
         scroll: mv.theirs_scroll,
         side: Some(CheckSide::Incoming),
