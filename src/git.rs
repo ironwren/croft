@@ -860,13 +860,13 @@ pub fn apply_patch(
     });
     for rel in paths {
         if let Some(filter) = path_filter(root, rel) {
-            let (part, whole) = match (cached, reverse) {
-                (true, false) => ("staged", "stage"),
-                (true, true) => ("unstaged", "unstage"),
-                _ => ("reverted", "discard"),
+            let whole = match (cached, reverse) {
+                (true, false) => "stage",
+                (true, true) => "unstage",
+                _ => "discard",
             };
             return Err(format!(
-                "{rel} goes through the {filter} filter, so a part of it can't be {part}: {whole} the whole file"
+                "{rel} uses the {filter} filter: {whole} the whole file, not a part"
             ));
         }
     }
@@ -4550,7 +4550,7 @@ filename seed.txt
         let err = apply_patch(tmp.path(), &patch, true, false).unwrap_err();
         assert_eq!(
             err,
-            "data.txt goes through the rot13 filter, so a part of it can't be staged: stage the whole file"
+            "data.txt uses the rot13 filter: stage the whole file, not a part"
         );
         assert_eq!(
             sh_git(tmp.path(), &["show", ":data.txt"]),
@@ -4559,7 +4559,7 @@ filename seed.txt
         );
         let err = apply_patch(tmp.path(), &patch, true, true).unwrap_err();
         assert!(
-            err.contains("can't be unstaged"),
+            err.contains("unstage the whole file"),
             "unstaging is refused too: {err}"
         );
     }
@@ -4572,7 +4572,7 @@ filename seed.txt
         let err = apply_patch(tmp.path(), &patch, false, true).unwrap_err();
         assert_eq!(
             err,
-            "data.txt goes through the rot13 filter, so a part of it can't be reverted: discard the whole file"
+            "data.txt uses the rot13 filter: discard the whole file, not a part"
         );
         let work = std::fs::read_to_string(tmp.path().join("data.txt")).unwrap();
         assert!(
