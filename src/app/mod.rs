@@ -54969,9 +54969,7 @@ impl App {
         if matches!(action, "squash" | "fixup")
             && !crate::rebase_todo::has_kept_commit_above(&self.editor.lines, row)
         {
-            self.status = format!(
-                "Can't {action} the first commit: git needs an earlier commit to fold it into"
-            );
+            self.status = format!("Can't {action} the first commit: no commit above it");
             return true;
         }
         self.editor
