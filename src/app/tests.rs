@@ -52818,7 +52818,11 @@ fn rebase_todo_keys_set_the_action_and_step_down() {
     ))
     .unwrap();
     assert_eq!(app.editor.lines[1], "fixup bbb222 second");
-    assert_eq!(app.editor.cursor_row, 2, "the caret moves to the next line");
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "no commit line follows, so the caret stays on the last one"
+    );
+    app.editor.cursor_row = 2;
     app.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Char('d'),
         KeyModifiers::NONE,
@@ -52828,6 +52832,97 @@ fn rebase_todo_keys_set_the_action_and_step_down() {
         app.editor.lines[2], "d# comment",
         "a comment line types normally"
     );
+}
+
+fn press_rebase_keys(app: &mut App, keys: &str) {
+    for c in keys.chars() {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        ))
+        .unwrap();
+    }
+}
+
+const REBASE_PLAN: &str = "pick aaa111 c2\npick bbb222 c3\npick ccc333 c4\n\n# Rebase 805d070..ccc333 onto 805d070 (3 commands)\n#\n";
+
+#[test]
+fn a_key_past_the_last_commit_leaves_the_plan_valid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    app.editor.cursor_row = 1;
+    press_rebase_keys(&mut app, "sss");
+    assert_eq!(
+        &app.editor.lines[..4],
+        &["pick aaa111 c2", "squash bbb222 c3", "squash ccc333 c4", ""],
+        "the third key lands on the last commit again, not the blank line"
+    );
+    assert_eq!(app.editor.cursor_row, 2);
+}
+
+#[test]
+fn an_action_key_on_a_blank_plan_line_types_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    app.editor.cursor_row = 3;
+    press_rebase_keys(&mut app, "psd");
+    assert_eq!(app.editor.lines[3], "", "the blank line stays blank");
+    assert_eq!(app.editor.cursor_row, 3);
+}
+
+#[test]
+fn the_caret_skips_comments_to_the_next_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "git-rebase-todo",
+        "pick aaa111 c2\n# keep this one\n\npick bbb222 c3\n",
+    );
+    press_rebase_keys(&mut app, "r");
+    assert_eq!(app.editor.lines[0], "reword aaa111 c2");
+    assert_eq!(app.editor.cursor_row, 3, "past the comment and the blank");
+    press_rebase_keys(&mut app, "f");
+    assert_eq!(app.editor.lines[3], "fixup bbb222 c3");
+}
+
+#[test]
+fn squash_on_the_first_commit_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "s");
+    assert_eq!(
+        app.editor.lines[0], "pick aaa111 c2",
+        "the line is unchanged"
+    );
+    assert_eq!(app.editor.cursor_row, 0, "the caret stays put");
+    assert!(
+        app.status.contains("Can't squash the first commit"),
+        "{}",
+        app.status
+    );
+    press_rebase_keys(&mut app, "f");
+    assert_eq!(app.editor.lines[0], "pick aaa111 c2");
+    assert!(app.status.contains("Can't fixup"), "{}", app.status);
+}
+
+#[test]
+fn squash_below_only_dropped_commits_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "ds");
+    assert_eq!(app.editor.lines[0], "drop aaa111 c2");
+    assert_eq!(app.editor.lines[1], "pick bbb222 c3");
+    assert!(app.status.contains("Can't squash"), "{}", app.status);
+}
+
+#[test]
+fn other_actions_on_the_first_commit_still_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
+    press_rebase_keys(&mut app, "e");
+    assert_eq!(app.editor.lines[0], "edit aaa111 c2");
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(app.status, crate::rebase_todo::HINT);
 }
 
 #[test]

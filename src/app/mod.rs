@@ -54934,7 +54934,7 @@ impl App {
     }
 
     /// In a `git-rebase-todo` tab (#620), a plain p/r/e/s/f/d on a commit
-    /// line sets its action and moves to the next line. Off in vim mode,
+    /// line sets its action and moves to the next commit line. Off in vim mode,
     /// where those letters are vim commands. Returns whether it acted.
     fn rebase_todo_key(&mut self, key: KeyEvent) -> bool {
         let KeyCode::Char(c) = key.code else {
@@ -54957,9 +54957,23 @@ impl App {
         let Some(line) = self.editor.lines.get(row).cloned() else {
             return false;
         };
+        // A blank line takes no action and must not take the letter either:
+        // git stops the rebase on a stray `s` (#1228).
+        if line.trim().is_empty() {
+            self.status = String::from(crate::rebase_todo::HINT);
+            return true;
+        }
         let Some(new_line) = crate::rebase_todo::set_action(&line, action) else {
             return false;
         };
+        if matches!(action, "squash" | "fixup")
+            && !crate::rebase_todo::has_kept_commit_above(&self.editor.lines, row)
+        {
+            self.status = format!(
+                "Can't {action} the first commit: git needs an earlier commit to fold it into"
+            );
+            return true;
+        }
         self.editor
             .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
                 start: (row, 0),
@@ -54967,7 +54981,14 @@ impl App {
                 new_text: new_line,
                 utf16: false,
             }]);
-        self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
+        // On to the next commit line, past comments and the trailing blank;
+        // the last commit keeps the caret (#1228).
+        if let Some(next) = self.editor.lines[row + 1..]
+            .iter()
+            .position(|l| crate::rebase_todo::is_commit_line(l))
+        {
+            self.editor.cursor_row = row + 1 + next;
+        }
         self.editor.cursor_col = 0;
         self.status = String::from(crate::rebase_todo::HINT);
         true
