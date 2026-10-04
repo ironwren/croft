@@ -603,36 +603,49 @@ fn check_sheet_extent(name: &str, rows: u64, cols: u64) -> std::io::Result<()> {
 /// rectangle from the first to the last row and column holding a value,
 /// with `number-rows-repeated` / `number-columns-repeated` counted inside
 /// it. Repeated EMPTY rows and cells past the last value (LibreOffice pads
-/// every sheet with them) expand to nothing, as in calamine. Streams
-/// content.xml without building anything.
+/// every sheet with them) expand to nothing, as in calamine. A cell holds a
+/// value when calamine reads one from it: any `office:*value` attribute, or
+/// a string value type (its text, even none). A value type alone, a comment
+/// or a formula is empty. Streams content.xml, keeping only running bounds.
 fn ods_extents(path: &Path) -> std::io::Result<Vec<(String, u64, u64)>> {
-    use quick_xml::events::Event;
+    use quick_xml::events::{BytesStart, Event};
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
     let content = zip
         .by_name("content.xml")
         .map_err(|e| std::io::Error::other(format!("content.xml: {e}")))?;
     let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(content));
-    let repeat = |e: &quick_xml::events::BytesStart, key: &[u8]| -> u64 {
+    let xml_err = |e: quick_xml::Error| std::io::Error::other(format!("content.xml: {e}"));
+    // calamine adds nothing for a repeat of 0, so neither does the count.
+    let repeat = |e: &BytesStart, key: &[u8]| -> u64 {
         e.try_get_attribute(key)
             .ok()
             .flatten()
             .and_then(|a| std::str::from_utf8(&a.value).ok()?.trim().parse().ok())
             .unwrap_or(1)
     };
+    let valued = |e: &BytesStart| {
+        e.attributes().flatten().any(|a| match a.key.as_ref() {
+            b"office:value"
+            | b"office:string-value"
+            | b"office:date-value"
+            | b"office:time-value"
+            | b"office:boolean-value" => true,
+            b"office:value-type" => &*a.value == b"string",
+            _ => false,
+        })
+    };
     let mut out = Vec::new();
     let mut buf = Vec::new();
+    let mut skip = Vec::new();
     let mut table: Option<String> = None;
-    // Per row entry: its repeat count and the span of columns with values.
-    let mut rows: Vec<(u64, Option<(u64, u64)>)> = Vec::new();
+    // Rows seen so far (repeats counted), the first valued row's start, the
+    // last valued row's end, and the valued columns' span over all rows.
+    let (mut row_at, mut first, mut last, mut cols) = (0u64, None::<u64>, 0u64, None::<(u64, u64)>);
+    // The open row: its repeat count, next column, and valued columns.
     let (mut row_repeat, mut col, mut span) = (1u64, 0u64, None::<(u64, u64)>);
-    // The open cell: where it starts, how many columns it covers, and
-    // whether it has a value yet.
-    let mut cell: Option<(u64, u64, bool)> = None;
     loop {
-        let ev = reader
-            .read_event_into(&mut buf)
-            .map_err(|e| std::io::Error::other(format!("content.xml: {e}")))?;
+        let ev = reader.read_event_into(&mut buf).map_err(xml_err)?;
         let empty = matches!(ev, Event::Empty(_));
         match ev {
             Event::Start(e) | Event::Empty(e)
@@ -645,16 +658,23 @@ fn ods_extents(path: &Path) -> std::io::Result<Vec<(String, u64, u64)>> {
                     .map(|a| String::from_utf8_lossy(&a.value).into_owned())
                     .unwrap_or_default();
                 table = Some(name);
-                rows.clear();
+                (row_at, first, last, cols) = (0, None, 0, None);
             }
             Event::Start(e) if e.name().as_ref() == b"table:table-row" => {
                 (row_repeat, col, span) = (repeat(&e, b"table:number-rows-repeated"), 0, None);
             }
             Event::Empty(e) if e.name().as_ref() == b"table:table-row" => {
-                rows.push((repeat(&e, b"table:number-rows-repeated"), None));
+                row_at = row_at.saturating_add(repeat(&e, b"table:number-rows-repeated"));
             }
             Event::End(e) if e.name().as_ref() == b"table:table-row" => {
-                rows.push((row_repeat, span));
+                if let Some((a, b)) = span
+                    && row_repeat > 0
+                {
+                    first.get_or_insert(row_at);
+                    last = row_at.saturating_add(row_repeat);
+                    cols = Some(cols.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
+                }
+                row_at = row_at.saturating_add(row_repeat);
             }
             Event::Start(e) | Event::Empty(e)
                 if matches!(
@@ -663,63 +683,26 @@ fn ods_extents(path: &Path) -> std::io::Result<Vec<(String, u64, u64)>> {
                 ) =>
             {
                 let n = repeat(&e, b"table:number-columns-repeated");
-                let valued = e
-                    .try_get_attribute(b"office:value-type")
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if empty {
-                    if valued {
-                        let last = col + n - 1;
-                        span = Some(span.map_or((col, last), |(a, _)| (a, last)));
-                    }
-                    col = col.saturating_add(n);
-                } else {
-                    cell = Some((col, n, valued));
+                if n > 0 && valued(&e) {
+                    let end = col.saturating_add(n - 1);
+                    span = Some(span.map_or((col, end), |(a, _)| (a, end)));
                 }
-            }
-            Event::Text(t) => {
-                if let Some(c) = cell.as_mut()
-                    && t.iter().any(|b| !b.is_ascii_whitespace())
-                {
-                    c.2 = true;
-                }
-            }
-            Event::End(e)
-                if matches!(
-                    e.name().as_ref(),
-                    b"table:table-cell" | b"table:covered-table-cell"
-                ) =>
-            {
-                if let Some((start, n, valued)) = cell.take() {
-                    if valued {
-                        let last = start + n - 1;
-                        span = Some(span.map_or((start, last), |(a, _)| (a, last)));
-                    }
-                    col = start.saturating_add(n);
+                col = col.saturating_add(n);
+                // The cell's text, comments and anything nested in it are
+                // not cells of this table.
+                if !empty {
+                    let name = e.name().as_ref().to_vec();
+                    reader
+                        .read_to_end_into(quick_xml::name::QName(&name), &mut skip)
+                        .map_err(xml_err)?;
+                    skip.clear();
                 }
             }
             Event::End(e) if e.name().as_ref() == b"table:table" => {
                 let name = table.take().unwrap_or_default();
-                let first = rows.iter().position(|r| r.1.is_some());
-                let last = rows.iter().rposition(|r| r.1.is_some());
-                if let (Some(first), Some(last)) = (first, last) {
-                    let height: u64 = rows[first..=last].iter().map(|r| r.0).sum();
-                    let lo = rows
-                        .iter()
-                        .filter_map(|r| r.1)
-                        .map(|s| s.0)
-                        .min()
-                        .unwrap_or(0);
-                    let hi = rows
-                        .iter()
-                        .filter_map(|r| r.1)
-                        .map(|s| s.1)
-                        .max()
-                        .unwrap_or(0);
-                    out.push((name, height, hi - lo + 1));
-                } else {
-                    out.push((name, 0, 0));
+                match (first, cols) {
+                    (Some(first), Some((lo, hi))) => out.push((name, last - first, hi - lo + 1)),
+                    _ => out.push((name, 0, 0)),
                 }
             }
             Event::Eof => break,
@@ -791,29 +774,42 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
     for name in sheet_names {
         // xlsx and xlsb build a dense range from sparse cells, so two values
         // at opposite corners ask for the whole grid between them.
+        // A sheet whose cells cannot be streamed (a chart sheet, a broken
+        // part) is skipped rather than built unmeasured, as one whose range
+        // cannot be read is below.
         let extent = match &mut workbook {
-            calamine::Sheets::Xlsx(x) => x.worksheet_cells_reader(&name).ok().and_then(|mut r| {
-                streamed_extent(|| {
+            calamine::Sheets::Xlsx(x) => {
+                let Ok(mut r) = x.worksheet_cells_reader(&name) else {
+                    continue;
+                };
+                let Ok(extent) = streamed_extent(|| {
                     r.next_cell().map(|c| {
                         c.map(|c| {
                             let (row, col) = c.get_position();
                             (row, col, matches!(c.get_value(), calamine::DataRef::Empty))
                         })
                     })
-                })
-                .ok()
-            }),
-            calamine::Sheets::Xlsb(x) => x.worksheet_cells_reader(&name).ok().and_then(|mut r| {
-                streamed_extent(|| {
+                }) else {
+                    continue;
+                };
+                Some(extent)
+            }
+            calamine::Sheets::Xlsb(x) => {
+                let Ok(mut r) = x.worksheet_cells_reader(&name) else {
+                    continue;
+                };
+                let Ok(extent) = streamed_extent(|| {
                     r.next_cell().map(|c| {
                         c.map(|c| {
                             let (row, col) = c.get_position();
                             (row, col, matches!(c.get_value(), calamine::DataRef::Empty))
                         })
                     })
-                })
-                .ok()
-            }),
+                }) else {
+                    continue;
+                };
+                Some(extent)
+            }
             _ => None,
         };
         if let Some((rows, cols)) = extent {
@@ -964,6 +960,92 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("too large"), "{err}");
         assert!(err.contains("700") && err.contains("16384"), "{err}");
+    }
+
+    #[test]
+    fn an_ods_value_without_a_value_type_counts_toward_the_budget() {
+        // #1187 review: calamine reads `office:value` as a number whatever
+        // the value type says, so a repeated bare value still expands.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("bare.ods");
+        ods_with(
+            &p,
+            r#"<table:table-row table:number-rows-repeated="700"><table:table-cell office:value="1" table:number-columns-repeated="16384"/></table:table-row>"#,
+        );
+        assert_eq!(
+            super::ods_extents(&p).unwrap(),
+            [(String::from("Sheet1"), 700, 16384)]
+        );
+    }
+
+    #[test]
+    fn empty_typed_and_annotation_only_ods_cells_are_not_counted() {
+        // #1187 review: a float-typed cell with no value and a cell holding
+        // only a comment are empty to calamine, so a 1x1 sheet padded with
+        // them is not refused as 701x16384.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("padded.ods");
+        ods_with(
+            &p,
+            concat!(
+                r#"<table:table-row><table:table-cell office:value-type="string"><text:p>a</text:p></table:table-cell><table:table-cell table:number-columns-repeated="4"/><table:table-cell><office:annotation><text:p>note</text:p></office:annotation></table:table-cell></table:table-row>"#,
+                r#"<table:table-row table:number-rows-repeated="700"><table:table-cell office:value-type="float" table:number-columns-repeated="16384"/></table:table-row>"#,
+            ),
+        );
+        assert_eq!(
+            super::ods_extents(&p).unwrap(),
+            [(String::from("Sheet1"), 1, 1)]
+        );
+        let view = super::open_sheet(&p).unwrap();
+        assert_eq!(view.sheets[0].headers, ["a"]);
+    }
+
+    #[test]
+    fn a_zero_ods_repeat_covers_nothing() {
+        // #1187 review: `number-columns-repeated="0"` made `col + n - 1`
+        // underflow. calamine adds no cell for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("zero.ods");
+        ods_with(
+            &p,
+            concat!(
+                r#"<table:table-row><table:table-cell office:value-type="string" table:number-columns-repeated="0"><text:p>gone</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>kept</text:p></table:table-cell></table:table-row>"#,
+                r#"<table:table-row table:number-rows-repeated="0"><table:table-cell office:value-type="string"><text:p>none</text:p></table:table-cell></table:table-row>"#,
+            ),
+        );
+        assert_eq!(
+            super::ods_extents(&p).unwrap(),
+            [(String::from("Sheet1"), 1, 1)]
+        );
+    }
+
+    #[test]
+    fn an_empty_string_typed_ods_cell_still_counts() {
+        // Negative: calamine reads a string-typed cell with no text as an
+        // empty string, which is a value, so it widens the sheet.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blank.ods");
+        ods_with(
+            &p,
+            r#"<table:table-row><table:table-cell office:value-type="string"><text:p>a</text:p></table:table-cell><table:table-cell table:number-columns-repeated="2"/><table:table-cell office:value-type="string"/></table:table-row>"#,
+        );
+        assert_eq!(
+            super::ods_extents(&p).unwrap(),
+            [(String::from("Sheet1"), 1, 4)]
+        );
+    }
+
+    #[test]
+    fn an_xlsx_sheet_that_cannot_be_streamed_fails_to_open() {
+        // #1187 review: a cells-reader error skipped the extent check and
+        // went on to build the range; such a sheet is now skipped unbuilt.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("broken.xlsx");
+        xlsx_with(
+            &p,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row><row r="2"><c r="!!" t="n"><v>1</v></c></row>"#,
+        );
+        assert!(super::open_sheet(&p).is_err());
     }
 
     #[test]
