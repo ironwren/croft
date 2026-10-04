@@ -62595,6 +62595,7 @@ impl App {
                     }
                     self.rename_open_path_everywhere(&old, &new_path);
                     self.rename_review_boxes_path(&old, &new_path);
+                    crate::history::move_path(&self.history_root, &old, &new_path);
                     self.sync_open_file_poll_mtime();
                     true
                 }
@@ -62638,6 +62639,7 @@ impl App {
                     if matches!(mode, ExplorerClipMode::Cut) {
                         self.rename_open_path_everywhere(src, &p);
                         self.rename_review_boxes_path(src, &p);
+                        crate::history::move_path(&self.history_root, src, &p);
                     }
                     placed.push(p);
                 }
