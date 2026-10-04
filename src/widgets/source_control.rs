@@ -131,6 +131,9 @@ pub struct RepoRow {
     pub workspace_root: std::path::PathBuf,
 }
 
+/// Most message rows the box shows before it scrolls.
+pub const MESSAGE_MAX_ROWS: usize = 6;
+
 pub struct SourceControlPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -147,6 +150,10 @@ pub struct SourceControlPanel {
     /// wider than the box. Recomputed every render from the cursor and the
     /// box width.
     pub message_scroll: usize,
+    /// Message lines scrolled out of view above the commit-message input
+    /// once the message has more lines than the box shows. Recomputed every
+    /// render, like `message_scroll`, to keep the caret's line visible.
+    pub message_line_scroll: usize,
     pub status: GitStatus,
     pub entries: Vec<ChangeEntry>,
     /// The multi-root repositories overview (#161), pushed by the App per
@@ -234,6 +241,7 @@ impl SourceControlPanel {
             message: String::new(),
             message_cursor: 0,
             message_scroll: 0,
+            message_line_scroll: 0,
             status: GitStatus::default(),
             entries: Vec::new(),
             repositories: Vec::new(),
@@ -344,22 +352,72 @@ impl SourceControlPanel {
         self.entries.len()
     }
 
+    /// Insert at the caret. A newline starts a new message line (the
+    /// commit body); a carriage return counts as one.
     pub fn insert_char(&mut self, c: char) {
-        if c == '\n' || c == '\r' {
-            return;
-        }
+        let c = if c == '\r' { '\n' } else { c };
         let idx = self.byte_index_at_cursor();
         self.message.insert(idx, c);
         self.message_cursor += 1;
     }
 
+    /// Insert pasted text at the caret, keeping its line breaks: CRLF and
+    /// a lone CR both become one newline, so words on adjacent lines never
+    /// run together.
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            if c == '\n' || c == '\r' {
-                continue;
-            }
+        for c in s.replace("\r\n", "\n").chars() {
             self.insert_char(c);
         }
+    }
+
+    /// The caret's (line, column) within the message, in chars.
+    fn caret_line_col(&self) -> (usize, usize) {
+        let before = self.message.chars().take(self.message_cursor);
+        let (mut line, mut col) = (0, 0);
+        for c in before {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Move the caret to `col` (clamped to the line's end) on message line
+    /// `line`.
+    fn set_caret_line_col(&mut self, line: usize, col: usize) {
+        let mut offset = 0;
+        for (n, text) in self.message.split('\n').enumerate() {
+            let len = text.chars().count();
+            if n == line {
+                self.message_cursor = offset + col.min(len);
+                return;
+            }
+            offset += len + 1;
+        }
+    }
+
+    /// Caret to the same column on the line above. False on the first
+    /// line, where there is nowhere to go.
+    pub fn move_cursor_up(&mut self) -> bool {
+        let (line, col) = self.caret_line_col();
+        if line == 0 {
+            return false;
+        }
+        self.set_caret_line_col(line - 1, col);
+        true
+    }
+
+    /// Caret to the same column on the line below. False on the last line.
+    pub fn move_cursor_down(&mut self) -> bool {
+        let (line, col) = self.caret_line_col();
+        if line + 1 >= self.message.split('\n').count() {
+            return false;
+        }
+        self.set_caret_line_col(line + 1, col);
+        true
     }
 
     pub fn backspace(&mut self) {
@@ -420,6 +478,7 @@ impl SourceControlPanel {
         self.message.clear();
         self.message_cursor = 0;
         self.message_scroll = 0;
+        self.message_line_scroll = 0;
     }
 
     pub fn entry_at_y(&self, y: u16) -> Option<usize> {
@@ -503,10 +562,11 @@ impl SourceControlPanel {
     /// to drive the host terminal's hardware caret. Returns `None` when
     /// the panel isn't focused, isn't in a repo (no input box painted),
     /// hasn't been laid out yet, or the cursor would land outside the
-    /// visible inner width of the input box. The render path paints the
-    /// message at `input_inner.x + 1` on `input_inner.y`, so the caret
-    /// sits at column `input_box.x + 2 + message_cursor`, row
-    /// `input_box.y + 1` (rounded border occupies one cell on each side).
+    /// visible inner width of the input box. The render path paints
+    /// message line `n` at `input_inner.x + 1` on `input_inner.y + n`
+    /// (less the scrolled-off lines and columns), so the caret sits at
+    /// column `input_box.x + 2 + col`, row `input_box.y + 1 + line`
+    /// (rounded border occupies one cell on each side).
     pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
         if !self.focused {
             return None;
@@ -515,12 +575,17 @@ impl SourceControlPanel {
         if r.width < 3 || r.height < 3 {
             return None;
         }
-        let cursor_col = self.message_cursor.saturating_sub(self.message_scroll) as u16;
+        let (line, col) = self.caret_line_col();
+        let cursor_col = col.saturating_sub(self.message_scroll) as u16;
         let max_col = r.width.saturating_sub(3);
         if cursor_col > max_col {
             return None;
         }
-        Some((r.x + 2 + cursor_col, r.y + 1))
+        let row = line.checked_sub(self.message_line_scroll)? as u16;
+        if row + 2 >= r.height {
+            return None;
+        }
+        Some((r.x + 2 + cursor_col, r.y + 1 + row))
     }
 
     /// Compute the visual layout of the change list as a flat sequence of
@@ -1164,15 +1229,18 @@ impl Widget for &mut SourceControlPanel {
         buf.set_line(inner.x, y, &Line::from(spans), inner.width);
         y += 2; // blank gap below branch row
 
-        // Rows y..y+3: commit-message input (3-row rounded box).
+        // Rows y..y+3: commit-message input, a rounded box one row per
+        // message line (up to MESSAGE_MAX_ROWS, then it scrolls).
         if y + 3 > inner.y + inner.height {
             return;
         }
+        let line_count = self.message.split('\n').count();
         let input_box = Rect {
             x: inner.x,
             y,
             width: inner.width,
-            height: 3,
+            height: (line_count.clamp(1, MESSAGE_MAX_ROWS) as u16 + 2)
+                .min(inner.y + inner.height - y),
         };
         self.last_input_area = input_box;
         let input_border_style = if self.focused {
@@ -1199,10 +1267,11 @@ impl Widget for &mut SourceControlPanel {
             let text_max = (input_inner.width as usize).saturating_sub(2);
             if self.message.is_empty() {
                 self.message_scroll = 0;
+                self.message_line_scroll = 0;
                 buf.set_stringn(
                     text_x,
                     content_y,
-                    "Message (Enter = commit, \u{2303}Enter = push)",
+                    "Message (Enter = commit, \u{21e7}Enter = new line, \u{2303}Enter = push)",
                     text_max,
                     Style::default()
                         .fg(Color::Rgb(
@@ -1217,30 +1286,43 @@ impl Widget for &mut SourceControlPanel {
                 // message wider than the input (e.g. a pasted path) stays
                 // editable. Without this the box always shows byte 0, the
                 // caret falls off the right edge, and edits at the tail are
-                // invisible — the field reads as frozen.
-                let len = self.message.chars().count();
-                let cursor = self.message_cursor.min(len);
+                // invisible — the field reads as frozen. Vertical scroll
+                // does the same for the caret's line in a long message.
+                let (line, cursor) = self.caret_line_col();
                 if cursor < self.message_scroll {
                     self.message_scroll = cursor;
                 } else if text_max > 0 && cursor > self.message_scroll + text_max {
                     self.message_scroll = cursor - text_max;
                 }
-                let visible: String = self
+                let rows = input_inner.height as usize;
+                if line < self.message_line_scroll {
+                    self.message_line_scroll = line;
+                } else if line >= self.message_line_scroll + rows {
+                    self.message_line_scroll = line + 1 - rows;
+                }
+                for (row, text) in self
                     .message
-                    .chars()
-                    .skip(self.message_scroll)
-                    .take(text_max)
-                    .collect();
-                buf.set_stringn(
-                    text_x,
-                    content_y,
-                    &visible,
-                    text_max,
-                    Style::default().fg(self.theme.ui(Color::White)),
-                );
+                    .split('\n')
+                    .skip(self.message_line_scroll)
+                    .take(rows)
+                    .enumerate()
+                {
+                    let visible: String = text
+                        .chars()
+                        .skip(self.message_scroll)
+                        .take(text_max)
+                        .collect();
+                    buf.set_stringn(
+                        text_x,
+                        content_y + row as u16,
+                        &visible,
+                        text_max,
+                        Style::default().fg(self.theme.ui(Color::White)),
+                    );
+                }
             }
         }
-        y += 3 + 1; // input box + 1-row gap
+        y += input_box.height + 1; // input box + 1-row gap
 
         // Rows y..y+3: chunky split-button — wide "Commit" main + narrow
         // chevron caret. The caret reveals a "Commit & Push" dropdown so
@@ -3189,5 +3271,98 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(p.changes_count(), 2);
+    }
+
+    fn render_rows(p: &mut SourceControlPanel) -> Vec<String> {
+        use ratatui::buffer::Buffer;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(p, area, &mut buf);
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Pasted line breaks are kept (CRLF and lone CR become LF), so a
+    /// message can have a body (#1241).
+    #[test]
+    fn pasted_line_breaks_are_kept_as_newlines() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("a\r\n\r\nb\rc\nd");
+        assert_eq!(p.message, "a\n\nb\nc\nd");
+        assert_eq!(p.message_cursor, p.message.chars().count());
+    }
+
+    /// The box grows a row per message line, so subject and body each show
+    /// on their own row, and the caret sits on its line.
+    #[test]
+    fn the_message_box_shows_each_line_on_its_own_row() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        p.insert_str("subject\n\nbody");
+        let rows = render_rows(&mut p);
+        let input = p.last_input_area;
+        assert_eq!(input.height, 5, "three lines plus the border");
+        let row = |n: u16| rows[(input.y + 1 + n) as usize].clone();
+        assert!(row(0).contains("subject"), "{rows:#?}");
+        assert!(!row(1).contains("body") && !row(1).contains("subject"));
+        assert!(row(2).contains("body"), "{rows:#?}");
+        assert_eq!(p.cursor_screen_pos(), Some((input.x + 2 + 4, input.y + 3)));
+    }
+
+    /// Past the row cap the box scrolls to keep the caret's line in view.
+    #[test]
+    fn a_long_message_scrolls_to_the_caret_line() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.focused = true;
+        let text: Vec<String> = (1..=12).map(|n| format!("line{n}")).collect();
+        p.insert_str(&text.join("\n"));
+        let rows = render_rows(&mut p);
+        let input = p.last_input_area;
+        assert_eq!(input.height, 2 + MESSAGE_MAX_ROWS as u16);
+        let last = rows[(input.y + input.height - 2) as usize].clone();
+        assert!(last.contains("line12"), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("line1 ")), "{rows:#?}");
+        let (_, caret_y) = p.cursor_screen_pos().unwrap();
+        assert_eq!(caret_y, input.y + input.height - 2);
+    }
+
+    /// Up and Down move the caret between message lines, keeping its
+    /// column where the line allows; at the first or last line they report
+    /// that nothing moved, so the panel can scroll its list as before.
+    #[test]
+    fn up_and_down_move_between_message_lines() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("abcdef\nxy\nlonger");
+        assert!(p.move_cursor_up(), "from the last line up");
+        assert_eq!(
+            p.message_cursor,
+            7 + 2,
+            "column 6 clamps to the end of 'xy'"
+        );
+        assert!(p.move_cursor_up());
+        assert_eq!(p.message_cursor, 2);
+        assert!(!p.move_cursor_up(), "the first line has nothing above");
+        assert!(p.move_cursor_down());
+        assert!(p.move_cursor_down());
+        assert_eq!(p.message_cursor, 10 + 2);
+        assert!(!p.move_cursor_down(), "the last line has nothing below");
+    }
+
+    /// A one-line message keeps the three-row box.
+    #[test]
+    fn a_one_line_message_keeps_the_three_row_box() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.insert_str("just a subject");
+        render_rows(&mut p);
+        assert_eq!(p.last_input_area.height, 3);
     }
 }
