@@ -1940,6 +1940,32 @@ pub fn stage_path(root: &Path, rel_path: &str) -> Result<(), String> {
     stage_paths(root, std::slice::from_ref(&rel_path.to_string()))
 }
 
+/// `git rm` one path: out of the index and off the disk. Resolves a
+/// modify/delete conflict in favour of the deletion (#1244).
+pub fn remove_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    let path_str = root
+        .to_str()
+        .ok_or_else(|| "non-utf8 workspace path".to_string())?;
+    let out = Command::new("git")
+        .args([
+            "-C",
+            path_str,
+            "--literal-pathspecs",
+            "rm",
+            "-q",
+            "-f",
+            "--",
+        ])
+        .arg(rel_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Stage all listed paths in a single `git add -- p1 p2 ...` invocation.
 /// Atomic with respect to the index lock — running N separate `git add`
 /// commands lets the background `git status` worker grab the lock
