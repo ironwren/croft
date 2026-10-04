@@ -1133,6 +1133,25 @@ fn render_merge_panes(
     }
 }
 
+/// `text` from char `skip` on, cut and space-padded to exactly `width`
+/// screen cells for one side of the side-by-side diff. A double-width (CJK,
+/// emoji) char takes two cells, and one that would straddle the edge is left
+/// out, so the text never runs over the seam into the other column.
+fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars().skip(skip) {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1341,16 +1360,7 @@ fn render_diff(
                 .bg(l_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let l_clipped: String = l_text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(l_text_w as usize)
-            .collect();
-        let mut l_padded = l_clipped.clone();
-        let l_pad = (l_text_w as usize).saturating_sub(l_padded.chars().count());
-        for _ in 0..l_pad {
-            l_padded.push(' ');
-        }
+        let l_padded = clip_pad_cells(&l_text, diff.scroll_x, l_text_w as usize);
         buf.set_string(
             l_text_x,
             y,
@@ -1417,16 +1427,7 @@ fn render_diff(
                 .bg(r_cell_bg)
                 .add_modifier(Modifier::BOLD),
         );
-        let r_clipped: String = r_text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(r_text_w as usize)
-            .collect();
-        let mut r_padded = r_clipped.clone();
-        let r_pad = (r_text_w as usize).saturating_sub(r_padded.chars().count());
-        for _ in 0..r_pad {
-            r_padded.push(' ');
-        }
+        let r_padded = clip_pad_cells(&r_text, diff.scroll_x, r_text_w as usize);
         buf.set_string(
             r_text_x,
             y,
@@ -1810,16 +1811,7 @@ fn render_unified_deletion(
         let text = left_idx
             .and_then(|i| diff.left_lines.get(i).cloned())
             .unwrap_or_default();
-        let clipped: String = text
-            .chars()
-            .skip(diff.scroll_x)
-            .take(text_w as usize)
-            .collect();
-        let mut padded = clipped;
-        let pad = (text_w as usize).saturating_sub(padded.chars().count());
-        for _ in 0..pad {
-            padded.push(' ');
-        }
+        let padded = clip_pad_cells(&text, diff.scroll_x, text_w as usize);
         buf.set_string(
             text_x,
             y,
@@ -25240,6 +25232,93 @@ mod tests {
             pos,
             Some((r_text_x + 3, body_top + 1)),
             "caret at right row 1 col 3 must land on the cell diff_hit_test maps that screen point back to"
+        );
+    }
+
+    /// Render a side-by-side diff of `left` vs `right` into an 80x10 buffer.
+    fn render_wide_diff(left: &str, right: &str) -> (ratatui::buffer::Buffer, Rect, u16) {
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), left).unwrap();
+        std::fs::write(f2.path(), right).unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let inner = t.editors[idx].last_inner;
+        let r_gutter = (t.editors[idx].diff.as_ref().unwrap().right_lines.len() + 1)
+            .to_string()
+            .len() as u16
+            + 1;
+        let r_text_x = inner.x + inner.width / 2 + 1 + r_gutter + 2;
+        (buf, inner, r_text_x)
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, from: u16, to: u16) -> String {
+        (from..to).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// Wide (CJK) characters take two cells: each side is clipped to its
+    /// half by display width, so the seam survives on every row and the
+    /// right side starts where it should (#1248).
+    #[test]
+    fn a_diff_of_wide_characters_keeps_each_side_in_its_half() {
+        let left = "# 项目\n这是一个轻量级的终端编辑器，支持多种编程语言和版本控制功能。\nend\n";
+        let right = "# 项目\n这是一个高性能的终端编辑器，支持多种编程语言和版本控制功能。\nend\n";
+        let (buf, inner, r_text_x) = render_wide_diff(left, right);
+        let seam_x = inner.x + inner.width / 2;
+        for y in inner.y + 1..inner.y + 4 {
+            assert_eq!(
+                buf[(seam_x, y)].symbol(),
+                "\u{2502}",
+                "row {y}: {:?}",
+                row_text(&buf, y, inner.x, inner.right())
+            );
+        }
+        let changed = (inner.y..inner.bottom())
+            .find(|&y| row_text(&buf, y, r_text_x, inner.right()).contains('高'))
+            .expect("the changed right line is drawn");
+        assert_eq!(
+            buf[(r_text_x, changed)].symbol(),
+            "这",
+            "starts at its column"
+        );
+        assert!(
+            !row_text(&buf, changed, inner.x, seam_x).contains('高'),
+            "no right text left of the seam"
+        );
+    }
+
+    /// A wide character that would straddle a column's edge is left out and
+    /// its cell padded, rather than drawn across the seam.
+    #[test]
+    fn clip_pad_cells_never_splits_a_wide_character() {
+        assert_eq!(clip_pad_cells("日本語", 0, 5), "日本 ");
+        assert_eq!(clip_pad_cells("日本語", 1, 6), "本語  ");
+        assert_eq!(clip_pad_cells("ab日", 0, 3), "ab ");
+    }
+
+    /// Narrow text clips and pads exactly as before: by character, to the
+    /// column's width.
+    #[test]
+    fn clip_pad_cells_matches_char_clipping_for_narrow_text() {
+        assert_eq!(clip_pad_cells("abcdef", 2, 3), "cde");
+        assert_eq!(clip_pad_cells("ab", 0, 4), "ab  ");
+        assert_eq!(clip_pad_cells("abc", 5, 2), "  ");
+        let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
+        let changed = (inner.y..inner.bottom())
+            .find(|&y| row_text(&buf, y, r_text_x, inner.right()).starts_with("new line"))
+            .expect("ascii right line drawn at its column");
+        assert_eq!(
+            buf[(inner.x + inner.width / 2, changed)].symbol(),
+            "\u{2502}"
         );
     }
 
