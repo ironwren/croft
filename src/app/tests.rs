@@ -68706,3 +68706,90 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
 }
+
+/// Workspace `tl/` holding the repo `tl/sub/` (#1227): the workspace root
+/// is in no repo, so its worker has no `repo_root`.
+fn nested_repo_1227() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "a@b"],
+        vec!["config", "user.name", "a"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&sub)
+            .args(&args)
+            .status();
+    }
+    let f = sub.join("plain.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "plain", "--quiet"]] {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&sub)
+            .args(&args)
+            .status();
+    }
+    (tmp, f)
+}
+
+#[test]
+fn git_gutter_baseline_comes_from_a_repo_below_the_workspace_root() {
+    let (tmp, f) = nested_repo_1227();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines,
+        Some(vec!["one".to_string(), "two".to_string()]),
+        "the committed text of sub/plain.txt is the gutter baseline"
+    );
+}
+
+#[test]
+fn git_gutter_baseline_stays_empty_for_a_file_outside_any_repo() {
+    let (tmp, _) = nested_repo_1227();
+    let loose = tmp.path().join("loose.txt");
+    std::fs::write(&loose, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&loose).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(app.editor.git_head_lines, None);
+}
+
+#[test]
+fn source_control_lists_the_repo_found_one_folder_down() {
+    let (tmp, _) = nested_repo_1227();
+    std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".hidden/.git")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let _ = render_buf(&mut app);
+    let sub = tmp.path().join("sub").canonicalize().unwrap();
+    assert_eq!(
+        app.source_control.nested_repos,
+        vec![(String::from("sub/"), sub.clone())],
+        "only sub/ holds a repo; hidden folders are skipped"
+    );
+    assert_eq!(
+        app.source_control.last_init_repo_button_area,
+        Rect::default()
+    );
+    let (btn, _) = app.source_control.nested_repo_button_areas[0].clone();
+    left_click(&mut app, btn.x + btn.width / 2, btn.y + 1);
+    assert_eq!(app.workspace_root(), sub.as_path());
+}
+
+#[test]
+fn source_control_still_offers_initialize_with_no_repo_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let _ = render_buf(&mut app);
+    assert!(app.source_control.nested_repos.is_empty());
+    assert!(app.source_control.last_init_repo_button_area.width > 0);
+}

@@ -2999,6 +2999,10 @@ pub struct App {
     /// The file the TIMELINE has been fetched (or is being fetched) for, so the
     /// fetch fires exactly once per active-file change.
     timeline_fetched: Option<PathBuf>,
+    /// When and for which folder the subfolder-repo scan behind the
+    /// Source Control empty state last ran (#1227); rescanned at most
+    /// every couple of seconds while that card shows.
+    nested_repo_scan: Option<(PathBuf, std::time::Instant)>,
     /// Off-thread per-line git blame for the active editor (GitLens-style
     /// inline annotation). Fetched once per (file, HEAD) like the gutter.
     blame_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>,
@@ -5573,6 +5577,7 @@ impl App {
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
+            nested_repo_scan: None,
             blame_rx,
             blame_tx,
             blame_fetched: None,
@@ -8637,6 +8642,34 @@ impl App {
             .to_path_buf()
     }
 
+    /// Feed the Source Control empty state the repos one folder below the
+    /// active root when that root is in none (#1227), so it offers to open
+    /// them rather than `git init` around them. A depth-1 `read_dir`,
+    /// rerun at most every two seconds while the card shows.
+    fn sync_nested_repos(&mut self) {
+        if self.source_control.status.in_repo {
+            self.source_control.nested_repos.clear();
+            self.nested_repo_scan = None;
+            return;
+        }
+        let root = self.active_scm_root.clone();
+        let fresh = self
+            .nested_repo_scan
+            .as_ref()
+            .is_some_and(|(r, at)| *r == root && at.elapsed() < Duration::from_secs(2));
+        if fresh {
+            return;
+        }
+        self.source_control.nested_repos = crate::git::child_repos(&root)
+            .into_iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                Some((format!("{name}/"), p))
+            })
+            .collect();
+        self.nested_repo_scan = Some((root, std::time::Instant::now()));
+    }
+
     /// The git worker for a workspace root: the primary's, or the
     /// matching secondary's (#149).
     fn git_worker_for_root(&self, ws_root: &Path) -> &GitWorker {
@@ -8716,19 +8749,17 @@ impl App {
         // each file resolves against the repo of ITS owning workspace
         // root (#149). Precompute (workspace root → repo toplevel) so the
         // editor loop below borrows nothing else off self.
-        let repo_bases: Vec<(PathBuf, PathBuf)> = self
+        // A root in no repo (or with no status reply yet) maps to `None`,
+        // and the file's own repo is asked instead: a workspace opened
+        // above its repo still gets gutters (#1227).
+        let repo_bases: Vec<(PathBuf, Option<PathBuf>)> = self
             .roots
             .iter()
             .map(Path::to_path_buf)
             .collect::<Vec<_>>()
             .into_iter()
             .map(|ws| {
-                let repo = self
-                    .git_worker_for_root(&ws)
-                    .status()
-                    .repo_root
-                    .clone()
-                    .unwrap_or_else(|| ws.clone());
+                let repo = self.git_worker_for_root(&ws).status().repo_root.clone();
                 (ws, repo)
             })
             .collect();
@@ -8737,7 +8768,8 @@ impl App {
                 .iter()
                 .filter(|(ws, _)| path.starts_with(ws))
                 .max_by_key(|(ws, _)| ws.components().count())
-                .map(|(_, repo)| repo.clone())
+                .and_then(|(_, repo)| repo.clone())
+                .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
         let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
             std::collections::HashMap::new();
@@ -18345,6 +18377,7 @@ impl App {
                         height: usable_area.height - graph_h,
                         ..usable_area
                     };
+                    self.sync_nested_repos();
                     frame.render_widget(&mut self.source_control, scm_area);
                     if graph_h > 0 {
                         let graph_area = Rect {
@@ -53101,6 +53134,10 @@ impl App {
                     }
                     if self.source_control.click_init_repo_button(m.column, m.row) {
                         self.initialize_repository();
+                        return;
+                    }
+                    if let Some(repo) = self.source_control.click_nested_repo(m.column, m.row) {
+                        self.change_workspace_root(repo);
                         return;
                     }
                     if self.source_control.click_button(m.column, m.row) {
