@@ -53208,6 +53208,81 @@ fn live_run_lands_a_real_run_on_the_tab() {
     assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
 }
 
+// ---- Local history follows Explorer renames and moves (#1246) ----
+
+fn app_with_history(root: &std::path::Path) -> (App, tempfile::TempDir) {
+    let hist = tempfile::tempdir().unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.history_root = hist.path().to_path_buf();
+    (app, hist)
+}
+
+#[test]
+fn renaming_a_file_in_the_explorer_keeps_its_local_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("notes.txt"), "v3\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    crate::history::record_in(&app.history_root, &root.join("notes.txt"), b"v1\n", 1_000).unwrap();
+    crate::history::record_in(&app.history_root, &root.join("notes.txt"), b"v2\n", 60_000).unwrap();
+    assert!(app.run_file_move(FileMove::Rename {
+        parent: root.clone(),
+        old: root.join("notes.txt"),
+        new_name: String::from("journal.txt"),
+    }));
+    let moved = crate::history::entries_in(&app.history_root, &root.join("journal.txt"));
+    assert_eq!(
+        moved.iter().map(|s| s.millis).collect::<Vec<_>>(),
+        [60_000, 1_000]
+    );
+    assert!(crate::history::entries_in(&app.history_root, &root.join("notes.txt")).is_empty());
+}
+
+#[test]
+fn cutting_a_folder_into_another_keeps_its_files_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join("archive")).unwrap();
+    std::fs::write(root.join("docs").join("a.md"), "a\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    let old = root.join("docs").join("a.md");
+    crate::history::record_in(&app.history_root, &old, b"a0\n", 1_000).unwrap();
+    assert!(app.run_file_move(FileMove::Paste {
+        dest_dir: root.join("archive"),
+        paths: vec![root.join("docs")],
+    }));
+    let new = root.join("archive").join("docs").join("a.md");
+    assert!(new.exists());
+    assert_eq!(crate::history::entries_in(&app.history_root, &new).len(), 1);
+    assert!(crate::history::entries_in(&app.history_root, &old).is_empty());
+}
+
+/// A copy is a new file: the original keeps its history, the copy starts
+/// empty.
+#[test]
+fn copying_a_file_leaves_its_history_with_the_original() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let (mut app, _hist) = app_with_history(&root);
+    crate::history::record_in(&app.history_root, &root.join("a.txt"), b"a0\n", 1_000).unwrap();
+    assert!(app.apply_paste_or_drop(
+        &root.join("sub"),
+        &[root.join("a.txt")],
+        ExplorerClipMode::Copy
+    ));
+    assert!(root.join("sub").join("a.txt").exists());
+    assert_eq!(
+        crate::history::entries_in(&app.history_root, &root.join("a.txt")).len(),
+        1
+    );
+    assert!(
+        crate::history::entries_in(&app.history_root, &root.join("sub").join("a.txt")).is_empty()
+    );
+}
+
 // ---- Explorer moves ask the servers first (#610) ----
 
 #[test]
