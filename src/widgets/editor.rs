@@ -9415,12 +9415,15 @@ impl Editor {
             return Ok(SaveOutcome::EncodingLoss);
         }
         if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
-            // The file is normally untouched, but an in-place write (a hard
-            // link, a foreign file) can fail after truncating it. Either way
-            // what is on disk now is croft's own doing: a stale stamp made
-            // the sync sweep offer to "reload" it over the only good copy.
-            self.disk_stamp = Self::disk_stamp_of(&path);
-            return Err(e.into());
+            // Only a write that got as far as changing the file makes what
+            // is on disk croft's own doing: a stale stamp then made the sync
+            // sweep offer to "reload" it over the only good copy. An
+            // untouched file keeps its stamp, so an edit made outside croft
+            // is still noticed and not overwritten by the next save.
+            if e.touched {
+                self.disk_stamp = Self::disk_stamp_of(&path);
+            }
+            return Err(e.error.into());
         }
         self.decode_lossy = false;
         self.encoding_loss = false;
@@ -23524,6 +23527,163 @@ mod tests {
         e.insert_str("x");
         e.save_to_disk().unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "x");
+    }
+
+    /// #1190 review: a save that fails before the file is touched must
+    /// not refresh the disk stamp: an overwrite of an outside edit that
+    /// fails leaves that edit on disk, and the next plain save must still
+    /// stop at the conflict instead of silently replacing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_save_keeps_an_external_edit_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_fails_a_save_after_an_external_edit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "edited elsewhere\n");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_fails_a_save_after_an_external_edit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let f = std::path::PathBuf::from(f);
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        std::fs::write(&f, "edited elsewhere\n").unwrap();
+        e.insert_str("# A new entry at the top\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::DiskConflict);
+        assert!(
+            e.save_to_disk_force().is_err(),
+            "the overwrite must fail past the limit"
+        );
+        assert!(
+            e.disk_changed_externally(),
+            "the failed overwrite left the outside edit on disk, still unresolved"
+        );
+    }
+
+    /// #1190 review: a hard link is written in place (a rename would split
+    /// it from its other names); running out of space there must still
+    /// leave the file whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_linked_file_that_runs_out_of_space_stays_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        std::fs::hard_link(&f, dir.path().join("other-name.md")).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_a_grown_buffer_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other-name.md")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_long_name_still_saves() {
+        // #1190 review: the temp name grew with the file's own, so a name
+        // near the 255-byte limit could not be saved at all.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(format!("{}.md", "n".repeat(240)));
+        std::fs::write(&f, "a\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
+    }
+
+    #[test]
+    fn a_save_never_touches_a_file_named_like_a_temp_file() {
+        // #1190 review: the temp name was predictable and a file already
+        // at it was removed first, so a save could delete an unrelated one.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        std::fs::write(&f, "a\n").unwrap();
+        let planted = dir
+            .path()
+            .join(format!(".notes.md.croft-save-{}", std::process::id()));
+        std::fs::write(&planted, "not croft's\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "not croft's\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file is left behind: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_files_group() {
+        // #1190 review: the renamed-in file took the default group.
+        use std::os::unix::fs::MetadataExt as _;
+        let mut groups = vec![0 as libc::gid_t; 64];
+        let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+        let egid = unsafe { libc::getegid() };
+        let Some(&other) = groups[..n.max(0) as usize].iter().find(|&&g| g != egid) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("shared.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        std::os::unix::fs::chown(&f, None, Some(other)).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::metadata(&f).unwrap().gid(), other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saving_keeps_the_files_extended_attributes() {
+        // #1190 review: xattrs, and the POSIX ACLs stored in them, were
+        // left behind on the old inode.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("tagged.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"user.croft-test";
+        let set =
+            unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"kept".as_ptr().cast(), 4, 0) };
+        if set != 0 {
+            return; // the filesystem has no user xattrs
+        }
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        let mut buf = [0u8; 16];
+        let got = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert_eq!(got, 4, "the xattr is gone");
+        assert_eq!(&buf[..4], b"kept");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
     }
 
     #[test]

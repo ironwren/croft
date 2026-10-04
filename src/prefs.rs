@@ -617,22 +617,48 @@ pub(crate) fn write_keeping_mode(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::
     file.write_all(bytes)
 }
 
+/// Why [`replace_file_contents`] failed, and whether the file it was
+/// replacing had been changed by then. Only a touched file needs its new
+/// state recorded; an untouched one may still hold someone else's edit.
+#[derive(Debug)]
+pub(crate) struct ReplaceError {
+    pub error: std::io::Error,
+    pub touched: bool,
+}
+
+impl From<ReplaceError> for std::io::Error {
+    fn from(e: ReplaceError) -> Self {
+        e.error
+    }
+}
+
 /// Replace the contents of the user's file at `path` with `bytes` so that
-/// a write that fails partway (a full disk) leaves the old contents whole:
-/// the bytes go to a temp file beside it, created with its mode, which is
-/// then renamed over it. Written in place, the file was truncated first and
-/// a failed write lost its end (#1124).
+/// a write that fails partway (a full disk) leaves the old contents whole
+/// (#1124).
 ///
-/// A symlink is followed, so the link survives and its target is replaced.
-/// A file that doesn't exist yet has nothing to lose and is written
-/// directly, with the usual umask mode. A rename would change more than the
-/// contents where the file is a hard link (the other names keep the old
-/// text) or belongs to someone else (the new file would be ours): those are
-/// written in place, as is a file whose directory refuses the temp file.
-pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// The bytes go to a temp file beside it, which takes on the file's mode,
+/// group and extended attributes (POSIX ACLs among them) and is then renamed
+/// over it. A symlink is followed, so the link survives and its target is
+/// replaced. A file that doesn't exist yet has nothing to lose and is written
+/// directly, with the usual umask mode.
+///
+/// A rename would change more than the contents where the file is a hard
+/// link (the other names keep the old text), belongs to someone else (the
+/// new file would be ours), or has a group or attribute the temp file can't
+/// be given; and it is impossible where the directory refuses the temp file.
+/// Those are written in place, with the space for the new contents reserved
+/// before the first byte changes.
+pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+    let untouched = |error| ReplaceError {
+        error,
+        touched: false,
+    };
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = std::fs::metadata(&target) else {
-        return std::fs::write(&target, bytes);
+        return std::fs::write(&target, bytes).map_err(|error| ReplaceError {
+            error,
+            touched: true,
+        });
     };
     #[cfg(unix)]
     let in_place = {
@@ -640,39 +666,203 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> std::io::Resul
         meta.nlink() > 1 || meta.uid() != unsafe { libc::geteuid() }
     };
     #[cfg(not(unix))]
-    let in_place = {
-        let _ = &meta;
-        false
-    };
+    let in_place = false;
     if !in_place {
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let tmp = target.with_file_name(format!(".{name}.croft-save-{}", std::process::id()));
-        match write_keeping_mode(&tmp, &target, bytes) {
-            Ok(()) => {
-                return std::fs::rename(&tmp, &target).inspect_err(|_| {
+        match write_aside(&target, &meta, bytes) {
+            Ok(tmp) => {
+                return std::fs::rename(&tmp, &target).map_err(|e| {
                     let _ = std::fs::remove_file(&tmp);
+                    untouched(e)
                 });
             }
-            // Only a temp file that cannot be created (a directory that
-            // refuses it, or a name already taken, which is never followed)
-            // falls through to an in-place write. A full disk would fail that
-            // write too, after it had already truncated the file.
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                use std::io::ErrorKind;
-                if !matches!(
-                    e.kind(),
-                    ErrorKind::PermissionDenied | ErrorKind::AlreadyExists
-                ) {
-                    return Err(e);
-                }
-            }
+            Err(Aside::Failed(e)) => return Err(untouched(e)),
+            Err(Aside::InPlace) => {}
         }
     }
-    std::fs::write(&target, bytes)
+    write_in_place(&target, bytes)
+}
+
+/// Why [`write_aside`] gave up: the write failed (a full disk), or the
+/// file has to be written in place instead.
+enum Aside {
+    Failed(std::io::Error),
+    InPlace,
+}
+
+/// Write `bytes` to a fresh temp file beside `target` that carries its mode,
+/// group and extended attributes, ready to be renamed over it. The name is
+/// short (a long file name would push it past the name limit) and never
+/// taken over: an existing file at it is skipped, not removed or followed.
+fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<PathBuf, Aside> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let (tmp, mut file) = 'open: {
+        for _ in 0..16 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!(
+                ".croft-save-{}-{seq}-{nonce:08x}",
+                std::process::id()
+            ));
+            match opts.open(&tmp) {
+                Ok(f) => break 'open (tmp, f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(Aside::InPlace);
+                }
+                Err(e) => return Err(Aside::Failed(e)),
+            }
+        }
+        return Err(Aside::InPlace);
+    };
+    let fail = |tmp: &Path, e| {
+        let _ = std::fs::remove_file(tmp);
+        Aside::Failed(e)
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
+        return Err(fail(&tmp, e));
+    }
+    if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
+        return Err(fail(&tmp, e));
+    }
+    #[cfg(unix)]
+    if !carry_owner_metadata(&file, target, meta) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Aside::InPlace);
+    }
+    Ok(tmp)
+}
+
+/// Give the open temp file `file` the group and extended attributes of
+/// `target`. False when one can't be carried over, so a rename would lose it.
+#[cfg(unix)]
+fn carry_owner_metadata(file: &std::fs::File, target: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let fd = file.as_raw_fd();
+    let ours = file.metadata().map(|m| m.gid()).ok();
+    if ours != Some(meta.gid()) && unsafe { libc::fchown(fd, u32::MAX, meta.gid()) } != 0 {
+        return false;
+    }
+    copy_xattrs(fd, target)
+}
+
+/// Copy every extended attribute of `target` onto the open file `fd`.
+#[cfg(target_os = "linux")]
+fn copy_xattrs(fd: libc::c_int, target: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let len = unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+    if len < 0 {
+        // A filesystem without xattrs has none to lose.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSUP);
+    }
+    let mut names = vec![0u8; len as usize];
+    let len = unsafe { libc::listxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if len < 0 {
+        return false;
+    }
+    names.truncate(len as usize);
+    for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return false;
+        };
+        let size = unsafe { libc::getxattr(c.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return false;
+        }
+        let mut value = vec![0u8; size as usize];
+        let size = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if size < 0
+            || unsafe {
+                libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), size as usize, 0)
+            } != 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// On macOS a file with any extended attribute is written in place rather
+/// than renamed over and stripped of it.
+#[cfg(target_os = "macos")]
+fn copy_xattrs(_fd: libc::c_int, target: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0, 0) == 0 }
+}
+
+/// Elsewhere there is no portable way to list them.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn copy_xattrs(_fd: libc::c_int, _target: &Path) -> bool {
+    true
+}
+
+/// Overwrite `target` with `bytes` without truncating it first. On Linux
+/// the space a longer file needs is reserved before the first byte changes,
+/// so running out of it fails with the file untouched.
+fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+    use std::io::{Seek as _, Write as _};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(target)
+        .map_err(|error| ReplaceError {
+            error,
+            touched: false,
+        })?;
+    let before = file.metadata().ok();
+    let old_len = before.as_ref().map_or(0, |m| m.len());
+    let new_len = bytes.len() as u64;
+    #[cfg(target_os = "linux")]
+    if new_len > old_len {
+        use std::os::unix::io::AsRawFd as _;
+        let err = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, new_len as libc::off_t) };
+        if err != 0 && err != libc::EOPNOTSUPP && err != libc::EINVAL {
+            // A reservation that failed partway may have grown the file: cut
+            // it back. The contents are as they were, but the attempt can
+            // still have moved the file's timestamp (ext4 marks it modified
+            // before checking the size), which is then croft's own doing.
+            let after = file.metadata().ok();
+            if after.as_ref().is_some_and(|m| m.len() != old_len) {
+                let _ = file.set_len(old_len);
+            }
+            let stamp = |m: &std::fs::Metadata| (m.modified().ok(), m.len());
+            let touched = before.as_ref().map(stamp) != file.metadata().ok().as_ref().map(stamp);
+            return Err(ReplaceError {
+                error: std::io::Error::from_raw_os_error(err),
+                touched,
+            });
+        }
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| file.write_all(bytes))
+        .and_then(|()| file.set_len(new_len))
+        .and_then(|()| file.flush())
+        .map_err(|error| ReplaceError {
+            error,
+            touched: true,
+        })
 }
 
 /// The settings file under `config_dir`. The real config dir means the
