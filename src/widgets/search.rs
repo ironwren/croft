@@ -57,8 +57,8 @@ pub struct SearchHit {
     pub path: PathBuf,
     /// 1-indexed line number, the way humans / editors talk about lines.
     pub line_no: usize,
-    /// The matched line, length capped, without its line break or any
-    /// indent before the first match trimmed.
+    /// The matched line without its line break, length capped, and with
+    /// any indent before the first match trimmed.
     pub line_text: String,
 }
 
