@@ -6948,9 +6948,15 @@ impl Editor {
         if is_pair_closer(c) {
             return false;
         }
-        // Opener guard: never before a word character. Quote guard: also
-        // never after a word character or the same quote.
-        let next_ok = next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c);
+        // Opener guard: VS Code's `autoCloseBefore`, so only before
+        // whitespace, a closer or punctuation. Anything else, a string's
+        // closing quote above all, means the opener is text: `"("` typed
+        // inside a string left a stray `)` (#1183). Quote guard: never
+        // before or after a word character or the same quote.
+        let next_ok = match is_pair_quote(c) {
+            true => next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c),
+            false => next.is_none_or(|n| AUTO_CLOSE_BEFORE.contains(n)),
+        };
         let prev = if self.cursor_col == 0 {
             None
         } else {
@@ -15794,6 +15800,10 @@ fn auto_close_partner(c: char) -> Option<char> {
         _ => None,
     }
 }
+
+/// The characters an opener may auto-close in front of: VS Code's default
+/// `autoCloseBefore` (#1183).
+const AUTO_CLOSE_BEFORE: &str = ";:.,=}])> \t";
 
 fn is_pair_closer(c: char) -> bool {
     matches!(c, ')' | ']' | '}')
@@ -30489,6 +30499,49 @@ mod tests {
             e.lines[0], "(foo",
             "no closer may be jammed into the following word"
         );
+    }
+
+    fn typed(text: &str) -> String {
+        let mut e = editor_with("");
+        for c in text.chars() {
+            e.insert_char(c);
+        }
+        e.lines[0].clone()
+    }
+
+    #[test]
+    fn a_bracket_typed_alone_inside_a_string_does_not_auto_close() {
+        // #1183: each row typed char by char comes out as VS Code has it.
+        for text in [
+            "print(\"(\")",
+            "x = \"[a\"",
+            "parts = line.split(\"[\")",
+            "smiley = ':-('",
+        ] {
+            assert_eq!(typed(text), text);
+        }
+    }
+
+    #[test]
+    fn openers_still_auto_close_before_spaces_closers_and_punctuation() {
+        for next in [")", "]", "}", ";", ",", ".", ":", "=", ">", " ", "\t"] {
+            let mut e = editor_with(next);
+            e.cursor_row = 0;
+            e.cursor_col = 0;
+            e.insert_char('(');
+            assert_eq!(e.lines[0], format!("(){next}"), "before {next:?}");
+        }
+    }
+
+    #[test]
+    fn openers_do_not_auto_close_before_a_quote_or_other_symbols() {
+        for next in ["\"", "'", "`", "-", "+", "$", "#"] {
+            let mut e = editor_with(next);
+            e.cursor_row = 0;
+            e.cursor_col = 0;
+            e.insert_char('[');
+            assert_eq!(e.lines[0], format!("[{next}"), "before {next:?}");
+        }
     }
 
     #[test]
