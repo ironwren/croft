@@ -205,9 +205,10 @@ pub fn template(lang: &str, user_file: Option<&str>, extra: &[&str]) -> String {
 /// `croft locale-template <lang> --write` (#1148): bring the translation at
 /// `path` up to date in place, keeping every value already in it and adding
 /// the strings it lacks as `""`. A file that isn't a JSON object of strings
-/// is refused, never replaced. The new file goes to a sibling and is renamed
-/// over the old one, so a failed write leaves the old file whole. Returns
-/// how many strings the file holds and how many are still untranslated.
+/// is refused, never replaced. The new file goes to a sibling of its own,
+/// created with the old file's permissions, and is renamed over the old
+/// one, so a failed write leaves the old file whole. Returns how many
+/// strings the file holds and how many are still untranslated.
 pub fn write_template(path: &std::path::Path, lang: &str) -> std::io::Result<(usize, usize)> {
     use std::io::{Error, ErrorKind};
     let existing = match std::fs::read_to_string(path) {
@@ -233,11 +234,13 @@ pub fn write_template(path: &std::path::Path, lang: &str) -> std::io::Result<(us
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // Each run writes its own sibling, created fresh: a shared name let an
+    // overlapping run rename this one's half-written file into place.
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".croft-tmp");
+    tmp.push(format!(".{}.croft-tmp", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
-    let written =
-        std::fs::write(&tmp, format!("{text}\n")).and_then(|()| std::fs::rename(&tmp, path));
+    let written = crate::prefs::write_keeping_mode(&tmp, path, format!("{text}\n").as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -247,6 +250,75 @@ pub fn write_template(path: &std::path::Path, lang: &str) -> std::io::Result<(us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_leaves_another_runs_temp_file_alone() {
+        // Two overlapping `--write` runs once shared `fr.json.croft-tmp`:
+        // one renamed it over the translation while the other was still
+        // writing into it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fr.json");
+        std::fs::write(&path, "{\"File: Save\": \"Enregistrer\"}").unwrap();
+        let other = dir.path().join("fr.json.croft-tmp");
+        std::fs::write(&other, "half written by another run").unwrap();
+        write_template(&path, "fr").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "half written by another run"
+        );
+        let map: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(map["File: Save"], "Enregistrer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_never_follows_a_link_planted_at_its_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fr.json");
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+        for name in [
+            "fr.json.croft-tmp".to_string(),
+            format!("fr.json.{}.croft-tmp", std::process::id()),
+        ] {
+            std::os::unix::fs::symlink(&target, dir.path().join(name)).unwrap();
+        }
+        write_template(&path, "fr").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("File: Save")
+        );
+    }
+
+    #[test]
+    fn a_write_leaves_no_temp_file_behind() {
+        // Negative: the temp file is the one renamed into place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fr.json");
+        write_template(&path, "fr").unwrap();
+        write_template(&path, "fr").unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["fr.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fr.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_template(&path, "fr").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn locales_reduce_to_a_language_and_english_means_none() {
