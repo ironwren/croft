@@ -692,9 +692,27 @@ pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let value = text.trim_end().rsplit(": ").next()?;
     match value {
-        "" | "unspecified" | "unset" | "set" => None,
+        "" => None,
+        // check-attr prints these states and the same-named values alike
+        // (`filter` and `filter=set` both read `set`): only a configured
+        // driver makes one a filter.
+        "unspecified" | "unset" | "set" if !filter_driver_configured(root, value) => None,
         name => Some(name.to_string()),
     }
+}
+
+/// Whether git config defines a `filter.<name>` driver.
+fn filter_driver_configured(root: &Path, name: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get-regexp"])
+        .arg(format!(
+            r"^filter\.{}\.(clean|smudge|process)$",
+            regex::escape(name)
+        ))
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 /// Result of an attempted commit. `Ok(summary)` carries git's stdout/stderr
@@ -4468,6 +4486,11 @@ filename seed.txt
     /// index and HEAD hold rot13 text, the working tree plain text, the way
     /// Git LFS keeps a pointer in git and the real file on disk (#1238).
     fn filtered_repo(root: &Path) {
+        filtered_repo_with(root, "rot13");
+    }
+
+    /// [`filtered_repo`] with the driver configured under `name`.
+    fn filtered_repo_with(root: &Path, name: &str) {
         let run = |args: &[&str]| {
             assert!(
                 Command::new("git")
@@ -4483,9 +4506,14 @@ filename seed.txt
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
-        run(&["config", "filter.rot13.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
-        run(&["config", "filter.rot13.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
-        std::fs::write(root.join(".gitattributes"), "*.txt filter=rot13\n").unwrap();
+        let rot13 = "tr A-Za-z N-ZA-Mn-za-m";
+        run(&["config", &format!("filter.{name}.clean"), rot13]);
+        run(&["config", &format!("filter.{name}.smudge"), rot13]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.txt filter={name}\n"),
+        )
+        .unwrap();
         let body: String = (1..=12).map(|i| format!("row {i}\n")).collect();
         std::fs::write(root.join("data.txt"), &body).unwrap();
         std::fs::write(root.join("notes.md"), &body).unwrap();
@@ -4578,6 +4606,41 @@ filename seed.txt
         assert!(
             work.contains("row FIVE\n"),
             "the working file is untouched: {work}"
+        );
+    }
+
+    #[test]
+    fn a_driver_named_like_a_check_attr_state_is_still_a_filter() {
+        // `git check-attr` prints `filter: set` both for a bare `filter` and
+        // for `filter=set`; the configured driver tells them apart.
+        for name in ["set", "unset", "unspecified"] {
+            let tmp = TempDir::new().unwrap();
+            filtered_repo_with(tmp.path(), name);
+            assert_eq!(path_filter(tmp.path(), "data.txt").as_deref(), Some(name));
+            let head = read_file_at_head(tmp.path(), "data.txt").unwrap();
+            assert_eq!(head.lines().next(), Some("row 1"), "{name}");
+            let patch = head_vs_work_patch(tmp.path(), "data.txt");
+            let err = apply_patch(tmp.path(), &patch, true, false).unwrap_err();
+            assert!(err.contains(&format!("the {name} filter")), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bare_or_unset_filter_attribute_names_no_filter() {
+        // Negative: with no driver behind them these are not filters.
+        let tmp = TempDir::new().unwrap();
+        filtered_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "*.txt filter=rot13\nbare.md filter\noff.md -filter\n",
+        )
+        .unwrap();
+        assert_eq!(path_filter(tmp.path(), "bare.md"), None);
+        assert_eq!(path_filter(tmp.path(), "off.md"), None);
+        assert_eq!(path_filter(tmp.path(), "notes.md"), None);
+        assert_eq!(
+            path_filter(tmp.path(), "data.txt").as_deref(),
+            Some("rot13")
         );
     }
 
