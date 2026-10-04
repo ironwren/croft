@@ -205,6 +205,24 @@ fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<
     Some(out?.stdout)
 }
 
+/// The immediate subfolders of `dir` that hold a repository (a `.git`
+/// entry: a folder, or a file for worktrees and submodules), sorted by
+/// name. Hidden folders are skipped, like VS Code's depth-1 scan (#1227).
+pub fn child_repos(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.join(".git").exists())
+        .collect();
+    repos.sort();
+    repos
+}
+
 /// The toplevel of the repository containing `dir`, or `None` outside a
 /// repo. This is the ONLY correct base for porcelain/numstat paths and
 /// for rev pathspecs (`HEAD:<rel>`), which git resolves against the
@@ -989,12 +1007,26 @@ pub struct FileHistoryEntry {
     pub age_secs: i64,
 }
 
+/// The folder to run a per-file query from, and the pathspec to pass it:
+/// the file's own folder and name, so git finds the repo that holds the
+/// file even when `root` (the workspace) sits above it (#1227). A
+/// cwd-relative pathspec is exact with `-C`. Falls back to `root` and
+/// `rel_path` when that folder is gone (a deleted file's history).
+fn file_cwd(root: &Path, rel_path: &str) -> (PathBuf, String) {
+    let abs = root.join(rel_path);
+    match (abs.parent(), abs.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) if dir.is_dir() => (dir.to_path_buf(), name.to_string()),
+        _ => (root.to_path_buf(), rel_path.to_string()),
+    }
+}
+
 /// Recent commits touching `rel_path`, newest first, via `git log --follow`
 /// (so the history survives renames, like VS Code's Timeline). Returns an
 /// empty vec when the path is untracked, the repo has no history, or git is
 /// unavailable — the panel renders that as an empty state, never an error.
 pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistoryEntry> {
-    let Some(path_str) = root.to_str() else {
+    let (dir, name) = file_cwd(root, rel_path);
+    let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
     let output = Command::new("git")
@@ -1006,7 +1038,7 @@ pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistor
             &format!("-n{limit}"),
             "--format=%h\x1f%s\x1f%an\x1f%ct",
             "--",
-            rel_path,
+            &name,
         ])
         .output();
     let Ok(output) = output else {
@@ -1691,12 +1723,13 @@ pub struct BlameLine {
 /// its author, author-time, and summary. Returns empty on any failure so the
 /// caller renders no annotation rather than an error.
 pub fn blame(root: &Path, rel_path: &str) -> Vec<BlameLine> {
-    let Some(path_str) = root.to_str() else {
+    let (dir, name) = file_cwd(root, rel_path);
+    let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
     let output = Command::new("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "blame", "--line-porcelain", "--", rel_path])
+        .args(["-C", path_str, "blame", "--line-porcelain", "--", &name])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -4151,6 +4184,100 @@ filename seed.txt
         );
         assert!(!b[0].uncommitted);
         assert!(!b[0].short_hash.is_empty());
+    }
+
+    /// A workspace opened one folder ABOVE its repo (#1227): `tl/` holding
+    /// the repo `tl/sub/`. Running git from the workspace root fails there,
+    /// so history and blame must resolve from the file's own folder.
+    #[test]
+    fn file_history_finds_the_repo_below_the_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        let hist = file_history(tmp.path(), "sub/seed.txt", 10);
+        assert_eq!(hist.len(), 1, "the commit in sub/ must be listed");
+    }
+
+    #[test]
+    fn blame_finds_the_repo_below_the_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        let b = blame(tmp.path(), "sub/seed.txt");
+        assert_eq!(b.len(), 2, "blame of sub/seed.txt from the parent");
+        assert!(!b[0].uncommitted);
+    }
+
+    #[test]
+    fn file_history_of_a_file_in_a_repo_subfolder_still_resolves() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir(p.join("dir")).unwrap();
+        std::fs::write(p.join("dir/x.txt"), "x\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["add", "."])
+            .status();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["commit", "-qm", "x"])
+            .status();
+        assert_eq!(file_history(p, "dir/x.txt", 10).len(), 1);
+        assert_eq!(blame(p, "dir/x.txt").len(), 1);
+    }
+
+    #[test]
+    fn history_and_blame_stay_empty_outside_any_repo() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("plain.txt"), "one\n").unwrap();
+        assert!(file_history(tmp.path(), "sub/plain.txt", 10).is_empty());
+        assert!(blame(tmp.path(), "sub/plain.txt").is_empty());
+    }
+
+    #[test]
+    fn history_of_a_file_untracked_in_a_nested_repo_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        std::fs::write(sub.join("new.txt"), "new\n").unwrap();
+        assert!(file_history(tmp.path(), "sub/new.txt", 10).is_empty());
+    }
+
+    #[test]
+    fn child_repos_finds_repos_one_level_down_only() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        for d in ["web", "api", "plain", ".hidden", "deep/inner"] {
+            std::fs::create_dir_all(p.join(d)).unwrap();
+        }
+        init_repo_with_commit(&p.join("web"));
+        init_repo_with_commit(&p.join("api"));
+        init_repo_with_commit(&p.join(".hidden"));
+        init_repo_with_commit(&p.join("deep/inner"));
+        std::fs::write(p.join("worktree_file_dir_marker"), "").unwrap();
+        std::fs::create_dir(p.join("wt")).unwrap();
+        std::fs::write(p.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(
+            child_repos(p),
+            vec![p.join("api"), p.join("web"), p.join("wt")],
+            "sorted, depth 1, hidden skipped, a .git file counts"
+        );
+    }
+
+    #[test]
+    fn child_repos_is_empty_for_a_missing_or_repo_free_folder() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("plain")).unwrap();
+        assert!(child_repos(tmp.path()).is_empty());
+        assert!(child_repos(&tmp.path().join("gone")).is_empty());
     }
 
     /// Stage a path so we can exercise `unstage_*` against a real index.
