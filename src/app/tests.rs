@@ -37250,6 +37250,28 @@ fn f12_family_chords_route_alt_to_peek() {
     );
 }
 
+/// A task declaring `["$gcc", "$eslint-stylish"]` puts both tools' errors
+/// in PROBLEMS, not just the first matcher's (#1240).
+#[test]
+fn a_task_with_a_matcher_list_reports_every_matchers_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let matcher =
+        crate::problem_matchers::from_tasks_json(&serde_json::json!(["$gcc", "$eslint-stylish"]))
+            .map(std::sync::Arc::new);
+    app.assign_task_matcher(9, matcher);
+    let out = "bad.c:3:10: error: 'y' undeclared\n\nweb/app.js\n  1:5  error  a is unused  no-unused-vars\n";
+    assert!(app.apply_build_scan(9, Some(tmp.path()), "gcc -c bad.c; ./lint.sh", out));
+    let mut files: Vec<String> = app
+        .problems
+        .groups()
+        .iter()
+        .map(|g| g.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["app.js", "bad.c"]);
+}
+
 #[test]
 fn build_scan_installs_problems_replaces_per_pane_and_merges_with_lsp() {
     let tmp = tempfile::tempdir().unwrap();
