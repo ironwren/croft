@@ -690,17 +690,17 @@ pub fn fit_image_auto(
 ) -> Result<Vec<u8>, image::ImageError> {
     #[cfg(test)]
     FIT_IMAGE_BAKES.with(|c| c.set(c.get() + 1));
-    let reader = || image::ImageReader::new(std::io::Cursor::new(src)).with_guessed_format();
-    let (sw, sh) = reader()?.into_dimensions()?;
+    // Sniffed once from the magic bytes; the header read and the decode
+    // each need their own reader over `src`.
+    let format = image::guess_format(src)?;
+    let reader = || image::ImageReader::with_format(std::io::Cursor::new(src), format);
+    let (sw, sh) = reader().into_dimensions()?;
     // The header is cheap and the decode is not: a few hundred KB can
     // declare a canvas that decodes to gigabytes (#1160).
     if sw as u64 * sh as u64 > MAX_DECODE_PIXELS {
-        let hint = reader()?
-            .format()
-            .map_or(image::error::ImageFormatHint::Unknown, Into::into);
         return Err(image::ImageError::Decoding(
             image::error::DecodingError::new(
-                hint,
+                format.into(),
                 format!(
                     "{sw}x{sh} is over the {} megapixels a preview decodes",
                     MAX_DECODE_PIXELS / 1_000_000
@@ -708,7 +708,7 @@ pub fn fit_image_auto(
             ),
         ));
     }
-    let img = reader()?.decode()?;
+    let img = reader().decode()?;
     let scale = f64::min(
         canvas_w_px as f64 / sw as f64,
         canvas_h_px as f64 / sh as f64,
