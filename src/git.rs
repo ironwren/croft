@@ -794,6 +794,79 @@ fn retarget_hunk_starts(patch: &str, side: HunkSide) -> String {
         .join("\n")
 }
 
+/// The path a single-file patch writes, from its `+++ b/<path>` header.
+fn patch_path(patch: &str) -> Option<&str> {
+    patch
+        .split('\n')
+        .find_map(|l| l.strip_prefix("+++ b/"))
+        .map(|p| p.trim_end_matches('\r'))
+}
+
+/// Whether `git add` turns this path's CRLF line endings into LF in the
+/// index, whatever decides it (`.gitattributes` `eol`/`text`,
+/// `core.autocrlf`, `core.eol`): git cleans a probe line for the path and
+/// the result is compared with the plain LF line.
+fn strips_cr_on_add(root: &Path, rel: &str) -> bool {
+    let hash = |input: &[u8], args: &[&str]| -> Option<String> {
+        use std::io::Write as _;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--stdin"])
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(input).ok()?;
+        let out = child.wait_with_output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let path_arg = format!("--path={rel}");
+    match (
+        hash(b"croft\r\n", &[&path_arg]),
+        hash(b"croft\n", &["--no-filters"]),
+    ) {
+        (Some(cleaned), Some(lf)) => cleaned == lf,
+        _ => false,
+    }
+}
+
+/// `patch` with the `\r` dropped from the end of every added line.
+fn strip_added_crs(patch: &str) -> String {
+    patch
+        .split('\n')
+        .map(|l| {
+            if l.starts_with('+') && !l.starts_with("+++ ") {
+                l.strip_suffix('\r').unwrap_or(l)
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `patch` with a `\r` put back on every context and removed line (the
+/// ones taken from HEAD), to match a CRLF working tree.
+fn add_crs_to_head_lines(patch: &str) -> String {
+    patch
+        .split('\n')
+        .map(|l| {
+            let from_head = (l.starts_with(' ') || l.starts_with('-')) && !l.starts_with("--- ");
+            if from_head && !l.ends_with('\r') {
+                format!("{l}\r")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Apply a unified-diff patch fed on stdin via `git apply`. `cached`
 /// targets the index (stage), `reverse` un-applies (`cached + reverse` =
 /// unstage, `reverse` alone = revert the working tree). Logged to the
@@ -827,6 +900,28 @@ pub fn apply_patch(
         (true, false) => retarget_hunk_starts(patch, HunkSide::Old),
         (false, true) => retarget_hunk_starts(patch, HunkSide::New),
         _ => patch.to_string(),
+    };
+    // A path git stores LF but checks out CRLF (`eol=crlf`,
+    // `core.autocrlf`) has two spellings, and the patch mixes them: its
+    // added lines come from the working tree (CRLF), its context and
+    // removed lines from HEAD (LF). `git apply` uses no conversion, so each
+    // target needs the patch in its own spelling (#1236): the index gets
+    // the added lines cleaned, as `git add` would (verbatim, a CRLF
+    // checkout's `\r` made the blob mixed), and the working tree gets the
+    // HEAD lines with its `\r` (without, a revert did not apply at all).
+    let retargeted = match patch_path(&retargeted) {
+        Some(rel) if strips_cr_on_add(root, rel) => {
+            if cached {
+                strip_added_crs(&retargeted)
+            } else if std::fs::read(root.join(rel))
+                .is_ok_and(|b| b.windows(2).any(|w| w == b"\r\n"))
+            {
+                add_crs_to_head_lines(&retargeted)
+            } else {
+                retargeted
+            }
+        }
+        _ => retargeted,
     };
     let patch = retargeted.as_str();
     crate::output::push(
@@ -2639,6 +2734,101 @@ mod tests {
         assert!(
             staged.trim().is_empty(),
             "reverse cached apply must empty the index diff: {staged}"
+        );
+    }
+
+    /// #1236: `run.bat` stored LF in the index and CRLF in the working tree,
+    /// with `echo two` changed to `echo TWO`; `config` is extra setup.
+    fn crlf_checkout_with_one_edit(root: &Path, attrs: &str, config: &[(&str, &str)]) -> String {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        for (k, v) in config {
+            git(&["config", k, v]);
+        }
+        std::fs::write(root.join(".gitattributes"), attrs).unwrap();
+        let head = "echo one\r\necho two\r\necho three\r\necho four\r\n";
+        std::fs::write(root.join("run.bat"), head).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let work = head.replace("two", "TWO");
+        std::fs::write(root.join("run.bat"), &work).unwrap();
+        let head = read_file_at_head(root, "run.bat").unwrap();
+        let diff = crate::widgets::diff::DiffData::build_with_byte_check(
+            std::path::PathBuf::new(),
+            root.join("run.bat"),
+            head.lines().map(str::to_string).collect(),
+            work.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&work),
+        );
+        diff.hunk_patch("run.bat", diff.hunk_range_at(0).unwrap())
+    }
+
+    #[test]
+    fn staging_a_hunk_of_an_eol_crlf_file_stores_lf_like_git_add() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "*.bat text eol=crlf\n", &[]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/lf "), "the index blob: {eol}");
+        let status = git_stdout(root, &["status", "--porcelain", "run.bat"]);
+        assert_eq!(status, "M  run.bat\n", "nothing is left unstaged");
+        // And back out again: the unstage patch must match the LF index.
+        apply_patch(root, &patch, true, true).unwrap();
+        assert_eq!(git_stdout(root, &["diff", "--cached"]), "");
+    }
+
+    #[test]
+    fn staging_a_hunk_under_core_autocrlf_stores_lf_like_git_add() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "", &[("core.autocrlf", "true")]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/lf "), "the index blob: {eol}");
+    }
+
+    #[test]
+    fn staging_a_hunk_of_a_file_kept_as_crlf_keeps_its_crs() {
+        // Negative: with no conversion configured, the index holds CRLF and
+        // `git add` keeps it, so the staged line keeps its `\r` too.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "", &[("core.autocrlf", "false")]);
+        apply_patch(root, &patch, true, false).unwrap();
+        let eol = git_stdout(root, &["ls-files", "--eol", "run.bat"]);
+        assert!(eol.starts_with("i/crlf "), "the index blob: {eol}");
+        assert_eq!(
+            git_stdout(root, &["status", "--porcelain", "run.bat"]),
+            "M  run.bat\n"
+        );
+    }
+
+    #[test]
+    fn reverting_a_hunk_of_an_eol_crlf_file_writes_crlf_to_the_work_tree() {
+        // Negative: a revert writes the working tree, which keeps CRLF.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let patch = crlf_checkout_with_one_edit(root, "*.bat text eol=crlf\n", &[]);
+        apply_patch(root, &patch, false, true).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("run.bat")).unwrap(),
+            b"echo one\r\necho two\r\necho three\r\necho four\r\n"
         );
     }
 
