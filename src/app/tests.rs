@@ -13727,6 +13727,7 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     let (tmp, mut app) = scm_ready_to_commit();
     app.handle_paste("Fix rounding\r\n\r\nTotals were floats\r\nFixes #42");
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     assert_eq!(
         last_commit_message(tmp.path()),
         "Fix rounding\n\nTotals were floats\nFixes #42\n\n"
@@ -13753,6 +13754,7 @@ fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
             "{modifier:?} must not commit"
         );
         app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        wait_for_git_net(&mut app);
         assert_eq!(last_commit_message(tmp.path()), "subj\n\nbody\n\n");
     }
 }
@@ -13765,6 +13767,7 @@ fn plain_enter_still_commits_a_one_line_message() {
         app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
     }
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
     assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
     assert_eq!(app.source_control.message, "");
 }
