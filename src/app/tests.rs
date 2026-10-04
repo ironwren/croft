@@ -58921,53 +58921,6 @@ fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::
     bin
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn a_codeql_cli_still_open_for_writing_runs_once_it_is_released() {
-    // A codeql binary just written (an update, or a test's stand-in) is
-    // "Text file busy" while a process forked meanwhile holds its write
-    // descriptor. The run waits that out instead of failing outright.
-    let bin = tempfile::tempdir().unwrap();
-    let program = fake_codeql(bin.path(), "", 0, "");
-    let writer = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&program)
-        .unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drop(writer);
-    });
-    let summary = App::codeql_command(&program, &[String::from("generate")]);
-    let stdout = App::codeql_stdout(&program, &[String::from("version")]);
-    release.join().unwrap();
-    assert_eq!(summary, Ok(()), "a busy CLI is retried, not reported");
-    assert!(stdout.is_ok(), "{stdout:?}");
-    let calls = std::fs::read_to_string(bin.path().join("codeql-calls.log")).unwrap();
-    assert_eq!(calls, "generate\nversion\n", "each command ran once");
-}
-
-#[test]
-fn a_missing_or_failing_codeql_cli_still_fails_at_once() {
-    // Only "Text file busy" is waited out: a missing CLI and one that
-    // exits non-zero report straight away.
-    let bin = tempfile::tempdir().unwrap();
-    let started = std::time::Instant::now();
-    let missing = App::codeql_command(&bin.path().join("no-codeql"), &[]);
-    assert!(
-        missing
-            .as_ref()
-            .is_err_and(|e| e.starts_with("could not run codeql:")),
-        "{missing:?}"
-    );
-    let failing = fake_codeql(bin.path(), "", 2, "A fatal error occurred: no database");
-    assert!(App::codeql_command(&failing, &[]).is_err());
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(400),
-        "no retry delay for a real failure: {:?}",
-        started.elapsed()
-    );
-}
-
 /// Drain the query run until it lands, or fail after a few seconds.
 fn wait_for_codeql(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -68705,4 +68658,81 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     );
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
+}
+
+/// A stand-in `codeql` still open for writing, the way a test's freshly
+/// written script is while another test thread forks: exec fails with
+/// "Text file busy" until the writer lets go. The handle is dropped after
+/// `hold`.
+#[cfg(unix)]
+fn busy_codeql(dir: &std::path::Path, hold: std::time::Duration) -> std::path::PathBuf {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bin = dir.join("codeql");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&bin)
+        .unwrap();
+    f.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+    f.flush().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(f);
+    });
+    bin
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_briefly_busy_after_writing_still_runs() {
+    // CI failed "Compare Performance" with "could not run codeql: Text file
+    // busy (os error 26)" when another test forked while the stand-in was
+    // open for writing; a CLI croft has just downloaded can be busy the same
+    // way. The run waits out the moment instead of failing.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::codeql_stdout(&bin, &[]), Ok(String::from("ran\n")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_briefly_busy_codeql_command_and_version_still_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::codeql_command(&bin, &[]), Ok(()));
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::read_codeql_version(&bin), Ok(String::from("ran")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_that_stays_busy_still_fails_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    let err = App::codeql_stdout(&bin, &[]).unwrap_err();
+    assert!(
+        err.starts_with("could not run codeql: Text file busy"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the wait is bounded, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_missing_codeql_fails_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let err = App::codeql_stdout(&dir.path().join("codeql"), &[]).unwrap_err();
+    assert!(
+        err.starts_with("could not run codeql: No such file"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(200));
 }

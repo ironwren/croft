@@ -1,1 +1,1 @@
-fix: CodeQL commands no longer fail with "Text file busy" when the CodeQL CLI was installed or updated a moment before.
+fix: CodeQL commands wait out a moment of "Text file busy" right after the CLI is written, such as a fresh download, instead of failing with "could not run codeql".

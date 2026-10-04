@@ -143,8 +143,8 @@ pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::pro
     }
 }
 
-/// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed,
-/// stdout and stderr captured, as `output` sets them.
+/// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
+/// and stderr captured, waiting out a moment of "Text file busy".
 pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
