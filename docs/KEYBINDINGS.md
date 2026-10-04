@@ -216,7 +216,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Click the left chevron (`▸`/`▾`) | Expand / collapse the Replace row (expanding focuses it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
 | Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references); files open with unsaved changes are skipped and named, and the search re-runs afterward |
 | Click the `...` icon | Expand / collapse the "files to include" and "files to exclude" glob inputs |
-| Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth). Editing re-runs the search live |
+| Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth, and brace alternates like `*.{ts,tsx}` are one glob). A glob that doesn't compile shows as `invalid glob: …` in red above its box, and an include box with no valid glob matches nothing. Editing re-runs the search live |
 | `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
 | Double-click a result | Pin its tab, so moving to the next result opens beside it instead of replacing it |
