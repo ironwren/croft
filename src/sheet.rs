@@ -292,24 +292,36 @@ impl SheetData {
     pub fn sort_by_column(&mut self, col: usize) -> bool {
         // Numbers sort before text. Comparing a mixed pair as text instead
         // made the order cyclic (2 < 10 < "1a" < 2), and the standard sort
-        // panics on a comparator that is not a total order (#1134).
-        fn cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        // panics on a comparator that is not a total order (#1134). Each
+        // cell is parsed and lowercased once, not on every comparison.
+        enum Key {
+            Num(f64),
+            Text(String),
+        }
+        fn cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
             use std::cmp::Ordering::{Greater, Less};
-            match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-                (Ok(x), Ok(y)) => x.total_cmp(&y),
-                (Ok(_), Err(_)) => Less,
-                (Err(_), Ok(_)) => Greater,
-                (Err(_), Err(_)) => a.to_lowercase().cmp(&b.to_lowercase()),
+            match (a, b) {
+                (Key::Num(x), Key::Num(y)) => x.total_cmp(y),
+                (Key::Num(_), Key::Text(_)) => Less,
+                (Key::Text(_), Key::Num(_)) => Greater,
+                (Key::Text(a), Key::Text(b)) => a.cmp(b),
             }
         }
-        let key = |r: &Vec<String>| r.get(col).cloned().unwrap_or_default();
-        let ascending = !self
+        let keys: Vec<Key> = self
             .rows
-            .windows(2)
-            .all(|w| cmp(&key(&w[0]), &key(&w[1])).is_le());
+            .iter()
+            .map(|r| {
+                let cell = r.get(col).map_or("", String::as_str);
+                match cell.trim().parse::<f64>() {
+                    Ok(x) => Key::Num(x),
+                    Err(_) => Key::Text(cell.to_lowercase()),
+                }
+            })
+            .collect();
+        let ascending = !keys.windows(2).all(|w| cmp(&w[0], &w[1]).is_le());
         let mut order: Vec<usize> = (0..self.rows.len()).collect();
         order.sort_by(|&i, &j| {
-            let o = cmp(&key(&self.rows[i]), &key(&self.rows[j]));
+            let o = cmp(&keys[i], &keys[j]);
             if ascending { o } else { o.reverse() }
         });
         let cursor = order.iter().position(|&i| i == self.cur_row);
