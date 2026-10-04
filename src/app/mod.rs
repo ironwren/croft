@@ -1664,6 +1664,12 @@ enum PrGhJob {
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
 
+/// The file the OUTLINE shows and the edit seq it was synced at.
+type OutlineKey = (PathBuf, Option<u64>);
+
+/// Where an off-thread outline parse delivers its symbols (#1150).
+type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+
 /// The BREAKPOINTS section of the debug tree (#250): a header and one row per
 /// breakpoint, or nothing when there are none.
 fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
@@ -3958,10 +3964,7 @@ pub struct App {
     /// (#1150): the `outline_synced` key its snapshot was taken at, and
     /// where the symbols land. One at a time; typing meanwhile coalesces
     /// into one fresh parse when it lands.
-    outline_parse: Option<(
-        (PathBuf, Option<u64>),
-        std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>,
-    )>,
+    outline_parse: Option<(OutlineKey, OutlineParse)>,
     /// The `outline_synced` key the last off-thread parse was started for.
     outline_parsed_for: Option<(PathBuf, Option<u64>)>,
     /// The file and edit seq whose language-server outline last landed: a
