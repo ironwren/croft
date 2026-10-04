@@ -38,6 +38,11 @@ pub struct GitStatus {
     /// entry list which only the active repo fetches (#161: the
     /// repositories overview and the cross-repo badge read this).
     pub changed_count: usize,
+    /// The message git prepared for the commit in progress (#1282): a
+    /// conflicted merge, cherry-pick or revert writes `MERGE_MSG`, a
+    /// `merge --squash` writes `SQUASH_MSG`. Comment lines are dropped, as
+    /// `commit.cleanup=strip` would. `None` when neither file is there.
+    pub prepared_message: Option<String>,
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -82,7 +87,37 @@ pub fn query(root: &Path) -> GitStatus {
         ignored: Arc::new(query_ignored(root)),
         repo_root: Some(repo_root),
         changed_count,
+        prepared_message: prepared_message(root),
     }
+}
+
+/// git's prepared message for the commit in progress (#1282): `MERGE_MSG`
+/// (a conflicted merge, cherry-pick or revert), else `SQUASH_MSG`, found
+/// through `--git-path` so a worktree or submodule reads its own. Comment
+/// lines are dropped as `commit.cleanup=strip` drops them; nothing left
+/// is no message.
+fn prepared_message(root: &Path) -> Option<String> {
+    let paths = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--git-path",
+            "MERGE_MSG",
+            "--git-path",
+            "SQUASH_MSG",
+        ],
+    )
+    .ok()?;
+    paths.lines().find_map(|p| {
+        let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::trim_end)
+            .collect();
+        let message = kept.join("\n").trim().to_string();
+        (!message.is_empty()).then_some(message)
+    })
 }
 
 /// The git-ignored paths under `root`, absolute.
@@ -3527,6 +3562,44 @@ mod tests {
             None,
             "outside a repo there is no toplevel"
         );
+    }
+
+    /// git's prepared message for a conflicted merge (#1282), comments
+    /// dropped, and a squash's when there is no merge message.
+    #[test]
+    fn a_merge_in_progress_carries_gits_prepared_message() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(query(p).prepared_message, None, "no merge, no message");
+        std::fs::write(
+            p.join(".git/SQUASH_MSG"),
+            "Squashed commit of the following:\n\ncommit abc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Squashed commit of the following:\n\ncommit abc")
+        );
+        std::fs::write(
+            p.join(".git/MERGE_MSG"),
+            "Merge branch 'other'\n\n# Conflicts:\n#\tf.txt\n",
+        )
+        .unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Merge branch 'other'")
+        );
+    }
+
+    #[test]
+    fn a_prepared_message_of_only_comments_is_none() {
+        // Negative: nothing left after stripping is no message.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".git/MERGE_MSG"), "# Conflicts:\n#\tf.txt\n\n").unwrap();
+        assert_eq!(query(p).prepared_message, None);
     }
 
     #[test]

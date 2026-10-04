@@ -6819,6 +6819,7 @@ fn git_status_spans_clean_branch_is_green() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -6843,6 +6844,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6870,6 +6872,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6889,6 +6892,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         ignored: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
+        prepared_message: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
