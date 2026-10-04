@@ -22883,8 +22883,32 @@ impl App {
                 self.source_control.end();
                 self.poke_cursor();
             }
-            KeyCode::Up => self.source_control.scroll_up(1),
-            KeyCode::Down => self.source_control.scroll_down(1),
+            // In a multi-line message Up/Down move between its lines; on
+            // its first/last line they scroll the change list as before.
+            KeyCode::Up => {
+                if self.source_control.move_cursor_up() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_up(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.source_control.move_cursor_down() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_down(1);
+                }
+            }
+            // Shift/Alt+Enter start a new message line (the commit body),
+            // VS Code's multi-line SCM input; plain Enter commits.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.source_control.insert_char('\n');
+                self.poke_cursor();
+            }
             KeyCode::Enter => self.commit_source_control(),
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)

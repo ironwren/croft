@@ -13563,6 +13563,81 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
     );
 }
 
+/// A repo with `seed.txt` changed and the Source Control panel open on it,
+/// ready to commit (#1241).
+fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    (tmp, app)
+}
+
+fn last_commit_message(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A pasted multi-line message is committed with its subject, blank line
+/// and body intact, not glued into one line.
+#[test]
+fn a_pasted_multi_line_message_commits_with_its_body() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Fix rounding\r\n\r\nTotals were floats\r\nFixes #42");
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        last_commit_message(tmp.path()),
+        "Fix rounding\n\nTotals were floats\nFixes #42\n\n"
+    );
+}
+
+/// Shift+Enter and Alt+Enter start a new line; neither commits.
+#[test]
+fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
+    for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let (tmp, mut app) = scm_ready_to_commit();
+        for c in "subj".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        app.handle_source_control_key(key(KeyCode::Enter, modifier));
+        for c in "body".chars() {
+            app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.source_control.message, "subj\n\nbody", "{modifier:?}");
+        assert_eq!(
+            last_commit_message(tmp.path()),
+            "init\n\n",
+            "{modifier:?} must not commit"
+        );
+        app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(last_commit_message(tmp.path()), "subj\n\nbody\n\n");
+    }
+}
+
+/// Plain Enter still commits a one-line message straight away.
+#[test]
+fn plain_enter_still_commits_a_one_line_message() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    for c in "one line".chars() {
+        app.handle_source_control_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
+    assert_eq!(app.source_control.message, "");
+}
+
 #[test]
 fn ctrl_enter_in_source_control_commits_and_pushes() {
     let tmp = make_committed_repo();
