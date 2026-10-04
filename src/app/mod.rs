@@ -32197,7 +32197,7 @@ impl App {
     pub fn push_source_control(&mut self) {
         let root = self.scm_root();
         self.spawn_git_net("push", move || {
-            let r = crate::git::push_current_branch(&root);
+            let r = crate::git::push_or_publish(&root);
             Box::new(move |app: &mut App| app.finish_push(r))
         });
     }
@@ -32257,13 +32257,17 @@ impl App {
 
     /// Sync = pull then push, mirroring VS Code's sync button. A failed
     /// pull short-circuits (we never push on top of an unmerged tree); a
-    /// successful pull followed by a failed push reports both halves.
+    /// successful pull followed by a failed push reports both halves. A
+    /// branch with no upstream has nothing to pull, so it is published.
     pub fn sync_source_control(&mut self) {
         let root = self.scm_root();
         self.spawn_git_net("sync", move || {
-            let pull = crate::git::pull_current_branch(&root);
+            let pull = match crate::git::unpublished_branch(&root) {
+                Some(_) => Ok(String::from("nothing, branch not published yet")),
+                None => crate::git::pull_current_branch(&root),
+            };
             // Never push on top of a failed pull.
-            let push = pull.is_ok().then(|| crate::git::push_current_branch(&root));
+            let push = pull.is_ok().then(|| crate::git::push_or_publish(&root));
             Box::new(move |app: &mut App| app.finish_sync(pull, push))
         });
     }
@@ -32643,7 +32647,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        self.spawn_scm_op("push -u origin", "Published", move |root| {
+        self.spawn_scm_op("push -u", "Published", move |root| {
             crate::git::publish_branch(root, &branch)
         });
     }
@@ -36223,7 +36227,7 @@ impl App {
         self.status = format!("Committed: {commit_summary}");
         let root = self.scm_root();
         self.spawn_git_net("push", move || {
-            let r = crate::git::push_current_branch(&root);
+            let r = crate::git::push_or_publish(&root);
             Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
         });
         self.active_git_bypass_debounce();

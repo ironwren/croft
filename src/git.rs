@@ -2171,11 +2171,59 @@ pub fn push_to_remote(root: &Path, remote: &str) -> Result<String, String> {
     run_mutation(root, &["push", remote])
 }
 
-/// Publish the current branch: push it to `origin` and set upstream
-/// tracking (`git push -u origin <branch>`). Used when a local branch has
-/// no upstream yet.
+/// Publish the current branch: push it and set upstream tracking
+/// (`git push -u <remote> <branch>`, the remote chosen by
+/// [`publish_remote`]). Used when a local branch has no upstream yet.
 pub fn publish_branch(root: &Path, branch: &str) -> Result<String, String> {
-    run_mutation(root, &["push", "-u", "origin", branch])
+    let remote = publish_remote(root)?;
+    run_mutation(root, &["push", "-u", &remote, branch])?;
+    Ok(format!("{branch} to {remote}"))
+}
+
+/// The current branch when it has no upstream to push to or pull from
+/// (`@{u}` does not resolve), the case `git push` refuses with "has no
+/// upstream branch". None on a tracked branch and on a detached HEAD.
+pub fn unpublished_branch(root: &Path) -> Option<String> {
+    let branch = run_git(root, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .and_then(parse_branch)?;
+    let tracked = run_git(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+    (!tracked).then_some(branch)
+}
+
+/// The remote an unpublished branch goes to: `remote.pushDefault` when
+/// set, else `origin`, else the only remote. With several remotes and
+/// none of those, picking one would be a guess, so it is an error.
+fn publish_remote(root: &Path) -> Result<String, String> {
+    if let Ok(remote) = run_git(root, &["config", "--get", "remote.pushDefault"])
+        && !remote.is_empty()
+    {
+        return Ok(remote);
+    }
+    let listed = run_git(root, &["remote"]).map_err(|e| e.to_string())?;
+    let remotes: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).collect();
+    match remotes.as_slice() {
+        [] => Err(String::from("no remote to publish this branch to")),
+        [only] => Ok((*only).to_string()),
+        several if several.contains(&"origin") => Ok(String::from("origin")),
+        _ => Err(String::from(
+            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+        )),
+    }
+}
+
+/// Push the current branch, publishing it first if it has no upstream
+/// (`git push -u <remote> <branch>`), as VS Code's Push and Sync do. A
+/// plain `git push` would refuse with "has no upstream branch".
+pub fn push_or_publish(root: &Path) -> Result<String, String> {
+    let Some(branch) = unpublished_branch(root) else {
+        return push_current_branch(root);
+    };
+    publish_branch(root, &branch).map(|summary| format!("published {summary}"))
 }
 
 // --- Branch management ---------------------------------------------------
