@@ -19038,7 +19038,7 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
 
 #[test]
 fn remote_launched_drop_queues_pull_request_via_relay_log() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // The user dragged a Finder file onto a remote-launched croft. The Mac path
     // doesn't exist on the remote box, but the session is a `croft remote` child
     // (CROFT_REMOTE_AUTOUPDATE set) whose local parent runs a drop pump, so the
@@ -19135,7 +19135,7 @@ fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
 /// same road in the other direction.
 #[test]
 fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -19223,7 +19223,7 @@ fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
 
 #[test]
 fn remote_finder_drag_queues_pull_without_tree_focus() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // A drop does not move keyboard focus to the Explorer tree, so a focus-only
     // gate dropped drags whenever the user had last clicked the terminal or
     // editor. A pure-path payload must be recognised regardless of focus.
@@ -19247,7 +19247,7 @@ fn remote_finder_drag_queues_pull_without_tree_focus() {
 
 #[test]
 fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
@@ -19284,7 +19284,7 @@ fn drain_remote_pulls_imports_file_when_relay_signals_ok() {
 
 #[test]
 fn drain_remote_pulls_surfaces_relay_error_message() {
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
@@ -43025,7 +43025,7 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
             *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
         }
     }
-    let _cache_lock = relay_test_lock().lock().unwrap();
+    let _cache_lock = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _restore = RestoreCacheDir;
     *CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
 
@@ -64666,7 +64666,7 @@ fn fleet_shell_commands_quote_the_target() {
 #[test]
 fn a_forwarded_port_is_reused_and_a_pending_forward_not_repeated() {
     use crate::widgets::ports::PortOrigin;
-    let _guard = relay_test_lock().lock().unwrap();
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut app = App::new(workspace.path().to_path_buf()).unwrap();
@@ -68699,4 +68699,81 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     );
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
+}
+
+/// A stand-in `codeql` still open for writing, the way a test's freshly
+/// written script is while another test thread forks: exec fails with
+/// "Text file busy" until the writer lets go. The handle is dropped after
+/// `hold`.
+#[cfg(unix)]
+fn busy_codeql(dir: &std::path::Path, hold: std::time::Duration) -> std::path::PathBuf {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bin = dir.join("codeql");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&bin)
+        .unwrap();
+    f.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+    f.flush().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(f);
+    });
+    bin
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_briefly_busy_after_writing_still_runs() {
+    // CI failed "Compare Performance" with "could not run codeql: Text file
+    // busy (os error 26)" when another test forked while the stand-in was
+    // open for writing; a CLI croft has just downloaded can be busy the same
+    // way. The run waits out the moment instead of failing.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::codeql_stdout(&bin, &[]), Ok(String::from("ran\n")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_briefly_busy_codeql_command_and_version_still_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::codeql_command(&bin, &[]), Ok(()));
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_millis(100));
+    assert_eq!(App::read_codeql_version(&bin), Ok(String::from("ran")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codeql_that_stays_busy_still_fails_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = busy_codeql(dir.path(), std::time::Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    let err = App::codeql_stdout(&bin, &[]).unwrap_err();
+    assert!(
+        err.starts_with("could not run codeql: Text file busy"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the wait is bounded, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_missing_codeql_fails_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let err = App::codeql_stdout(&dir.path().join("codeql"), &[]).unwrap_err();
+    assert!(
+        err.starts_with("could not run codeql: No such file"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(200));
 }
