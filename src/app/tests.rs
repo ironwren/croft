@@ -49500,15 +49500,15 @@ fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
 
 #[test]
 fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
-    // A final newline added to the working file changes no line text, so the
-    // rows come back identical -- but `right_no_final_nl` and the "bytes
-    // differ, lines equal" banner feed the hunk patch and the header. The
+    // A switch back from CRLF changes no line text, so the rows come back
+    // identical -- but `right_crlf` and the "bytes differ, lines equal"
+    // banner feed the hunk patch and the header. The
     // same-content skip must see those facts as content, or stage/revert
     // would build a patch from bytes no longer on disk.
     let (tmp, f) = repo_with_seed("a\nb\n");
     let root = tmp.path().to_path_buf();
     let mut app = App::new(root.clone()).unwrap();
-    std::fs::write(&f, "a\nb").unwrap();
+    std::fs::write(&f, "a\r\nb\r\n").unwrap();
     app.editor
         .open_head_diff_with_text(
             std::path::PathBuf::from("seed.txt (HEAD)"),
@@ -49523,7 +49523,7 @@ fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
     });
     let d = app.editor.diff.as_ref().unwrap();
     assert!(
-        d.right_no_final_nl && d.bytes_differ_but_lines_equal,
+        d.right_crlf.iter().all(|&cr| cr) && d.bytes_differ_but_lines_equal,
         "precondition: {d:?}"
     );
 
@@ -49534,8 +49534,8 @@ fn a_rewrite_that_only_changes_bytes_still_refreshes_the_byte_facts() {
     );
     let d = app.editor.diff.as_ref().unwrap();
     assert!(
-        !d.right_no_final_nl,
-        "the working side now ends in a newline"
+        !d.right_crlf.iter().any(|&cr| cr),
+        "the working side is LF again"
     );
     assert!(
         !d.bytes_differ_but_lines_equal,
