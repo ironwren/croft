@@ -11027,6 +11027,10 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
     fn leader_in_shell(key: KeyEvent) -> bool {
         is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
     }
+    // `is_save_key` also takes whether Shift is reported with Ctrl.
+    fn is_save_key_reporting_shift(key: KeyEvent) -> bool {
+        is_save_key(key, true)
+    }
     let mut predicates: Vec<(&str, Pred)> = preds![
         is_terminal_copy_key,
         is_compare_key,
@@ -11100,7 +11104,7 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_terminal_cycle_back_key,
         is_delete_node_key,
         is_completion_trigger_key,
-        is_save_key,
+        is_save_key_reporting_shift,
         is_editor_copy_key,
         is_editor_cut_key,
         is_search_paste_key,
