@@ -24331,6 +24331,37 @@ fn zen_layout_collapses_explorer_and_terminal_and_survives_opening_a_file() {
     assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
 }
 
+/// A relative launch path opens the file under the workspace root by its
+/// absolute path, whatever directory the process runs in (#1193).
+#[test]
+fn a_relative_launch_path_opens_the_absolute_file_under_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("pkg")).unwrap();
+    std::fs::write(root.join("pkg/util.py"), "x = 1\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.open_file_at_launch(std::path::Path::new("pkg/util.py"));
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(root.join("pkg/util.py").as_path())
+    );
+    assert!(app.focus == Pane::Editor);
+}
+
+/// A launch file that can't be opened says so instead of leaving "Ready".
+#[test]
+fn a_launch_file_that_cannot_be_opened_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(std::path::Path::new("pkg/missing.py"));
+    assert!(app.editor.path.is_none());
+    assert!(
+        app.status.starts_with("Couldn't open ") && app.status.contains("pkg/missing.py"),
+        "status: {:?}",
+        app.status
+    );
+}
+
 #[test]
 fn open_file_at_launch_opens_the_file_and_focuses_the_editor() {
     let tmp = tempfile::tempdir().unwrap();

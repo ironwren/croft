@@ -5095,7 +5095,17 @@ impl WorkerState {
         new_name: String,
         tx: &std_mpsc::Sender<RenameResult>,
     ) {
+        // Every early exit answers with no edits, so the caller's "Renaming
+        // symbol" always resolves (#1193).
+        let unanswerable = |path: PathBuf| {
+            let _ = tx.send(RenameResult {
+                request_id,
+                path,
+                edits: None,
+            });
+        };
         let Some(doc) = self.docs.get(&path) else {
+            unanswerable(path);
             return;
         };
         let lang = doc.language;
@@ -5105,6 +5115,7 @@ impl WorkerState {
         // without reopening the file. Cheap once the list is non-empty.
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
+            unanswerable(path);
             return;
         };
         let picked = clients
@@ -5112,14 +5123,11 @@ impl WorkerState {
             .find(|c| c.supports_rename)
             .map(|c| (c.name.clone(), c.client.clone()));
         let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(RenameResult {
-                request_id,
-                path,
-                edits: None,
-            });
+            unanswerable(path);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
+            unanswerable(path);
             return;
         };
         let tx = tx.clone();
@@ -9167,6 +9175,30 @@ while True:
             labels.iter().any(|l| l.starts_with("input")),
             "expected at least one item starting with `input`, got: {labels:?}"
         );
+    }
+
+    /// A rename for a file no server tracks (a tab opened by a relative
+    /// path, #1193) is answered with no edits instead of never, which left
+    /// "Renaming symbol" on the status bar forever.
+    #[test]
+    fn a_rename_for_an_untracked_file_is_answered_with_no_edits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let mut manager = LspManager::new(root).expect("manager");
+        let id = manager.request_rename(PathBuf::from("pkg/util.py"), 0, 4, "grand_total".into());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            if let Some(r) = manager.drain_rename() {
+                break Some(r);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let result = result.expect("the rename is answered");
+        assert_eq!(result.request_id, id);
+        assert!(result.edits.is_none());
     }
 
     fn drain_hover_blocking(manager: &LspManager, timeout: Duration) -> Option<HoverResult> {

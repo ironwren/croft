@@ -32446,12 +32446,20 @@ impl App {
     /// for `croft <root> --open-file <path>` (the new window spawned by Move /
     /// Copy into New Window opens the handed-off file this way). Best-effort: a
     /// missing / unreadable file just leaves the editor on the welcome screen.
+    /// A relative `path` is taken under the workspace root, so the tab gets
+    /// the absolute path its language server is keyed by; a file that can't
+    /// be opened says why instead of opening nothing (#1193).
     pub fn open_file_at_launch(&mut self, path: &Path) {
-        if self.editor.open_pinned(path).is_ok() {
-            // Launch is not a user focus gesture: collapsing here would hide
-            // the sidebar before the user has interacted at all (#260).
-            self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
-            self.sync_open_file_poll_mtime();
+        let path = self.workspace_root().join(path);
+        match self.editor.open_pinned(&path) {
+            Ok(_) => {
+                // Launch is not a user focus gesture: collapsing here would
+                // hide the sidebar before the user has interacted at all
+                // (#260).
+                self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
+                self.sync_open_file_poll_mtime();
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
         }
     }
 
