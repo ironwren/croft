@@ -92,6 +92,7 @@ pub enum Command {
     UnfoldAllRegions,
     // --- File / editor management ---
     SaveFile,
+    SaveAs,
     /// File: Save All (#852): every dirty tab, in every split.
     SaveAll,
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
@@ -335,6 +336,7 @@ pub enum Command {
     AttachPythonProcess,
     ColorTheme,
     KeyboardShortcuts,
+    UpdateCroft,
     OpenSettings,
     OpenSettingsJson,
     OpenWorkspaceSettingsJson,
@@ -511,6 +513,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::FoldAllRegions,
     Command::UnfoldAllRegions,
     Command::SaveFile,
+    Command::SaveAs,
     Command::SaveAll,
     Command::NewFile,
     Command::NewFolder,
@@ -728,6 +731,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RerunLastTask,
     Command::ColorTheme,
     Command::KeyboardShortcuts,
+    Command::UpdateCroft,
     Command::OpenSettings,
     Command::OpenSettingsJson,
     Command::OpenWorkspaceSettingsJson,
@@ -881,6 +885,7 @@ impl Command {
             Command::FoldAllRegions => "Fold All Regions",
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
+            Command::SaveAs => "File: Save As…",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
             Command::NewFolder => "File: New Folder…",
@@ -1102,6 +1107,7 @@ impl Command {
             Command::RerunLastTask => "Tasks: Rerun Last Task",
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
+            Command::UpdateCroft => "Help: Update croft (Relaunch or Rebuild)",
             Command::OpenSettings => "Preferences: Open Settings",
             Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
             Command::OpenWorkspaceSettingsJson => "Preferences: Open Workspace Settings (JSON)",
@@ -1252,6 +1258,7 @@ impl Command {
             Command::FoldAllRegions => "Cmd+K Cmd+8",
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
+            Command::SaveAs => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
             Command::SaveAll => "Cmd+Opt+S",
@@ -1431,6 +1438,7 @@ impl Command {
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
             Command::KeyboardShortcuts => "F1",
+            Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
             Command::SelectDebugConfig => "",
             Command::AddDebugConfig => "",
@@ -1612,6 +1620,7 @@ impl Command {
             Command::FoldAllRegions => "fold_all_regions",
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
+            Command::SaveAs => "save_as",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
             Command::NewFolder => "new_folder",
@@ -1826,6 +1835,7 @@ impl Command {
             Command::AttachPythonProcess => "attach_python_process",
             Command::ColorTheme => "color_theme",
             Command::KeyboardShortcuts => "keyboard_shortcuts",
+            Command::UpdateCroft => "update_croft",
             Command::OpenSettings => "open_settings",
             Command::OpenSettingsJson => "open_settings_json",
             Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
@@ -2385,6 +2395,21 @@ mod tests {
         palette.set_query("quick fix");
         assert_eq!(palette.results.first(), Some(&builtin(Command::QuickFix)));
         assert_eq!(Command::QuickFix.keybinding_hint(), "Cmd+.");
+    }
+
+    /// #865: the palette names chords in its macOS spelling, `Cmd` where
+    /// macOS has Cmd, as the other Cmd hints do, so the updater reads
+    /// `Cmd+Shift+F9` here; the status bar picks each platform's own.
+    #[test]
+    fn update_croft_is_reachable_and_shows_its_chord_in_the_palettes_spelling() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("update croft");
+        assert!(
+            palette.results.contains(&builtin(Command::UpdateCroft)),
+            "{:?}",
+            palette.results
+        );
+        assert_eq!(Command::UpdateCroft.keybinding_hint(), "Cmd+Shift+F9");
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+Q",
-                description: "Quit",
+                description: "Quit (in a focused terminal it goes to the app there)",
                 handler: "",
             },
             ShortcutEntry {
@@ -172,9 +172,9 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_focus_group_left_key is_focus_group_right_key",
             },
             ShortcutEntry {
-                keys: "F9",
-                description: "When a background update is ready: relaunch croft into the new binary",
-                handler: "",
+                keys: "Cmd/Ctrl+Shift+F9",
+                description: "croft's updater: relaunch into a ready background update, or rebuild a croft older than its source checkout",
+                handler: "is_update_croft_key",
             },
             ShortcutEntry {
                 keys: "F1",

@@ -59,7 +59,7 @@ src/
 ├── provenance.rs         which SEAT wrote each line (`Seat` plus a per-buffer line map) for the gutter overlay and inline blame; the invariant is that a line croft did not watch being written is Unknown, never guessed
 ├── prefs.rs              durable user preferences (theme, layout chrome, format-on-save, auto-save) at `~/.config/croft/config.json` behind the "Preferences: Open Settings" hub; `host_accents` rules drive per-host terminal pane dressing
 ├── quick_select.rs       WezTerm-style quick-select pure core for the terminal pane (Ctrl+Shift+Space): a priority-ordered pattern set matched over soft-wrap-stitched logical lines, with home-row labels
-├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, baked in by `build.rs` — no git log, no network, and a missing file is a build error
+├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/` for a build past its release (headed "IN THIS BUILD"), baked in by `build.rs` through `release_notes/select.rs` — no git log, no network, and a build with neither is a build error
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
@@ -110,7 +110,7 @@ src/
 │   ├── perf_hud.rs      F8 performance HUD
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   └── tests.rs         unit / integration tests
-├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python, 3.14+, no fallback) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
+├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop/kill signals the process group and reaps the child
 │   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with
@@ -118,7 +118,7 @@ src/
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers)
 │   ├── remote_attach.rs pure attach planning: parse / gate the CPython version (>=3.14 ships sys.remote_exec), the platform-aware sudo-elevation decision (macOS always, Linux unless Yama ptrace_scope is relaxed), and the `pdb -p` command builder
-│   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo plus a per-candidate `--version` probe
+│   ├── discovery.rs     enumerate attachable CPython 3.14+ processes via sysinfo (argv included, for the picker row; `-m pdb -p` attach clients left out, #868) plus a per-candidate `--version` probe
 │   └── reaper.rs             sweeps orphaned vscode-js-debug processes (server plus its detached watchdog) left by a crash or force-quit; kills only `~/.croft/js-debug` scripts reparented to pid 1, so a live session is never touched
 ├── testing/              Test Runner: a background worker runs the project's test tool off the render loop (cargo/pytest/vitest/jest/go/codeql, picked by `registry::runner_for`) and streams parsed cases into the Testing panel
 │   ├── mod.rs           shared NO_RUNNER_STATUS, `suite_pattern` (anchors a suite as `parse::` so cargo's substring filter and the panel's marking cannot sweep `parse_utils::b`), and `regex_escape` (shared by the JS `-t` argv builders and the locator; test titles are arbitrary strings)
@@ -308,7 +308,7 @@ Remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offe
 
 **Why a palette command first.** The first slice used a palette command rather than an automatic prompt. An offer that appears on detection needs a per-host opt-out, a memory of hosts that refused provisioning, and a decision about nagging, none of which should be invented alongside the detection.
 
-**Launch dispatch and stdin discipline.** An installed remote croft is attached to immediately — the presence probe fires the launch signal within one roundtrip — while any update cross-builds and ships on a background thread, surfacing as the running croft's F9 reload. The install must never read the terminal the attached session is reading, or the two split the user's keystrokes between them. So every ssh command it runs directly carries `-n`, and rsync and the zig cross-build (whose nested ssh has no `-n` of its own) are spawned with stdin closed, which their children inherit. The one exception is the throughput probe, which pipes its payload into a remote `cat` and so must keep the stdin it feeds.
+**Launch dispatch and stdin discipline.** An installed remote croft is attached to immediately — the presence probe fires the launch signal within one roundtrip — while any update cross-builds and ships on a background thread, surfacing as the running croft's `Ctrl+Shift+F9` relaunch. The install must never read the terminal the attached session is reading, or the two split the user's keystrokes between them. So every ssh command it runs directly carries `-n`, and rsync and the zig cross-build (whose nested ssh has no `-n` of its own) are spawned with stdin closed, which their children inherit. The one exception is the throughput probe, which pipes its payload into a remote `cat` and so must keep the stdin it feeds.
 
 **A crates.io install ships the release binary (#261).** Before any build, `try_prebuilt_install` checks whether this croft IS a release: installed from crates.io (`remote_prebuilt::eligible`, a `/registry/src/` source dir; `cargo install --git` checkouts do not count). If so, it fetches `v<CARGO_PKG_VERSION>/croft-<triple>.tar.gz` and `SHA256SUMS` from the GitHub release LOCALLY, checks `SHA256SUMS` against the release's Sigstore bundle (`SHA256SUMS.sigstore.json`) with `cosign verify-blob` pinned to `release.yml` at tag `v<version>` before trusting any sum (a bad signature or a missing bundle refuses the release; with no `cosign` installed the sums rest on HTTPS and the install log says the signature was not checked, and a binary cached that way is checked again once it can be), refuses a checksum mismatch or any link entry, caches the verified binary under `~/.cache/croft/prebuilt/`, and ships it through the same rsync-and-activate steps as the cross-build. The remote therefore needs no outbound internet. The install stamp stays the local source hash, which is honest only because the release was built from that exact published source; a source checkout keeps cross-compiling rather than pairing a newer local with an older release. A version with no release artifacts is a plain skip, and `croft remote --build` forces the build path.
 
@@ -388,7 +388,7 @@ The inline-image baking pipeline and protocol dispatch: iTerm2 OSC 1337, Kitty g
 
 **The one unconditional wipe.** Resize/WINCH (`App::consume_resize_repaint`) always wipes. A dtach reattach fires WINCH against a blank physical screen while ratatui's back buffer says every cell is painted, so the next frame must clear and repaint on every protocol, Kitty included.
 
-**Re-asserting terminal modes on reattach.** The same WINCH also re-asserts the startup terminal modes (`mode_reassert_seq` in app/mod.rs: alt screen, mouse tracking, bracketed paste, kitty keyboard flags via the SET form, never a push) when `CROFT_SESSION_PERSISTENT` is set, because a reattached terminal never received the startup DECSETs and would otherwise have a dead mouse until the next F9 re-exec. `takeover_mode_seq` is the single source of truth for those modes — startup, the post-scp TUI restore, and the reattach re-assert all emit the same block, with a test pinning the embedding — so a mode added at startup can never go missing from the reattach path. New startup modes go there, never inline at a call site.
+**Re-asserting terminal modes on reattach.** The same WINCH also re-asserts the startup terminal modes (`mode_reassert_seq` in app/mod.rs: alt screen, mouse tracking, bracketed paste, kitty keyboard flags via the SET form, never a push) when `CROFT_SESSION_PERSISTENT` is set, because a reattached terminal never received the startup DECSETs and would otherwise have a dead mouse until the next updater re-exec. `takeover_mode_seq` is the single source of truth for those modes — startup, the post-scp TUI restore, and the reattach re-assert all emit the same block, with a test pinning the embedding — so a mode added at startup can never go missing from the reattach path. New startup modes go there, never inline at a call site.
 
 ### session_host.rs
 
@@ -1057,15 +1057,17 @@ The remote vetted index at `extensions.croft.software`. It fetches `index.json` 
 
 ### release_notes.rs
 
-Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) shown on the welcome panel. The text is DATA: one file per version in `src/release_notes/<version>.md`, baked in by `build.rs` and parsed once. No git log, no network.
+Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) shown on the welcome panel. The text is DATA: one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/`, baked in by `build.rs` and parsed once. No git log, no network.
 
-**One file per version.** A single shared const sat on every open pull request's rebase path. A missing file for the current version is a BUILD error, so a binary always describes itself.
+**Fragments in pull requests, versions after merge.** A pull request writes its highlights to `src/release_notes/unreleased/<name>.md` and never changes `version`; `.github/workflows/version-bump.yml` runs `scripts/release.py cut` on main after each merge, folding the pending fragments into the next version's file and bumping the version once. A single shared const, and then a version bump in every pull request, sat on every open pull request's conflict path.
+
+**Which notes a build carries.** `release_notes/select.rs`, which `build.rs` includes by path and the tests compile as `release_notes::select`, picks the pending fragments when there are any, headed "IN THIS BUILD (vX.Y.Z+)" (`heading`, `unreleased`), and this version's file otherwise. A build with neither is a BUILD error, so a binary always describes itself.
 
 **The card is sized before the logo.** `welcome_card_inner_width` is the one wrap width shared by the height measure and the paint pass, and the logo yields down to its 4-row minimum before the card may clip. The logo-first order kept a full-height logo above a note clipped mid-sentence in height-starved windows.
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output, and a `❯` REPL prompt. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867), and a `❯` REPL prompt. Every console line is also mirrored to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
@@ -1107,7 +1109,7 @@ Auto-detected project tasks. It reads the manifests the repo already has — `.v
 
 A release-availability check plus a staged upgrade. Once a day, tracked by the cache file `~/.cache/croft/update-check.json`, a local croft asks GitHub's latest-release endpoint off-thread; a newer, undismissed version raises a click-only popup at bottom-left offering Update or Later.
 
-**Update stages, it does not replace.** Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged` in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path F9 takes.
+**Update stages, it does not replace.** Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged` in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path the updater chord (`Ctrl+Shift+F9`) takes.
 
 **Never automatic.** Later remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
 
@@ -1268,7 +1270,7 @@ The tree-sitter outline provider. It extracts the OUTLINE panel's symbol tree �
 
 ### src/output.rs
 
-The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named channels — one per language server, plus Debug Adapter, Git, Server Provisioning and Navigator (the resident AI pair programmer's commentary) — each a capped ring buffer of levelled lines.
+The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named channels — one per language server, plus Debug Adapter, Debug Console (the Run and Debug console mirrored at full width), Git, Server Provisioning and Navigator (the resident AI pair programmer's commentary) — each a capped ring buffer of levelled lines.
 
 **Producers push here and mirror to disk.** Code across the codebase writes to the bus while also mirroring to the on-disk `lsp.log`. A generation counter lets the widget re-pull only when something actually changed.
 
