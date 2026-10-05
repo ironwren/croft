@@ -346,7 +346,18 @@ fn compute_chrome_layout(
     } else {
         0
     };
-    let secondary_w = if secondary_visible { secondary_w } else { 0 };
+    // A secondary side bar the window can't seat beside the editor's minimum
+    // is dropped: reserving it anyway placed it past the frame's right edge,
+    // where its scrollbar wrote outside the buffer (#1132).
+    let fits = main.width
+        >= activity_w
+            .saturating_add(secondary_w)
+            .saturating_add(RIGHT_PANE_MIN);
+    let secondary_w = if secondary_visible && fits {
+        secondary_w
+    } else {
+        0
+    };
     // Reserve activity + secondary first, then fit the primary side bar in
     // what's left while keeping RIGHT_PANE_MIN for the editor column.
     let reserved = activity_w.saturating_add(secondary_w);
@@ -1723,6 +1734,12 @@ enum PrGhJob {
 /// of the operation, applied to the app when it arrives.
 type GitNetDone = Box<dyn FnOnce(&mut App) + Send>;
 
+/// The file the OUTLINE shows and the edit seq it was synced at.
+type OutlineKey = (PathBuf, Option<u64>);
+
+/// Where an off-thread outline parse delivers its symbols (#1150).
+type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+
 /// The BREAKPOINTS section of the debug tree (#250): a header and one row per
 /// breakpoint, or nothing when there are none.
 fn breakpoint_section_rows(count: usize) -> Vec<crate::widgets::run_debug::DebugRow> {
@@ -1864,6 +1881,8 @@ struct PendingFileMove {
     op: FileMove,
     renames: Vec<crate::lsp::manager::FileRenameOp>,
     deadline: std::time::Instant,
+    /// The open buffers' `edit_seq`s when the request went out (#1151).
+    baseline: Vec<(PathBuf, u64)>,
 }
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
@@ -3312,6 +3331,9 @@ pub struct App {
     /// The pack install or download in flight (#578): where its outcome
     /// arrives, and the status lines for success and failure.
     codeql_pack_job: Option<CodeqlPackJob>,
+    /// A database being downloaded or extracted (#1155): what is being
+    /// added, for the status line, and where its folder arrives.
+    codeql_db_job: Option<(String, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
     /// A CodeQL document being made (#578: View CFG, the alert and result
     /// views): the file it writes or why not, and the status lines for
     /// each.
@@ -4021,6 +4043,17 @@ pub struct App {
     /// to, so `sync_outline` re-requests symbols exactly once per tab switch or
     /// edit batch. `None` seq means the file has no language server.
     outline_synced: Option<(PathBuf, Option<u64>)>,
+    /// A large buffer's syntax outline being parsed off the UI thread
+    /// (#1150): the `outline_synced` key its snapshot was taken at, and
+    /// where the symbols land. One at a time; typing meanwhile coalesces
+    /// into one fresh parse when it lands.
+    outline_parse: Option<(OutlineKey, OutlineParse)>,
+    /// The `outline_synced` key the last off-thread parse was started for.
+    outline_parsed_for: Option<(PathBuf, Option<u64>)>,
+    /// The file and edit seq whose language-server outline last landed: a
+    /// syntax parse of that same buffer finishing later must not replace
+    /// the richer symbols.
+    outline_lsp_landed: Option<(PathBuf, u64)>,
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
@@ -4052,6 +4085,9 @@ pub struct App {
     occ_observed: Option<(PathBuf, usize, usize, u64)>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
+    /// The open buffers' `edit_seq`s when the in-flight rename went out
+    /// (#1151): a reply for a buffer edited since is refused.
+    rename_baseline: Vec<(PathBuf, u64)>,
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
@@ -4062,6 +4098,9 @@ pub struct App {
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
     format_request_selection: bool,
+    /// The `edit_seq` of the tab the in-flight format request was computed
+    /// against (#1127): a reply for a buffer typed into since is dropped.
+    format_request_seq: Option<u64>,
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
@@ -4075,6 +4114,9 @@ pub struct App {
     /// (the reply is one resolved action to apply directly) rather than the
     /// initial `textDocument/codeAction` (whose reply opens the picker).
     code_action_pending_resolve: bool,
+    /// The open buffers' `edit_seq`s when the code-action (or resolve)
+    /// request whose edits are pending went out (#1151).
+    code_action_baseline: Vec<(PathBuf, u64)>,
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
@@ -5707,6 +5749,7 @@ impl App {
             codeql_perf_compare: None,
             codeql_query_help: None,
             codeql_pack_job: None,
+            codeql_db_job: None,
             codeql_ast_job: None,
             codeql_doc_job: None,
             codeql_results_walk: None,
@@ -6085,14 +6128,17 @@ impl App {
             signature_help_request_id: None,
             signature_help_anchor: None,
             rename_request_id: None,
+            rename_baseline: Vec::new(),
             pending_file_move: None,
             prepare_rename_request: None,
             format_request_id: None,
+            format_request_seq: None,
             format_request_selection: false,
             format_on_type: loaded_prefs.format_on_type,
             on_type_request: None,
             code_action_request_id: None,
             code_action_pending_resolve: false,
+            code_action_baseline: Vec::new(),
             pending_code_actions: Vec::new(),
             review_boxes: None,
             review_pending: Vec::new(),
@@ -6183,6 +6229,9 @@ impl App {
             peek_refs: None,
             references_want_peek: false,
             outline_synced: None,
+            outline_parse: None,
+            outline_parsed_for: None,
+            outline_lsp_landed: None,
             declaration_request_id: None,
             type_definition_request_id: None,
             implementation_request_id: None,
@@ -8056,7 +8105,7 @@ impl App {
             self.search.query.clone(),
             self.search.opts,
         ));
-        let term = if self.search.query.trim().is_empty() {
+        let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
             Some(self.search.query.clone())
@@ -10753,17 +10802,79 @@ impl App {
             // Tree-sitter paints the outline instantly from the buffer's own
             // syntax tree, before any language server replies. The LSP request
             // below refines it with richer kinds/detail when (and if) it lands.
-            let syntax = self.compute_syntax_outline(&path);
             let lsp_pending = seq.is_some();
-            self.outline
-                .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            if outline_parses_inline(&self.editor.lines) {
+                let syntax = self.compute_syntax_outline(&path);
+                self.outline
+                    .set_syntax_symbols(path.clone(), syntax, lsp_pending);
+            } else if self.outline.path.as_ref() != Some(&path) {
+                // A large buffer is parsed off the UI thread (#1150); until
+                // that lands, another file's outline must never stand in.
+                self.outline
+                    .set_syntax_symbols(path.clone(), Vec::new(), true);
+            }
             if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
                 lsp.request_document_symbols(path, seq);
             }
         }
+        let landed = self.drain_outline_parse();
+        self.start_outline_parse();
         // Follow-cursor every tick; cheap (O(symbols)) and only repaints when
         // the enclosing symbol actually changes.
-        self.outline.follow_caret(self.editor.cursor_row as u32)
+        self.outline.follow_caret(self.editor.cursor_row as u32) | landed
+    }
+
+    /// Parse a large buffer's syntax outline on a worker (#1150): inline, a
+    /// multi-megabyte file re-parsed from scratch on every keystroke and each
+    /// character took seconds to appear. Starts only when no parse is
+    /// running and the buffer moved past the last one started, so a burst of
+    /// typing costs one parse when it ends, not one per key.
+    fn start_outline_parse(&mut self) {
+        if self.outline_parse.is_some() || self.outline_parsed_for == self.outline_synced {
+            return;
+        }
+        let Some(key) = self.outline_synced.clone() else {
+            return;
+        };
+        if self.editor.path.as_ref() != Some(&key.0) || outline_parses_inline(&self.editor.lines) {
+            return;
+        }
+        let (path, lines) = (key.0.clone(), self.editor.lines.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(syntax_outline_for(&path, &lines));
+        });
+        self.outline_parsed_for = Some(key.clone());
+        self.outline_parse = Some((key, rx));
+    }
+
+    /// Apply a finished off-thread outline parse, if the buffer is still the
+    /// one it parsed and the language server's outline of that same buffer
+    /// has not landed first. True when the outline changed.
+    fn drain_outline_parse(&mut self) -> bool {
+        let Some((key, rx)) = &self.outline_parse else {
+            return false;
+        };
+        let symbols = match rx.try_recv() {
+            Ok(symbols) => symbols,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.outline_parse = None;
+                return false;
+            }
+        };
+        let key = key.clone();
+        self.outline_parse = None;
+        if self.outline_synced.as_ref() != Some(&key) {
+            return false;
+        }
+        let (path, seq) = key;
+        if seq.is_some_and(|seq| self.outline_lsp_landed == Some((path.clone(), seq))) {
+            return false;
+        }
+        self.outline
+            .set_syntax_symbols(path, symbols, seq.is_some());
+        true
     }
 
     /// Keep the Explorer's non-OUTLINE stacked sub-views current: re-project the
@@ -11120,6 +11231,9 @@ impl App {
         // filled. Keep the syntactic symbols rather than flashing "No symbols".
         if symbols.is_empty() && !self.outline.is_empty() {
             return false;
+        }
+        if !symbols.is_empty() {
+            self.outline_lsp_landed = Some((path.clone(), seq));
         }
         self.outline.set_symbols(path, symbols);
         self.outline.follow_caret(self.editor.cursor_row as u32);
@@ -13433,17 +13547,50 @@ impl App {
             return false;
         }
         self.rename_request_id = None;
+        self.land_rename(edits);
+        true
+    }
+
+    /// Apply a rename reply, unless a buffer it edits was typed into after
+    /// the request went out (#1151): its positions were computed against
+    /// the text as it was then, and would land on whatever sits there now.
+    fn land_rename(
+        &mut self,
+        edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>>,
+    ) {
+        let baseline = std::mem::take(&mut self.rename_baseline);
         match edits {
-            Some(files) => match self.apply_rename_edits(&files) {
-                Ok((file_count, occ)) => {
-                    self.status =
-                        format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+            Some(files) => {
+                if let Some(file) = self.stale_edit_target(&baseline, &files) {
+                    self.status = format!(
+                        "Rename cancelled: {file} changed while the server was working; press F2 again"
+                    );
+                    return;
                 }
-                Err(e) => self.status = format!("Rename failed: {e}"),
-            },
+                match self.apply_rename_edits(&files) {
+                    Ok((file_count, occ)) => {
+                        self.status =
+                            format!("Renamed {occ} occurrence(s) across {file_count} file(s)");
+                    }
+                    Err(e) => self.status = format!("Rename failed: {e}"),
+                }
+            }
             None => self.status = String::from("Rename produced no changes"),
         }
-        true
+    }
+
+    /// The first file of a workspace edit whose open buffer changed after
+    /// `baseline` was taken, named for the status bar (#1151).
+    fn stale_edit_target(
+        &self,
+        baseline: &[(PathBuf, u64)],
+        files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
+    ) -> Option<String> {
+        files
+            .iter()
+            .filter(|(_, edits)| !edits.is_empty())
+            .find(|(path, _)| self.editor.edited_since(baseline, path))
+            .map(|(path, _)| self.status_path(path))
     }
 
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
@@ -13489,18 +13636,33 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        if self.lsp.is_none() {
             self.status = String::from("No language server for this file");
             return;
-        };
+        }
         // Mirror the editor's indentation preference; servers that carry their
         // own config (rustfmt, ruff, prettier) ignore these but the fields are
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = false;
         self.status = String::from("Formatting document");
+    }
+
+    /// The `edit_seq` of the tab a format reply for `path` lands in (the
+    /// one `apply_rename_to_open_tab` picks), or `None` when no tab holds it.
+    fn format_target_seq(&self, path: &std::path::Path) -> Option<u64> {
+        let idx = self
+            .editor
+            .find_tab_with_path(path)
+            .or_else(|| self.editor.find_any_tab_with_path(path))?;
+        Some(self.editor.editors[idx].edit_seq)
     }
 
     /// "Format Selection" (#254): `textDocument/rangeFormatting` over the
@@ -13522,12 +13684,14 @@ impl App {
         let start = self.editor.pos_to_utf16(sr, sc);
         let end = self.editor.pos_to_utf16(er, ec);
         let (tab_size, insert_spaces) = self.editor.indent_preference();
+        let seq = self.format_target_seq(&path);
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
         let id = lsp.request_range_formatting(path, start, end, tab_size, insert_spaces);
         self.format_request_id = Some(id);
+        self.format_request_seq = seq;
         self.format_request_selection = true;
         self.status = String::from("Formatting selection");
     }
@@ -13555,7 +13719,21 @@ impl App {
             return false;
         }
         self.format_request_id = None;
+        self.land_format(edits, unsupported, path);
+        true
+    }
+
+    /// Apply a formatter's reply to the request in flight, then finish a
+    /// format-on-save. Split from [`Self::drain_lsp_format`] so tests can
+    /// deliver a reply without a server.
+    fn land_format(
+        &mut self,
+        edits: Option<Vec<crate::widgets::editor::TextSpanEdit>>,
+        unsupported: bool,
+        path: Option<PathBuf>,
+    ) {
         let selection = std::mem::take(&mut self.format_request_selection);
+        let requested_at = self.format_request_seq.take();
         if unsupported {
             self.status = if selection {
                 String::from("No range formatter available for this file")
@@ -13563,9 +13741,29 @@ impl App {
                 String::from("No formatter available for this file")
             };
             self.complete_pending_save();
-            return true;
+            return;
         }
         match (edits, path) {
+            // The edits are positions in the text the server was sent; typed
+            // into since, they land on the wrong lines (#1127). Drop them, as
+            // VS Code does, and let a format-on-save write what is there.
+            (Some(edits), Some(path))
+                if !edits.is_empty() && self.format_target_seq(&path) != requested_at =>
+            {
+                let file = self.status_path(&path);
+                let saving = self.save_after_format.is_some();
+                self.complete_pending_save();
+                self.status = if saving {
+                    format!(
+                        "Saved {file} without formatting: it changed while the formatter was running"
+                    )
+                } else {
+                    format!(
+                        "Format skipped: {file} changed while the formatter was running; format again"
+                    )
+                };
+                return;
+            }
             (Some(edits), Some(path)) if !edits.is_empty() => {
                 match self.editor.apply_rename_to_open_tab(&path, &edits) {
                     Some(_) => {
@@ -13590,7 +13788,6 @@ impl App {
         // A format-on-save write is deferred until now so the disk file gets the
         // formatted text in one go.
         self.complete_pending_save();
-        true
     }
 
     /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code
@@ -13738,6 +13935,28 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
+        // A modify/delete conflict resolved to the deleting side leaves an
+        // empty Result: the resolution is "no file", so remove it from the
+        // index and the disk, as `git rm` would (#1244).
+        if self
+            .editor
+            .merge
+            .as_ref()
+            .is_some_and(|mv| mv.deleted.is_some())
+            && self.editor.lines.iter().all(|l| l.is_empty())
+        {
+            let rel = self.repo_rel(&path);
+            let root = self.scm_root();
+            match crate::git::remove_path(&root, &rel) {
+                Ok(()) => {
+                    self.close_tabs_with_path_everywhere(&path);
+                    self.refresh_source_control();
+                    self.status = format!("Merge complete: removed {rel}");
+                }
+                Err(e) => self.status = format!("Remove failed: {e}"),
+            }
+            return;
+        }
         if self.editor.dirty {
             self.save();
         }
@@ -13781,18 +14000,29 @@ impl App {
         let to_lines = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
         let ours = crate::git::read_file_at_stage(&canon_root, &rel, 2).map(to_lines);
         let theirs = crate::git::read_file_at_stage(&canon_root, &rel, 3).map(to_lines);
+        let mut deleted = None;
         let sides = match (ours, theirs) {
             // Neither stage exists: the path is not unmerged in git at
             // all — fall through to marker synthesis below.
             (Err(_), Err(_)) => None,
             // Unmerged: a missing single stage is a deleted side (DU/UD)
-            // and a missing base is added-by-both (AA) — both mean "that
-            // side is empty", not an error.
+            // and a missing base is added-by-both (AA). Both read as an
+            // empty side; a deleted one is also remembered, so taking it
+            // removes the file rather than staging an empty one (#1244).
             (o, t) => {
-                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1)
-                    .map(&to_lines)
-                    .unwrap_or_default();
-                Some((base, o.unwrap_or_default(), t.unwrap_or_default()))
+                let base = crate::git::read_file_at_stage(&canon_root, &rel, 1).map(&to_lines);
+                if base.is_ok() {
+                    deleted = match (&o, &t) {
+                        (Err(_), Ok(_)) => Some(crate::merge_editor::CheckSide::Current),
+                        (Ok(_), Err(_)) => Some(crate::merge_editor::CheckSide::Incoming),
+                        _ => None,
+                    };
+                }
+                Some((
+                    base.unwrap_or_default(),
+                    o.unwrap_or_default(),
+                    t.unwrap_or_default(),
+                ))
             }
         };
         let built = match sides {
@@ -13808,6 +14038,7 @@ impl App {
             self.status = format!("{rel} has no merge conflicts");
             return false;
         };
+        mv.deleted = deleted;
         if let Err(e) = self.editor.open_pinned(path) {
             self.status = format!("Open failed: {e}");
             return false;
@@ -14023,6 +14254,7 @@ impl App {
         let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Finding quick fixes");
     }
 
@@ -14132,6 +14364,12 @@ impl App {
     /// that returns a still-edit-less action after resolve can't loop.
     fn apply_resolved_code_action(&mut self, item: crate::lsp::manager::CodeActionItem) {
         let mut applied = false;
+        if let Some(file) = self.stale_edit_target(&self.code_action_baseline, &item.edits) {
+            self.status = format!(
+                "Quick fix cancelled: {file} changed while the server was working; try it again"
+            );
+            return;
+        }
         if !item.edits.is_empty() {
             match self.apply_rename_edits(&item.edits) {
                 Ok((files, occ)) => {
@@ -14175,6 +14413,7 @@ impl App {
         let id = lsp.request_code_action_resolve(path, item.server, action);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = true;
+        self.code_action_baseline = self.editor.edit_seqs();
         self.status = String::from("Resolving quick fix");
     }
 
@@ -22277,15 +22516,20 @@ impl App {
         // everywhere, which is what keeps the sidebar reachable from the
         // terminal; only the Ctrl form is released, matching iTerm2 and
         // Ghostty, which reserve Cmd and pass Ctrl through.
-        let terminal_owns_ctrl_b = self.focus == Pane::Terminal
+        //
+        // Ctrl+Q follows the same rule (#1290): it is vim's visual block,
+        // nano's search backwards and the shell's XON, and quitting from
+        // inside one of them killed the app, the shell and every unsaved
+        // tab. Quit keeps Ctrl+Q from every other pane.
+        let terminal_owns_ctrl = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
             && key.modifiers == KeyModifiers::CONTROL;
-        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl_b {
+        if is_sidebar_toggle_key(key) && !terminal_owns_ctrl {
             self.toggle_side_bar();
             return Ok(());
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) if !terminal_owns_ctrl => {
                 self.quit = true;
                 return Ok(());
             }
@@ -22469,7 +22713,7 @@ impl App {
             self.status = String::from("Replace All is owner-only in a shared session");
             return;
         }
-        if self.search.query.trim().is_empty() {
+        if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
@@ -22649,8 +22893,32 @@ impl App {
                 self.source_control.end();
                 self.poke_cursor();
             }
-            KeyCode::Up => self.source_control.scroll_up(1),
-            KeyCode::Down => self.source_control.scroll_down(1),
+            // In a multi-line message Up/Down move between its lines; on
+            // its first/last line they scroll the change list as before.
+            KeyCode::Up => {
+                if self.source_control.move_cursor_up() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_up(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.source_control.move_cursor_down() {
+                    self.poke_cursor();
+                } else {
+                    self.source_control.scroll_down(1);
+                }
+            }
+            // Shift/Alt+Enter start a new message line (the commit body),
+            // VS Code's multi-line SCM input; plain Enter commits.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.source_control.insert_char('\n');
+                self.poke_cursor();
+            }
             KeyCode::Enter => self.commit_source_control(),
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -28812,37 +29080,90 @@ impl App {
         value: &str,
     ) {
         use crate::widgets::input_prompt::CodeqlDbSource;
-        let found: Result<PathBuf, String> = match source {
-            CodeqlDbSource::Folder => {
-                let dir = self.typed_path(value);
-                crate::codeql_db::find_database_in(&dir).ok_or_else(|| {
-                    format!(
+        if source == CodeqlDbSource::Folder {
+            let dir = self.typed_path(value);
+            match crate::codeql_db::find_database_in(&dir) {
+                Some(found) => self.register_codeql_database(&found),
+                None => {
+                    self.status = format!(
                         "{} is not a CodeQL database (no codeql-database.yml)",
                         dir.display()
+                    );
+                }
+            }
+            return;
+        }
+        // Downloads and extraction run on a worker (#1155): a database is
+        // commonly hundreds of megabytes, and inline the whole UI froze until
+        // it was on disk.
+        if let Some((what, _)) = &self.codeql_db_job {
+            self.status = format!("Still adding the CodeQL database {what}");
+            return;
+        }
+        let cache = Self::codeql_db_cache_dir();
+        let (what, job): (String, Box<dyn FnOnce() -> Result<PathBuf, String> + Send>) =
+            match source {
+                CodeqlDbSource::Archive => {
+                    let zip = self.typed_path(value);
+                    let stem = zip
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("database"));
+                    (
+                        zip.display().to_string(),
+                        Box::new(move || Self::extract_codeql_zip(&cache, &zip, &stem)),
                     )
-                })
-            }
-            CodeqlDbSource::Archive => {
-                let zip = self.typed_path(value);
-                let stem = zip
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| String::from("database"));
-                self.extract_codeql_zip(&zip, &stem)
-            }
-            CodeqlDbSource::Url => self.download_codeql_zip_from_url(value.trim()),
-            CodeqlDbSource::Github => self.download_codeql_db_from_github(value.trim()),
+                }
+                CodeqlDbSource::Url => {
+                    let url = value.trim().to_string();
+                    (
+                        url.clone(),
+                        Box::new(move || Self::download_codeql_zip_from_url(&cache, &url)),
+                    )
+                }
+                CodeqlDbSource::Github => {
+                    let repo = value.trim().to_string();
+                    let gh = self.gh_program.clone();
+                    (
+                        repo.clone(),
+                        Box::new(move || Self::download_codeql_db_from_github(&gh, &cache, &repo)),
+                    )
+                }
+                CodeqlDbSource::Folder => unreachable!("added above"),
+            };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.status = format!("Adding the CodeQL database {what}\u{2026}");
+        self.codeql_db_job = Some((what, rx));
+    }
+
+    /// Register a database that finished downloading or extracting (#1155).
+    pub fn drain_codeql_db_job(&mut self) -> bool {
+        let Some((what, rx)) = self.codeql_db_job.as_ref() else {
+            return false;
         };
-        let dir = match found {
-            Ok(d) => d,
-            Err(why) => {
-                self.status = why;
-                return;
-            }
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(format!(
+                "Adding the CodeQL database {what} stopped unexpectedly"
+            )),
         };
+        self.codeql_db_job = None;
+        match outcome {
+            Ok(dir) => self.register_codeql_database(&dir),
+            Err(why) => self.status = why,
+        }
+        true
+    }
+
+    /// Add a database folder to the saved list and make it current.
+    fn register_codeql_database(&mut self, dir: &std::path::Path) {
         let path = Self::codeql_db_store_path();
         let mut store = crate::codeql_db::DatabaseStore::load(&path);
-        match store.add(&dir) {
+        match store.add(dir) {
             Ok(i) => {
                 if let Err(e) = store.save(&path) {
                     self.status = format!("Could not save the database list: {e}");
@@ -28863,14 +29184,19 @@ impl App {
         }
     }
 
-    fn extract_codeql_zip(&self, zip: &std::path::Path, name: &str) -> Result<PathBuf, String> {
-        let dest = Self::codeql_db_cache_dir().join(name);
+    /// Unpack `zip` into `cache/<name>`. Runs on the add-database worker.
+    fn extract_codeql_zip(
+        cache: &std::path::Path,
+        zip: &std::path::Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        let dest = cache.join(name);
         crate::codeql_db::extract_zip(zip, &dest, None)?;
         crate::codeql_db::find_database_in(&dest)
             .ok_or_else(|| format!("{} holds no CodeQL database", zip.display()))
     }
 
-    fn download_codeql_zip_from_url(&self, url: &str) -> Result<PathBuf, String> {
+    fn download_codeql_zip_from_url(cache: &std::path::Path, url: &str) -> Result<PathBuf, String> {
         if !url.starts_with("https://") {
             return Err(String::from("A database URL must be https://"));
         }
@@ -28884,20 +29210,22 @@ impl App {
             .unwrap_or("database")
             .trim_end_matches(".zip")
             .to_string();
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
-        let out = self.extract_codeql_zip(&tmp, &name);
+        let out = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         out
     }
 
     /// `owner/repo` or `owner/repo language`. With no language, the one
     /// database GitHub has is used; several need the language named.
-    fn download_codeql_db_from_github(&self, value: &str) -> Result<PathBuf, String> {
+    fn download_codeql_db_from_github(
+        gh: &std::path::Path,
+        cache: &std::path::Path,
+        value: &str,
+    ) -> Result<PathBuf, String> {
         let mut parts = value.split_whitespace();
         let repo = parts
             .next()
@@ -28913,7 +29241,7 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new("gh")
+                let out = std::process::Command::new(gh)
                     .args([
                         "api",
                         &format!("/repos/{repo}/code-scanning/codeql/databases"),
@@ -28944,23 +29272,26 @@ impl App {
                 }
             }
         };
-        let out = std::process::Command::new("gh")
+        // Streamed straight to disk: a database can be larger than the
+        // memory croft should hold at once.
+        let name = format!("{}-{language}", repo.replace('/', "-"));
+        let tmp = cache.join(format!("{name}.download.zip"));
+        std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new(gh)
             .args(crate::codeql_db::github_database_args(&repo, &language))
+            .stdin(std::process::Stdio::null())
+            .stdout(file)
             .output()
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
+            let _ = std::fs::remove_file(&tmp);
             return Err(format!(
                 "Download failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let name = format!("{}-{language}", repo.replace('/', "-"));
-        let tmp = Self::codeql_db_cache_dir().join(format!("{name}.download.zip"));
-        if let Some(dir) = tmp.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&tmp, &out.stdout).map_err(|e| e.to_string())?;
-        let result = self.extract_codeql_zip(&tmp, &name);
+        let result = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
         result
     }
@@ -34097,7 +34428,9 @@ impl App {
         true
     }
 
-    /// Notes: Delete Note: the focused note, else the next from the caret.
+    /// Notes: Delete Note: the focused note, else the one on the caret's
+    /// line. A note further down is never reached for: a tombstone can't be
+    /// undone, so the command deletes only a note the user is on (#1131).
     fn delete_sticky_note_here(&mut self) {
         let id = self
             .editor
@@ -34110,16 +34443,27 @@ impl App {
                 let lines = &self.editor.lines;
                 self.notes
                     .on_file(&file)
-                    .map(|n| (n.place(lines), Self::note_box_id(&n.id)))
-                    .filter(|(row, _)| *row >= self.editor.cursor_row)
-                    .min()
-                    .map(|(_, id)| id)
+                    .find(|n| n.place(lines) == self.editor.cursor_row)
+                    .map(|n| Self::note_box_id(&n.id))
             });
-        match id {
-            Some(id) if self.change_note_box(id, |n| n.deleted = true) => {
-                self.status = String::from("Note deleted");
-            }
-            _ => self.status = String::from("No note here"),
+        let Some(note) = id
+            .and_then(|id| self.note_box_ids.get(&id))
+            .and_then(|note_id| self.notes.get(note_id))
+        else {
+            self.status = String::from("No note on this line");
+            return;
+        };
+        let line = note.place(&self.editor.lines) + 1;
+        let first = note.body.lines().next().unwrap_or_default();
+        // The first words, cut at a space so the status doesn't end mid-word.
+        let mut gist = truncate_for_display(first, 40);
+        if gist.len() < first.len()
+            && let Some(cut) = gist.rfind(' ')
+        {
+            gist.truncate(cut);
+        }
+        if id.is_some_and(|id| self.change_note_box(id, |n| n.deleted = true)) {
+            self.status = format!("Note deleted on line {line}: {gist}");
         }
     }
 
@@ -34893,6 +35237,29 @@ impl App {
                 }
                 CollabEvent::BootstrapTimedOut { file } => {
                     self.status = format!("{file}: no session owner answered; editing locally");
+                }
+                CollabEvent::OwnerLeft => {
+                    self.status = String::from("The session owner left; saves now write to disk");
+                }
+                CollabEvent::OwnerReturned { files } => {
+                    // The new owner starts from the file on disk, so that is
+                    // the merge base for this guest's work since the owner
+                    // left (#1147): only this side's changes replay, and any
+                    // the new owner already made survive.
+                    for file in files {
+                        match crate::collab::contained_path(&root, &file)
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                        {
+                            Some(disk) => {
+                                self.collab_offline_base
+                                    .insert(file, disk.replace("\r\n", "\n"));
+                            }
+                            None => {
+                                self.collab_offline_base.remove(&file);
+                            }
+                        }
+                    }
+                    self.status = String::from("The session owner is back; rejoining shared files");
                 }
                 CollabEvent::Caret {
                     file,
@@ -40162,7 +40529,7 @@ impl App {
                 // horizontally and the user lands on the match instead of the
                 // line's leftmost cell - which on a 200k-char line means
                 // never seeing the match without manual scrolling.
-                let needle = self.search.query.trim();
+                let needle = crate::widgets::search::as_typed(&self.search.query);
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
                 // Locate the first match on the line: its start column and
@@ -42745,11 +43112,12 @@ impl App {
             self.copy_terminal_selection();
             return;
         }
-        // Cmd+V / Ctrl+V / Ctrl+Shift+V: paste local clipboard into the
-        // embedded shell. Without this, raw Ctrl+V bytes (\x16) just go
-        // through to the shell unchanged, and Cmd+V — when not eaten by
-        // the host terminal's menu shortcut — would do nothing useful.
-        if is_clipboard_paste_key(key) {
+        // Cmd+V / Ctrl+Shift+V: paste local clipboard into the embedded
+        // shell; Cmd+V, when not eaten by the host terminal's menu
+        // shortcut, would otherwise do nothing useful. Plain Ctrl+V is the
+        // app's (#1290): vim's visual block and nano's page down need the
+        // 0x16 byte, as in VS Code's terminal on Linux.
+        if is_clipboard_paste_key(key) && !is_plain_ctrl_v(key) {
             self.paste_clipboard_into_terminal();
             return;
         }
@@ -42885,7 +43253,7 @@ impl App {
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
-    /// Ctrl+V / Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
+    /// Ctrl+Shift+V) and the pane menu's "Paste" both land here, so
     /// bracketed paste, broadcast fan-out and the remote-clipboard fallback
     /// behave identically whichever one the user reached for.
     ///
@@ -55407,7 +55775,7 @@ impl App {
     }
 
     /// In a `git-rebase-todo` tab (#620), a plain p/r/e/s/f/d on a commit
-    /// line sets its action and moves to the next line. Off in vim mode,
+    /// line sets its action and moves to the next commit line. Off in vim mode,
     /// where those letters are vim commands. Returns whether it acted.
     fn rebase_todo_key(&mut self, key: KeyEvent) -> bool {
         let KeyCode::Char(c) = key.code else {
@@ -55430,9 +55798,21 @@ impl App {
         let Some(line) = self.editor.lines.get(row).cloned() else {
             return false;
         };
+        // A blank line takes no action and must not take the letter either:
+        // git stops the rebase on a stray `s` (#1228).
+        if line.trim().is_empty() {
+            self.status = String::from(crate::rebase_todo::HINT);
+            return true;
+        }
         let Some(new_line) = crate::rebase_todo::set_action(&line, action) else {
             return false;
         };
+        if matches!(action, "squash" | "fixup")
+            && !crate::rebase_todo::has_kept_commit_above(&self.editor.lines, row)
+        {
+            self.status = format!("Can't {action} the first commit: no commit above it");
+            return true;
+        }
         self.editor
             .apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
                 start: (row, 0),
@@ -55440,7 +55820,14 @@ impl App {
                 new_text: new_line,
                 utf16: false,
             }]);
-        self.editor.cursor_row = (row + 1).min(self.editor.lines.len().saturating_sub(1));
+        // On to the next commit line, past comments and the trailing blank;
+        // the last commit keeps the caret (#1228).
+        if let Some(next) = self.editor.lines[row + 1..]
+            .iter()
+            .position(|l| crate::rebase_todo::is_commit_line(l))
+        {
+            self.editor.cursor_row = row + 1 + next;
+        }
         self.editor.cursor_col = 0;
         self.status = String::from(crate::rebase_todo::HINT);
         true
@@ -56201,7 +56588,8 @@ impl App {
         // guest is its only author, and refusing meant the work could never
         // persist anywhere. Same when there is NO session at all (relay
         // link down, reconnect pending): with nobody to defer to, blocking
-        // strands the offline work in RAM for the whole outage.
+        // strands the offline work in RAM for the whole outage. And when
+        // the owner left (#1147): there is nobody to save for this guest.
         if self.is_collab_guest()
             && self
                 .editor
@@ -56211,7 +56599,7 @@ impl App {
                 .is_some_and(|file| {
                     self.collab
                         .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file))
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
                 })
         {
             self.status =
@@ -62540,6 +62928,7 @@ impl App {
             op,
             renames,
             deadline: std::time::Instant::now() + FILE_MOVE_DEADLINE,
+            baseline: self.editor.edit_seqs(),
         });
     }
 
@@ -62585,11 +62974,27 @@ impl App {
                 .into_iter()
                 .map(|(path, e)| (moved_path(&path, &pending.renames), e))
                 .collect();
-            match self.apply_rename_edits(&edits) {
-                Ok((files, _)) => {
-                    self.status = format!("{moved_status}, references updated in {files} file(s)");
+            // The move carried open tabs to their new paths; so too their
+            // request-time seqs, for the check below to find them.
+            let baseline: Vec<_> = pending
+                .baseline
+                .iter()
+                .map(|(path, seq)| (moved_path(path, &pending.renames), *seq))
+                .collect();
+            if let Some(file) = self.stale_edit_target(&baseline, &edits) {
+                self.status = format!(
+                    "{moved_status}; references not updated: {file} changed while the server was working"
+                );
+            } else {
+                match self.apply_rename_edits(&edits) {
+                    Ok((files, _)) => {
+                        self.status =
+                            format!("{moved_status}, references updated in {files} file(s)");
+                    }
+                    Err(e) => {
+                        self.status = format!("{moved_status}; could not update references: {e}")
+                    }
                 }
-                Err(e) => self.status = format!("{moved_status}; could not update references: {e}"),
             }
         }
         if let Some(lsp) = self.lsp.as_mut() {
@@ -62969,6 +63374,7 @@ impl App {
                 };
                 let id = lsp.request_rename(path, line, character, new_name);
                 self.rename_request_id = Some(id);
+                self.rename_baseline = self.editor.edit_seqs();
                 self.prompt = None;
                 self.status = String::from("Renaming symbol");
             }
@@ -64372,6 +64778,23 @@ fn syntax_outline_for(
     crate::outline_syntax::symbols_for_lines(path, lines)
 }
 
+/// The largest buffer whose syntax outline is parsed on the UI thread
+/// (#1150). A from-scratch parse costs about a quarter of a millisecond per
+/// kilobyte, so this keeps it within a frame; larger buffers go to
+/// [`App::start_outline_parse`].
+const OUTLINE_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Whether `lines` is small enough to parse for the outline inline.
+fn outline_parses_inline(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .try_fold(0usize, |bytes, l| {
+            let bytes = bytes + l.len() + 1;
+            (bytes <= OUTLINE_INLINE_MAX_BYTES).then_some(bytes)
+        })
+        .is_some()
+}
+
 /// The breadcrumb scope chain for `line`: the indices of every outline symbol
 /// whose range encloses the caret line, ordered outermost first (the enclosing
 /// class before the method inside it). Sibling symbols never overlap, so the
@@ -64940,6 +65363,16 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Ctrl+V with no other modifier (or its raw 0x16 form), which the
+/// terminal hands to the app rather than pasting (#1290).
+fn is_plain_ctrl_v(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('\u{16}') => true,
+        KeyCode::Char(c) => c.eq_ignore_ascii_case(&'v') && key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 fn is_search_editing_shortcut(key: KeyEvent) -> bool {
@@ -67713,6 +68146,9 @@ pub fn run(
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
 
     let result = main_loop(&mut app, &mut terminal);
+    // An owner's goodbye goes out now (#1147): the drop-to-local and
+    // self-update exits below never drop the App.
+    drop(app.collab.take());
 
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
@@ -68255,6 +68691,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_perf_compare()
             | app.drain_codeql_query_help()
             | app.drain_codeql_pack_job()
+            | app.drain_codeql_db_job()
             | app.drain_codeql_cli_download()
             | app.drain_codeql_cli_check()
             | app.drain_codeql_code_search()
