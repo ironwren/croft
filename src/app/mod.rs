@@ -8115,11 +8115,13 @@ impl App {
     pub fn drain_search_results(&mut self) -> bool {
         use crate::widgets::search::SearchEvent;
         let mut applied = false;
+        // Every batch waiting is merged in one pass (#1340).
+        let mut arrived = Vec::new();
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
                 SearchEvent::Hits(q, opts, batch) => {
                     if q == self.search.query && opts == self.search.opts {
-                        self.search.hits.extend(batch);
+                        arrived.extend(batch);
                         applied = true;
                     }
                 }
@@ -8131,6 +8133,7 @@ impl App {
                 }
             }
         }
+        self.search.add_hits(arrived);
         applied
     }
 
