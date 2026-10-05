@@ -23734,6 +23734,132 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     assert_eq!(app.search.include, "*.md", "the seeded include is intact");
 }
 
+/// The issue's repo (#1345): a committed `.vscode/settings.json` hides
+/// `**/generated` from files and `**/tests/fixtures` from search, and
+/// `parse_order` has one real hit, six fixture hits and one generated one.
+fn app_with_vscode_excludes() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "src", "tests/fixtures", "generated"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "**/generated": true },
+  "search.exclude": { "**/tests/fixtures": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/orders.py"), "def parse_order(x): return x\n").unwrap();
+    for i in 1..=6 {
+        std::fs::write(
+            root.join(format!("tests/fixtures/case{i}.txt")),
+            format!("parse_order fixture {i}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("generated/api_pb2.py"),
+        "# parse_order generated stub\n",
+    )
+    .unwrap();
+    let app = App::new(root.to_path_buf()).unwrap();
+    (app, tmp)
+}
+
+/// Run the Search panel's query to completion; the hit paths, relative
+/// and sorted.
+fn search_hit_paths(app: &mut App, root: &std::path::Path, query: &str) -> Vec<String> {
+    app.search.query = String::from(query);
+    app.submit_search_query();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.search.complete && std::time::Instant::now() < deadline {
+        app.drain_search_results();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.search.complete, "the search must finish");
+    let mut paths: Vec<String> = app
+        .search
+        .hits
+        .iter()
+        .map(|h| {
+            h.path
+                .strip_prefix(root)
+                .unwrap_or(&h.path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// #1345: `.vscode/settings.json`'s `files.exclude` and `search.exclude`
+/// keep their folders out of Search, so the one real hit is all there is.
+#[test]
+fn search_honours_the_vscode_exclude_settings() {
+    let (mut app, t) = app_with_vscode_excludes();
+    assert_eq!(
+        search_hit_paths(&mut app, t.path(), "parse_order"),
+        vec![String::from("src/orders.py")]
+    );
+}
+
+/// #1345: the exclude box adds to the project's exclusions rather than
+/// replacing them.
+#[test]
+fn the_exclude_box_adds_to_the_project_excludes() {
+    let (mut app, t) = app_with_vscode_excludes();
+    app.search.exclude = String::from("src");
+    assert!(
+        search_hit_paths(&mut app, t.path(), "parse_order").is_empty(),
+        "src is excluded by the box and the rest by the project"
+    );
+}
+
+/// #1345 negative: turning the project exclusions off (VS Code's "Use
+/// Exclude Settings and Ignore Files") searches everything again.
+#[test]
+fn project_excludes_can_be_switched_off_for_one_search() {
+    let (mut app, t) = app_with_vscode_excludes();
+    app.toggle_project_excludes();
+    assert!(!app.search.use_exclude_settings);
+    assert_eq!(search_hit_paths(&mut app, t.path(), "parse_order").len(), 8);
+}
+
+/// #1345: the Explorer hides a `files.exclude` folder, and only that:
+/// `search.exclude` leaves the fixtures listed, as in VS Code.
+#[test]
+fn the_explorer_hides_files_exclude_folders_only() {
+    let (app, t) = app_with_vscode_excludes();
+    let listed: Vec<_> = app.tree.nodes.iter().map(|n| n.path.clone()).collect();
+    assert!(!listed.contains(&t.path().join("generated")), "{listed:?}");
+    assert!(listed.contains(&t.path().join("tests")), "{listed:?}");
+    assert!(listed.contains(&t.path().join("src")), "{listed:?}");
+}
+
+/// #1345: Go to File skips excluded files, as VS Code's file search does
+/// for both settings, and still finds the rest.
+#[test]
+fn quick_open_skips_excluded_files() {
+    let (mut app, _t) = app_with_vscode_excludes();
+    app.open_file_finder();
+    let rels: Vec<String> = app
+        .file_finder
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(rels.contains(&String::from("src/orders.py")), "{rels:?}");
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.starts_with("generated/") || r.starts_with("tests/")),
+        "{rels:?}"
+    );
+}
+
 /// Open a file into the focused editor group of a fresh App.
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
