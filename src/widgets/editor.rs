@@ -31003,7 +31003,7 @@ mod tests {
     }
 
     /// An editor in `lang` with `text` typed into it one key at a time.
-    fn typed(lang: Option<LangKind>, text: &str) -> Editor {
+    fn typed_in(lang: Option<LangKind>, text: &str) -> Editor {
         let mut e = editor_with("");
         e.lang = lang;
         for c in text.chars() {
@@ -31022,13 +31022,13 @@ mod tests {
             "r'\\d'",
             "x = Rb'\\x00' + fr\"{y}\"",
         ] {
-            let e = typed(Some(LangKind::Python), text);
+            let e = typed_in(Some(LangKind::Python), text);
             assert_eq!(e.lines, [text], "typing {text:?}");
         }
-        let mut e = typed(Some(LangKind::Python), "print(f");
+        let mut e = typed_in(Some(LangKind::Python), "print(f");
         e.insert_char('"');
         assert_eq!(e.lines[0], "print(f\"\")", "a string prefix opens the pair");
-        let mut e = typed(Some(LangKind::Python), "elif");
+        let mut e = typed_in(Some(LangKind::Python), "elif");
         e.insert_char('"');
         assert_eq!(e.lines[0], "elif\"", "a word that is not a prefix does not");
     }
@@ -31127,16 +31127,16 @@ mod tests {
         // opener. In any other language, or after a word Python does not
         // take as a prefix, a quote after a word character stays single.
         for lang in [None, Some(LangKind::Rust), Some(LangKind::JavaScript)] {
-            let mut e = typed(lang, "f");
+            let mut e = typed_in(lang, "f");
             e.insert_char('"');
             assert_eq!(e.lines[0], "f\"", "{lang:?}");
         }
         for word in ["ub", "fu", "bb", "rbf", "print"] {
-            let mut e = typed(Some(LangKind::Python), word);
+            let mut e = typed_in(Some(LangKind::Python), word);
             e.insert_char('\'');
             assert_eq!(e.lines[0], format!("{word}'"), "{word:?} is no prefix");
         }
-        let mut e = typed(Some(LangKind::Python), "x = U");
+        let mut e = typed_in(Some(LangKind::Python), "x = U");
         e.insert_char('\'');
         assert_eq!(e.lines[0], "x = U''", "a prefix in either case");
     }
