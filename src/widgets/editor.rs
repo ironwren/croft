@@ -2638,9 +2638,9 @@ pub struct Editor {
     pub dirty: bool,
     /// Bumped on every SAVE (`mark_synced_with_disk`, reached only from
     /// `write_buffer_to_disk`). Undo snapshots record it so a restore across
-    /// a save point re-dirties. Load/reload paths do not bump it; they clear
-    /// the undo stacks instead, so no stale snapshot can span them — a
-    /// change that preserves undo history across a reload must bump it too.
+    /// a save point re-dirties. A load clears the undo stacks instead, so no
+    /// stale snapshot can span it; a reload keeps them and bumps this
+    /// (`carry_history_across_reload`).
     save_seq: u64,
     pub status: String,
     pub last_area: Rect,
@@ -9208,7 +9208,21 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // `open` starts a text tab's history afresh. A reload keeps it
+        // (#1357): the text from before an agent's or formatter's rewrite is
+        // one undo away, with everything typed before that behind it.
+        let history = (!self.has_non_text_view()).then(|| {
+            (
+                self.snapshot(),
+                std::mem::take(&mut self.undo_stack),
+                std::mem::take(&mut self.redo_stack),
+                self.encoding,
+            )
+        });
         let result = self.open(&path);
+        if let Some((before, undo, redo, encoding)) = history {
+            self.carry_history_across_reload(before, undo, redo, encoding, result.is_ok());
+        }
         if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
             view.carry_from(old);
         }
@@ -9221,6 +9235,45 @@ impl Editor {
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
         result
+    }
+
+    /// Put back the history [`Self::reload_from_disk`] took aside, with the
+    /// pre-reload text as one more step when the reload changed it. Dropped
+    /// when the file came back as something other than text in the same
+    /// encoding, where the old lines mean nothing; kept untouched when the
+    /// open failed and the buffer was never replaced.
+    fn carry_history_across_reload(
+        &mut self,
+        before: Snapshot,
+        mut undo: Vec<Snapshot>,
+        redo: Vec<Snapshot>,
+        encoding: &'static encoding_rs::Encoding,
+        reloaded: bool,
+    ) {
+        if !reloaded {
+            self.undo_stack = undo;
+            self.redo_stack = redo;
+            return;
+        }
+        if self.has_non_text_view() || self.encoding != encoding {
+            return;
+        }
+        if before.lines == self.lines {
+            // Only the stamp moved (`touch`, a formatter with nothing to
+            // do): no step that undoes to the same text.
+            self.undo_stack = undo;
+            self.redo_stack = redo;
+        } else {
+            // Its own step, never merged with typing; like any new edit it
+            // ends the redo branch.
+            undo.push(before);
+            self.undo_stack = undo;
+            self.trim_undo_stack();
+            self.undo_step_id = next_undo_step_id();
+            self.mirrored_step = None;
+        }
+        // A new buffer<->disk sync point: every kept step restores as dirty.
+        self.save_seq = self.save_seq.wrapping_add(1);
     }
 
     /// Discard local edits and reload from disk unconditionally — the
@@ -23677,6 +23730,76 @@ mod tests {
         assert!(!e.disk_conflict);
         // A second sweep with no further change is a no-op.
         assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+    }
+
+    /// #1357: a clean tab reloaded after an external rewrite (an agent, a
+    /// formatter, a checkout) kept no history, so Ctrl+Z said "Nothing to
+    /// undo" and could take back neither the rewrite nor what came before.
+    #[test]
+    fn an_external_reload_is_one_undo_step_and_keeps_the_history_before_it() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "def total(xs):\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].len();
+        e.insert_str(" # typed");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        std::fs::write(tmp.path(), "def total(xs):\n    return sum(xs)\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines, vec!["def total(xs):", "    return sum(xs)"]);
+        assert!(!e.dirty);
+
+        assert!(e.undo(), "the reload itself is undoable");
+        assert_eq!(e.lines, vec!["def total(xs): # typed"]);
+        assert!(e.dirty, "the restored text no longer matches disk");
+        assert!(e.undo(), "and so is what was typed before it");
+        assert_eq!(e.lines, vec!["def total(xs):"]);
+        assert!(e.dirty);
+
+        assert!(e.redo() && e.redo(), "redo walks forward again");
+        assert_eq!(e.lines, vec!["def total(xs):", "    return sum(xs)"]);
+        assert!(
+            !e.dirty,
+            "back at the reloaded text, which is what disk holds"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_changes_no_text_pushes_no_undo_step() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "a\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.cursor_col = 1;
+        e.insert_str("b");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        let steps = e.undo_stack.len();
+        // Same bytes, new mtime: `touch`, or a formatter with nothing to do.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.undo_stack.len(), steps, "no empty step to undo through");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "a", "the typing before it is one undo away");
+    }
+
+    #[test]
+    fn a_file_reloaded_as_a_different_view_starts_its_history_afresh() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "text\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("x");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        std::fs::write(tmp.path(), [0u8, 159, 146, 150, 0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.hex.is_some(), "precondition: the file is binary now");
+        assert!(!e.undo(), "text history cannot be undone into a hex view");
     }
 
     #[test]
