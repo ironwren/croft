@@ -34993,11 +34993,7 @@ impl App {
         let Some(file) = collab_file_key(&self.tree.root, &path) else {
             return false;
         };
-        let Some(kind) = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(crate::highlight::lang_for_extension)
-        else {
+        let Some(kind) = crate::highlight::lang_for_path(&path) else {
             return false;
         };
         let Some(old) = host.last_seen(&file) else {
@@ -39118,11 +39114,8 @@ impl App {
         }
         // Highlighting only: no language server hears about a tab with no
         // file behind it.
-        self.editor.set_language(
-            path.extension()
-                .and_then(|x| x.to_str())
-                .and_then(crate::highlight::lang_for_extension),
-        );
+        self.editor
+            .set_language(crate::highlight::lang_for_path(&path));
         self.close_scrubber_for_tab();
         self.status = format!("{rel} at {} — {}", commit.short_hash, commit.summary);
     }
@@ -67888,7 +67881,7 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
 /// The tree-sitter grammar for `path`, by extension: what symbol tabs
 /// (#369) parse to re-find a renamed or displaced symbol.
 fn syntax_kind_of(path: &Path) -> Option<crate::highlight::LangKind> {
-    crate::highlight::lang_for_extension(path.extension()?.to_str()?)
+    crate::highlight::lang_for_path(path)
 }
 
 /// `path` relative to `repo_root` with forward slashes, as GitHub names it.
