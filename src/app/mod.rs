@@ -42730,12 +42730,12 @@ impl App {
             return None;
         };
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let vars = crate::http_file::load_env(&dir);
+        let vars = crate::http_file::variables(&text, crate::http_file::load_env(&dir));
         let (resolved, missing) = crate::http_file::resolve(&req, &vars);
         if !missing.is_empty() {
             let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
             self.status = format!(
-                "HTTP: no value for {} (add it to {} beside the file, or $env)",
+                "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
                 holes.join(", "),
                 crate::http_file::ENV_FILE
             );

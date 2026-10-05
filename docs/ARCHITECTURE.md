@@ -905,7 +905,7 @@ An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-p
 
 ### http_file.rs
 
-Support for `.http` and `.rest` request files. The REST-Client format is parsed — `###` blocks, headers, bodies, and `{{variables}}` from a `.http.env.json` beside the file or from `{{$env.NAME}}` — and sent on a worker thread through `ureq`.
+Support for `.http` and `.rest` request files. The REST-Client format is parsed — `###` blocks, headers, bodies, and `{{variables}}` from the file's own `@name = value` lines, a `.http.env.json` beside the file, or `{{$env.NAME}}` — and sent on a worker thread through `ureq`.
 
 **What counts as an error.** A non-2xx status is a response, not an error. Bodies are capped at 8 MiB.
 

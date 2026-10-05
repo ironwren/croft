@@ -43982,6 +43982,54 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     );
     assert!(app.http_run.is_none(), "nothing was sent");
 }
+/// #1186: a `.http` file's own `@base = …` line fills `{{base}}`, and
+/// Ctrl+Enter on the `@base` line sends nothing.
+#[test]
+fn an_http_file_variable_fills_the_request_and_is_not_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "@base = http://127.0.0.1:8765\n\n### Fetch the hello document\nGET {{base}}/hello.json\nAccept: application/json\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 3;
+    let (_, resolved, _) = app.http_request_under_caret().expect("resolves");
+    assert_eq!(resolved.url, "http://127.0.0.1:8765/hello.json");
+
+    app.editor.cursor_row = 0;
+    app.send_http_request_under_caret();
+    assert_eq!(app.status, "No request under the caret");
+    assert!(app.http_run.is_none(), "the @base line is not sent");
+}
+
+/// Negative (#1186): a hole neither the file nor `.http.env.json` defines
+/// still refuses to send, and the status says where a value can go.
+#[test]
+fn an_http_hole_no_file_variable_defines_still_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(
+        &http,
+        "@base = http://127.0.0.1:8765\nGET {{base}}/{{path}}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.editor.cursor_row = 1;
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{path}}"),
+        "{}",
+        app.status
+    );
+    assert!(!app.status.contains("{{base}}"), "{}", app.status);
+    assert!(app.status.contains("@name"), "{}", app.status);
+    assert!(app.http_run.is_none(), "nothing was sent");
+}
+
 /// #356: a recorded frame carries the VISIBLE screen, not the scrollback.
 ///
 /// `grid_lines` starts at `topmost_line()`, which is negative scrollback —
