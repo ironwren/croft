@@ -11104,7 +11104,10 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_terminal_cycle_back_key,
         is_delete_node_key,
         is_completion_trigger_key,
-        is_save_key_reporting_shift,
+        is_save_all_key,
+        is_show_output_key,
+        is_show_problems_key,
+        is_update_croft_key,
         is_editor_copy_key,
         is_editor_cut_key,
         is_search_paste_key,
@@ -11134,6 +11137,7 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_editor_open_line_above_key,
         is_close_tab_key,
     ];
+    predicates.push(("is_save_key", is_save_key_reporting_shift));
     predicates.push(("is_cmd_k_leader_key", leader_in_editor));
     predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
 
@@ -71119,6 +71123,12 @@ fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
             .iter()
             .find(|r| r.id == format!("kb:{id}"))
             .unwrap_or_else(|| panic!("no Keyboard Shortcuts row for {id}"));
+        // Off macOS the row shows the Ctrl+K leader croft takes there (#843).
+        let chord = if cfg!(target_os = "macos") {
+            chord.to_string()
+        } else {
+            chord.replace("Cmd+K", "Ctrl+K")
+        };
         assert_eq!(row.label, format!("{title}  \u{00b7}  {chord}"));
     }
 }
