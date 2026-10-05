@@ -96,6 +96,13 @@ pub enum Command {
     UnfoldAllRegions,
     // --- File / editor management ---
     SaveFile,
+    SaveAs,
+    /// File: Save All (#852): every dirty tab, in every split.
+    SaveAll,
+    /// File: New File… / New Folder… (#852): the Explorer's create prompt
+    /// from any pane, beside the active file or in the Explorer selection.
+    NewFile,
+    NewFolder,
     Undo,
     Redo,
     SelectAll,
@@ -120,6 +127,18 @@ pub enum Command {
     /// Explorer: Jump to Directory (zoxide) (#843): the Explorer's Cmd+Z,
     /// which has no `Ctrl` form.
     ZoxideJump,
+    /// The editor tab menu's close / pin / keep rows as commands (#852),
+    /// VS Code's names, each on the active tab of the focused group.
+    CloseOtherEditors,
+    CloseEditorsToTheRight,
+    CloseSavedEditors,
+    CloseAllEditors,
+    /// View: Pin Editor / Unpin Editor. The palette offers only the one
+    /// that applies to the active tab, as VS Code does
+    /// (`CommandPalette::set_hidden`); both stay bindable.
+    PinEditor,
+    UnpinEditor,
+    KeepEditor,
     SplitEditor,
     /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
     /// which have no `Ctrl` form off macOS.
@@ -257,6 +276,27 @@ pub enum Command {
     ToggleSecondarySideBar,
     ToggleZenMode,
     ToggleTerminal,
+    /// The Customize Layout popup's rows as commands (#852), VS Code's
+    /// names: the bars' visibility, the side bar's side, and pickers for
+    /// the panel alignment and the quick input position. `LAYOUT_COMMANDS`
+    /// lists them with the popup's other rows so "layout" finds them all.
+    ToggleActivityBar,
+    ToggleStatusBar,
+    ToggleSideBarPosition,
+    SetPanelAlignment,
+    SetQuickInputPosition,
+    /// View: Customize Layout… (#852): the popup itself.
+    CustomizeLayout,
+    /// Terminal: Focus Terminal (#852): the TERMINAL tab, shown and focused.
+    /// With the `Show*` commands below, one command per bottom-panel tab
+    /// (`BottomPanelTab::show_command` pairs them).
+    FocusTerminal,
+    ShowProblems,
+    ShowOutput,
+    /// Output: Select Channel… (#852): the OUTPUT dropdown as a picker.
+    OutputSelectChannel,
+    ShowPorts,
+    ShowCaptures,
     ToggleMinimap,
     /// Run the whole-project checker and put its findings in PROBLEMS (#256).
     ProblemsCheckProject,
@@ -484,6 +524,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::FoldAllRegions,
     Command::UnfoldAllRegions,
     Command::SaveFile,
+    Command::SaveAs,
+    Command::SaveAll,
+    Command::NewFile,
+    Command::NewFolder,
     Command::Undo,
     Command::Redo,
     Command::SelectAll,
@@ -504,6 +548,13 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CloseEditor,
     Command::ReopenClosedEditor,
     Command::ZoxideJump,
+    Command::CloseOtherEditors,
+    Command::CloseEditorsToTheRight,
+    Command::CloseSavedEditors,
+    Command::CloseAllEditors,
+    Command::PinEditor,
+    Command::UnpinEditor,
+    Command::KeepEditor,
     Command::SplitEditor,
     Command::FocusLeftEditorGroup,
     Command::FocusRightEditorGroup,
@@ -634,6 +685,18 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleSecondarySideBar,
     Command::ToggleZenMode,
     Command::ToggleTerminal,
+    Command::ToggleActivityBar,
+    Command::ToggleStatusBar,
+    Command::ToggleSideBarPosition,
+    Command::SetPanelAlignment,
+    Command::SetQuickInputPosition,
+    Command::CustomizeLayout,
+    Command::FocusTerminal,
+    Command::ShowProblems,
+    Command::ShowOutput,
+    Command::OutputSelectChannel,
+    Command::ShowPorts,
+    Command::ShowCaptures,
     Command::ToggleMinimap,
     Command::ProblemsCheckProject,
     Command::ProblemsToggleProjectAuto,
@@ -741,6 +804,25 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::IgnoreComment,
 ];
 
+/// The Customize Layout popup as palette commands (#852): the popup itself,
+/// then one command per row group in the popup's order. VS Code's titles
+/// mostly don't say "layout", so the palette also matches these on that
+/// word, and the query "layout" lists everything the popup can change.
+pub const LAYOUT_COMMANDS: &[Command] = &[
+    Command::CustomizeLayout,
+    Command::ToggleActivityBar,
+    Command::ToggleSideBar,
+    Command::ToggleSecondarySideBar,
+    Command::ToggleTerminal,
+    Command::ToggleStatusBar,
+    Command::ToggleMinimap,
+    Command::ToggleAutoHideSideBar,
+    Command::ToggleSideBarPosition,
+    Command::SetPanelAlignment,
+    Command::SetQuickInputPosition,
+    Command::ToggleZenMode,
+];
+
 impl Command {
     /// The human-readable label shown in the palette and matched against the
     /// query. Mirrors VS Code's command titles.
@@ -817,6 +899,10 @@ impl Command {
             Command::FoldAllRegions => "Fold All Regions",
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
+            Command::SaveAs => "File: Save As…",
+            Command::SaveAll => "File: Save All",
+            Command::NewFile => "File: New File…",
+            Command::NewFolder => "File: New Folder…",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
             Command::SelectAll => "Select All",
@@ -837,6 +923,13 @@ impl Command {
             Command::CloseEditor => "View: Close Editor",
             Command::ReopenClosedEditor => "View: Reopen Closed Editor",
             Command::ZoxideJump => "Explorer: Jump to Directory (zoxide)",
+            Command::CloseOtherEditors => "View: Close Other Editors in Group",
+            Command::CloseEditorsToTheRight => "View: Close Editors to the Right in Group",
+            Command::CloseSavedEditors => "View: Close Saved Editors in Group",
+            Command::CloseAllEditors => "View: Close All Editors",
+            Command::PinEditor => "View: Pin Editor",
+            Command::UnpinEditor => "View: Unpin Editor",
+            Command::KeepEditor => "View: Keep Editor",
             Command::SplitEditor => "View: Split Editor",
             Command::FocusLeftEditorGroup => "View: Focus Left Editor Group",
             Command::FocusRightEditorGroup => "View: Focus Right Editor Group",
@@ -969,6 +1062,18 @@ impl Command {
             Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
             Command::ToggleZenMode => "View: Toggle Zen Mode",
             Command::ToggleTerminal => "View: Toggle Terminal",
+            Command::ToggleActivityBar => "View: Toggle Activity Bar Visibility",
+            Command::ToggleStatusBar => "View: Toggle Status Bar Visibility",
+            Command::ToggleSideBarPosition => "View: Toggle Primary Side Bar Position",
+            Command::SetPanelAlignment => "View: Set Panel Alignment…",
+            Command::SetQuickInputPosition => "View: Set Quick Input Position…",
+            Command::CustomizeLayout => "View: Customize Layout…",
+            Command::FocusTerminal => "Terminal: Focus Terminal",
+            Command::ShowProblems => "View: Show Problems",
+            Command::ShowOutput => "View: Show Output",
+            Command::OutputSelectChannel => "Output: Select Channel…",
+            Command::ShowPorts => "View: Show Ports",
+            Command::ShowCaptures => "View: Show Captures",
             Command::ToggleMinimap => "View: Toggle Minimap",
             Command::ProblemsCheckProject => "Problems: Check Whole Project",
             Command::ProblemsToggleProjectAuto => {
@@ -1180,12 +1285,31 @@ impl Command {
             Command::FoldAllRegions => "Cmd+K Cmd+8",
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
+            Command::SaveAs => "",
+            // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
+            // Compare here, so Linux takes `Ctrl+Alt+S` instead.
+            Command::SaveAll => "Cmd+Opt+S",
+            // Palette-only: the Explorer's `Cmd+F` / `Cmd+Shift+N` are Find
+            // and unbound outside it, so neither is the command's chord.
+            Command::NewFile => "",
+            Command::NewFolder => "",
             Command::Undo => "Cmd+Z",
             Command::Redo => "Shift+Cmd+Z",
             Command::SelectAll => "Cmd+A",
             Command::CloseEditor => "Cmd+W",
             Command::ReopenClosedEditor => "Cmd+K Shift+W",
             Command::ZoxideJump => "Cmd+Z in Explorer",
+            // No chord: the tab menu's ⌥⌘T hint is iTerm2's own New Tab
+            // chord, which croft leaves alone.
+            Command::CloseOtherEditors => "",
+            Command::CloseEditorsToTheRight => "Cmd+K →",
+            Command::CloseSavedEditors => "Cmd+K U",
+            Command::CloseAllEditors => "Cmd+K W",
+            // One chord toggles, as VS Code's `Ctrl+K Shift+Enter` serves
+            // both through their `when` clauses.
+            Command::PinEditor => "Cmd+K P",
+            Command::UnpinEditor => "Cmd+K P",
+            Command::KeepEditor => "Cmd+K Shift+P",
             Command::SplitEditor => "Cmd+\\",
             Command::FocusLeftEditorGroup => "Cmd+Opt+←",
             Command::FocusRightEditorGroup => "Cmd+Opt+→",
@@ -1316,6 +1440,18 @@ impl Command {
             Command::ToggleSecondarySideBar => "Cmd+Opt+B",
             Command::ToggleZenMode => "Cmd+K Z",
             Command::ToggleTerminal => "Ctrl+J",
+            Command::ToggleActivityBar => "",
+            Command::ToggleStatusBar => "",
+            Command::ToggleSideBarPosition => "",
+            Command::SetPanelAlignment => "",
+            Command::SetQuickInputPosition => "",
+            Command::CustomizeLayout => "",
+            Command::FocusTerminal => "Cmd+Shift+T",
+            Command::ShowProblems => "Cmd+Shift+M",
+            Command::ShowOutput => "Cmd+Shift+U",
+            Command::OutputSelectChannel => "",
+            Command::ShowPorts => "",
+            Command::ShowCaptures => "",
             Command::ToggleMinimap => "Cmd+Opt+M",
             Command::ProblemsCheckProject => "",
             Command::ProblemsToggleProjectAuto => "",
@@ -1509,6 +1645,10 @@ impl Command {
             Command::FoldAllRegions => "fold_all_regions",
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
+            Command::SaveAs => "save_as",
+            Command::SaveAll => "save_all",
+            Command::NewFile => "new_file",
+            Command::NewFolder => "new_folder",
             Command::Undo => "undo",
             Command::Redo => "redo",
             Command::SelectAll => "select_all",
@@ -1529,6 +1669,13 @@ impl Command {
             Command::CloseEditor => "close_editor",
             Command::ReopenClosedEditor => "reopen_closed_editor",
             Command::ZoxideJump => "zoxide_jump",
+            Command::CloseOtherEditors => "close_other_editors",
+            Command::CloseEditorsToTheRight => "close_editors_to_the_right",
+            Command::CloseSavedEditors => "close_saved_editors",
+            Command::CloseAllEditors => "close_all_editors",
+            Command::PinEditor => "pin_editor",
+            Command::UnpinEditor => "unpin_editor",
+            Command::KeepEditor => "keep_editor",
             Command::SplitEditor => "split_editor",
             Command::FocusLeftEditorGroup => "focus_left_editor_group",
             Command::FocusRightEditorGroup => "focus_right_editor_group",
@@ -1659,6 +1806,18 @@ impl Command {
             Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
             Command::ToggleZenMode => "toggle_zen_mode",
             Command::ToggleTerminal => "toggle_terminal",
+            Command::ToggleActivityBar => "toggle_activity_bar",
+            Command::ToggleStatusBar => "toggle_status_bar",
+            Command::ToggleSideBarPosition => "toggle_side_bar_position",
+            Command::SetPanelAlignment => "set_panel_alignment",
+            Command::SetQuickInputPosition => "set_quick_input_position",
+            Command::CustomizeLayout => "customize_layout",
+            Command::FocusTerminal => "focus_terminal",
+            Command::ShowProblems => "show_problems",
+            Command::ShowOutput => "show_output",
+            Command::OutputSelectChannel => "output_select_channel",
+            Command::ShowPorts => "show_ports",
+            Command::ShowCaptures => "show_captures",
             Command::ToggleMinimap => "toggle_minimap",
             Command::ProblemsCheckProject => "problems_check_project",
             Command::ProblemsToggleProjectAuto => "problems_toggle_project_auto",
@@ -1767,6 +1926,20 @@ impl Command {
         }
     }
 
+    /// An extra word the palette matches this command on, beyond its
+    /// title: "layout" for the Customize Layout commands (#852), whose
+    /// VS Code names mostly don't say it, and the tab menu's "Keep Open"
+    /// for View: Keep Editor. Empty for the rest.
+    pub fn keyword(self) -> &'static str {
+        if LAYOUT_COMMANDS.contains(&self) {
+            "layout"
+        } else if self == Command::KeepEditor {
+            "keep open"
+        } else {
+            ""
+        }
+    }
+
     /// Resolve a `keybindings.json` command id back to its [`Command`]. Returns
     /// `None` for an unknown id so a typo in the user's config is ignored rather
     /// than fatal.
@@ -1872,6 +2045,11 @@ pub struct CommandPalette {
     /// separate from the built-in registry and merged into `results` on each
     /// re-rank.
     pub extensions: Vec<ExtensionCommand>,
+    /// Built-ins left out of the list because they do not apply right now,
+    /// VS Code's `when` clause for its palette (#852: Pin Editor on a pinned
+    /// tab). They stay commands: keybindings.json and the Keyboard
+    /// Shortcuts editor still reach them.
+    pub hidden: Vec<Command>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -1885,6 +2063,7 @@ impl CommandPalette {
             cursor: 0,
             results: Vec::new(),
             extensions: Vec::new(),
+            hidden: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -1898,6 +2077,15 @@ impl CommandPalette {
     /// then re-rank. Called by the app when opening the palette.
     pub fn set_extension_commands(&mut self, extensions: Vec<ExtensionCommand>) {
         self.extensions = extensions;
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Leave `hidden` out of the list (see [`CommandPalette::hidden`]),
+    /// then re-rank. Called by the app when opening the palette.
+    pub fn set_hidden(&mut self, hidden: Vec<Command>) {
+        self.hidden = hidden;
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
@@ -2005,7 +2193,8 @@ impl CommandPalette {
     }
 
     /// Re-rank the command list against the current query, over built-ins AND
-    /// injected extension commands. An empty query shows every command in
+    /// injected extension commands, less the `hidden` built-ins. An empty
+    /// query shows every command in
     /// declaration order (built-ins first, then extensions); otherwise rows are
     /// kept only when their lower-cased title fuzzy-matches the needle, ranked
     /// by score (best first), ties broken by declaration order for stability.
@@ -2013,6 +2202,7 @@ impl CommandPalette {
     fn refresh_results(&mut self) {
         let all: Vec<PaletteItem> = ALL_COMMANDS
             .iter()
+            .filter(|c| !self.hidden.contains(c))
             .map(|&c| PaletteItem::Builtin(c))
             .chain(self.extensions.iter().cloned().map(PaletteItem::Extension))
             .collect();
@@ -2033,7 +2223,17 @@ impl CommandPalette {
                 let local = (shown != title_lower)
                     .then(|| fuzzy_score(&needle, &shown, 0))
                     .flatten();
-                english.max(local).map(|score| (score, idx, item))
+                // A search word the title lacks, e.g. "layout" (#852).
+                let keyword = match &item {
+                    PaletteItem::Builtin(c) if !c.keyword().is_empty() => {
+                        fuzzy_score(&needle, c.keyword(), 0)
+                    }
+                    _ => None,
+                };
+                english
+                    .max(local)
+                    .max(keyword)
+                    .map(|score| (score, idx, item))
             })
             .collect();
         // Higher score first; equal scores keep declaration order.
@@ -2333,6 +2533,84 @@ mod tests {
         palette.select_next();
         palette.push_char('s');
         assert_eq!(palette.selected, 0);
+    }
+
+    /// #852 negative: the "layout" search word reaches the Customize Layout
+    /// commands only; an unrelated command whose title lacks the word is not
+    /// pulled in, and a title query still ranks by the title alone.
+    #[test]
+    fn the_layout_keyword_finds_only_the_layout_commands() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("layout");
+        for c in LAYOUT_COMMANDS {
+            assert!(palette.results.contains(&builtin(*c)), "{c:?}");
+        }
+        for c in [Command::SaveAll, Command::ShowProblems, Command::SaveFile] {
+            assert!(!palette.results.contains(&builtin(c)), "{c:?}");
+        }
+        palette.set_query("status bar");
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::ToggleStatusBar))
+        );
+        assert!(!palette.results.contains(&builtin(Command::ToggleZenMode)));
+    }
+
+    /// #852 (comment 3): each editor-tab action is in the palette under
+    /// VS Code's title, as the top row for that title, showing the chord
+    /// croft has for it (Close Others has none: the tab menu's ⌥⌘T is not a
+    /// chord croft binds).
+    #[test]
+    fn the_editor_tab_commands_are_found_under_their_vscode_titles() {
+        let mut palette = CommandPalette::new();
+        for (title, chord) in [
+            ("View: Close Other Editors in Group", ""),
+            ("View: Close Editors to the Right in Group", "Cmd+K →"),
+            ("View: Close Saved Editors in Group", "Cmd+K U"),
+            ("View: Close All Editors", "Cmd+K W"),
+            ("View: Pin Editor", "Cmd+K P"),
+            ("View: Unpin Editor", "Cmd+K P"),
+            ("View: Keep Editor", "Cmd+K Shift+P"),
+        ] {
+            palette.set_query(title);
+            let top = palette.results.first();
+            assert_eq!(
+                top.map(PaletteItem::title),
+                Some(title),
+                "the palette's top row for {title:?}"
+            );
+            assert_eq!(
+                top.map(PaletteItem::keybinding_hint),
+                Some(chord),
+                "{title:?}"
+            );
+        }
+    }
+
+    /// #852 (comment 3): the tab menu's own labels find the same commands,
+    /// so a query in the menu's words ("keep open") is not a dead end.
+    #[test]
+    fn the_tab_menu_labels_find_the_editor_tab_commands() {
+        let mut palette = CommandPalette::new();
+        for (label, title) in [
+            ("close others", "View: Close Other Editors in Group"),
+            (
+                "close to the right",
+                "View: Close Editors to the Right in Group",
+            ),
+            ("close saved", "View: Close Saved Editors in Group"),
+            ("close all", "View: Close All Editors"),
+            ("pin", "View: Pin Editor"),
+            ("unpin", "View: Unpin Editor"),
+            ("keep open", "View: Keep Editor"),
+        ] {
+            palette.set_query(label);
+            let titles: Vec<&str> = palette.results.iter().map(PaletteItem::title).collect();
+            assert!(
+                titles.contains(&title),
+                "{label:?} must find {title:?}; it found {titles:?}"
+            );
+        }
     }
 
     #[test]
