@@ -13606,6 +13606,43 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     );
 }
 
+/// #1336: finishing a conflicted `git revert` from Source Control commits
+/// git's whole message, "This reverts commit <sha>." included, as
+/// `git revert --continue` would.
+#[test]
+fn finishing_a_conflicted_revert_commits_gits_whole_message() {
+    let tmp = make_committed_repo();
+    let root = tmp.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    std::fs::write(root.join("seed.txt"), b"rate = 2\n").unwrap();
+    git(&["commit", "-qam", "Raise rate", "-m", "Body explaining why."]);
+    let reverted = git_stdout(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("seed.txt"), b"rate = 3\n").unwrap();
+    git(&["commit", "-qam", "Raise rate again"]);
+    let out = git(&["revert", "--no-edit", "HEAD~1"]);
+    assert!(
+        !out.status.success(),
+        "staging: the revert stops on a conflict"
+    );
+    std::fs::write(root.join("seed.txt"), b"rate = 1\n").unwrap();
+    git(&["add", "seed.txt"]);
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| !a.source_control.message.is_empty());
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let expected = format!("Revert \"Raise rate\"\n\nThis reverts commit {reverted}.");
+    assert_eq!(app.source_control.message, expected);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(last_commit_message(root), format!("{expected}\n\n"));
+}
+
 /// Shift+Enter and Alt+Enter start a new line; neither commits.
 #[test]
 fn shift_or_alt_enter_adds_a_line_instead_of_committing() {
