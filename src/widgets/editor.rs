@@ -4151,10 +4151,52 @@ impl Editor {
         self.content_cols();
     }
 
+    /// Go to Next / Previous Change in an editor tab (#1352): the first
+    /// line of the next (or previous) run of change-bar lines, wrapping at
+    /// either end as the diff view's F7 does. `None` when the file has no
+    /// change bars.
+    pub fn git_change_from(&mut self, row: usize, forward: bool) -> Option<usize> {
+        self.refresh_git_marks();
+        let mut lines: Vec<usize> = self.git_marks.keys().copied().collect();
+        lines.sort_unstable();
+        let starts: Vec<usize> = lines
+            .iter()
+            .copied()
+            .filter(|&l| l == 0 || !self.git_marks.contains_key(&(l - 1)))
+            .collect();
+        if forward {
+            starts
+                .iter()
+                .copied()
+                .find(|&s| s > row)
+                .or_else(|| starts.first().copied())
+        } else {
+            // From inside a run, "previous" is the run before this one.
+            let here = starts.iter().copied().rev().find(|&s| s <= row);
+            let from = match here {
+                Some(s) if self.git_marks.contains_key(&row) => s,
+                _ => row,
+            };
+            starts
+                .iter()
+                .copied()
+                .rev()
+                .find(|&s| s < from)
+                .or_else(|| starts.last().copied())
+        }
+    }
+
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
     /// last computed marks (call after a render, or after `refresh_git_marks`).
     pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
         self.git_marks.get(&line).copied()
+    }
+
+    /// `git_mark_at` after bringing the marks up to date with the buffer,
+    /// for callers outside the render pass that computes them.
+    pub fn current_git_mark_at(&mut self, line: usize) -> Option<GitMark> {
+        self.refresh_git_marks();
+        self.git_mark_at(line)
     }
 
     /// Soft-wrap mode: long lines fold onto multiple visual rows instead of

@@ -12611,6 +12611,153 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
+/// The issue's repo (#1352): `value_1`..`value_20` committed, then line 5
+/// changed to `value_FIVE` and line 9 deleted, open in an editor tab with
+/// its change bars computed.
+fn app_with_change_bars() -> (App, tempfile::TempDir) {
+    let tmp = make_committed_repo();
+    let root = tmp.path();
+    let f = root.join("v.txt");
+    let body: String = (1..=20).map(|i| format!("value_{i}\n")).collect();
+    std::fs::write(&f, &body).unwrap();
+    for args in [&["add", "v.txt"][..], &["commit", "-q", "-m", "values"]] {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    let edited: String = (1..=20)
+        .filter(|&i| i != 9)
+        .map(|i| {
+            if i == 5 {
+                String::from("value_FIVE\n")
+            } else {
+                format!("value_{i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&f, edited).unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.sync_git_gutters();
+    (app, tmp)
+}
+
+/// #1352: F7 in an editor tab walks its change bars (line 5, then the
+/// deletion boundary at line 9) and wraps; Shift+F7 goes back.
+#[test]
+fn next_change_in_the_editor_walks_the_change_bars_and_wraps() {
+    let (mut app, _t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    let f7 = |app: &mut App, m: KeyModifiers| {
+        app.handle_key(key(KeyCode::F(7), m)).unwrap();
+        app.editor.cursor_row
+    };
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 4);
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 8);
+    assert_eq!(f7(&mut app, KeyModifiers::NONE), 4, "wraps to the first");
+    assert_eq!(f7(&mut app, KeyModifiers::SHIFT), 8, "Shift+F7 wraps back");
+    assert_eq!(f7(&mut app, KeyModifiers::SHIFT), 4);
+}
+
+/// #1352: the palette's Go to Next/Previous Change run the same walk as
+/// F7, and VS Code's command ids import onto them.
+#[test]
+fn go_to_next_change_is_a_palette_command() {
+    use crate::widgets::command_palette::Command;
+    let (mut app, _t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    app.run_command(Command::from_id("next_change").expect("next_change id"));
+    assert_eq!(app.editor.cursor_row, 4);
+    app.run_command(Command::from_id("previous_change").expect("previous_change id"));
+    assert_eq!(app.editor.cursor_row, 8, "wraps back to the last change");
+    let mut report = crate::import_vscode::Report::default();
+    crate::import_vscode::convert_keybindings(
+        &serde_json::json!([
+            { "key": "alt+f5", "command": "workbench.action.editor.nextChange" }
+        ]),
+        &mut report,
+    );
+    assert!(
+        report.keybindings.iter().any(|(_, c)| c == "next_change"),
+        "{:?}",
+        report.keybindings
+    );
+}
+
+/// #1352: Git: Revert Hunk with the caret on line 5 of an editor tab
+/// restores `value_5`, in the file and the tab, and leaves line 9's
+/// deletion alone.
+#[test]
+fn revert_hunk_in_the_editor_restores_the_head_lines() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::RevertHunk);
+    assert!(app.pending_revert_hunk.is_some(), "{}", app.status);
+    app.confirm_pending_revert_hunk();
+    let disk = std::fs::read_to_string(t.path().join("v.txt")).unwrap();
+    assert!(
+        disk.contains("value_5\n") && !disk.contains("value_FIVE"),
+        "{disk}"
+    );
+    assert!(!disk.contains("value_9\n"), "the other hunk stays");
+    assert_eq!(
+        app.editor.lines[4], "value_5",
+        "the tab shows the reverted text"
+    );
+}
+
+/// #1352: Git: Stage Hunk from an editor tab stages only that hunk.
+#[test]
+fn stage_hunk_in_the_editor_stages_only_that_hunk() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.run_command(crate::widgets::command_palette::Command::StageHunk);
+    let staged = git_stdout(t.path(), &["diff", "--cached"]);
+    assert!(staged.contains("+value_FIVE"), "{staged}\n{}", app.status);
+    assert!(!staged.contains("-value_9"), "{staged}");
+    let unstaged = git_stdout(t.path(), &["diff"]);
+    assert!(unstaged.contains("-value_9"), "{unstaged}");
+}
+
+/// #1352 negative: with unsaved edits the hunk actions refuse, since they
+/// work on the file on disk, and say to save first.
+#[test]
+fn hunk_actions_in_the_editor_refuse_a_dirty_buffer() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 4;
+    app.editor.insert_str("x");
+    app.run_command(crate::widgets::command_palette::Command::RevertHunk);
+    assert!(app.pending_revert_hunk.is_none());
+    assert!(app.status.contains("Save"), "{}", app.status);
+    assert!(
+        std::fs::read_to_string(t.path().join("v.txt"))
+            .unwrap()
+            .contains("value_FIVE")
+    );
+}
+
+/// #1352 negative: on an unchanged line there is no hunk to act on, and
+/// F7 in a file with no changes leaves the caret where it is.
+#[test]
+fn an_unchanged_line_has_no_hunk_and_a_clean_file_no_next_change() {
+    let (mut app, t) = app_with_change_bars();
+    app.editor.cursor_row = 0;
+    app.run_command(crate::widgets::command_palette::Command::StageHunk);
+    assert!(app.status.contains("No change"), "{}", app.status);
+    assert_eq!(git_stdout(t.path(), &["diff", "--cached"]), "");
+    app.editor.open_pinned(&t.path().join("seed.txt")).unwrap();
+    app.sync_git_gutters();
+    app.editor.cursor_row = 0;
+    app.handle_key(key(KeyCode::F(7), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 0);
+}
+
 #[test]
 fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
     use crate::widgets::input_prompt::InputPurpose;

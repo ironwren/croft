@@ -203,6 +203,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("explorer.newFolder", "new_folder"),
     ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
+    ("workbench.action.editor.nextChange", "next_change"),
+    ("workbench.action.editor.previousChange", "previous_change"),
     ("workbench.action.gotoSymbol", "go_to_symbol"),
     ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
     ("workbench.action.closeActiveEditor", "close_editor"),
