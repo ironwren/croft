@@ -351,8 +351,8 @@ pub struct Prefs {
     #[serde(default)]
     pub terminal_scrollback: usize,
     /// Memory, in megabytes, that terminal rewind (#357) may hold across ALL
-    /// panes together (#694). Unset means 128 locally and 32 on a remote
-    /// host; `0` turns rewind recording off. Applies from the next pane
+    /// panes together (#694). Unset or `0` records nothing: no Session:
+    /// Rewind exists yet to show it (#1342). Applies from the next pane
     /// opened, and re-splits the budget across the panes already open.
     #[serde(default)]
     pub terminal_rewind_mb: Option<usize>,
