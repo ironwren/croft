@@ -97,7 +97,7 @@ pub fn extension_is_doc(ext: &str) -> bool {
 /// Escape markdown metacharacters in document text (#200 review): the
 /// walker SYNTHESISES markdown, so literal #, -, *, _, |, etc. in the
 /// document must not become structure.
-fn md_escape(text: &str) -> String {
+pub(crate) fn md_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(
