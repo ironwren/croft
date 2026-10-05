@@ -433,24 +433,32 @@ pub fn sanitize_extension(raw: &str) -> Option<String> {
 /// The test is deliberately strict (every one of the first lines must
 /// carry the SAME non-zero count of the delimiter) because the cost of a
 /// false positive (prose opening in a grid) is worse than the cost of a
-/// false negative (a `--as csv` away).
+/// false negative (a `--as csv` away). Fields are counted per record with
+/// CSV's quoting rules, so a quoted comma (`"Doe, John"`, `"1,200"`) or a
+/// quoted line break is part of its field, not a column (#1217); TSV has no
+/// quoting, so its tabs are counted as written.
 pub fn looks_delimited(bytes: &[u8]) -> Option<&'static str> {
     if bytes.contains(&0) {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(8)
-        .collect();
-    // One line is a sentence, not a table: a header alone tells us nothing.
-    if lines.len() < 2 {
-        return None;
-    }
-    for (delim, ext) in [(',', "csv"), ('\t', "tsv")] {
-        let first = lines[0].matches(delim).count();
-        if first > 0 && lines.iter().all(|l| l.matches(delim).count() == first) {
+    std::str::from_utf8(bytes).ok()?;
+    for (delim, quoting, ext) in [(b',', true, "csv"), (b'\t', false, "tsv")] {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .delimiter(delim)
+            .quoting(quoting)
+            .from_reader(bytes);
+        let widths: Vec<usize> = reader
+            .records()
+            .map_while(Result::ok)
+            .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
+            .take(8)
+            .map(|r| r.len())
+            .collect();
+        // One record is a sentence, not a table: a header alone tells us
+        // nothing.
+        if widths.len() >= 2 && widths[0] > 1 && widths.iter().all(|&w| w == widths[0]) {
             return Some(ext);
         }
     }
@@ -1084,6 +1092,34 @@ mod tests {
             None,
             "the eighth row is INSIDE the window, so it must reject the sniff"
         );
+    }
+
+    /// A quoted field holding a comma is one field, so piped CSV with names
+    /// or thousands separators still opens in the grid (#1217).
+    #[test]
+    fn a_quoted_comma_is_part_of_its_field_in_the_sniff() {
+        assert_eq!(looks_delimited(b"\"Doe, John\",42\nRoe,7\n"), Some("csv"));
+        let data = b"name,qty,price\nwidget,3,9.99\ngadget,10,1.50\n\"comma, inc\",1,100\n";
+        assert_eq!(looks_delimited(data), Some("csv"));
+        // A quoted line break stays inside its record too.
+        assert_eq!(
+            looks_delimited(b"note,id\n\"two\nlines\",1\nok,2\n"),
+            Some("csv")
+        );
+    }
+
+    /// Negative: prose with commas is still not a table, a quoted comma
+    /// doesn't paper over a row that really has a column too many, and a
+    /// tab inside quotes still counts for TSV, which has no quoting.
+    #[test]
+    fn prose_and_ragged_rows_are_still_not_a_table() {
+        assert_eq!(
+            looks_delimited(b"Hello, world.\nThis is prose, really, honestly.\n"),
+            None
+        );
+        assert_eq!(looks_delimited(b"a,b\n\"x, y\",1,2\n"), None);
+        assert_eq!(looks_delimited(b"a\tb\n\"x\ty\"\t1\n"), None);
+        assert_eq!(looks_delimited(b"a\tb\nx\t1\n"), Some("tsv"));
     }
 
     #[test]
