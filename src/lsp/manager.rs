@@ -175,6 +175,12 @@ pub struct OutlineSymbol {
     pub character: u32,
     pub range_start_line: u32,
     pub range_end_line: u32,
+    /// The construct's start column on `range_start_line` and end column on
+    /// `range_end_line` (#1221), so symbols sharing a line (a one-line
+    /// interface's fields, a minified bundle's functions) are told apart.
+    /// `0` / `u32::MAX` when only the lines are known.
+    pub range_start_character: u32,
+    pub range_end_character: u32,
 }
 
 /// The Outline for one document. Keyed by `path` (the latest batch wins, like
@@ -6579,6 +6585,8 @@ fn flatten_symbols(resp: DocumentSymbolResponse) -> Vec<OutlineSymbol> {
                         character: start.character,
                         range_start_line: info.location.range.start.line,
                         range_end_line: info.location.range.end.line,
+                        range_start_character: info.location.range.start.character,
+                        range_end_character: info.location.range.end.character,
                     }
                 })
                 .collect();
@@ -6599,6 +6607,8 @@ fn push_nested(syms: &[DocumentSymbol], depth: u16, out: &mut Vec<OutlineSymbol>
             character: sym.selection_range.start.character,
             range_start_line: sym.range.start.line,
             range_end_line: sym.range.end.line,
+            range_start_character: sym.range.start.character,
+            range_end_character: sym.range.end.character,
         });
         if let Some(children) = &sym.children {
             push_nested(children, depth + 1, out);

@@ -3429,6 +3429,8 @@ fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
             character: 0,
             range_start_line: i,
             range_end_line: i,
+            range_start_character: 0,
+            range_end_character: u32::MAX,
         })
         .collect();
     app.outline.set_symbols(f.clone(), syms);
@@ -23759,6 +23761,8 @@ fn outline_sym(
         character: 0,
         range_start_line: start,
         range_end_line: end,
+        range_start_character: 0,
+        range_end_character: u32::MAX,
     }
 }
 
@@ -27921,6 +27925,8 @@ fn sym(
         character: 0,
         range_start_line: start,
         range_end_line: end,
+        range_start_character: 0,
+        range_end_character: u32::MAX,
     }
 }
 
@@ -27933,14 +27939,77 @@ fn breadcrumb_symbol_chain_returns_enclosing_symbols_outermost_first() {
         sym("paint", OutlineKind::Method, 1, 10, 18),
     ];
     // Caret on line 4 sits inside Widget::build.
-    let chain = breadcrumb_symbol_chain(&symbols, 4);
+    let chain = breadcrumb_symbol_chain(&symbols, 4, 0);
     assert_eq!(chain, vec![0, 1], "outermost (Widget) then inner (build)");
     // Caret on line 15 sits inside Widget::paint.
-    assert_eq!(breadcrumb_symbol_chain(&symbols, 15), vec![0, 2]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 15, 0), vec![0, 2]);
     // Caret on line 0 (the class header) is inside the class only.
-    assert_eq!(breadcrumb_symbol_chain(&symbols, 0), vec![0]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0, 0), vec![0]);
     // Caret past every symbol has no scope chain.
-    assert!(breadcrumb_symbol_chain(&symbols, 30).is_empty());
+    assert!(breadcrumb_symbol_chain(&symbols, 30, 0).is_empty());
+}
+
+/// An outline symbol spanning `(line, col)` to `(line, col)`.
+fn sym_span(
+    name: &str,
+    depth: u16,
+    start: (u32, u32),
+    end: (u32, u32),
+) -> crate::lsp::manager::OutlineSymbol {
+    crate::lsp::manager::OutlineSymbol {
+        range_start_character: start.1,
+        range_end_character: end.1,
+        character: start.1,
+        ..sym(
+            name,
+            crate::lsp::manager::OutlineKind::Field,
+            depth,
+            start.0,
+            end.0,
+        )
+    }
+}
+
+/// #1221: symbols that share a line are siblings, not a nesting chain. On
+/// `export interface Item { id: number; cents: number }` the caret at
+/// `export` is in `Item` only, and on `cents` in `Item` then `cents`.
+#[test]
+fn breadcrumb_chain_tells_siblings_on_one_line_apart() {
+    // export interface Item { id: number; cents: number }
+    // 0      7         17   22 24         36             51
+    let symbols = vec![
+        sym_span("Item", 0, (0, 0), (0, 51)),
+        sym_span("id", 1, (0, 24), (0, 35)),
+        sym_span("cents", 1, (0, 36), (0, 50)),
+    ];
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0, 0), vec![0]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0, 40), vec![0, 2]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0, 26), vec![0, 1]);
+    // A minified bundle: three functions on one line, the caret in the
+    // second, is in the second only.
+    let symbols = vec![
+        sym_span("f0", 0, (0, 0), (0, 30)),
+        sym_span("f1", 0, (0, 31), (0, 61)),
+        sym_span("f2", 0, (0, 62), (0, 92)),
+    ];
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 0, 40), vec![1]);
+    assert!(breadcrumb_symbol_chain(&symbols, 1, 0).is_empty());
+}
+
+/// Negative (#1221): multi-line scopes still chain by line. Inside a
+/// method's body, at any column, the chain is the class then the method;
+/// on the method's first line before it starts, only the class.
+#[test]
+fn breadcrumb_chain_still_nests_multi_line_scopes() {
+    let symbols = vec![
+        sym_span("Cart", 0, (11, 0), (20, 1)),
+        sym_span("total", 1, (16, 2), (18, 3)),
+    ];
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 17, 0), vec![0, 1]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 17, 40), vec![0, 1]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 16, 0), vec![0]);
+    assert_eq!(breadcrumb_symbol_chain(&symbols, 16, 2), vec![0, 1]);
+    assert!(breadcrumb_symbol_chain(&symbols, 21, 0).is_empty());
 }
 
 #[test]
@@ -28584,6 +28653,8 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
         character: 3,
         range_start_line: 0,
         range_end_line: 0, // ranges from an older buffer: caret now outside
+        range_start_character: 0,
+        range_end_character: u32::MAX,
     };
     let applied = app.apply_outline_symbols(file.clone(), 3, vec![stale_symbol.clone()]);
     assert!(

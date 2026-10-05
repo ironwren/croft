@@ -10693,7 +10693,11 @@ impl App {
                 .as_ref()
                 .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let symbols = self.outline.symbols();
-            for i in breadcrumb_symbol_chain(symbols, line) {
+            let col = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
+            for i in breadcrumb_symbol_chain(symbols, line, col) {
                 let s = &symbols[i];
                 crumbs.push(Crumb {
                     label: s.name.clone(),
@@ -10720,7 +10724,7 @@ impl App {
         }
         let top = self.editor.scroll as u32;
         let symbols = self.outline.symbols();
-        breadcrumb_symbol_chain(symbols, top)
+        breadcrumb_symbol_chain(symbols, top, 0)
             .into_iter()
             .map(|i| symbols[i].range_start_line)
             .filter(|&l| l < top)
@@ -64790,28 +64794,31 @@ fn outline_parses_inline(lines: &[String]) -> bool {
         .is_some()
 }
 
-/// The breadcrumb scope chain for `line`: the indices of every outline symbol
-/// whose range encloses the caret line, ordered outermost first (the enclosing
-/// class before the method inside it). Sibling symbols never overlap, so the
-/// enclosing symbols form a single nesting chain and ordering by decreasing
-/// span puts the outermost first.
+/// The breadcrumb scope chain for the caret at (`line`, `col`): the indices
+/// of every outline symbol whose range encloses that position, ordered
+/// outermost first (the enclosing class before the method inside it).
+/// Columns count (#1221): symbols sharing a line, such as a one-line
+/// interface's fields or a minified bundle's functions, are siblings, and
+/// only the one the caret is in belongs to the chain. Enclosing ranges nest,
+/// so the earliest start (then the latest end) is the outermost.
 fn breadcrumb_symbol_chain(
     symbols: &[crate::lsp::manager::OutlineSymbol],
     line: u32,
+    col: u32,
 ) -> Vec<usize> {
+    let start =
+        |s: &crate::lsp::manager::OutlineSymbol| (s.range_start_line, s.range_start_character);
+    let end = |s: &crate::lsp::manager::OutlineSymbol| (s.range_end_line, s.range_end_character);
     let mut hits: Vec<usize> = symbols
         .iter()
         .enumerate()
-        .filter(|(_, s)| line >= s.range_start_line && line <= s.range_end_line)
+        .filter(|(_, s)| start(s) <= (line, col) && (line, col) <= end(s))
         .map(|(i, _)| i)
         .collect();
     hits.sort_by(|&a, &b| {
-        let span = |i: usize| symbols[i].range_end_line - symbols[i].range_start_line;
-        span(b).cmp(&span(a)).then(
-            symbols[a]
-                .range_start_line
-                .cmp(&symbols[b].range_start_line),
-        )
+        start(&symbols[a])
+            .cmp(&start(&symbols[b]))
+            .then(end(&symbols[b]).cmp(&end(&symbols[a])))
     });
     hits
 }
