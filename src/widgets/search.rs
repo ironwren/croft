@@ -214,8 +214,6 @@ struct HitSink<'a> {
     matcher: &'a RegexMatcher,
     batch: &'a mut Vec<SearchHit>,
     cancel: Option<Arc<AtomicBool>>,
-    /// The search's own matcher, to count each line's occurrences.
-    matcher: &'a RegexMatcher,
 }
 
 impl<'a> Sink for HitSink<'a> {
@@ -371,7 +369,6 @@ pub fn search_workspace_streaming_filtered<F>(
                     matcher: &matcher,
                     batch: &mut batch,
                     cancel: Some(cancel.clone()),
-                    matcher: &matcher,
                 };
                 let mut searcher = build_searcher();
                 let _ = searcher.search_path(&matcher, path, &mut sink);
@@ -755,7 +752,6 @@ pub fn collect_matches_in_text(
         matcher: &matcher,
         batch: out,
         cancel: None,
-        matcher: &matcher,
     };
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
