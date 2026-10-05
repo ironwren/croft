@@ -2,16 +2,16 @@ name: tag
 
 # Every merge to main gets a tag (#1091).
 #
-# The release-hygiene gate in ci.yml already makes every merge that changes
-# what ships bump the version in Cargo.toml, so the version at the merge
-# commit names that binary. This job turns it into `v<version>` on that commit
-# and starts release.yml for it, so a merged version is a published release
-# rather than a number waiting for someone to remember to cut it.
+# version-bump.yml folds every merge's pending release notes into a
+# `chore: release <version>` commit on main, so the version at that commit
+# names the binary it ships. This job turns it into `v<version>` on that commit
+# and starts release.yml for it, so a released version is published rather
+# than a number waiting for someone to remember to cut it.
 #
-# A merge that ships nothing (docs, CI, tests) keeps the previous version, and
-# that version's tag already exists on the commit that introduced it. Moving
-# it would change what a published release points at, so such a merge is
-# reported and left alone.
+# Any other push to main (the merge itself, or one that ships nothing) still
+# carries the previous version, and that version's tag already exists on the
+# commit that introduced it. Moving it would change what a published release
+# points at, so such a push is reported and left alone.
 
 on:
   push:
