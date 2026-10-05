@@ -398,7 +398,7 @@ CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx
 |------|--------|
 | `↑` / `↓` / `←` / `→` | Move the cell cursor (viewport follows) |
 | `PageUp` / `PageDown` | Move a full viewport vertically |
-| `Home` / `End` | First / last column; with `Cmd`/`Ctrl` also first / last row |
+| `Home` / `End` | First / last column; with `Cmd`/`Ctrl` also first / last row (in a SQLite table, of the whole table: its first or last 500-row page is loaded) |
 | Type a character | Start editing the cell, REPLACING its value (spreadsheet convention) |
 | `Enter` / `F2` | Edit the cell in place (caret at the end) |
 | `Enter` (while editing) | Commit and move down; `Tab` commits and moves right; `Esc` cancels |

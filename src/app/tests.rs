@@ -259,6 +259,93 @@ fn sqlite_pages_step_at_batch_boundaries() {
     );
 }
 
+/// A database with one table `t` of `n` rows holding 1..=n.
+fn sqlite_table_of(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
+    let p = dir.join("big.db");
+    let conn = rusqlite::Connection::open(&p).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (n INTEGER); WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+         SELECT x+1 FROM c WHERE x < {n}) INSERT INTO t SELECT x FROM c;"
+    ))
+    .unwrap();
+    p
+}
+
+/// #1222: Ctrl+End in a SQLite table goes to the table's last row, not the
+/// last row of the loaded batch, and Ctrl+Home comes back to the first.
+#[test]
+fn ctrl_end_in_a_sqlite_table_reaches_its_last_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = sqlite_table_of(tmp.path(), 2 * crate::sqlite_view::ROW_CAP + 7);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::CONTROL));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert!(data.name.ends_with("rows 1001-1007"), "{}", data.name);
+    assert_eq!(data.cell(data.cur_row, data.cur_col), "1007");
+    app.handle_sheet_key(key(KeyCode::Home, KeyModifiers::CONTROL));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert!(
+        data.name.contains("rows 1-500, more follow"),
+        "{}",
+        data.name
+    );
+    assert_eq!(data.cell(data.cur_row, data.cur_col), "1");
+    // PageUp at the top of the last page still steps back one page.
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::CONTROL));
+    let view = app.editor.sheet.as_mut().unwrap();
+    assert_eq!(view.sqlite_pages[0].1, 2, "the page index follows the jump");
+    (view.sheets[0].cur_row, view.sheets[0].scroll_row) = (0, 0);
+    app.handle_sheet_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert!(data.name.contains("rows 501-1000"), "{}", data.name);
+}
+
+/// #1222: a batch's rows are numbered by their place in the table, so
+/// the grid says where in the table you are.
+#[test]
+fn sqlite_rows_are_numbered_by_their_place_in_the_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = sqlite_table_of(tmp.path(), 2 * crate::sqlite_view::ROW_CAP + 7);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::CONTROL));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let dump: String = (0..buf.area.height)
+        .map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row + "\n"
+        })
+        .collect();
+    assert!(
+        dump.contains(" 1007 ") && dump.contains("rows 1001–1007"),
+        "{dump}"
+    );
+}
+
+/// Negative (#1222): a table that fits in one batch, and a CSV, keep
+/// Ctrl+End within what is loaded, numbered from 1.
+#[test]
+fn ctrl_end_in_a_one_batch_table_or_a_csv_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = sqlite_table_of(tmp.path(), 7);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::CONTROL));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!(data.name, "t: 7 rows");
+    assert_eq!(data.cell(data.cur_row, data.cur_col), "7");
+    let csv = tmp.path().join("s.csv");
+    std::fs::write(&csv, "a,b\n1,2\n3,4\n").unwrap();
+    app.editor.open(&csv).unwrap();
+    app.handle_sheet_key(key(KeyCode::End, KeyModifiers::CONTROL));
+    let data = &app.editor.sheet.as_ref().unwrap().sheets[0];
+    assert_eq!((data.cur_row, data.cur_col), (1, 1));
+    assert_eq!(data.row_base, 0);
+}
+
 #[test]
 fn media_file_opens_as_an_info_card_and_save_refuses() {
     // #183: a WAV opens as the rendered info card (duration, rates), a
