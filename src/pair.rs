@@ -1692,7 +1692,7 @@ fn pump_session(state: &Mutex<PairState>, sink: &TurnSink, req_id: &AtomicU64) {
         let events = st.session.poll(|_| None);
         for event in events {
             match event {
-                CollabEvent::RemoteEdit { file, spans } => {
+                CollabEvent::RemoteEdit { file, spans, .. } => {
                     if let Some(r) = st.region.as_mut()
                         && r.file == file
                     {

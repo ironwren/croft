@@ -35201,12 +35201,25 @@ impl App {
         // land in a real buffer that saves, auto-saves, and reloads through
         // the one code path.
         let events = session.poll(|file| self.owner_buffer_text(&root, file));
+        // One undo step per author per file per tick (#1207): a peer's edit
+        // reaches us as one op per changed run, and undoing them run by run
+        // walked through texts nobody ever wrote.
+        let mut tick_groups: std::collections::HashMap<(String, u64), u64> =
+            std::collections::HashMap::new();
         for event in events {
             changed = true;
             match event {
-                CollabEvent::RemoteEdit { file, spans } => {
+                CollabEvent::RemoteEdit { file, site, spans } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
-                    self.apply_collab_spans(&root, &file, &spans, doc_gen);
+                    // An AI stream's fragments span many ticks; the whole
+                    // stream is one step, as its cancel already is.
+                    let group = match self.collab_stream.as_ref() {
+                        Some(st) if st.file == file && st.site == site => st.undo_group,
+                        _ => *tick_groups
+                            .entry((file.clone(), site))
+                            .or_insert_with(next_remote_undo_group),
+                    };
+                    self.apply_collab_spans(&root, &file, &spans, doc_gen, group);
                 }
                 CollabEvent::Bootstrapped { file, text } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
@@ -35293,7 +35306,24 @@ impl App {
                     // Truncate like caret names: a badge can never paint a
                     // whole status row.
                     let name: String = name.chars().take(24).collect();
-                    self.collab_stream = active.then_some(CollabStreamInfo { file, name, site });
+                    let same = |st: &CollabStreamInfo| st.file == file && st.site == site;
+                    let previous = self.collab_stream.take();
+                    let undo_group = match &previous {
+                        Some(st) if active && same(st) => st.undo_group,
+                        _ => next_remote_undo_group(),
+                    };
+                    // A stream that ended (or gave way to another) closes
+                    // its undo step; one whose cancel restored the text
+                    // leaves none.
+                    if let Some(st) = previous.filter(|st| !(active && same(st))) {
+                        self.end_collab_undo_group(&root, &st.file, st.undo_group);
+                    }
+                    self.collab_stream = active.then_some(CollabStreamInfo {
+                        file,
+                        name,
+                        site,
+                        undo_group,
+                    });
                 }
                 // The cancel request is for the streaming pilot, not for
                 // viewers; the badge clears via StreamState(inactive).
@@ -35535,12 +35565,31 @@ impl App {
     /// are valid in each); a never-attached pane still holds stale disk
     /// text where the offsets would splice garbage — the attach pass seeds
     /// it from the doc instead.
+    /// Close a remote undo group in every text tab of `file` (#1207).
+    fn end_collab_undo_group(&mut self, root: &Path, file: &str, group: u64) {
+        let Some(path) = crate::collab::contained_path(root, file) else {
+            return;
+        };
+        let groups = self.editor_layout.inactive_groups_mut();
+        for ed in self
+            .editor
+            .editors
+            .iter_mut()
+            .chain(groups.into_iter().flat_map(|g| g.editors.iter_mut()))
+        {
+            if ed.path.as_deref() == Some(path.as_path()) && !ed.has_non_text_view() {
+                ed.end_remote_undo_group(group);
+            }
+        }
+    }
+
     fn apply_collab_spans(
         &mut self,
         root: &Path,
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
         doc_gen: u64,
+        undo_group: u64,
     ) {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
@@ -35560,12 +35609,15 @@ impl App {
             for s in spans {
                 let (sr, sc) = crate::collab::position(&ed.lines, s.at);
                 let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
-                ed.apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
-                    start: (sr, sc),
-                    end: (er, ec),
-                    new_text: s.inserted.clone(),
-                    utf16: false,
-                }]);
+                ed.apply_remote_span_edits(
+                    &[crate::widgets::editor::TextSpanEdit {
+                        start: (sr, sc),
+                        end: (er, ec),
+                        new_text: s.inserted.clone(),
+                        utf16: false,
+                    }],
+                    undo_group,
+                );
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
             // re-arm the tick diff and rebroadcast what was just applied.
@@ -67842,6 +67894,16 @@ struct CollabStreamInfo {
     file: String,
     name: String,
     site: u64,
+    /// The undo group the stream's edits share (#1207), so the whole
+    /// stream undoes in one step.
+    undo_group: u64,
+}
+
+/// A fresh remote undo group id (#1207), unique for the process.
+fn next_remote_undo_group() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The name this participant broadcasts on its carets: `CROFT_COLLAB_NAME`

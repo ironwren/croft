@@ -2811,6 +2811,10 @@ pub struct Editor {
     /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
     redo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
+    /// The group of the remote edit that opened the undo step on top of
+    /// the stack (#1207): further remote spans of that group join the step
+    /// instead of opening their own. Any other edit, undo or redo ends it.
+    remote_undo_group: Option<u64>,
     lang: Option<LangKind>,
     /// Explicit indentation preference set from the status-bar pill. `None`
     /// falls back to the language default (2 spaces for YAML, 4 otherwise);
@@ -3205,6 +3209,7 @@ impl Editor {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
+            remote_undo_group: None,
             lang: None,
             indent_override: None,
             detected_indent: None,
@@ -7018,17 +7023,47 @@ impl Editor {
     /// marking the tab dirty (the user saves to persist). Returns the number
     /// of edits applied.
     pub fn apply_span_edits(&mut self, edits: &[TextSpanEdit]) -> usize {
+        self.apply_span_edits_grouped(edits, None)
+    }
+
+    /// [`Self::apply_span_edits`] for text a collab peer wrote (#1207). Every
+    /// call with the same `group` lands in one undo step while nothing else
+    /// edits the buffer in between: the runs of one peer edit, which arrive
+    /// one span at a time, and the fragments of one AI stream. Undo then
+    /// restores the text from before the group, never a mix of halves.
+    pub fn apply_remote_span_edits(&mut self, edits: &[TextSpanEdit], group: u64) -> usize {
+        self.apply_span_edits_grouped(edits, Some(group))
+    }
+
+    fn apply_span_edits_grouped(&mut self, edits: &[TextSpanEdit], group: Option<u64>) -> usize {
         if edits.is_empty() {
             return 0;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
         n
+    }
+
+    /// Close a remote edit group (#1207): later spans open a new undo step,
+    /// and a group that left the text as it found it (a cancelled AI stream
+    /// whose revert undid every fragment) leaves no step behind.
+    pub fn end_remote_undo_group(&mut self, group: u64) {
+        if self.remote_undo_group != Some(group) {
+            return;
+        }
+        self.remote_undo_group = None;
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|s| s.lines == self.lines)
+        {
+            self.undo_stack.pop();
+        }
     }
 
     /// The buffer's active indentation style, in precedence order: the
@@ -9016,6 +9051,12 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        self.push_undo_step(kind, None);
+    }
+
+    /// [`Self::push_undo`], joining the open step when `group` is the remote
+    /// edit group that opened it (#1207).
+    fn push_undo_step(&mut self, kind: EditKind, group: Option<u64>) {
         // The pre-edit text, for bookmarks to be diffed against afterwards.
         self.seed_bookmark_shadow();
         // Where the edit about to happen begins — the linked-editing
@@ -9024,8 +9065,10 @@ impl Editor {
         // Where the edit about to happen begins — the merge editor's
         // region tracker reads this when it reconciles (#253).
         self.merge_edit_row = self.cursor_row;
-        let coalesce =
-            kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
+        let coalesce = (kind == EditKind::InsertChar
+            && self.last_edit_kind == Some(EditKind::InsertChar))
+            || (group.is_some() && group == self.remote_undo_group && !self.undo_stack.is_empty());
+        self.remote_undo_group = group;
         if !coalesce {
             self.undo_stack.push(self.snapshot());
             self.trim_undo_stack();
@@ -9044,6 +9087,7 @@ impl Editor {
         let Some(snap) = self.undo_stack.pop() else {
             return false;
         };
+        self.remote_undo_group = None;
         // Stash the pre-undo state so `redo` can reinstate it.
         self.redo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
@@ -9058,6 +9102,7 @@ impl Editor {
         let Some(snap) = self.redo_stack.pop() else {
             return false;
         };
+        self.remote_undo_group = None;
         self.undo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
         self.undo_step_id = next_undo_step_id();
@@ -21714,6 +21759,98 @@ mod tests {
         }];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 1);
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
+    }
+
+    /// An insert of `text` at the end of row 0, as a remote span.
+    fn append_span(e: &Editor, text: &str) -> TextSpanEdit {
+        let col = e.lines[0].chars().count();
+        TextSpanEdit {
+            start: (0, col),
+            end: (0, col),
+            new_text: text.to_string(),
+            utf16: false,
+        }
+    }
+
+    /// #1207: every span of one remote group (the runs of a peer's edit,
+    /// the fragments of an AI stream) is one undo step.
+    #[test]
+    fn remote_spans_of_one_group_undo_as_one_step() {
+        let mut e = editor_with("def add(a, b):");
+        for frag in [" return", " a", " +", " b"] {
+            let span = append_span(&e, frag);
+            e.apply_remote_span_edits(&[span], 5);
+        }
+        assert_eq!(e.lines[0], "def add(a, b): return a + b");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines[0], "def add(a, b):",
+            "one undo drops the whole group"
+        );
+        assert!(!e.undo(), "and it was the only step");
+        assert!(e.redo());
+        assert_eq!(e.lines[0], "def add(a, b): return a + b");
+    }
+
+    /// Negative (#1207): another group, a local keystroke in between, or
+    /// ungrouped span edits still open steps of their own.
+    #[test]
+    fn a_local_edit_or_another_group_splits_remote_steps() {
+        let mut e = editor_with("x");
+        let span = append_span(&e, "1");
+        e.apply_remote_span_edits(&[span], 5);
+        let span = append_span(&e, "2");
+        e.apply_remote_span_edits(&[span], 6);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('3');
+        let span = append_span(&e, "4");
+        e.apply_remote_span_edits(&[span], 6);
+        for _ in 0..2 {
+            let span = append_span(&e, "5");
+            e.apply_span_edits(&[span]);
+        }
+        let mut seen = vec![e.lines[0].clone()];
+        while e.undo() {
+            seen.push(e.lines[0].clone());
+        }
+        assert_eq!(
+            seen,
+            ["x123455", "x12345", "x1234", "x123", "x12", "x1", "x"]
+        );
+    }
+
+    /// #1207: a group whose edits restored the text it started from (a
+    /// cancelled stream's revert) leaves no undo step once it ends; one
+    /// that changed the text keeps its step.
+    #[test]
+    fn an_ended_group_that_restored_its_text_leaves_no_step() {
+        let mut e = editor_with("return a - b");
+        let span = append_span(&e, "\n    raise TypeError(");
+        e.apply_remote_span_edits(&[span], 7);
+        let len = e.lines[1].chars().count();
+        let revert = TextSpanEdit {
+            start: (0, 12),
+            end: (1, len),
+            new_text: String::new(),
+            utf16: false,
+        };
+        e.apply_remote_span_edits(&[revert], 7);
+        assert_eq!(e.lines, vec!["return a - b".to_string()]);
+        e.end_remote_undo_group(7);
+        assert!(
+            !e.undo(),
+            "nothing to undo: the stream left the text as it was"
+        );
+
+        let span = append_span(&e, " + c");
+        e.apply_remote_span_edits(&[span], 8);
+        e.end_remote_undo_group(8);
+        let span = append_span(&e, " + d");
+        e.apply_remote_span_edits(&[span], 8);
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "return a - b");
     }
 
     #[test]

@@ -33683,6 +33683,7 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
         file: "f.txt".into(),
         name: "pilot".into(),
         site: 7,
+        undo_group: 0,
     });
     assert_eq!(app.stream_stop_row(), Some(app.editor.scroll));
 
@@ -35393,6 +35394,160 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
         owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// An owner croft with `f.txt` open on a fresh relay, and a pilot
+/// stand-in seat with the file live (#1207).
+fn owner_and_pilot_on(tmp: &tempfile::TempDir, text: &str) -> (App, crate::collab::CollabSession) {
+    use std::time::{Duration, Instant};
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, text).unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
+    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.open_file_at_launch(&file);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.collab.is_none() {
+        assert!(Instant::now() < deadline, "owner never joined the relay");
+        owner.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut pilot = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(ch) =
+                crate::collab::CollabChannel::connect(&socket, crate::collab::CollabRole::Guest)
+            {
+                break crate::collab::CollabSession::new(ch, "pilot".into());
+            }
+            assert!(Instant::now() < deadline, "pilot never connected");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    pilot.request_file("f.txt");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pilot.is_live("f.txt") {
+        assert!(Instant::now() < deadline, "the pilot never got the file");
+        owner.poll_collab();
+        pilot.poll(|_| None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (owner, pilot)
+}
+
+/// Send the pilot's buffer as `text` and wait until the owner's tab shows
+/// it, so each call lands on its own owner tick.
+fn pilot_writes(owner: &mut App, pilot: &mut crate::collab::CollabSession, text: &str) {
+    use std::time::{Duration, Instant};
+    assert!(pilot.local_change("f.txt", text));
+    // Let every op of this change reach the relay before the owner drains.
+    std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.editor.lines.join("\n") != text {
+        assert!(Instant::now() < deadline, "the owner never saw {text:?}");
+        owner.poll_collab();
+        pilot.poll(|_| None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn set_stream(owner: &mut App, pilot: &mut crate::collab::CollabSession, active: bool) {
+    use std::time::{Duration, Instant};
+    pilot.send_stream_state("f.txt", active);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.collab_stream.is_some() != active {
+        assert!(Instant::now() < deadline, "the stream state never arrived");
+        owner.poll_collab();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const ADD: &str = "def add(a, b):\n    return a - b";
+
+/// #1207: a navigator edit streamed over many ticks undoes in one Ctrl+Z,
+/// back to the text from before the stream, instead of one fragment at a
+/// time through broken code.
+#[test]
+fn a_navigator_stream_undoes_in_one_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, ADD);
+    set_stream(&mut owner, &mut pilot, true);
+    let mut text = String::from("def add(a, b):\n");
+    for frag in [
+        "    if not isins",
+        "tance(a, (int, float)):\n",
+        "        raise TypeError(\"a mus",
+        "t be a number\")\n",
+        "    return a + b",
+    ] {
+        text.push_str(frag);
+        pilot_writes(&mut owner, &mut pilot, &text);
+    }
+    set_stream(&mut owner, &mut pilot, false);
+    assert!(owner.editor.undo());
+    assert_eq!(
+        owner.editor.lines.join("\n"),
+        ADD,
+        "one undo rejects the edit"
+    );
+    assert!(!owner.editor.undo(), "nothing else to undo");
+}
+
+/// #1207 (comment): after a cancelled stream's revert, the text is back and
+/// there is nothing left to undo, never a hybrid of the two texts.
+#[test]
+fn a_cancelled_navigator_stream_leaves_nothing_to_undo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, ADD);
+    set_stream(&mut owner, &mut pilot, true);
+    pilot_writes(
+        &mut owner,
+        &mut pilot,
+        "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n    raise TypeError(\"a mus",
+    );
+    pilot_writes(&mut owner, &mut pilot, ADD);
+    set_stream(&mut owner, &mut pilot, false);
+    assert_eq!(owner.editor.lines.join("\n"), ADD);
+    assert!(
+        !owner.editor.undo(),
+        "the cancelled stream left no undo step"
+    );
+    assert_eq!(owner.editor.lines.join("\n"), ADD);
+}
+
+/// #1207 (comment): a peer's edit that changes several separate runs
+/// arrives as one op per run and still undoes as one step. Negative: two
+/// separate peer edits stay two steps.
+#[test]
+fn a_peer_edit_of_several_runs_undoes_in_one_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, "let a = x;\nlet b = x;\nlet c = x;");
+    pilot_writes(&mut owner, &mut pilot, "let a = y;\nlet b = y;\nlet c = y;");
+    pilot_writes(&mut owner, &mut pilot, "let a = y;\nlet b = y;\nlet c = z;");
+    assert!(owner.editor.undo());
+    assert_eq!(
+        owner.editor.lines.join("\n"),
+        "let a = y;\nlet b = y;\nlet c = y;",
+        "the later edit undoes on its own"
+    );
+    assert!(owner.editor.undo());
+    assert_eq!(
+        owner.editor.lines.join("\n"),
+        "let a = x;\nlet b = x;\nlet c = x;",
+        "the three-run Replace All undoes in one step"
+    );
+    assert!(!owner.editor.undo());
 }
 
 /// A caret name tag is visible while inside its 2s fade window and signals
