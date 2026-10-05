@@ -35557,14 +35557,6 @@ impl App {
         (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none()).then(|| ed.lines.join("\n"))
     }
 
-    /// Replay resolved remote spans onto every open buffer for `file`,
-    /// converting each byte span to the editor's char coordinates. Spans are
-    /// sequential (each relative to the text with earlier ones applied), so
-    /// they go through `apply_span_edits` one at a time. Every ATTACHED pane
-    /// gets them (attached panes hold identical text, so the byte offsets
-    /// are valid in each); a never-attached pane still holds stale disk
-    /// text where the offsets would splice garbage — the attach pass seeds
-    /// it from the doc instead.
     /// Close a remote undo group in every text tab of `file` (#1207).
     fn end_collab_undo_group(&mut self, root: &Path, file: &str, group: u64) {
         let Some(path) = crate::collab::contained_path(root, file) else {
@@ -35583,6 +35575,15 @@ impl App {
         }
     }
 
+    /// Replay resolved remote spans onto every open buffer for `file`,
+    /// converting each byte span to the editor's char coordinates. Spans are
+    /// sequential (each relative to the text with earlier ones applied), so
+    /// they go through `apply_remote_span_edits` one at a time, all in
+    /// `undo_group`'s one undo step (#1207). Every ATTACHED pane
+    /// gets them (attached panes hold identical text, so the byte offsets
+    /// are valid in each); a never-attached pane still holds stale disk
+    /// text where the offsets would splice garbage — the attach pass seeds
+    /// it from the doc instead.
     fn apply_collab_spans(
         &mut self,
         root: &Path,
