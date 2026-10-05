@@ -3084,19 +3084,46 @@ impl PtyTerminal {
         self.term.lock().grid().display_offset() as i32
     }
 
-    /// Text of the grid row under screen cell `(col, row)`, plus the 0-based
-    /// column within that text the click landed on. Drives Cmd/Ctrl+click URL
-    /// detection. `None` when the cell is outside the content area.
+    /// Text of the logical line under screen cell `(col, row)`, plus the
+    /// 0-based char index within that text the click landed on. Drives
+    /// Cmd/Ctrl+click URL and `path:line` detection. A line the terminal
+    /// soft-wrapped (WRAPLINE) is stitched back together from all its rows,
+    /// so a long URL resolves whole from any of them (#1355). `None` when
+    /// the cell is outside the content area.
     pub fn line_text_at(&self, col: u16, row: u16) -> Option<(String, usize)> {
         let (r, c) = self.cell_at(col, row)?;
         let term = self.term.lock();
         let line = r as i32 - term.grid().display_offset() as i32;
-        let (text, cols_map) = row_text_and_cols(&term, line);
+        let (row_text, cols_map) = row_text_and_cols(&term, line);
         // Grid column → char index in the spacer-skipped text: the last
         // produced char at-or-before the clicked column, so clicking a wide
         // char's spacer cell resolves to the wide char itself.
         let idx = cols_map.iter().rposition(|&gc| gc <= c as usize)?;
-        Some((text, idx))
+        let top = -(term.grid().history_size() as i32);
+        let bottom = term.screen_lines() as i32 - 1;
+        let mut first = line;
+        while first > top && row_wraps(&term, first - 1) {
+            first -= 1;
+        }
+        let mut last = line;
+        while last < bottom && row_wraps(&term, last) {
+            last += 1;
+        }
+        if first == line && last == line {
+            return Some((row_text, idx));
+        }
+        let mut text = String::new();
+        let mut offset = 0;
+        for l in first..=last {
+            let part = if l == line {
+                offset = text.chars().count();
+                row_text.clone()
+            } else {
+                row_text_and_cols(&term, l).0
+            };
+            text.push_str(&part);
+        }
+        Some((text, offset + idx))
     }
 
     /// The OSC 8 hyperlink under a screen position (host cell coords), if

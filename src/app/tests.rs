@@ -1686,6 +1686,47 @@ fn cell_with_link(pane: &crate::widgets::terminal::PtyTerminal, uri: &str) -> Op
     cells_of(pane).find(|&(c, r)| pane.hyperlink_at_screen(c, r).as_deref() == Some(uri))
 }
 
+/// #1355: a URL longer than the pane soft-wraps, and Cmd/Ctrl+click read
+/// only the clicked row: the first row opened a cut-down URL, the others
+/// opened nothing. Every row of it must resolve to the whole URL.
+#[test]
+fn a_url_that_wraps_the_pane_edge_resolves_whole_from_any_of_its_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.terminals[0].last_inner;
+    let w = inner.width as usize;
+    let url = format!("https://example.com/oauth?state={}END", "y".repeat(w));
+    let chunk = format!("\r\nsee{} {url}\r\nnext line\r\n", "x".repeat(w - 10));
+    app.terminals[0].feed_bytes_for_test(chunk.as_bytes());
+    term.draw(|f| app.render(f)).unwrap();
+
+    let pane = &app.terminals[0];
+    let (_, head_row) = cell_carrying(pane, "https:").expect("the URL's first row");
+    // The URL's head sits in the last six cells of its first row, then fills
+    // the next row and ends on the one after.
+    let clicks = [
+        (inner.x + inner.width - 3, head_row),
+        (inner.x + 5, head_row + 1),
+        (inner.x + 1, head_row + 2),
+    ];
+    for (col, row) in clicks {
+        let (text, idx) = pane.line_text_at(col, row).expect("inside the pane");
+        assert_eq!(
+            crate::port_detect::url_at(&text, idx).as_deref(),
+            Some(url.as_str()),
+            "click at ({col}, {row}) on {text:?}"
+        );
+    }
+    // The row after it does not wrap into anything: it reads as itself.
+    let (text, idx) = pane.line_text_at(inner.x + 1, head_row + 3).unwrap();
+    assert!(text.starts_with("next line"), "{text:?}");
+    assert_eq!(idx, 1);
+    assert!(crate::port_detect::url_at(&text, idx).is_none());
+}
+
 /// `cell_carrying` returns a cell INSIDE the needle, not the row's first cell.
 ///
 /// The refinement has exactly one red state in the suite, and it is a
