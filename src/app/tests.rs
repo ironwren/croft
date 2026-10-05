@@ -42421,6 +42421,99 @@ fn find_in_a_rendered_color_log_matches_the_visible_text() {
     );
 }
 
+/// A 300-line rendered log (an escape on line 1 makes it one), open in a
+/// drawn 100x30 app with the editor focused (#1189).
+fn open_rendered_log(tmp: &tempfile::TempDir) -> App {
+    let p = tmp.path().join("build.log");
+    let mut body = String::from("\u{1b}[32mINFO\u{1b}[0m line 1\n");
+    for i in 2..=300 {
+        body.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(&p, &body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.log.is_some(), "the fixture is a rendered log");
+    draw(&mut app, 100, 30);
+    app
+}
+
+/// #1189: the arrows, PageUp/PageDown, Home/End and Ctrl+Home/End move a
+/// rendered log, which they used to leave on line 1.
+#[test]
+fn the_keyboard_scrolls_a_rendered_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_rendered_log(&tmp);
+    let press = |app: &mut App, code, mods| app.handle_key(key(code, mods)).unwrap();
+    press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+    let page = app.editor.scroll;
+    assert!(page > 10, "PageDown moves a screen: {page}");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.editor.scroll, page + 1);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+    assert_eq!(app.editor.scroll, 0);
+    press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+    let tail = app.editor.scroll;
+    assert!(tail > 250, "Ctrl+End reaches the tail: {tail}");
+    press(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+    assert_eq!(app.editor.scroll, 0);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    assert_eq!(app.editor.scroll, tail, "End is the tail too");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.editor.scroll, tail, "and the tail is where it stops");
+}
+
+/// #1189: a key after a wheel scroll carries on from there instead of
+/// throwing the view back to line 1.
+#[test]
+fn a_key_keeps_a_wheel_scrolled_log_where_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_rendered_log(&tmp);
+    app.editor.scroll_down(25);
+    assert_eq!(app.editor.scroll, 25);
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.scroll, 26);
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.scroll, 26,
+        "an unbound key leaves the view alone"
+    );
+}
+
+/// Negative (#1189): typing into a rendered log changes nothing and never
+/// marks it modified, while a plain `.log` with no colour is still an
+/// ordinary editable file.
+#[test]
+fn typing_into_a_rendered_log_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = open_rendered_log(&tmp);
+    for code in [
+        KeyCode::Char('z'),
+        KeyCode::Enter,
+        KeyCode::Backspace,
+        KeyCode::Tab,
+    ] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    app.clipboard_reader = || Some(String::from("pasted"));
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "the read-only log is never modified");
+    assert_eq!(app.editor.lines, vec![String::new()]);
+
+    let plain = tmp.path().join("plain.log");
+    std::fs::write(&plain, "line 1\nline 2\n").unwrap();
+    app.editor.open(&plain).unwrap();
+    assert!(app.editor.log.is_none());
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty, "a plain log is edited as before");
+    assert_eq!(app.editor.lines[0], "zline 1");
+}
+
 /// #257: Enter and Shift+Enter step through a log's matches. The log has no
 /// caret to carry the position, so the walk is anchored on the active match
 /// alone; without that anchor every Enter would re-find the same line.
