@@ -346,7 +346,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 `Cmd`+`E` toggles a native, Rust-implemented modal layer over the editor. It emulates the common daily-driver subset rather than embedding neovim, so it carries no `nvim` dependency and behaves identically local and remote. For full vim with your own plugins, run `nvim` in the shell pane.
 
-The toggle is global and app-wide: it works from any pane and with no file open, and stays on as you switch files. A coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While off, the editor behaves exactly as the tables above describe, and `Cmd`/`Ctrl` shortcuts keep working in Normal mode, since modal editing only claims unmodified keys.
+The toggle is global and app-wide: it works from any pane and with no file open, and stays on as you switch files. It is also remembered: croft saves it as `vim_mode` in `config.json`, and the next launch starts in the mode you left. Settings has the same switch as **Editor: Vim Mode**, and `croft import-vscode` turns it on when VSCodeVim is installed. A coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While off, the editor behaves exactly as the tables above describe, and `Cmd`/`Ctrl` shortcuts keep working in Normal mode, since modal editing only claims unmodified keys.
 
 | Keys | Action |
 |------|--------|
