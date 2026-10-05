@@ -44090,6 +44090,7 @@ impl App {
                     finder.push_char(c);
                 }
             }
+            self.follow_quick_open_prefix();
             return;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
@@ -46964,6 +46965,7 @@ impl App {
                     }
                 }
             }
+            self.follow_quick_open_prefix();
             return;
         }
         let Some(finder) = self.file_finder.as_mut() else {
@@ -46997,16 +46999,44 @@ impl App {
             }
             _ => {}
         }
-        // VS Code's shared quick input: a leading `#` turns Quick Open into
-        // Go to Symbol in Workspace, carrying any text after it as the query.
-        let hash_query = self
-            .file_finder
-            .as_ref()
-            .and_then(|f| f.query.strip_prefix('#'))
-            .map(str::to_string);
-        if let Some(q) = hash_query {
-            self.close_file_finder();
-            self.open_workspace_symbols(&q);
+        self.follow_quick_open_prefix();
+    }
+
+    /// VS Code's shared quick input: the first character of Quick Open's
+    /// query picks the mode, and the text after it carries over as the new
+    /// query. `#` is Go to Symbol in Workspace, `>` the Command Palette
+    /// (#1306), `@` Go to Symbol in Editor, and `:` Go to Line, which is
+    /// Go to Symbol's own `:N` mode. Anything else stays a file search,
+    /// `name:12` included.
+    fn follow_quick_open_prefix(&mut self) {
+        let Some(query) = self.file_finder.as_ref().map(|f| f.query.clone()) else {
+            return;
+        };
+        let mut chars = query.chars();
+        let (Some(prefix), rest) = (chars.next(), chars.as_str()) else {
+            return;
+        };
+        if !matches!(prefix, '#' | '>' | '@' | ':') {
+            return;
+        }
+        self.close_file_finder();
+        match prefix {
+            '#' => self.open_workspace_symbols(rest),
+            '>' => {
+                self.open_command_palette();
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.set_query(rest);
+                }
+            }
+            _ => {
+                self.open_go_to_symbol();
+                if let Some(picker) = self.go_to_symbol.as_mut() {
+                    let carried = if prefix == ':' { &query } else { rest };
+                    for c in carried.chars() {
+                        picker.push_char(c);
+                    }
+                }
+            }
         }
     }
 
