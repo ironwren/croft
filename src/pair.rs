@@ -3035,7 +3035,7 @@ mod tests {
                 .any(|e| matches!(e, CollabEvent::StreamState { active: false, .. }))
         });
         let events = harness.events.lock().unwrap();
-        let first = |pred: &dyn Fn(&CollabEvent) -> bool| events.iter().position(|e| pred(e));
+        let first = |pred: &dyn Fn(&CollabEvent) -> bool| events.iter().position(pred);
         let announced = first(&|e| matches!(e, CollabEvent::StreamState { active: true, .. }))
             .expect("the stream is announced");
         let edited =
