@@ -125,6 +125,9 @@ pub struct SheetData {
     /// SOURCE sheet (#178): calamine's grid starts at the used range, not
     /// A1, so writing an edit back needs this offset. (0, 0) for CSV.
     pub origin: (u32, u32),
+    /// Rows of the source above this batch (#1222): a SQLite page holds
+    /// rows `row_base + 1 ..` of its table, and is numbered so. 0 elsewhere.
+    pub row_base: usize,
 }
 
 impl SheetData {
@@ -153,6 +156,7 @@ pub fn sheet_data_from_parts(
         cur_row: 0,
         cur_col: 0,
         origin: (0, 0),
+        row_base: 0,
     }
 }
 
@@ -323,6 +327,7 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         cur_row: 0,
         cur_col: 0,
         origin: (0, 0),
+        row_base: 0,
     })
 }
 
@@ -890,6 +895,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             cur_row: 0,
             cur_col: 0,
             origin,
+            row_base: 0,
         });
     }
     let _ = Data::Empty; // keeps the import explicit even if unused above

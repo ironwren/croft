@@ -60393,6 +60393,16 @@ impl App {
                 }
                 data.cur_row = data.cur_row.saturating_sub(visible);
             }
+            KeyCode::Home | KeyCode::End
+                if sheet.kind == crate::sheet::SheetKind::Sqlite
+                    && (key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER)) =>
+            {
+                // The table's first or last row, not the loaded batch's
+                // (#1222).
+                self.sqlite_jump(key.code == KeyCode::End, visible);
+                return;
+            }
             KeyCode::Home => {
                 data.cur_col = 0;
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -62893,14 +62903,11 @@ impl App {
     /// Step the active SQLite table to an adjacent page (#201 review),
     /// replacing the sheet's rows and keeping the cursor sane.
     fn sqlite_page_step(&mut self, delta: i64) {
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(view) = self.editor.sheet.as_mut() else {
+        let Some(view) = self.editor.sheet.as_ref() else {
             return;
         };
         let idx = view.current_sheet;
-        let Some((table, page)) = view.sqlite_pages.get(idx).cloned() else {
+        let Some(&(_, page)) = view.sqlite_pages.get(idx) else {
             return;
         };
         let next = page.saturating_add_signed(delta as isize);
@@ -62914,15 +62921,73 @@ impl App {
         } else if page == 0 {
             return;
         }
+        self.sqlite_load_page(next, delta < 0);
+    }
+
+    /// Ctrl+Home / Ctrl+End in a SQLite table (#1222): the table's first or
+    /// last row, loading its page, not the loaded batch's.
+    fn sqlite_jump(&mut self, to_end: bool, visible: usize) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(view) = self.editor.sheet.as_ref() else {
+            return;
+        };
+        let idx = view.current_sheet;
+        let Some((table, page)) = view.sqlite_pages.get(idx).cloned() else {
+            return;
+        };
+        let target = if to_end {
+            match crate::sqlite_view::last_page(&path, &table) {
+                Ok(last) => last,
+                Err(e) => {
+                    self.status = format!("Page fetch failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            0
+        };
+        if target != page {
+            self.sqlite_load_page(target, to_end);
+        }
+        if let Some(view) = self.editor.sheet.as_mut() {
+            let data = &mut view.sheets[idx];
+            (data.cur_row, data.cur_col) = if to_end {
+                (
+                    data.row_count().saturating_sub(1),
+                    data.col_count().saturating_sub(1),
+                )
+            } else {
+                (0, 0)
+            };
+            sheet_follow_cursor(view, idx, visible);
+        }
+    }
+
+    /// Replace the current SQLite sheet with page `next` of its table, the
+    /// cursor on its last row when `at_end`.
+    fn sqlite_load_page(&mut self, next: usize, at_end: bool) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(view) = self.editor.sheet.as_mut() else {
+            return;
+        };
+        let idx = view.current_sheet;
+        let Some((table, _)) = view.sqlite_pages.get(idx).cloned() else {
+            return;
+        };
         match crate::sqlite_view::table_page(&path, &table, next) {
             Ok((headers, rows, more)) if !rows.is_empty() || next == 0 => {
                 let got = rows.len();
                 let label = crate::sqlite_view::page_label(&table, next, got, more);
-                view.sheets[idx] = crate::sheet::sheet_data_from_parts(label, headers, rows);
-                if delta < 0 {
-                    let last = view.sheets[idx].row_count().saturating_sub(1);
-                    view.sheets[idx].cur_row = last;
+                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
+                data.row_base = next * crate::sqlite_view::ROW_CAP;
+                if at_end {
+                    data.cur_row = data.row_count().saturating_sub(1);
                 }
+                view.sheets[idx] = data;
                 view.sqlite_pages[idx].1 = next;
             }
             Ok(_) => self.status = String::from("Last page"),

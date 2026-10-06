@@ -741,7 +741,7 @@ fn render_sheet(
 
     // Reserve a row-number gutter so the user can see the absolute row
     // index even after horizontal scrolling.
-    let gutter_w = (row_count.max(1).to_string().len() as u16 + 2).max(4);
+    let gutter_w = ((sheet.row_base + row_count).max(1).to_string().len() as u16 + 2).max(4);
     if grid_w <= gutter_w + 2 {
         return;
     }
@@ -802,7 +802,13 @@ fn render_sheet(
             buf[(x, y)].set_style(style);
             buf[(x, y)].set_symbol(" ");
         }
-        let row_label = format!(" {:>width$} ", row_idx + 1, width = (gutter_w - 2) as usize);
+        // Numbered by place in the source (#1222): a SQLite page's rows
+        // continue from the pages before it.
+        let row_label = format!(
+            " {:>width$} ",
+            sheet.row_base + row_idx + 1,
+            width = (gutter_w - 2) as usize
+        );
         buf.set_string(
             inner.x,
             y,
@@ -871,8 +877,17 @@ fn render_sheet(
         .last()
         .map(|(c, _)| *c + 1)
         .unwrap_or(visible_col_first);
+    // A SQLite page names its rows by place in the table, with no total:
+    // nobody counted the table (#1222), and the sheet name says whether
+    // more rows follow.
+    let rows = if view.kind == crate::sheet::SheetKind::Sqlite {
+        let base = sheet.row_base;
+        format!("rows {}–{}", base + visible_first, base + visible_last)
+    } else {
+        format!("rows {visible_first}–{visible_last} of {row_count}")
+    };
     let status = format!(
-        " rows {visible_first}–{visible_last} of {row_count} · cols {visible_col_first}–{visible_col_last} of {col_count} · ←/→ ↑/↓ PgUp/PgDn Tab=next sheet "
+        " {rows} · cols {visible_col_first}–{visible_col_last} of {col_count} · ←/→ ↑/↓ PgUp/PgDn Tab=next sheet "
     );
     buf.set_string(
         inner.x,
