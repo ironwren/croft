@@ -1620,9 +1620,63 @@ impl SearchPanel {
         (total, skipped, failed)
     }
 
+    /// Where a hit belongs in the list (#1340): by workspace root, in the
+    /// order the workspace lists them, then by the path under that root,
+    /// then by line. The walker is parallel, so files arrive in whatever
+    /// order its threads finish them.
+    fn hit_order<'a>(&self, hit: &'a SearchHit) -> (usize, &'a Path, usize) {
+        let roots = if self.roots.is_empty() {
+            std::slice::from_ref(&self.root)
+        } else {
+            self.roots.as_slice()
+        };
+        // The deepest root that holds it, as the row label picks.
+        let owner = roots
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| hit.path.starts_with(r))
+            .max_by_key(|(_, r)| r.components().count());
+        match owner {
+            Some((i, r)) => (
+                i,
+                hit.path.strip_prefix(r).unwrap_or(&hit.path),
+                hit.line_no,
+            ),
+            None => (usize::MAX, hit.path.as_path(), hit.line_no),
+        }
+    }
+
+    /// Take in streamed hits, each landing in its final place
+    /// ([`Self::hit_order`]) so the list reads the same however the walk
+    /// went. One merge pass over the list, not an insert per hit: a broad
+    /// query streams thousands of files. The selection stays on its hit.
+    pub fn add_hits(&mut self, mut batch: Vec<SearchHit>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.sort_by(|a, b| self.hit_order(a).cmp(&self.hit_order(b)));
+        let old = std::mem::take(&mut self.hits);
+        let selected = (self.selected < old.len()).then_some(self.selected);
+        let mut merged = Vec::with_capacity(old.len() + batch.len());
+        let mut new = batch.into_iter().peekable();
+        for (i, hit) in old.into_iter().enumerate() {
+            let key = self.hit_order(&hit);
+            while new.peek().is_some_and(|n| self.hit_order(n) < key) {
+                merged.extend(new.next());
+            }
+            if selected == Some(i) {
+                self.selected = merged.len();
+            }
+            merged.push(hit);
+        }
+        merged.extend(new);
+        self.hits = merged;
+    }
+
     /// Run the current query, store the results, and reset selection.
     pub fn run_query(&mut self) {
-        self.hits = search_workspace(&self.root, &self.query, self.opts);
+        self.hits.clear();
+        self.add_hits(search_workspace(&self.root, &self.query, self.opts));
         self.selected = 0;
         self.scroll = 0;
     }
@@ -3617,6 +3671,93 @@ mod tests {
         panel.move_down();
         panel.move_down(); // would go to 3, but clamped to 2
         assert_eq!(panel.selected, 2);
+    }
+
+    fn hit(path: &Path, line_no: usize) -> SearchHit {
+        SearchHit {
+            path: path.to_path_buf(),
+            line_no,
+            line_text: format!("line {line_no}"),
+        }
+    }
+
+    fn listed(panel: &SearchPanel) -> Vec<(String, usize)> {
+        panel
+            .hits
+            .iter()
+            .map(|h| {
+                let root = panel
+                    .roots
+                    .iter()
+                    .find(|r| h.path.starts_with(r))
+                    .unwrap_or(&panel.root);
+                let rel = h.path.strip_prefix(root).unwrap_or(&h.path);
+                (rel.display().to_string(), h.line_no)
+            })
+            .collect()
+    }
+
+    /// #1340: the parallel walker finishes files in whatever order its
+    /// threads do, and the list showed them that way, differently each run.
+    #[test]
+    fn streamed_batches_are_listed_by_path_whatever_order_they_arrive_in() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut panel = SearchPanel::new(root.to_path_buf());
+        panel.add_hits(vec![hit(&root.join("b.rs"), 2), hit(&root.join("b.rs"), 9)]);
+        panel.add_hits(vec![hit(&root.join("src/z.rs"), 1)]);
+        panel.add_hits(vec![hit(&root.join("a.rs"), 7)]);
+        panel.add_hits(vec![hit(&root.join("c.rs"), 4)]);
+        panel.add_hits(vec![hit(&root.join("src/m.rs"), 3)]);
+        assert_eq!(
+            listed(&panel),
+            [
+                ("a.rs".into(), 7),
+                ("b.rs".into(), 2),
+                ("b.rs".into(), 9),
+                ("c.rs".into(), 4),
+                ("src/m.rs".into(), 3),
+                ("src/z.rs".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_hit_of_the_first_root_is_listed_before_the_second_roots() {
+        let tmp = TempDir::new().unwrap();
+        // Listed in the workspace's order, which is not alphabetical.
+        let first = tmp.path().join("zeta");
+        let second = tmp.path().join("alpha");
+        let mut panel = SearchPanel::new(first.clone());
+        panel.roots = vec![first.clone(), second.clone()];
+        panel.add_hits(vec![hit(&second.join("a.rs"), 1)]);
+        panel.add_hits(vec![hit(&first.join("y.rs"), 1)]);
+        panel.add_hits(vec![hit(&second.join("b.rs"), 1)]);
+        panel.add_hits(vec![hit(&first.join("x.rs"), 1)]);
+        let paths: Vec<PathBuf> = panel.hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                first.join("x.rs"),
+                first.join("y.rs"),
+                second.join("a.rs"),
+                second.join("b.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_hit_as_earlier_files_arrive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut panel = SearchPanel::new(root.to_path_buf());
+        panel.add_hits(vec![hit(&root.join("m.rs"), 1), hit(&root.join("m.rs"), 5)]);
+        panel.move_down();
+        assert_eq!(panel.selected_hit().map(|h| h.line_no), Some(5));
+        panel.add_hits(vec![hit(&root.join("a.rs"), 3)]);
+        panel.add_hits(vec![hit(&root.join("z.rs"), 3)]);
+        let sel = panel.selected_hit().unwrap();
+        assert_eq!((sel.path.clone(), sel.line_no), (root.join("m.rs"), 5));
     }
 
     fn make_panel_with_hits(tmp: &TempDir, n: usize) -> SearchPanel {
