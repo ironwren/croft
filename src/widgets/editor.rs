@@ -7515,7 +7515,12 @@ impl Editor {
 
         self.insert_newline_raw();
 
-        let new_indent = format!("{leading}{extra}");
+        let new_indent = if self.lang == Some(LangKind::Yaml) {
+            let prefix: String = prefix_chars.iter().collect();
+            yaml_newline_indent(&prefix, &unit)
+        } else {
+            format!("{leading}{extra}")
+        };
         for c in new_indent.chars() {
             self.insert_char_raw(c);
         }
@@ -13205,6 +13210,81 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
+}
+
+/// The indent for the line Enter opens after `prefix` in YAML (#1309).
+/// A key with no value (`services:`), a block scalar (`run: |`) or an open
+/// flow collection (`args: [`) starts a nested block one `unit` deeper. In a
+/// list item (`- name: x`) the base column is the item's content, so the
+/// next key lines up with `name`; anything else keeps the line's indent.
+fn yaml_newline_indent(prefix: &str, unit: &str) -> String {
+    let leading: String = prefix
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let mut content = &prefix[leading.len()..];
+    let mut base = leading.clone();
+    while let Some(rest) = content.strip_prefix('-')
+        && (rest.is_empty() || rest.starts_with(' '))
+    {
+        let after = rest.trim_start_matches(' ');
+        base.push_str(&" ".repeat(content.len() - after.len()));
+        content = after;
+    }
+    let content = yaml_strip_comment(content).trim_end();
+    let Some(colon) = yaml_key_colon(content) else {
+        return leading;
+    };
+    let value = content[colon + 1..].trim();
+    let opens_block = value.is_empty()
+        || value.ends_with('[')
+        || value.ends_with('{')
+        || (value.starts_with(['|', '>'])
+            && value[1..]
+                .chars()
+                .all(|c| matches!(c, '-' | '+') || c.is_ascii_digit()));
+    if opens_block {
+        format!("{base}{unit}")
+    } else {
+        base
+    }
+}
+
+/// `line` up to a `#` comment: a `#` at the start or after whitespace,
+/// outside quotes.
+fn yaml_strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut prev_ws = true;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' && prev_ws => return &line[..i],
+            None => {}
+        }
+        prev_ws = c.is_whitespace();
+    }
+    line
+}
+
+/// Byte offset of the `:` that ends a mapping key in `content`: the first
+/// one outside quotes followed by a space or the end of the line.
+fn yaml_key_colon(content: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut chars = content.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if (c == '\'' || c == '"') && i == 0 => quote = Some(c),
+            None if c == ':' && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) => {
+                return Some(i);
+            }
+            None => {}
+        }
+    }
+    None
 }
 
 fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Option<char>) -> bool {
@@ -22641,8 +22721,59 @@ mod tests {
         e.lang = Some(LangKind::Yaml);
         e.cursor_col = e.line_char_len(0);
         e.insert_newline();
-        assert_eq!(e.lines, vec!["  key:".to_string(), "  ".to_string()]);
-        assert_eq!(e.cursor_col, 2);
+        assert_eq!(e.lines, vec!["  key:".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    /// Enter at the end of a YAML line; returns the new line's indent.
+    fn yaml_enter(line: &str) -> String {
+        let mut e = editor_with(line);
+        e.lang = Some(LangKind::Yaml);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines.len(), 2, "one new line for {line:?}");
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, e.lines[1].chars().count());
+        e.lines[1].clone()
+    }
+
+    #[test]
+    fn yaml_enter_after_a_key_that_opens_a_mapping_indents_one_step() {
+        assert_eq!(yaml_enter("services:"), "  ");
+        assert_eq!(yaml_enter("  web:  # the app"), "    ");
+        assert_eq!(yaml_enter("run: |"), "  ");
+        assert_eq!(yaml_enter("  script: >-"), "    ");
+        assert_eq!(yaml_enter("\"quoted key\":"), "  ");
+        assert_eq!(yaml_enter("args: ["), "  ");
+    }
+
+    #[test]
+    fn yaml_enter_in_a_list_item_lines_up_with_the_item_content() {
+        assert_eq!(yaml_enter("  - name: x"), "    ");
+        assert_eq!(yaml_enter("- name:"), "    ");
+        assert_eq!(yaml_enter("  - run: |"), "      ");
+    }
+
+    #[test]
+    fn yaml_enter_after_a_plain_value_keeps_the_indent() {
+        // Negative: nothing opens a block, so the caret stays in the column.
+        assert_eq!(yaml_enter("image: nginx"), "");
+        assert_eq!(yaml_enter("  ports:  [80]"), "  ");
+        assert_eq!(yaml_enter("  - \"80:80\""), "  ");
+        assert_eq!(yaml_enter("- plain item"), "");
+        assert_eq!(yaml_enter("url: http://x.io/a"), "");
+        assert_eq!(yaml_enter("  note: 'ends with a colon:'"), "  ");
+        assert_eq!(yaml_enter("# todo:"), "");
+        assert_eq!(yaml_enter("cmd: echo hi # really:"), "");
+    }
+
+    #[test]
+    fn enter_after_a_colon_does_not_indent_outside_yaml_and_python() {
+        let mut e = editor_with("key:");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["key:".to_string(), String::new()]);
     }
 
     #[test]
