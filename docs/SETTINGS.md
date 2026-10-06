@@ -31,6 +31,13 @@ terminal scrollback) still need a relaunch. The hub shows where a value came
 from (`· workspace`, `· user-local`, …) whenever a layer other than your own
 user config decided it.
 
+The **Preferences: Open Settings** hub is also a searchable editor over the
+settings themselves. Type to filter, Enter flips a toggle or asks for a
+value, and Tab switches which layer the change is written to: your user
+config or the workspace.
+
+![Settings editor: search a setting, flip a toggle, set a number, then write to the workspace layer](images/settings-editor.gif)
+
 In a multi-root workspace the workspace layers come from the **primary**
 root. Re-rooting re-merges against the new primary.
 
