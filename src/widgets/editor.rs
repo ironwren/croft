@@ -9,6 +9,7 @@ use ratatui::{
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, lang_for_extension,
@@ -4628,7 +4629,7 @@ impl Editor {
             .find(|&(s, _)| s == seg_start)
             .unwrap_or((seg_start, seg_start));
         self.cursor_row = line;
-        self.cursor_col = (s + goal_col).min(e).min(self.line_char_len(line));
+        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(e));
     }
 
     /// Identifier chars immediately to the left of the cursor on the
@@ -7568,11 +7569,11 @@ impl Editor {
         }
         if self.cursor_col > 0 {
             let row = self.cursor_row;
-            let col = self.cursor_col - 1;
+            let col = prev_grapheme_col(&self.lines[row], self.cursor_col);
             let from = self.byte_index(row, col);
-            let to = self.byte_index(row, col + 1);
+            let to = self.byte_index(row, self.cursor_col);
             self.lines[row].replace_range(from..to, "");
-            self.cursor_col -= 1;
+            self.cursor_col = col;
             self.mark_buffer_changed();
         } else if self.cursor_row > 0 {
             let cur = self.lines.remove(self.cursor_row);
@@ -7602,7 +7603,8 @@ impl Editor {
         let len = self.line_char_len(row);
         if self.cursor_col < len {
             let from = self.byte_index(row, self.cursor_col);
-            let to = self.byte_index(row, self.cursor_col + 1);
+            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
+            let to = self.byte_index(row, next);
             self.lines[row].replace_range(from..to, "");
             self.mark_buffer_changed();
         } else if row + 1 < self.lines.len() {
@@ -9550,7 +9552,7 @@ impl Editor {
         } else if self.cursor_row > 0 {
             // Step over a collapsed region, as `move_down` does.
             self.cursor_row = self.prev_visible_line(self.cursor_row - 1);
-            self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+            self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         }
         self.last_edit_kind = None;
     }
@@ -9564,7 +9566,7 @@ impl Editor {
             // the user can actually see.
             if let Some(next) = self.next_visible_line(self.cursor_row + 1) {
                 self.cursor_row = next;
-                self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+                self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
             }
         }
         self.last_edit_kind = None;
@@ -9957,7 +9959,7 @@ impl Editor {
 
     pub fn move_left(&mut self) {
         if self.cursor_col > 0 {
-            self.cursor_col -= 1;
+            self.cursor_col = prev_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.cursor_col = self.line_char_len(self.cursor_row);
@@ -9968,7 +9970,7 @@ impl Editor {
 
     pub fn move_right(&mut self) {
         if self.cursor_col < self.line_char_len(self.cursor_row) {
-            self.cursor_col += 1;
+            self.cursor_col = next_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         } else if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
             self.cursor_col = 0;
@@ -11870,7 +11872,7 @@ impl Editor {
             }
         };
         self.cursor_row = target_line;
-        self.cursor_col = target_col.min(self.line_char_len(target_line));
+        self.cursor_col = floor_grapheme_col(&self.lines[target_line], target_col);
         self.last_edit_kind = None;
         // A click is a deliberate reposition; any multi-cursor session ends.
         self.carets.clear();
@@ -12060,6 +12062,59 @@ fn char_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// Char column of the extended grapheme cluster boundary before `col` on
+/// `line`, so one step never stops inside a ZWJ emoji, a flag or a letter with
+/// its combining accent (#1196). Columns stay char-indexed: every cluster
+/// boundary is a char boundary.
+fn prev_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return col.saturating_sub(1);
+    }
+    let mut start = 0;
+    let mut prev = 0;
+    for g in line.graphemes(true) {
+        if start >= col {
+            break;
+        }
+        prev = start;
+        start += g.chars().count();
+    }
+    prev
+}
+
+/// Char column of the extended grapheme cluster boundary after `col` on
+/// `line`, saturating at the line's end (#1196).
+fn next_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return (col + 1).min(line.len());
+    }
+    let mut end = 0;
+    for g in line.graphemes(true) {
+        end += g.chars().count();
+        if end > col {
+            return end;
+        }
+    }
+    end
+}
+
+/// `col` moved back to the start of the grapheme cluster it falls inside, so
+/// a vertical move or a click never leaves the caret mid-cluster (#1196).
+fn floor_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return col.min(line.len());
+    }
+    let mut start = 0;
+    for g in line.graphemes(true) {
+        let len = g.chars().count();
+        if start + len > col {
+            return start;
+        }
+        start += len;
+    }
+    start
 }
 
 fn is_word_char(c: char) -> bool {
@@ -21989,6 +22044,160 @@ mod tests {
         assert_eq!(e.line_char_len(0), 5);
         e.lines[0] = String::from("日本語");
         assert_eq!(e.line_char_len(0), 3);
+    }
+
+    // #1196: the caret and single-character deletes step by extended
+    // grapheme cluster, so a ZWJ emoji, a flag or a decomposed accent is
+    // never split.
+    const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const FLAG: &str = "\u{1F1EB}\u{1F1F7}";
+
+    #[test]
+    fn move_right_steps_over_a_zwj_emoji_whole() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.move_right();
+        assert_eq!(e.cursor_col, 1);
+        e.move_right();
+        assert_eq!(e.cursor_col, 6, "one Right crosses all five code points");
+        e.move_right();
+        assert_eq!(e.cursor_col, 7);
+    }
+
+    #[test]
+    fn move_left_steps_over_a_flag_whole() {
+        let mut e = editor_with(&format!("{FLAG} France"));
+        e.cursor_col = 2;
+        e.move_left();
+        assert_eq!(e.cursor_col, 0, "one Left crosses both regional indicators");
+    }
+
+    #[test]
+    fn typing_after_two_rights_lands_after_the_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.move_right();
+        e.move_right();
+        e.insert_char('Z');
+        assert_eq!(e.lines[0], format!("a{FAMILY}Zb"));
+    }
+
+    #[test]
+    fn typing_after_a_decomposed_accent_keeps_it_on_its_letter() {
+        let mut e = editor_with("cafe\u{301}!");
+        for _ in 0..4 {
+            e.move_right();
+        }
+        assert_eq!(e.cursor_col, 5, "the fourth Right crosses e and its accent");
+        e.insert_char('Y');
+        assert_eq!(e.lines[0], "cafe\u{301}Y!");
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_flag() {
+        let mut e = editor_with(&format!("{FLAG} France"));
+        e.cursor_col = 2;
+        e.backspace();
+        assert_eq!(e.lines[0], " France");
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn delete_forward_removes_a_whole_zwj_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.cursor_col = 1;
+        e.delete_forward();
+        assert_eq!(e.lines[0], "ab");
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn move_down_snaps_out_of_a_cluster() {
+        let mut e = editor_with(&format!("abcdef\na{FAMILY}b"));
+        e.cursor_col = 3;
+        e.move_down();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 1),
+            "col 3 is inside the emoji"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.wrap_override = Some(true);
+        let _ = first_row_text(&mut e);
+        e.move_down();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 1),
+            "wrapped lines snap the same way"
+        );
+    }
+
+    #[test]
+    fn click_inside_a_cluster_snaps_to_its_start() {
+        let mut e = editor_with(&format!("x{FAMILY}y\ncafe\u{301}!"));
+        let _ = first_row_text(&mut e);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        for dx in 0..8 {
+            e.click(text_x + dx, y);
+            assert!(
+                [0, 1, 6, 7].contains(&e.cursor_col),
+                "a click at cell {dx} left the caret at col {}, inside the emoji",
+                e.cursor_col
+            );
+        }
+    }
+
+    #[test]
+    fn shift_right_selects_a_whole_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.cursor_col = 1;
+        e.start_selection_at_cursor();
+        e.move_right();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), FAMILY);
+    }
+
+    #[test]
+    fn plain_and_cjk_text_still_step_one_char() {
+        let mut e = editor_with("ab\u{65E5}\u{672C}c");
+        for want in 1..=5 {
+            e.move_right();
+            assert_eq!(e.cursor_col, want);
+        }
+        for want in (0..5).rev() {
+            e.move_left();
+            assert_eq!(e.cursor_col, want);
+        }
+        e.cursor_col = 3;
+        e.backspace();
+        assert_eq!(e.lines[0], "ab\u{672C}c");
+        e.delete_forward();
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn backspace_and_delete_still_join_lines_at_the_edges() {
+        let mut e = editor_with(&format!("{FLAG}\nx"));
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines, vec![format!("{FLAG}x")]);
+        assert_eq!(e.cursor_col, 2);
+        let mut e = editor_with(&format!("{FLAG}\nx"));
+        e.cursor_col = 2;
+        e.delete_forward();
+        assert_eq!(e.lines, vec![format!("{FLAG}x")]);
+    }
+
+    #[test]
+    fn a_lone_combining_mark_and_a_lone_indicator_are_one_step_each() {
+        let mut e = editor_with("\u{301}\u{1F1EB}x");
+        e.move_right();
+        assert_eq!(e.cursor_col, 1);
+        e.move_right();
+        assert_eq!(e.cursor_col, 2);
+        e.backspace();
+        assert_eq!(e.lines[0], "\u{301}x");
     }
 
     #[test]
