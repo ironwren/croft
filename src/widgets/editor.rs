@@ -9514,7 +9514,17 @@ impl Editor {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, encoded)?;
+        if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
+            // Only a write that got as far as changing the file makes what
+            // is on disk croft's own doing: a stale stamp then made the sync
+            // sweep offer to "reload" it over the only good copy. An
+            // untouched file keeps its stamp, so an edit made outside croft
+            // is still noticed and not overwritten by the next save.
+            if e.touched {
+                self.disk_stamp = Self::disk_stamp_of(&path);
+            }
+            return Err(e.error.into());
+        }
         self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
@@ -23654,6 +23664,284 @@ mod tests {
         assert!(!e.dirty);
         let written = std::fs::read_to_string(tmp.path()).unwrap();
         assert_eq!(written, "hello\nworld");
+    }
+
+    /// Run the test named `child` in a fresh copy of this test binary whose
+    /// files can't grow past `fsize` bytes (RLIMIT_FSIZE, with SIGXFSZ
+    /// ignored so a write past it fails with EFBIG instead of killing the
+    /// process). That is a disk that fills up mid-write, scoped to one
+    /// process, so it can't reach the other tests running in parallel.
+    #[cfg(target_os = "linux")]
+    fn run_with_file_size_limit(child: &str, file: &std::path::Path, fsize: u64) {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([child, "--exact", "--test-threads=1", "--nocapture"])
+            .env("CROFT_TEST_FSIZE_FILE", file);
+        // SAFETY: only async-signal-safe libc calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit {
+                    rlim_cur: fsize,
+                    rlim_max: fsize,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{child} failed:\n{log}");
+        assert!(log.contains("1 passed"), "{child} did not run:\n{log}");
+    }
+
+    /// #1124: a save that runs out of space must leave the file as it was,
+    /// and must not make croft's own failed write look like someone else's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_runs_out_of_space_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        // The file is ~5.6 KB; the child can write at most 4 KB of any file.
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_a_grown_buffer_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the failed save cut the file short"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_saves_a_grown_buffer_under_a_file_size_limit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let mut e = Editor::new();
+        e.open(std::path::Path::new(&f)).unwrap();
+        e.insert_str("# A new entry at the top\n");
+        assert!(
+            e.save_to_disk().is_err(),
+            "the write must fail past the limit"
+        );
+        assert!(e.dirty, "the edits are still only in the buffer");
+        assert!(
+            !e.disk_changed_externally(),
+            "croft's own failed write must not read as an external change"
+        );
+    }
+
+    #[test]
+    fn saving_keeps_the_mode_and_writes_through_a_symlink() {
+        // Negative: writing aside and renaming in must not change what a
+        // save changes: the file keeps its mode, a symlink stays a link
+        // to the file it named, and a new file is still created.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("run.sh");
+        std::fs::write(&real, "echo a\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path().join("link.sh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut e = Editor::new();
+        e.open(&link).unwrap();
+        e.insert_str("# hi\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "# hi\necho a\n");
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert!(!e.disk_changed_externally());
+
+        let fresh = dir.path().join("new.txt");
+        let mut e = Editor::new();
+        e.path = Some(fresh.clone());
+        e.insert_str("x");
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "x");
+    }
+
+    /// #1190 review: a save that fails before the file is touched must
+    /// not refresh the disk stamp: an overwrite of an outside edit that
+    /// fails leaves that edit on disk, and the next plain save must still
+    /// stop at the conflict instead of silently replacing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_save_keeps_an_external_edit_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_fails_a_save_after_an_external_edit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "edited elsewhere\n");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_fails_a_save_after_an_external_edit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let f = std::path::PathBuf::from(f);
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        std::fs::write(&f, "edited elsewhere\n").unwrap();
+        e.insert_str("# A new entry at the top\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::DiskConflict);
+        assert!(
+            e.save_to_disk_force().is_err(),
+            "the overwrite must fail past the limit"
+        );
+        assert!(
+            e.disk_changed_externally(),
+            "the failed overwrite left the outside edit on disk, still unresolved"
+        );
+    }
+
+    /// #1190 review: a hard link is written in place (a rename would split
+    /// it from its other names); running out of space there must still
+    /// leave the file whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_linked_file_that_runs_out_of_space_stays_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        std::fs::hard_link(&f, dir.path().join("other-name.md")).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_a_grown_buffer_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other-name.md")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_long_name_still_saves() {
+        // #1190 review: the temp name grew with the file's own, so a name
+        // near the 255-byte limit could not be saved at all.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(format!("{}.md", "n".repeat(240)));
+        std::fs::write(&f, "a\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
+    }
+
+    #[test]
+    fn a_save_never_touches_a_file_named_like_a_temp_file() {
+        // #1190 review: the temp name was predictable and a file already
+        // at it was removed first, so a save could delete an unrelated one.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        std::fs::write(&f, "a\n").unwrap();
+        let planted = dir
+            .path()
+            .join(format!(".notes.md.croft-save-{}", std::process::id()));
+        std::fs::write(&planted, "not croft's\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "not croft's\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file is left behind: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_files_group() {
+        // #1190 review: the renamed-in file took the default group.
+        use std::os::unix::fs::MetadataExt as _;
+        let mut groups = vec![0 as libc::gid_t; 64];
+        let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+        let egid = unsafe { libc::getegid() };
+        let Some(&other) = groups[..n.max(0) as usize].iter().find(|&&g| g != egid) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("shared.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        std::os::unix::fs::chown(&f, None, Some(other)).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::metadata(&f).unwrap().gid(), other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saving_keeps_the_files_extended_attributes() {
+        // #1190 review: xattrs, and the POSIX ACLs stored in them, were
+        // left behind on the old inode.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("tagged.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"user.croft-test";
+        let set =
+            unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"kept".as_ptr().cast(), 4, 0) };
+        if set != 0 {
+            return; // the filesystem has no user xattrs
+        }
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        let mut buf = [0u8; 16];
+        let got = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert_eq!(got, 4, "the xattr is gone");
+        assert_eq!(&buf[..4], b"kept");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
     }
 
     #[test]
