@@ -62,7 +62,8 @@ pub fn query(root: &Path) -> GitStatus {
     } else {
         None
     };
-    let porcelain = run_git(root, &["status", "--porcelain"]).unwrap_or_default();
+    let porcelain =
+        run_git(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap_or_default();
     let dirty = parse_porcelain_dirty(&porcelain);
     let changed_count = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
     let (ahead, behind) = match run_git(
@@ -648,7 +649,7 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
     let output = match Command::new("git")
         // Poll without taking index.lock; see run_git.
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "status", "--porcelain"])
+        .args(["-C", path_str, "status", "--porcelain", "--untracked-files=all"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -3977,6 +3978,48 @@ mod tests {
             None,
             "outside a repo there is no toplevel"
         );
+    }
+
+    /// A new folder lists each of its files (#1279), not one `dir/` row
+    /// that opens nothing and has no line count.
+    #[test]
+    fn a_new_folder_lists_each_of_its_files() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir_all(p.join("src/billing")).unwrap();
+        std::fs::write(
+            p.join("src/billing/invoice.py"),
+            "def invoice(total):\n    return round(total * 1.2, 2)\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("src/billing/tax.py"), "RATE = 0.2\n").unwrap();
+        let entries = query_changes(p);
+        let untracked: Vec<(&str, usize)> = entries
+            .iter()
+            .filter(|e| e.kind == ChangeKind::Untracked)
+            .map(|e| (e.path.as_str(), e.additions))
+            .collect();
+        assert_eq!(
+            untracked,
+            [("src/billing/invoice.py", 2), ("src/billing/tax.py", 1)]
+        );
+        assert_eq!(query(p).changed_count, 2, "the badge counts files too");
+    }
+
+    #[test]
+    fn an_ignored_folder_still_lists_nothing() {
+        // Negative: `-uall` lists untracked files, never ignored ones.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitignore"), "build/\n").unwrap();
+        sh_git(p, &["add", ".gitignore"]);
+        sh_git(p, &["commit", "-qm", "ignore"]);
+        std::fs::create_dir_all(p.join("build/out")).unwrap();
+        std::fs::write(p.join("build/out/a.o"), "x").unwrap();
+        assert!(query_changes(p).is_empty());
+        assert_eq!(query(p).changed_count, 0);
     }
 
     /// git's prepared message for a conflicted merge (#1282), comments
