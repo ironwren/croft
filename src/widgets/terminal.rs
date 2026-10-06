@@ -1972,10 +1972,14 @@ impl PtyTerminal {
         // it re-splits the budget over the panes already open; registering
         // then trims them to the smaller share before this pane records.
         let rewind_budget = crate::rewind::budget();
-        rewind_budget.set_total(crate::rewind::configured_budget_bytes(
-            crate::prefs::Prefs::load_or_default().terminal_rewind_mb,
-            crate::remote::running_over_ssh(),
-        ));
+        let rewind_mb = crate::prefs::Prefs::load_or_default().terminal_rewind_mb;
+        // Off by default until it can be replayed (#1342), but the recorder's
+        // own tests drive it through real panes, and every spawn sets the one
+        // shared total: test panes all record under the same explicit figure
+        // rather than one turning it off under another.
+        #[cfg(test)]
+        let rewind_mb = rewind_mb.or(Some(128));
+        rewind_budget.set_total(crate::rewind::configured_budget_bytes(rewind_mb));
         let rewind = rewind_budget.register();
         let rewind_for_thread = rewind.clone();
         // MONOTONIC, not the wall clock. Every read the buffer offers —
