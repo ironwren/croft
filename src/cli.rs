@@ -404,9 +404,10 @@ pub enum CliCommand {
     },
     /// Print a JSON template for translating croft's UI into `lang` (#621).
     ///
-    /// Every palette title, with your own or the built-in translation filled
-    /// in where one exists. `--write` updates `<config>/locales/<lang>.json`
-    /// in place, keeping what it already holds; fill in the rest there.
+    /// Every palette title and every other string croft translates, with
+    /// your own or the built-in translation filled in where one exists.
+    /// `--write` updates `<config>/locales/<lang>.json` in place, keeping what
+    /// it already holds; fill in the rest there.
     LocaleTemplate {
         /// Language code, such as `de` or `fr`.
         lang: String,
@@ -844,7 +845,10 @@ impl Cli {
                     "Run `croft locale-template {code} --write` to update locales/{code}.json in croft's config directory in place."
                 );
                 let user = std::fs::read_to_string(&path).ok();
-                println!("{}", crate::i18n::template(&code, user.as_deref(), &[]));
+                println!(
+                    "{}",
+                    crate::i18n::template(&code, user.as_deref(), crate::i18n::TRANSLATABLE)
+                );
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
