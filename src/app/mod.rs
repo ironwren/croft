@@ -38670,16 +38670,14 @@ impl App {
         // a confirmation saying "run on 5 hosts?" asks them to approve a list
         // they cannot see, which is not consent. `*` is how to say "all of
         // them" deliberately.
-        let Some((picked, command)) =
-            crate::fleet::parse_request_with_groups(command, &known, &self.fleet_groups)
-        else {
-            self.status = format!(
-                "Fleet run needs 'hosts: command' — e.g. '{}: uptime', or '*: uptime' for all {}",
-                known[0],
-                known.len()
-            );
-            return;
-        };
+        let (picked, command) =
+            match crate::fleet::parse_request_with_groups(command, &known, &self.fleet_groups) {
+                Ok(parsed) => parsed,
+                Err(refusal) => {
+                    self.status = refusal.message(&known);
+                    return;
+                }
+            };
         let hosts: Vec<String> = picked.into_iter().cloned().collect();
         if self.fleet_running {
             self.status = String::from("A fleet run is already in flight");
