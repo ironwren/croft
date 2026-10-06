@@ -712,7 +712,11 @@ impl Cli {
                     std::fs::create_dir_all(dir)?;
                 }
                 crate::collab::ensure_relay(&socket)?;
-                crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+                crate::collab_agent::run(
+                    &socket,
+                    &workspace,
+                    name.unwrap_or_else(|| "claude".into()),
+                )
             }
             Some(CliCommand::Pr { number }) => {
                 let Some(selector) = crate::pr_review::parse_pr_selector(&number) else {
