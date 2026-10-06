@@ -940,10 +940,12 @@ fn render_merge_panes(
         buf[(x, inner.y)].set_style(head_style);
         buf[(x, inner.y)].set_symbol(" ");
     }
-    let src = if mv.from_markers {
-        "markers"
+    let src = if let Some(agent) = mv.proposal_from.as_deref() {
+        format!("{agent}'s proposal \u{2194} your unsaved edits")
+    } else if mv.from_markers {
+        String::from("markers")
     } else {
-        "git stages"
+        String::from("git stages")
     };
     let header = format!(
         " MERGE ({src})  {resolved}/{total} conflict{} resolved \u{2022} F7 next \u{2022} Alt+\u{2191}\u{2193} scroll sources ",
@@ -959,13 +961,12 @@ fn render_merge_panes(
         buf[(x, sep_y)].set_style(sep_style);
         buf[(x, sep_y)].set_symbol(" ");
     }
-    buf.set_stringn(
-        inner.x,
-        sep_y,
-        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file ",
-        inner.width as usize,
-        sep_style,
-    );
+    let result_hint = if mv.proposal_from.is_some() {
+        " RESULT (editable) \u{2014} save to approve \u{b7} close unsaved to go back "
+    } else {
+        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file "
+    };
+    buf.set_stringn(inner.x, sep_y, result_hint, inner.width as usize, sep_style);
 
     // The panes: Current | (Base) | Incoming, or stacked when narrow.
     struct Pane<'a> {
@@ -995,6 +996,8 @@ fn render_merge_panes(
     panes.push(Pane {
         title: if mv.deleted == Some(CheckSide::Current) {
             "CURRENT (yours): deleted"
+        } else if mv.proposal_from.is_some() {
+            "CURRENT (your unsaved edits)"
         } else {
             "CURRENT (yours)"
         },
@@ -1029,6 +1032,8 @@ fn render_merge_panes(
     panes.push(Pane {
         title: if mv.deleted == Some(CheckSide::Incoming) {
             "INCOMING (theirs): deleted"
+        } else if mv.proposal_from.is_some() {
+            "INCOMING (the agent's proposal)"
         } else {
             "INCOMING (theirs)"
         },
@@ -17720,8 +17725,11 @@ pub(crate) fn disambiguated_tab_labels(editors: &[Editor]) -> Vec<String> {
     for (i, e) in editors.iter().enumerate() {
         // A symbol tab's label already differs from its file's tab, and the
         // two share a path, so no parent suffix could tell them apart.
+        // A proposal merge's scratch copy is labelled as one, and its
+        // parent is a cache token that would only add noise (#1353).
         if e.diff.is_none()
             && e.symbol_view.is_none()
+            && !e.merge.as_ref().is_some_and(|m| m.proposal_from.is_some())
             && let Some(name) = e.path.as_deref().and_then(|p| p.file_name())
         {
             groups
@@ -17863,7 +17871,9 @@ fn tab_label(e: &Editor) -> String {
     };
     // The merge editor is text underneath (dirty dot still applies), but
     // the tab says which flavour of the file it is showing.
-    let name = if e.merge.is_some() {
+    let name = if e.merge.as_ref().is_some_and(|m| m.proposal_from.is_some()) {
+        format!("{name} (proposal merge)")
+    } else if e.merge.is_some() {
         format!("{name} (merge)")
     } else if let Some(view) = e.symbol_view.as_ref() {
         // A symbol tab (#369) leads with its symbol; the file says where.

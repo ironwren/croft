@@ -14007,6 +14007,21 @@ impl App {
             }
             return;
         }
+        // The merge of an agent's proposal with unsaved edits (#1353): the
+        // save is the approval, and the file is croft's scratch copy, which
+        // no repository should stage.
+        if self
+            .approval_edit
+            .as_ref()
+            .is_some_and(|(_, scratch)| *scratch == path)
+        {
+            if self.editor.dirty {
+                self.save();
+            } else {
+                self.approve_saved_edit(&path);
+            }
+            return;
+        }
         if self.editor.dirty {
             self.save();
         }
@@ -17313,6 +17328,7 @@ impl App {
             self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
             self.editor.cursor_col = 0;
         }
+        mv.proposal_from = Some(agent.clone());
         self.editor.merge = Some(mv);
         self.approval_merge_into = Some(target);
         self.status = format!(

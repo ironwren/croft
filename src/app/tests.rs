@@ -39311,6 +39311,15 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         app.status
     );
 
+    // #1353's negative: a git conflict keeps its git wording.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = screen_text(&term);
+    assert!(screen.contains("MERGE (git stages)"), "{screen}");
+    assert!(
+        screen.contains("\"Merge: Complete Merge\" stages the file"),
+        "{screen}"
+    );
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
     assert_eq!(
         app.editor
@@ -69397,6 +69406,86 @@ fn an_agent_edit_to_a_dirty_tab_goes_through_a_three_way_merge() {
         // to write.
         app.editor.open_pinned(&target).unwrap();
         assert_eq!(app.editor.lines, ["ONE", "two", "theirs", "four", "FIVE"]);
+    });
+}
+
+#[test]
+fn completing_an_approval_merge_approves_it_and_stages_nothing() {
+    // #1353: the merge of an agent's proposal with unsaved edits wore the
+    // git merge editor's chrome ("git stages", "Complete Merge stages the
+    // file"), and Complete Merge, after the save that approved it, ran
+    // `git add` on croft's scratch copy: "Stage failed: … outside repository".
+    use std::io::{BufRead, Write};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&target).unwrap();
+        app.editor.lines[1] = String::from("mine");
+        app.editor.dirty = true;
+        app.editor.pin_active();
+        let sock = tmp.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        app.hook_listener = Some(listener);
+        let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let req = crate::agent_hook::EditRequest {
+            agent: "claude-code".into(),
+            tool: "Write".into(),
+            input: serde_json::json!({"file_path": target, "content": "one\ntheirs\nthree\n"}),
+            cwd: tmp.path().into(),
+        };
+        writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        app.drain_hook_requests();
+        app.approval_ui.as_mut().unwrap().shown_at -= crate::agent_approval::ARM_DELAY;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.editor.merge.is_some(), "precondition: the merge is up");
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("MERGE (claude-code's proposal"),
+            "the header names what is being merged: {screen}"
+        );
+        assert!(
+            screen.contains("save to approve"),
+            "the Result row says how to approve: {screen}"
+        );
+        assert!(!screen.contains("git stages"), "{screen}");
+        assert!(!screen.contains("stages the file"), "{screen}");
+
+        app.merge_apply(crate::merge_editor::ConflictState::Incoming);
+        app.run_command(crate::widgets::command_palette::Command::MergeComplete);
+        assert!(app.approvals.is_empty(), "approved: {}", app.status);
+        assert!(!app.status.contains("Stage failed"), "{}", app.status);
+        assert!(app.status.starts_with("Approved"), "{}", app.status);
+        let staged = git(&["diff", "--cached", "--name-only"]);
+        assert!(staged.stdout.is_empty(), "nothing staged");
+
+        hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(hook).read_line(&mut line).unwrap();
+        let crate::agent_hook::Decision::AllowEdited { input } =
+            serde_json::from_str(line.trim()).unwrap()
+        else {
+            panic!("not an edited approval: {line}");
+        };
+        assert_eq!(input["content"], "one\ntheirs\nthree\n");
     });
 }
 
