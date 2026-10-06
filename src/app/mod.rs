@@ -36930,7 +36930,7 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => Err("Hunk actions work inside a Source Control diff"),
+            None => self.editor_hunk_patch_at_caret(),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
@@ -36952,6 +36952,59 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Stage / Unstage / Revert Hunk from an editor tab (#1352): the hunk
+    /// whose change bar the caret is on, as a patch of the file on disk
+    /// against HEAD, the same pair the gutter's bars come from. Refused
+    /// with unsaved edits, since the patch is applied to the saved file.
+    fn editor_hunk_patch_at_caret(&mut self) -> Result<(String, String), &'static str> {
+        let Some(path) = self.editor.path.clone() else {
+            return Err("Hunk actions need a file in a git repository");
+        };
+        if self.editor.dirty {
+            return Err("Save the file first: hunk actions apply to the file on disk");
+        }
+        let row = self.editor.cursor_row;
+        let Some(mark) = self.editor.current_git_mark_at(row) else {
+            return Err("No change at the cursor");
+        };
+        let rel = self
+            .repo_relative_path(&path)
+            .ok_or("File is outside the repository")?;
+        let head = crate::git::read_file_at_head(&self.scm_root(), &rel)
+            .map_err(|_| "This file has no version in HEAD")?;
+        let disk = std::fs::read_to_string(&path).map_err(|_| "Could not read the file")?;
+        let data = crate::widgets::diff::DiffData::build_with_byte_check(
+            PathBuf::from(&rel),
+            path,
+            head.lines().map(str::to_string).collect(),
+            disk.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&disk),
+        );
+        // The diff row showing this line; a deletion bar sits on the line
+        // after the removed run, so its hunk is the row just above.
+        use crate::widgets::diff::DiffRow;
+        let at = data
+            .rows
+            .iter()
+            .position(|r| match *r {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => right == row,
+                DiffRow::Removed { .. } => false,
+            })
+            .map(|i| {
+                if mark == crate::widgets::editor::GitMark::Deleted {
+                    i.saturating_sub(1)
+                } else {
+                    i
+                }
+            })
+            .ok_or("No change at the cursor")?;
+        let range = data.hunk_range_at(at).ok_or("No change at the cursor")?;
+        Ok((rel.clone(), data.hunk_patch(&rel, range)))
     }
 
     /// The workspace-relative path + patch for the SELECTED lines of the
@@ -37180,6 +37233,11 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
+                // Reverted from an editor tab (#1352): show the restored text
+                // now rather than on the next file-system sweep.
+                if self.editor.diff.is_none() && self.editor.reload_if_clean().is_some() {
+                    self.sync_open_file_poll_mtime();
+                }
                 // The revert rewrote the working file; force the HEAD-side rebuild
                 // of the open view so it refreshes even if the rewrite landed
                 // within the stamp's granularity. Forced by the root the VIEW is
@@ -41257,6 +41315,12 @@ impl App {
         // exist, so F7 keeps its normal meaning everywhere else.
         if matches!(key.code, KeyCode::F(7)) && !self.editor.conflicts().is_empty() {
             self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
+            return;
+        }
+        // F7 / Shift+F7 elsewhere: Go to Next / Previous Change over the
+        // gutter's change bars (#1352), as the diff view walks its hunks.
+        if matches!(key.code, KeyCode::F(7)) && self.editor.merge.is_none() {
+            self.jump_editor_change(!key.modifiers.contains(KeyModifiers::SHIFT));
             return;
         }
         // Merge editor (#253): F7 hops the tracked Result regions (the
@@ -48875,6 +48939,8 @@ impl App {
                     self.jump_conflict(false)
                 }
             }
+            Cmd::GoToNextChange => self.jump_editor_change(true),
+            Cmd::GoToPrevChange => self.jump_editor_change(false),
             Cmd::MergePrevConflict => {
                 if self.editor.merge.is_some() {
                     self.merge_jump(true);
@@ -60182,6 +60248,29 @@ impl App {
     /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
     /// switch worksheets. Anything else is swallowed so a stray keystroke
     /// can't insert characters into a buffer the user can't see.
+    /// Go to Next / Previous Change (#1352): in a diff tab its hunks, in a
+    /// buffer with merge conflicts its conflicts, otherwise the editor's
+    /// change bars, wrapping at the ends.
+    fn jump_editor_change(&mut self, forward: bool) {
+        if self.editor.diff.is_some() {
+            self.jump_diff_change(forward);
+            return;
+        }
+        if !self.editor.conflicts().is_empty() {
+            self.jump_conflict(!forward);
+            return;
+        }
+        let row = self.editor.cursor_row;
+        match self.editor.git_change_from(row, forward) {
+            Some(line) => {
+                self.editor.clear_selection();
+                self.editor.goto_line_centered(line);
+                self.status = format!("Change at line {}", line + 1);
+            }
+            None => self.status = String::from("No changes in this file"),
+        }
+    }
+
     /// Scroll the active diff to the next change hunk (forward=true) or
     /// the previous one (forward=false), wrapping around the ends so a
     /// user can keep clicking the same arrow to cycle through every
