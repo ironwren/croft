@@ -41667,6 +41667,9 @@ impl App {
             self.refresh_sarif_preview();
             return;
         }
+        if self.editor.log.is_some() && self.handle_log_key(key) {
+            return;
+        }
         // Image preview tabs are read-only. PDF tabs page with every
         // navigation key (arrows, PageUp/PageDown, Space, Home/End) and with
         // the wheel; everything else is swallowed.
@@ -62544,6 +62547,30 @@ impl App {
             Ok(()) => format!("Opened {}:{}", path.display(), line + 1),
             Err(e) => format!("Open failed: {e}"),
         };
+    }
+
+    /// Rendered log keys (#1189): the arrows move a line, PageUp/PageDown a
+    /// screen, Home/End (with or without Ctrl) go to the top and the tail.
+    /// The tab's text side is a one-line stub, so every other key is
+    /// swallowed: reaching the editor, it pinned the view to line 1 and
+    /// typing marked the read-only tab modified. Copy, Esc and the
+    /// tab-number jumps are left to the editor (false), which handles them
+    /// for a log.
+    fn handle_log_key(&mut self, key: KeyEvent) -> bool {
+        if is_editor_copy_key(key) || jump_to_tab_index(key).is_some() || key.code == KeyCode::Esc {
+            return false;
+        }
+        let page = self.editor.visible_rows().saturating_sub(2).max(1);
+        match key.code {
+            KeyCode::Down => self.editor.scroll_down(1),
+            KeyCode::Up => self.editor.scroll_up(1),
+            KeyCode::PageDown => self.editor.scroll_down(page),
+            KeyCode::PageUp => self.editor.scroll_up(page),
+            KeyCode::End => self.editor.scroll_down(usize::MAX / 2),
+            KeyCode::Home => self.editor.scroll_up(usize::MAX / 2),
+            _ => {}
+        }
+        true
     }
 
     /// Archive browser keys (#179): selection movement, Enter extracts
