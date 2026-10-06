@@ -5017,6 +5017,7 @@ const SGR_FLAGS: Flags = Flags::BOLD
     .union(Flags::DOTTED_UNDERLINE)
     .union(Flags::DASHED_UNDERLINE)
     .union(Flags::INVERSE)
+    .union(Flags::HIDDEN)
     .union(Flags::STRIKEOUT);
 
 /// The SGR sequence that reproduces a cell's colours and attributes, or an
@@ -5046,6 +5047,9 @@ fn cell_sgr(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> String {
     }
     if flags.contains(Flags::INVERSE) {
         codes.push("7".into());
+    }
+    if flags.contains(Flags::HIDDEN) {
+        codes.push("8".into());
     }
     if flags.contains(Flags::STRIKEOUT) {
         codes.push("9".into());
@@ -5080,6 +5084,7 @@ fn style_is_default(fg: AnsiColor, bg: AnsiColor, flags: Flags) -> bool {
                 | Flags::DOTTED_UNDERLINE
                 | Flags::DASHED_UNDERLINE
                 | Flags::INVERSE
+                | Flags::HIDDEN
                 | Flags::STRIKEOUT,
         )
 }
@@ -5428,6 +5433,17 @@ impl Widget for &mut PtyTerminal {
                 }
                 if flags.contains(Flags::INVERSE) {
                     style = style.add_modifier(Modifier::REVERSED);
+                }
+                // SGR 9: coding agents strike through finished todo items.
+                if flags.contains(Flags::STRIKEOUT) {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                // SGR 8 (conceal) paints a blank, not just HIDDEN, so the
+                // text stays hidden on a host terminal that ignores SGR 8.
+                // The grid keeps the real text for copy, as in xterm.
+                if flags.contains(Flags::HIDDEN) {
+                    style = style.add_modifier(Modifier::HIDDEN);
+                    display_char = ' ';
                 }
                 // Trigger highlight: the user's per-trigger colours over the
                 // matched span. Cursor / selection / find / quick-select all
@@ -7333,6 +7349,76 @@ mod tests {
             }
         }
         panic!("the faint sentinel never appeared in the rendered buffer");
+    }
+
+    /// A quiet pane fed the issue's bytes (#1288): two struck-through todo
+    /// items, a concealed password and a plain word.
+    fn strike_and_conceal_pane() -> (PtyTerminal, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap();
+        term.feed_bytes_for_test(
+            b"\x1b[2J\x1b[H\x1b[9mDONE\x1b[0m [\x1b[8mhunter2\x1b[0m] PLAIN\r\n",
+        );
+        (term, tmp)
+    }
+
+    #[test]
+    fn struck_through_cells_paint_crossed_out_and_concealed_cells_paint_blank() {
+        let (mut term, _tmp) = strike_and_conceal_pane();
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("DONE"))
+            .expect("the todo row is painted") as u16;
+        let row = &rows[y as usize];
+        assert!(!row.contains("hunter2"), "SGR 8 text is hidden: {row:?}");
+        assert!(row.contains("DONE [       ] PLAIN"), "{row:?}");
+        // Cells, not bytes: the pane border is a multi-byte glyph.
+        let at = |word: &str| row[..row.find(word).unwrap()].chars().count() as u16;
+        for x in at("DONE")..at("DONE") + 4 {
+            assert!(
+                buf[(x, y)].modifier.contains(Modifier::CROSSED_OUT),
+                "SGR 9 cell at {x} is struck through"
+            );
+        }
+        for x in at("PLAIN")..at("PLAIN") + 5 {
+            assert!(
+                !buf[(x, y)]
+                    .modifier
+                    .intersects(Modifier::CROSSED_OUT | Modifier::HIDDEN),
+                "plain cell at {x} carries neither"
+            );
+        }
+    }
+
+    #[test]
+    fn concealed_text_still_copies_and_exports_with_its_sgr() {
+        // Negative: hiding is paint-only, as in xterm. The grid, and so a
+        // copy, keeps the real text, and an export with styles writes the
+        // attributes back out as 8 and 9 for the reader to honour.
+        let (term, _tmp) = strike_and_conceal_pane();
+        let (lines, _) = term.grid_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("DONE [hunter2] PLAIN")),
+            "{lines:?}"
+        );
+        let exported = term.grid_lines_ansi();
+        let (_, raw) = exported
+            .iter()
+            .find(|(p, _)| p.contains("hunter2"))
+            .expect("the row is exported");
+        assert!(raw.contains("\x1b[9mDONE"), "{raw:?}");
+        assert!(raw.contains("\x1b[8mhunter2"), "{raw:?}");
     }
 
     #[test]
