@@ -4070,6 +4070,11 @@ pub struct App {
     /// debounce, and when it settled — occurrences' idle pattern.
     linked_observed: Option<(PathBuf, usize, usize, u64)>,
     linked_observed_at: std::time::Instant,
+    /// A request already went out for `linked_observed` (#1299). Kept
+    /// apart from `linked_request`, which the reply clears: a `null`
+    /// answer left nothing to say the position was asked, so every UI
+    /// wake asked again while the caret stayed put.
+    linked_asked: bool,
     /// In-flight Expand Selection request (#254). Extra Shift+Alt+Right
     /// presses while the chains are in flight stack up and apply
     /// together on drain; an `unsupported` verdict resolves them via
@@ -6239,6 +6244,7 @@ impl App {
             linked_request: None,
             linked_observed: None,
             linked_observed_at: std::time::Instant::now(),
+            linked_asked: false,
             selection_range_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
@@ -11877,6 +11883,7 @@ impl App {
         let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
             self.linked_observed = None;
             self.linked_request = None;
+            self.linked_asked = false;
             self.editor.clear_linked_ranges();
             return mirrored;
         };
@@ -11895,13 +11902,10 @@ impl App {
             self.linked_observed = Some(cur);
             self.linked_observed_at = std::time::Instant::now();
             self.linked_request = None;
+            self.linked_asked = false;
             return mirrored;
         }
-        let already = self
-            .linked_request
-            .as_ref()
-            .is_some_and(|(_, p, s)| (p, s) == (&cur.0, &cur.3));
-        if already || self.linked_observed_at.elapsed() < LINKED_IDLE {
+        if self.linked_asked || self.linked_observed_at.elapsed() < LINKED_IDLE {
             return mirrored;
         }
         let (uline, uchar) = self.editor.cursor_position_utf16();
@@ -11910,6 +11914,7 @@ impl App {
         };
         let id = lsp.request_linked_editing(cur.0.clone(), uline, uchar);
         self.linked_request = Some((id, cur.0, cur.3));
+        self.linked_asked = true;
         mirrored
     }
 
