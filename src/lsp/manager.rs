@@ -6685,7 +6685,17 @@ fn flatten_symbols(resp: DocumentSymbolResponse) -> Vec<OutlineSymbol> {
     }
 }
 
+/// Each level in file order (#1220): tsserver sorts its navigation tree's
+/// children by name, so vtsls replies `Cart` before `sum`; VS Code orders by
+/// position client-side, and so does this.
 fn push_nested(syms: &[DocumentSymbol], depth: u16, out: &mut Vec<OutlineSymbol>) {
+    let mut syms: Vec<&DocumentSymbol> = syms.iter().collect();
+    syms.sort_by_key(|s| {
+        (
+            s.selection_range.start.line,
+            s.selection_range.start.character,
+        )
+    });
     for sym in syms {
         out.push(OutlineSymbol {
             name: sym.name.clone(),
@@ -11312,5 +11322,115 @@ while True:
             "the site is the supertype's name, from selectionRange"
         );
         runtime.handle().clone().block_on(state.shutdown_all());
+    }
+
+    /// A nested `documentSymbol` reply from JSON.
+    fn nested_reply(json: serde_json::Value) -> DocumentSymbolResponse {
+        DocumentSymbolResponse::Nested(serde_json::from_value(json).unwrap())
+    }
+
+    fn doc_symbol(name: &str, line: u32, children: serde_json::Value) -> serde_json::Value {
+        let pos = serde_json::json!({"line": line, "character": 2});
+        let range = serde_json::json!({"start": pos, "end": pos});
+        serde_json::json!({
+            "name": name, "kind": 5, "range": range, "selectionRange": range,
+            "children": children,
+        })
+    }
+
+    /// #1220: tsserver sorts each level of its navigation tree by name, so
+    /// OUTLINE and Go to Symbol listed `Cart` before `sum` and `cents`
+    /// before `id`. Every level comes out in file order, as in VS Code.
+    #[test]
+    fn nested_symbols_list_in_file_order_at_every_level() {
+        let reply = nested_reply(serde_json::json!([
+            doc_symbol(
+                "Cart",
+                11,
+                serde_json::json!([
+                    doc_symbol("add", 13, serde_json::json!([])),
+                    doc_symbol("items", 12, serde_json::json!([])),
+                    doc_symbol("total", 16, serde_json::json!([])),
+                ])
+            ),
+            doc_symbol("handler", 6, serde_json::json!([])),
+            doc_symbol(
+                "Item",
+                0,
+                serde_json::json!([
+                    doc_symbol("cents", 0, serde_json::json!([])),
+                    doc_symbol("id", 0, serde_json::json!([])),
+                ])
+            ),
+            doc_symbol("sum", 2, serde_json::json!([])),
+        ]));
+        let mut reply = reply;
+        // `cents` is declared after `id` on the same line.
+        if let DocumentSymbolResponse::Nested(syms) = &mut reply {
+            let item = syms.iter_mut().find(|s| s.name == "Item").unwrap();
+            let fields = item.children.as_mut().unwrap();
+            fields[0].selection_range.start.character = 30;
+            fields[1].selection_range.start.character = 17;
+        }
+        let names: Vec<(String, u16)> = flatten_symbols(reply)
+            .into_iter()
+            .map(|s| (s.name, s.depth))
+            .collect();
+        let expected = [
+            ("Item", 0),
+            ("id", 1),
+            ("cents", 1),
+            ("sum", 0),
+            ("handler", 0),
+            ("Cart", 0),
+            ("items", 1),
+            ("add", 1),
+            ("total", 1),
+        ];
+        let expected: Vec<(String, u16)> =
+            expected.iter().map(|(n, d)| (n.to_string(), *d)).collect();
+        assert_eq!(names, expected);
+    }
+
+    /// Negative (#1220): a reply already in file order (Python, Rust) comes
+    /// out unchanged, children stay under their own parent, and the flat
+    /// `SymbolInformation` shape still sorts by position.
+    #[test]
+    fn symbols_already_in_file_order_and_flat_replies_are_unchanged() {
+        let reply = nested_reply(serde_json::json!([
+            doc_symbol(
+                "first",
+                1,
+                serde_json::json!([doc_symbol("late_child", 9, serde_json::json!([])),])
+            ),
+            doc_symbol("second", 4, serde_json::json!([])),
+        ]));
+        let names: Vec<(String, u16)> = flatten_symbols(reply)
+            .into_iter()
+            .map(|s| (s.name, s.depth))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("first".to_string(), 0),
+                ("late_child".to_string(), 1),
+                ("second".to_string(), 0)
+            ],
+            "a child declared after the next sibling's line stays under its parent"
+        );
+        let pos = |line: u32| {
+            serde_json::json!({"start": {"line": line, "character": 0},
+                                                 "end": {"line": line, "character": 1}})
+        };
+        let flat: Vec<lsp_types::SymbolInformation> = serde_json::from_value(serde_json::json!([
+            {"name": "b", "kind": 12, "location": {"uri": "file:///x.py", "range": pos(5)}},
+            {"name": "a", "kind": 12, "location": {"uri": "file:///x.py", "range": pos(2)}},
+        ]))
+        .unwrap();
+        let names: Vec<String> = flatten_symbols(DocumentSymbolResponse::Flat(flat))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
     }
 }
