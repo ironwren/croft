@@ -2986,6 +2986,9 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// The project's `files_exclude` globs (#1345), as last applied to the
+    /// Explorer, so a settings reload re-lists the tree only on a change.
+    files_exclude: Vec<String>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -5596,6 +5599,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            files_exclude: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -6290,6 +6294,7 @@ impl App {
         }
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
+        app.apply_project_excludes(&loaded_prefs);
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -8109,7 +8114,7 @@ impl App {
         // next scan honours them (VS Code's Search filter inputs).
         let _ = self.search_query_tx.send(SearchRequest::SetFilter(
             self.search.include.clone(),
-            self.search.exclude.clone(),
+            self.search.effective_exclude(),
         ));
         let _ = self.search_query_tx.send(SearchRequest::Query(
             self.search.query.clone(),
@@ -47334,8 +47339,9 @@ impl App {
                 let arc = std::sync::Arc::new(entries);
                 self.file_finder_index = Some(arc.clone());
                 self.file_finder_index_rx = None;
+                let visible = self.without_project_excludes(arc);
                 if let Some(finder) = self.file_finder.as_mut() {
-                    finder.replace_entries(arc);
+                    finder.replace_entries(visible);
                 }
                 if self.file_finder_index_dirty {
                     self.kick_file_finder_index_rebuild();
@@ -47390,6 +47396,7 @@ impl App {
             .file_finder_index
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+        let entries = self.without_project_excludes(entries);
         let count = entries.len();
         self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
         self.overlays.file_finder_clear.request();
@@ -53963,6 +53970,10 @@ impl App {
                         self.run_search_replace_all();
                         return;
                     }
+                    if self.search.project_exclude_toggle_at(m.column, m.row) {
+                        self.toggle_project_excludes();
+                        return;
+                    }
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
@@ -57301,6 +57312,65 @@ impl App {
         }
     }
 
+    /// Flip the Search panel's project exclusions on or off (#1345), VS
+    /// Code's "Use Exclude Settings and Ignore Files", and search again.
+    fn toggle_project_excludes(&mut self) {
+        self.search.use_exclude_settings = !self.search.use_exclude_settings;
+        self.status = String::from(if self.search.use_exclude_settings {
+            "Search: project exclusions on"
+        } else {
+            "Search: project exclusions off, searching every folder"
+        });
+        if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+            self.submit_search_query();
+        }
+    }
+
+    /// Apply the project's `files_exclude` / `search_exclude` globs
+    /// (#1345): the Explorer hides `files_exclude`, Search and Go to File
+    /// leave out both. Re-lists the tree and re-runs a live search only
+    /// when the globs changed.
+    fn apply_project_excludes(&mut self, p: &crate::prefs::Prefs) {
+        let mut search = p.files_exclude.clone();
+        search.extend(p.search_exclude.iter().cloned());
+        if search != self.search.project_exclude {
+            self.search.project_exclude = search;
+            if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+                self.submit_search_query();
+            }
+        }
+        if p.files_exclude != self.files_exclude {
+            self.files_exclude = p.files_exclude.clone();
+            self.tree.exclude = crate::widgets::search::PathFilter::excluding(&self.files_exclude);
+            self.tree.refresh_children(0);
+        }
+    }
+
+    /// The Go to File index without the files the project excludes
+    /// (#1345): VS Code's file search honours both exclude settings.
+    fn without_project_excludes(
+        &self,
+        entries: std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>,
+    ) -> std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>> {
+        if self.search.project_exclude.is_empty() {
+            return entries;
+        }
+        let filter = crate::widgets::search::PathFilter::excluding(&self.search.project_exclude);
+        let kept = entries
+            .iter()
+            .filter(|e| {
+                let root = self
+                    .roots
+                    .iter()
+                    .find(|r| e.path.starts_with(r))
+                    .map_or_else(|| self.roots.primary().to_path_buf(), |r| r.to_path_buf());
+                !filter.excludes(&root, &e.path)
+            })
+            .cloned()
+            .collect();
+        std::sync::Arc::new(kept)
+    }
+
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
     /// when any file of the chain is saved in the editor; layout and other
@@ -57340,6 +57410,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.apply_project_excludes(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
