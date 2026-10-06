@@ -17942,6 +17942,12 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
+        // The labels go through `set_stringn`, which indexes the buffer
+        // directly, so a strip with no row inside the frame paints nothing.
+        let strip = strip.intersection(frame.area());
+        if strip.is_empty() {
+            return;
+        }
         let strip_bg = self.theme.editor_bg();
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
@@ -19004,11 +19010,14 @@ impl App {
             // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
             // row; the active tab's view fills the rest. Mirrors VS Code's
             // bottom-panel tab bar.
+            // `min(1)`: at a one-row window the band is zero rows high just
+            // below the frame, and a one-row strip there writes outside the
+            // buffer (#1133).
             let strip = Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: 1,
+                height: area.height.min(1),
             };
             let content = if area.height > 1 {
                 Rect {
@@ -25505,9 +25514,9 @@ impl App {
 
     /// `program`'s bare version number, or why it could not be read.
     fn read_codeql_version(program: &std::path::Path) -> Result<String, String> {
-        let out = std::process::Command::new(program)
-            .args(crate::codeql_query::version_args())
-            .output();
+        let out = crate::review_ops::output_retrying_busy(
+            std::process::Command::new(program).args(crate::codeql_query::version_args()),
+        );
         match out {
             Ok(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -27626,10 +27635,11 @@ impl App {
     /// Refuse suite `suite` when it selects a query whose results are not
     /// alerts (#578): `database analyze` cannot produce those tables.
     fn check_codeql_suite(program: &Path, suite: &Path) -> Result<(), String> {
-        let out = std::process::Command::new(program)
-            .args(crate::codeql_query::resolve_suite_args(suite))
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out = crate::review_ops::output_retrying_busy(
+            std::process::Command::new(program)
+                .args(crate::codeql_query::resolve_suite_args(suite)),
+        )
+        .map_err(|e| format!("could not run codeql: {e}"))?;
         if !out.status.success() {
             return Err(crate::codeql_query::failure_reason(
                 &String::from_utf8_lossy(&out.stderr),
@@ -27748,13 +27758,14 @@ impl App {
         if cancel.load(Ordering::SeqCst) {
             return Err(String::from("cancelled"));
         }
-        let mut child = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let mut child = crate::review_ops::spawn_retrying_busy(
+            std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .map_err(|e| format!("could not run codeql: {e}"))?;
         let mut stderr = child.stderr.take();
         let reader = std::thread::spawn(move || {
             let mut text = String::new();
@@ -27981,10 +27992,9 @@ impl App {
     /// Run `codeql` with `args` and return what it printed on stdout; a
     /// failure is read as [`Self::codeql_command`] reads it.
     fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out =
+            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
+                .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -28675,10 +28685,9 @@ impl App {
     /// Run `codeql` with `args` and wait. A failure is the reason and the
     /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
-        let out = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out =
+            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
+                .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(());
         }
