@@ -247,6 +247,11 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "values shown".
     #[serde(default)]
     pub disable_inline_values: bool,
+    /// Start in Vim mode (#1286). Toggle Vim Mode saves it, so the mode a
+    /// user left croft in is the one the next launch starts in. Applies
+    /// only while the `vim` extension is enabled.
+    #[serde(default)]
+    pub vim_mode: bool,
     /// Whitespace rendering mode (#133): "selection" (VS Code's default,
     /// also what the empty string an older config deserializes to means),
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
@@ -1128,6 +1133,15 @@ pub fn save_inline_values(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.disable_inline_values = !enabled;
+    prefs.save(&path)
+}
+
+/// Persist Vim mode as the mode croft starts in (#1286), under an explicit
+/// config dir so a test can point it at a scratch dir.
+pub fn save_vim_mode_in(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = prefs_file_in(config_dir);
+    let mut prefs = Prefs::load_for_update(&path)?;
+    prefs.vim_mode = enabled;
     prefs.save(&path)
 }
 

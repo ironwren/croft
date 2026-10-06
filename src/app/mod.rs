@@ -3043,6 +3043,10 @@ pub struct App {
     /// commit diff, a COMMITS patch): a large repo's `git show` or rename
     /// walk froze the editor when run inline. A newer click replaces it.
     git_view_job: Option<std::sync::mpsc::Receiver<GitNetDone>>,
+    /// The `vim_mode` pref as last applied (#1286). A settings reload
+    /// changes the live mode only when the pref itself changed, so an
+    /// unrelated edit to config.json does not reset the mode in use.
+    vim_mode_pref: bool,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -5637,6 +5641,7 @@ impl App {
             blame_fetched: None,
             git_net_job: None,
             git_view_job: None,
+            vim_mode_pref: false,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -6255,6 +6260,8 @@ impl App {
         // focused-but-not-gradient: the Black-theme gradient border only
         // arms on the first focus change because nothing ran the sync at
         // construction time.
+        // #1286: start in Vim mode when it was saved as the default.
+        app.follow_vim_mode_pref(loaded_prefs.vim_mode);
         // #256: the PROBLEMS scope comes from prefs; set it after
         // construction so the panel keeps one plain `new()`.
         app.problems.scope =
@@ -36244,6 +36251,7 @@ impl App {
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
+                    "toggle:vim_mode" => self.toggle_vim_mode(),
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
@@ -36382,6 +36390,14 @@ impl App {
                     "Editor: Render Whitespace: {}{}",
                     self.whitespace_mode.label(),
                     prov("render_whitespace")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:vim_mode"),
+                label: format!(
+                    "Editor: Vim Mode: {}{}",
+                    on_off(self.vim.enabled),
+                    prov("vim_mode")
                 ),
             },
             ListRow {
@@ -41092,6 +41108,31 @@ impl App {
             self.editor
                 .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
             self.status = String::from("vim mode off");
+        }
+        // Saved as the mode the next launch starts in (#1286). Under test
+        // only into a config dir the test chose, never the developer's.
+        self.vim_mode_pref = self.vim.enabled;
+        if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
+            let _ = crate::prefs::save_vim_mode_in(&self.config_dir, self.vim.enabled);
+        }
+    }
+
+    /// Follow the `vim_mode` pref (#1286) at launch and on a settings
+    /// reload: Vim mode on when it is set and the `vim` extension is
+    /// enabled. Only a change of the pref moves the live mode, so a reload
+    /// for another setting leaves the mode, and Insert or Normal, as it is.
+    fn follow_vim_mode_pref(&mut self, want: bool) {
+        if want == self.vim_mode_pref {
+            return;
+        }
+        self.vim_mode_pref = want;
+        let on = want && self.is_extension_enabled("vim");
+        if on != self.vim.enabled {
+            self.vim.toggle();
+            if !on {
+                self.editor
+                    .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+            }
         }
     }
 
@@ -57268,6 +57309,7 @@ impl App {
         }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
+        self.follow_vim_mode_pref(p.vim_mode);
         if !p.disable_inline_blame && !self.inline_blame_enabled {
             // Re-enabling refetches, like toggle_inline_blame.
             self.blame_fetched = None;

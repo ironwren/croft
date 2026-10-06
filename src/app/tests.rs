@@ -24992,6 +24992,96 @@ fn vim_gg_and_capital_g_jump_between_ends() {
     assert_eq!(app.editor.cursor_row, 0);
 }
 
+/// #1286: a saved `vim_mode` turns modal editing on, in Normal mode, the
+/// way a launch applies it, and taking the pref back off turns it off.
+#[test]
+fn a_saved_vim_mode_turns_modal_editing_on_in_normal_mode() {
+    let (mut app, _t) = vim_app("alpha one");
+    app.vim.enabled = false;
+    let on = crate::prefs::Prefs {
+        vim_mode: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&on);
+    assert!(app.vim.enabled, "the saved default applies");
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+    vim_feed_str(&mut app, "dd");
+    assert_eq!(app.editor.lines, vec![""], "dd deletes the line, not typed");
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(!app.vim.enabled, "the pref taken off turns it off");
+}
+
+/// #1286: Toggle Vim Mode saves the choice, so the next launch starts in it.
+#[test]
+fn toggling_vim_mode_saves_it_as_the_default() {
+    let (mut app, t) = vim_app("abc");
+    app.vim.enabled = false;
+    let croft = t.path().join("croft-config");
+    std::fs::create_dir_all(&croft).unwrap();
+    app.config_dir = croft.clone();
+    let saved = || {
+        crate::prefs::Prefs::load(&croft.join("config.json"))
+            .expect("config written")
+            .vim_mode
+    };
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.vim.enabled);
+    assert!(saved(), "turning it on is saved");
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!saved(), "turning it off is saved too");
+}
+
+/// #1286: Settings has an Editor: Vim Mode row that shows and flips it.
+#[test]
+fn the_settings_picker_has_a_vim_mode_row() {
+    let (mut app, _t) = vim_app("abc");
+    app.vim.enabled = false;
+    app.open_settings_view();
+    let picker = app.list_picker.as_mut().expect("settings open");
+    let row = picker
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Editor: Vim Mode: off"))
+        .expect("a Vim Mode row");
+    picker.selected = row;
+    app.confirm_list_picker();
+    assert!(app.vim.enabled, "{}", app.status);
+}
+
+/// #1286 negative: with the vim extension disabled a saved `vim_mode`
+/// leaves modal editing off, as Toggle Vim Mode itself does.
+#[test]
+fn a_disabled_vim_extension_keeps_a_saved_vim_mode_off() {
+    let (mut app, _t) = vim_app("abc");
+    app.vim.enabled = false;
+    app.disabled_extensions.insert(String::from("vim"));
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        vim_mode: true,
+        ..Default::default()
+    });
+    assert!(!app.vim.enabled);
+}
+
+/// #1286 negative: a settings reload that leaves `vim_mode` as it was
+/// (a theme change, say) does not reset the mode the user is in.
+#[test]
+fn a_settings_reload_keeps_the_current_vim_mode() {
+    let (mut app, _t) = vim_app("abc");
+    app.vim.enabled = false;
+    let on = crate::prefs::Prefs {
+        vim_mode: true,
+        ..Default::default()
+    };
+    app.apply_merged_settings(&on);
+    vim_feed(&mut app, 'i');
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Insert);
+    app.apply_merged_settings(&on);
+    assert!(app.vim.enabled);
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Insert);
+}
+
 #[test]
 fn vim_toggle_works_from_any_pane_even_with_no_editor_focus() {
     let (mut app, _t) = vim_app("abc");

@@ -748,6 +748,14 @@ pub fn scan_profile_with_extensions(dir: &Path, extension_dirs: &[PathBuf]) -> R
     if let Some(doc) = read_jsonc(&dir.join("keybindings.json"))? {
         convert_keybindings(&doc, &mut report);
     }
+    // VSCodeVim maps to croft's built-in Vim mode (#1286): a Vim user who
+    // imports their profile starts croft in it rather than typing `dd`
+    // into the first file they open.
+    if vscodevim_installed(extension_dirs) {
+        report
+            .settings
+            .insert(String::from("vim_mode"), Value::Bool(true));
+    }
     let snippets_dir = dir.join("snippets");
     if snippets_dir.is_dir() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&snippets_dir)
@@ -770,6 +778,17 @@ pub fn scan_profile_with_extensions(dir: &Path, extension_dirs: &[PathBuf]) -> R
         }
     }
     Ok(report)
+}
+
+/// Whether VSCodeVim (`vscodevim.vim`) is installed in any of
+/// `extension_dirs`, each holding `publisher.name-version` directories.
+fn vscodevim_installed(extension_dirs: &[PathBuf]) -> bool {
+    extension_dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().is_dir() && extension_order(&e.path()).0 == "vscodevim.vim")
 }
 
 /// Whether `path` carries JSONC extras croft would destroy by rewriting it:
@@ -1680,6 +1699,36 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1286: VSCodeVim installed in the profile's product turns croft's
+    /// Vim mode on, so a Vim user's first `dd` after the import is a
+    /// command rather than text.
+    #[test]
+    fn an_installed_vscodevim_turns_vim_mode_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("vscodevim.vim-1.30.1")).unwrap();
+        let report = scan_profile_with_extensions(&profile, &[extensions]).unwrap();
+        assert_eq!(report.settings.get("vim_mode"), Some(&json!(true)));
+        assert!(!report.is_empty(), "the import has something to write");
+    }
+
+    /// #1286 negative: without VSCodeVim (another extension whose name
+    /// merely starts the same way included), the import leaves Vim mode
+    /// alone.
+    #[test]
+    fn without_vscodevim_the_import_leaves_vim_mode_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("vscodevim.vimish-0.1.0")).unwrap();
+        std::fs::create_dir_all(extensions.join("rust-lang.rust-analyzer-0.3.2")).unwrap();
+        let report = scan_profile_with_extensions(&profile, &[extensions]).unwrap();
+        assert_eq!(report.settings.get("vim_mode"), None);
     }
 
     /// Build a VS Code extensions directory holding one colour theme.
