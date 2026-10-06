@@ -31439,6 +31439,95 @@ fn hash_prefix_in_quick_open_switches_to_workspace_symbols() {
     assert_eq!(picker.query, "", "the # itself is not part of the query");
 }
 
+/// Cmd+P, then each character of `typed` as a keystroke.
+fn quick_open_typing(app: &mut App, typed: &str) {
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.file_finder.is_some(), "Cmd+P opens Quick Open");
+    for c in typed.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+/// #1306: `>` in Quick Open is VS Code's route to the Command Palette.
+#[test]
+fn angle_prefix_in_quick_open_opens_the_command_palette() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    quick_open_typing(&mut app, ">");
+    assert!(app.file_finder.is_none(), "Quick Open hands over");
+    let palette = app.command_palette.as_ref().expect("the palette opens");
+    assert_eq!(palette.query, "", "the > itself is not part of the query");
+}
+
+/// #1306: text pasted after the prefix carries over as the new query, for
+/// `>` and for the `#` that already switched when typed.
+#[test]
+fn a_pasted_prefixed_query_carries_into_the_picker_it_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    quick_open_typing(&mut app, "");
+    app.handle_paste(">toggle word wrap");
+    let palette = app.command_palette.as_ref().expect("the palette opens");
+    assert_eq!(palette.query, "toggle word wrap");
+    app.command_palette = None;
+    quick_open_typing(&mut app, "");
+    app.handle_paste("#main");
+    let picker = app.workspace_symbols.as_ref().expect("symbols open");
+    assert_eq!(picker.query, "main");
+}
+
+/// #1306: `@` in Quick Open opens Go to Symbol in Editor.
+#[test]
+fn at_prefix_in_quick_open_opens_go_to_symbol_in_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "def f():\n    pass\n");
+    quick_open_typing(&mut app, "@");
+    assert!(app.file_finder.is_none(), "Quick Open hands over");
+    let picker = app.go_to_symbol.as_ref().expect("Go to Symbol opens");
+    assert_eq!(picker.query, "");
+}
+
+/// #1306: `:12` then Enter in Quick Open goes to line 12 of the open file.
+#[test]
+fn colon_line_in_quick_open_goes_to_that_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("x = {i}\n")).collect();
+    let mut app = app_with_open_file(tmp.path(), "a.py", &body);
+    quick_open_typing(&mut app, ":12");
+    assert!(app.file_finder.is_none(), "Quick Open hands over");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 11, "{}", app.status);
+}
+
+/// #1306 negative: a file name with a line after it is still a file
+/// search, so `b.py:12` opens b.py at line 12, and an `@` or `>` later in
+/// the query is just text.
+#[test]
+fn a_file_name_with_a_line_still_opens_that_file_at_the_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=50).map(|i| format!("y = {i}\n")).collect();
+    std::fs::write(tmp.path().join("b.py"), body).unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    quick_open_typing(&mut app, "b@>");
+    assert!(
+        app.file_finder.is_some(),
+        "a later @ or > is part of the name"
+    );
+    assert!(app.command_palette.is_none() && app.go_to_symbol.is_none());
+    app.file_finder = None;
+    quick_open_typing(&mut app, "b.py:12");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.py").as_path())
+    );
+    assert_eq!(app.editor.cursor_row, 11);
+}
+
 #[test]
 fn palette_go_to_symbol_in_workspace_opens_the_picker() {
     let tmp = tempfile::tempdir().unwrap();

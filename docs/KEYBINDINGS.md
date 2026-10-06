@@ -27,6 +27,7 @@ Per platform:
 | `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column, or the Command Palette's "View: Focus Left Editor Group" / "View: Focus Right Editor Group") |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer). Add `:236` after the name to land on that line, `:236:7` for a column, or `:236-239` to open with those lines selected. Results are mouse-friendly: click a row to open it, wheel to move the selection, and the same goes for all the quick-pick popups (Command Palette, Go to Symbol, the branch and directory pickers, and the Debug: Attach to Python Process list) |
 | `Ctrl+p` / `Cmd+p`, then `#` | Go to Symbol in Workspace: the query goes to every running language server as a `workspace/symbol` search; Enter opens the picked symbol's file at its definition (also Command Palette "Go to Symbol in Workspace") |
+| `Ctrl+p` / `Cmd+p`, then `>`, `@` or `:` | As in VS Code, the first character picks the mode and the rest carries over: `>` runs commands (the Command Palette), `@` goes to a symbol in the open file (Go to Symbol in Editor), and `:12` goes to line 12 of it. A file name with a line, `a.py:12`, is still a file search |
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
