@@ -234,6 +234,21 @@ pub fn delve_zero_config_request(file: &Path) -> Value {
     })
 }
 
+/// A delve `launch` request with `outputMode: "remote"` unless it names a
+/// mode: delve then forwards the program's stdout and stderr as DAP `output`
+/// events for the Debug Console, as vscode-go does. In delve's default
+/// `local` mode they go to delve's own stdout and stderr, which croft
+/// discards, so nothing the program printed was shown (#1205). An `attach`
+/// is left alone: the process's output is not delve's to forward.
+pub fn with_remote_output(mut request: Value) -> Value {
+    if request["command"] == "launch"
+        && let Some(args) = request.get_mut("arguments").and_then(Value::as_object_mut)
+    {
+        args.entry("outputMode").or_insert_with(|| json!("remote"));
+    }
+    request
+}
+
 /// delve's `test` mode for the package in `dir`, with `args` for the test
 /// binary: `-test.run` scopes it to one test (#264).
 pub fn delve_test_request(dir: &Path, args: &[String]) -> Value {
@@ -1184,7 +1199,7 @@ impl DapSession {
             DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
         transport.send(initialize_request())?;
         let attached = is_attach(&start_request);
-        transport.send(start_request)?;
+        transport.send(with_remote_output(start_request))?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
         session.attached = attached;
         Ok(session)
@@ -2044,6 +2059,76 @@ while True:
         let test = delve_zero_config_request(Path::new("/w/pkg/util_test.go"));
         assert_eq!(test["arguments"]["mode"], "test");
         assert_eq!(test["arguments"]["program"], "/w/pkg");
+    }
+
+    /// Every delve launch asks for its program's output as DAP `output`
+    /// events, whichever builder made it (#1205).
+    #[test]
+    fn delve_launches_forward_the_program_output() {
+        let zero = with_remote_output(delve_zero_config_request(Path::new("/w/main.go")));
+        assert_eq!(zero["arguments"]["outputMode"], "remote");
+        let test = with_remote_output(delve_test_request(Path::new("/w"), &[]));
+        assert_eq!(test["arguments"]["outputMode"], "remote");
+    }
+
+    /// Negative: a launch.json `outputMode` wins, and an attach (whose
+    /// process prints wherever it already does) gets none.
+    #[test]
+    fn an_explicit_output_mode_or_an_attach_is_left_alone() {
+        let local = json!({"command": "launch", "arguments": {"outputMode": "local"}});
+        assert_eq!(
+            with_remote_output(local)["arguments"]["outputMode"],
+            "local"
+        );
+        let attach = json!({"command": "attach", "arguments": {"processId": 7}});
+        assert!(
+            with_remote_output(attach)["arguments"]
+                .get("outputMode")
+                .is_none()
+        );
+    }
+
+    /// End to end against a real delve: what the program prints to stdout
+    /// and stderr reaches the session as `output` events (#1205). Needs Go
+    /// and `dlv`; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_shows_the_program_output() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"starting up\")\n\tfmt.Fprintln(os.Stderr, \"warning: done\")\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let mut s = DapSession::launch_delve(
+            &dlv,
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            BTreeMap::new(),
+        )
+        .expect("delve starts");
+        let mut output = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while s.phase != SessionPhase::Terminated && std::time::Instant::now() < deadline {
+            for ev in s.poll() {
+                if let DapEvent::Output { text, .. } = ev {
+                    output.push_str(&text);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(output.contains("starting up"), "stdout missing: {output:?}");
+        assert!(
+            output.contains("warning: done"),
+            "stderr missing: {output:?}"
+        );
     }
 
     /// End to end against a real delve: a breakpoint in a small Go program
