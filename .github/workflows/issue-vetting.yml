@@ -23,9 +23,6 @@ on:
         description: Issue number to vet
         required: true
         type: string
-  schedule:
-    # Daily sweep for external issues that missed their event.
-    - cron: "23 4 * * *"
 
 permissions: {}
 
